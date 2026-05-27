@@ -1,0 +1,12 @@
+venv/
+downloads/
+ffmpeg.exe
+ffmpeg.zip
+node_modules/
+*.pyc
+__pycache__/
+.idea/
+.vscode/
+*.xlsx
+.ytdlp_cache/
+cookies.txt

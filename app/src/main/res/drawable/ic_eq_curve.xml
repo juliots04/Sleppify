@@ -1,0 +1,21 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="300dp"
+    android:height="150dp"
+    android:viewportWidth="300"
+    android:viewportHeight="150">
+    <!-- Fades under the curve -->
+    <path
+        android:fillColor="#11AEC7FD"
+        android:pathData="M10,130 C30,130 50,50 70,50 C90,50 110,80 130,80 C150,80 170,120 190,120 C210,120 230,40 250,40 C270,40 290,60 290,60 L290,150 L10,150 Z" />
+    <!-- The glowing curve -->
+    <path
+        android:strokeColor="@color/stitch_blue_light"
+        android:strokeWidth="4"
+        android:pathData="M10,130 C30,130 50,50 70,50 C90,50 110,80 130,80 C150,80 170,120 190,120 C210,120 230,40 250,40 C270,40 290,60 290,60" />
+    <!-- The 5 points -->
+    <path android:fillColor="@color/white" android:pathData="M66,50 a4,4 0 1,0 8,0 a4,4 0 1,0 -8,0" />
+    <path android:fillColor="@color/white" android:pathData="M126,80 a4,4 0 1,0 8,0 a4,4 0 1,0 -8,0" />
+    <path android:fillColor="@color/white" android:pathData="M186,120 a4,4 0 1,0 8,0 a4,4 0 1,0 -8,0" />
+    <path android:fillColor="@color/white" android:pathData="M246,40 a4,4 0 1,0 8,0 a4,4 0 1,0 -8,0" />
+    <path android:fillColor="@color/white" android:pathData="M286,60 a4,4 0 1,0 8,0 a4,4 0 1,0 -8,0" />
+</vector>

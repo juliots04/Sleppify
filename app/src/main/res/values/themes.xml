@@ -1,0 +1,42 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Base application theme. -->
+    <style name="Base.Theme.Sleppify" parent="Theme.Material3.Dark.NoActionBar">
+        <!-- Customize your light/dark theme here. -->
+        <item name="colorPrimary">@color/stitch_blue</item>
+        <item name="colorSecondary">@color/stitch_blue_light</item>
+        <item name="android:windowBackground">@color/surface_dark</item>
+        <item name="android:navigationBarColor">@color/surface_dark</item>
+        <item name="android:statusBarColor">@color/surface_dark</item>
+        <item name="android:textColorPrimary">@color/text_primary</item>
+        <item name="android:textColorSecondary">@color/text_secondary</item>
+    </style>
+
+    <style name="Theme.Sleppify" parent="Base.Theme.Sleppify" />
+
+    <style name="ShapeAppearance.Sleppify.Rounded12" parent="ShapeAppearance.Material3.MediumComponent">
+        <item name="cornerSize">12dp</item>
+    </style>
+
+    <style name="ShapeAppearance.Sleppify.Circular" parent="ShapeAppearance.Material3.MediumComponent">
+        <item name="cornerSize">50%</item>
+    </style>
+
+    <style name="ShapeAppearance.Sleppify.MixRound" parent="ShapeAppearance.Material3.MediumComponent">
+        <item name="cornerSize">8dp</item>
+    </style>
+
+    <!-- Eliminate the active indicator pill in BottomNavigationView -->
+    <style name="BottomNavNoIndicator" parent="Widget.Material3.BottomNavigationView.ActiveIndicator">
+        <item name="android:width">0dp</item>
+        <item name="android:height">0dp</item>
+        <item name="shapeAppearance">@null</item>
+    </style>
+
+    <!-- Compact styles for Bottom Navigation -->
+    <style name="BottomNavLabel" parent="TextAppearance.Material3.LabelSmall">
+        <item name="android:textSize">9.5sp</item>
+        <item name="android:letterSpacing">0.02</item>
+        <item name="android:includeFontPadding">false</item>
+        <item name="lineHeight">14sp</item>
+    </style>
+</resources>

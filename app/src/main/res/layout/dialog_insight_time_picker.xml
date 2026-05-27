@@ -1,0 +1,236 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/insightDialogRoot"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#B3111319"
+    android:padding="24dp">
+
+    <com.google.android.material.card.MaterialCardView
+        android:id="@+id/cardInsightTimePicker"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:layout_marginHorizontal="4dp"
+        app:cardBackgroundColor="@color/surface_low"
+        app:cardCornerRadius="32dp"
+        app:strokeColor="#33434653"
+        app:strokeWidth="1dp">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:paddingHorizontal="24dp"
+            android:paddingTop="24dp"
+            android:paddingBottom="20dp">
+
+            <LinearLayout
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <View
+                    android:layout_width="8dp"
+                    android:layout_height="8dp"
+                    android:layout_marginEnd="8dp"
+                    android:background="@drawable/bg_timeline_dot" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:fontFamily="@font/inter_variable"
+                    android:letterSpacing="0.18"
+                    android:text="SELECCIONA UNA HORA"
+                    android:textColor="@color/stitch_blue"
+                    android:textSize="10sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/tvInsightDialogTaskTitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:fontFamily="@font/manrope_variable"
+                android:text="Tarea"
+                android:textColor="@color/text_primary"
+                android:textSize="24sp"
+                android:textStyle="bold" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="18dp"
+                android:gravity="center"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:id="@+id/tvInsightPreviewHour"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:fontFamily="@font/manrope_variable"
+                    android:text="02"
+                    android:textColor="@color/text_primary"
+                    android:textSize="52sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginHorizontal="6dp"
+                    android:fontFamily="@font/manrope_variable"
+                    android:text=":"
+                    android:textColor="#66AEC7FD"
+                    android:textSize="52sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:id="@+id/tvInsightPreviewMinute"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:fontFamily="@font/manrope_variable"
+                    android:text="30"
+                    android:textColor="@color/text_primary"
+                    android:textSize="52sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:id="@+id/tvInsightPreviewPeriod"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:fontFamily="@font/inter_variable"
+                    android:text="PM"
+                    android:textAllCaps="true"
+                    android:textColor="@color/stitch_blue"
+                    android:textSize="18sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:background="@color/surface_dark"
+                android:gravity="center"
+                android:orientation="horizontal"
+                android:paddingHorizontal="14dp"
+                android:paddingVertical="10dp">
+
+                <NumberPicker
+                    android:id="@+id/npInsightHour"
+                    android:layout_width="72dp"
+                    android:layout_height="128dp"
+                    android:theme="@style/ThemeOverlay.Material3.Dark" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginHorizontal="6dp"
+                    android:text=":"
+                    android:textColor="#66AEC7FD"
+                    android:textSize="28sp"
+                    android:textStyle="bold" />
+
+                <NumberPicker
+                    android:id="@+id/npInsightMinute"
+                    android:layout_width="72dp"
+                    android:layout_height="128dp"
+                    android:theme="@style/ThemeOverlay.Material3.Dark" />
+
+                <NumberPicker
+                    android:id="@+id/npInsightPeriod"
+                    android:layout_width="88dp"
+                    android:layout_height="128dp"
+                    android:theme="@style/ThemeOverlay.Material3.Dark" />
+            </LinearLayout>
+
+            <HorizontalScrollView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:scrollbars="none">
+
+                <LinearLayout
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal">
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnInsightChip15Min"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:minHeight="40dp"
+                        android:text="En 15 min"
+                        android:textAllCaps="false"
+                        android:textColor="@color/text_primary"
+                        app:backgroundTint="@color/surface_high"
+                        app:cornerRadius="999dp" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnInsightChip1Hour"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="8dp"
+                        android:minHeight="40dp"
+                        android:text="En 1 hora"
+                        android:textAllCaps="false"
+                        android:textColor="@color/text_primary"
+                        app:backgroundTint="@color/surface_high"
+                        app:cornerRadius="999dp" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnInsightChip12Hours"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="8dp"
+                        android:minHeight="40dp"
+                        android:text="En 12 horas"
+                        android:textAllCaps="false"
+                        android:textColor="@color/text_primary"
+                        app:backgroundTint="@color/surface_high"
+                        app:cornerRadius="999dp" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnInsightChip24Hours"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="8dp"
+                        android:minHeight="40dp"
+                        android:text="En 24 horas"
+                        android:textAllCaps="false"
+                        android:textColor="@color/text_primary"
+                        app:backgroundTint="@color/surface_high"
+                        app:cornerRadius="999dp" />
+                </LinearLayout>
+            </HorizontalScrollView>
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnInsightConfirm"
+                android:layout_width="match_parent"
+                android:layout_height="56dp"
+                android:layout_marginTop="16dp"
+                android:text="Confirmar horario"
+                android:textAllCaps="false"
+                android:textColor="#002C70"
+                android:textStyle="bold"
+                app:backgroundTint="@color/stitch_blue"
+                app:cornerRadius="999dp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnInsightCancel"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:layout_marginTop="4dp"
+                android:text="Cancelar"
+                android:textAllCaps="false"
+                android:textColor="@color/text_secondary" />
+
+        </LinearLayout>
+    </com.google.android.material.card.MaterialCardView>
+
+</FrameLayout>

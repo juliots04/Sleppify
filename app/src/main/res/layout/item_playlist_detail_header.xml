@@ -1,0 +1,218 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/llPlaylistHeaderRoot"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:clipChildren="false"
+    android:clipToPadding="false">
+
+        <androidx.constraintlayout.widget.ConstraintLayout
+            android:id="@+id/flPlaylistHeaderContainer"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="-36dp"
+            android:clipChildren="false"
+            android:clipToPadding="false">
+
+            <ImageView
+                android:id="@+id/ivPlaylistBackdrop"
+                android:layout_width="0dp"
+                android:layout_height="520dp"
+                android:layout_marginTop="-82dp"
+                android:alpha="1.0"
+                android:scaleType="centerCrop"
+                app:layout_constraintEnd_toEndOf="parent"
+                app:layout_constraintStart_toStartOf="parent"
+                app:layout_constraintTop_toTopOf="parent" />
+ 
+            <View
+                android:id="@+id/vPlaylistBackdropScrim"
+                android:layout_width="0dp"
+                android:layout_height="0dp"
+                android:layout_marginTop="-82dp"
+                android:background="@drawable/bg_playlist_backdrop_scrim"
+                app:layout_constraintBottom_toBottomOf="parent"
+                app:layout_constraintEnd_toEndOf="parent"
+                app:layout_constraintStart_toStartOf="parent"
+                app:layout_constraintTop_toTopOf="parent" />
+
+            <View
+                android:id="@+id/vPlaylistBackdropBottomFade"
+                android:layout_width="0dp"
+                android:layout_height="280dp"
+                android:background="@drawable/bg_playlist_backdrop_bottom_fade"
+                app:layout_constraintBottom_toBottomOf="parent"
+                app:layout_constraintEnd_toEndOf="parent"
+                app:layout_constraintStart_toStartOf="parent" />
+
+            <View
+                android:id="@+id/vPlaylistBackdropAmoledFade"
+                android:layout_width="0dp"
+                android:layout_height="280dp"
+                android:background="@drawable/bg_playlist_backdrop_amoled_fade"
+                android:visibility="gone"
+                app:layout_constraintBottom_toBottomOf="parent"
+                app:layout_constraintEnd_toEndOf="parent"
+                app:layout_constraintStart_toStartOf="parent" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_horizontal"
+                android:orientation="vertical"
+                android:paddingBottom="40dp"
+                app:layout_constraintBottom_toBottomOf="parent"
+                app:layout_constraintEnd_toEndOf="parent"
+                app:layout_constraintStart_toStartOf="parent"
+                app:layout_constraintTop_toTopOf="parent">
+
+                <FrameLayout
+                    android:layout_width="260dp"
+                    android:layout_height="260dp"
+                    android:layout_marginTop="14dp"
+                    android:layout_marginBottom="18dp">
+
+                    <View
+                        android:layout_width="match_parent"
+                        android:layout_height="match_parent"
+                        android:background="@drawable/bg_playlist_cover_glow"
+                        android:scaleX="1.06"
+                        android:scaleY="1.06" />
+
+                    <ImageView
+                        android:id="@+id/ivPlaylistCover"
+                        android:layout_width="match_parent"
+                        android:layout_height="match_parent"
+                        android:scaleType="centerCrop" />
+                </FrameLayout>
+
+                <TextView
+                    android:id="@+id/tvPlaylistName"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:gravity="center"
+                    android:maxLines="2"
+                    android:text="Lista"
+                    android:textColor="@color/text_primary"
+                    android:textSize="22sp"
+                    android:textStyle="bold" />
+
+                <LinearLayout
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+
+                    <com.google.android.material.imageview.ShapeableImageView
+                        android:id="@+id/ivGoogleProfile"
+                        android:layout_width="18dp"
+                        android:layout_height="18dp"
+                        android:scaleType="centerCrop"
+                        android:src="@android:drawable/ic_menu_myplaces"
+                        app:shapeAppearanceOverlay="@style/ShapeAppearance.Material3.Corner.Full" />
+
+                    <TextView
+                        android:id="@+id/tvGoogleProfileName"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="6dp"
+                        android:fontFamily="@font/inter_variable"
+                        android:text="Tu cuenta"
+                        android:textColor="@color/text_secondary"
+                        android:textSize="11sp" />
+                </LinearLayout>
+
+                <TextView
+                    android:id="@+id/tvPlaylistInfo"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:fontFamily="@font/inter_variable"
+                    android:maxLines="2"
+                    android:text="Lista"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="12sp" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:clipChildren="false"
+                    android:clipToPadding="false"
+                    android:gravity="center"
+                    android:orientation="horizontal">
+
+                    <ImageButton
+                        android:id="@+id/btnDownload"
+                        android:layout_width="48dp"
+                        android:layout_height="48dp"
+                        android:background="@drawable/bg_playlist_action_dark"
+                        android:padding="14dp"
+                        android:scaleType="center"
+                        android:src="@drawable/ic_download_bold"
+                        app:tint="#FFFFFF" />
+
+                    <ImageButton
+                        android:id="@+id/btnEditPlaylist"
+                        android:layout_width="48dp"
+                        android:layout_height="48dp"
+                        android:layout_marginStart="10dp"
+                        android:background="@drawable/bg_playlist_action_dark"
+                        android:padding="14dp"
+                        android:scaleType="center"
+                        android:src="@drawable/ic_edit_24"
+                        android:visibility="visible"
+                        app:tint="#FFFFFF" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnListenNow"
+                        android:layout_width="60dp"
+                        android:layout_height="60dp"
+                        android:layout_marginStart="10dp"
+                        android:layout_marginEnd="10dp"
+                        android:backgroundTint="@android:color/white"
+                        android:insetTop="0dp"
+                        android:insetBottom="0dp"
+                        android:minWidth="0dp"
+                        android:minHeight="0dp"
+                        android:padding="0dp"
+                        app:cornerRadius="30dp"
+                        app:icon="@drawable/ic_player_play"
+                        app:iconGravity="textStart"
+                        app:iconPadding="0dp"
+                        app:iconSize="34dp"
+                        app:iconTint="#101010"
+                        app:rippleColor="#33000000" />
+
+                    <ImageButton
+                        android:id="@+id/btnSharePlaylist"
+                        android:layout_width="48dp"
+                        android:layout_height="48dp"
+                        android:layout_marginEnd="10dp"
+                        android:background="@drawable/bg_playlist_action_dark"
+                        android:padding="14dp"
+                        android:scaleType="center"
+                        android:src="@drawable/ic_playlist_share"
+                        app:tint="#FFFFFF" />
+
+                    <ImageButton
+                        android:id="@+id/btnShufflePlay"
+                        android:layout_width="48dp"
+                        android:layout_height="48dp"
+                        android:layout_marginEnd="6dp"
+                        android:background="@drawable/bg_playlist_action_dark"
+                        android:padding="14dp"
+                        android:scaleType="center"
+                        android:src="@drawable/ic_shuffle_custom"
+                        app:tint="#FFFFFF" />
+                </LinearLayout>
+
+            </LinearLayout>
+        </androidx.constraintlayout.widget.ConstraintLayout>
+
+
+</LinearLayout>

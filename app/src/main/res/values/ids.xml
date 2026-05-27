@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <item name="tag_artwork_signature" type="id" />
+    <item name="tag_playback_state" type="id" />
+    <item name="tag_backdrop_top_color" type="id" />
+    <item name="nav_scanner" type="id" />
+    <item name="nav_equalizer" type="id" />
+</resources>

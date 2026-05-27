@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Override Material component dimension to reduce space between icon and text in BottomNavigationView -->
+    <dimen name="design_bottom_navigation_margin" tools:override="true">2dp</dimen>
+</resources>

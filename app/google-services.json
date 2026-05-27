@@ -1,0 +1,47 @@
+{
+  "project_info": {
+    "project_number": "579664672215",
+    "project_id": "sleppify",
+    "storage_bucket": "sleppify.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:579664672215:android:8d24dbce95ea0f16dc8792",
+        "android_client_info": {
+          "package_name": "com.example.sleppify"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "579664672215-2ou0t6efgv9vjhnh36h8r1ufi1pbtvnt.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.example.sleppify",
+            "certificate_hash": "42638a1d18b0aa7b357e73ddc85f83e9dee5da38"
+          }
+        },
+        {
+          "client_id": "579664672215-leu3f0fos9i3ocam6jgmt89ifcvnggnp.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBbDT12i9itOimk4pyYz36By_OUse3TeZk"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "579664672215-leu3f0fos9i3ocam6jgmt89ifcvnggnp.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

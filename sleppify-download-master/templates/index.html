@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sleppify - Test Descargas</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; min-height: 100vh; padding: 40px 20px; }
+        .container { max-width: 700px; margin: 0 auto; }
+        h1 { font-size: 1.5rem; margin-bottom: 8px; color: #7c3aed; }
+        .subtitle { color: #888; font-size: 0.85rem; margin-bottom: 24px; }
+        .input-row { display: flex; gap: 8px; margin-bottom: 16px; }
+        input[type="text"] { flex: 1; padding: 12px 16px; border-radius: 8px; border: 1px solid #333; background: #16213e; color: #eee; font-size: 0.95rem; outline: none; }
+        input[type="text"]:focus { border-color: #7c3aed; }
+        button { padding: 12px 20px; border-radius: 8px; border: none; font-size: 0.9rem; font-weight: 600; cursor: pointer; transition: opacity 0.2s; }
+        button:hover { opacity: 0.85; }
+        button:disabled { opacity: 0.4; cursor: not-allowed; }
+        .btn-test { background: #7c3aed; color: #fff; }
+        .btn-download { background: #10b981; color: #fff; }
+        .actions { display: flex; gap: 8px; margin-bottom: 24px; }
+        .log-box { background: #0f0f23; border: 1px solid #333; border-radius: 8px; padding: 16px; font-family: 'Fira Code', 'Consolas', monospace; font-size: 0.8rem; line-height: 1.6; white-space: pre-wrap; word-break: break-all; max-height: 500px; overflow-y: auto; min-height: 120px; }
+        .log-box .ok { color: #10b981; }
+        .log-box .err { color: #ef4444; }
+        .log-box .info { color: #60a5fa; }
+        .log-box .warn { color: #f59e0b; }
+        .status-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; font-size: 0.85rem; }
+        .dot { width: 8px; height: 8px; border-radius: 50%; }
+        .dot.green { background: #10b981; }
+        .dot.red { background: #ef4444; }
+        .dot.yellow { background: #f59e0b; animation: pulse 1s infinite; }
+        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+        .health-info { color: #888; font-size: 0.8rem; margin-bottom: 16px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Sleppify Download Tester</h1>
+        <p class="subtitle">Prueba el endpoint /api/video — diagnostica errores y descarga video</p>
+
+        <div class="health-info" id="healthInfo">Verificando servidor...</div>
+
+        <div class="input-row">
+            <input type="text" id="urlInput" placeholder="YouTube URL o Video ID (ej: aOSGEoxZ-Vk)">
+        </div>
+
+        <div class="actions">
+            <button class="btn-test" id="btnTest" onclick="runTest()">Diagnosticar</button>
+            <button class="btn-download" id="btnDownload" onclick="runDownload()">Descargar a PC</button>
+            <button class="btn-stream" id="btnStream" onclick="runStream()" style="background: #3b82f6; color: #fff;">Probar Streaming</button>
+        </div>
+
+        <div id="videoContainer" style="display:none; margin-bottom: 24px; border-radius: 8px; overflow: hidden; background: #000; border: 1px solid #333;">
+            <video id="videoPlayer" controls style="width: 100%; display: block;" autoplay></video>
+        </div>
+
+        <div class="status-bar" id="statusBar" style="display:none;">
+            <div class="dot" id="statusDot"></div>
+            <span id="statusText"></span>
+        </div>
+
+        <div class="log-box" id="logBox">Esperando acción...</div>
+    </div>
+
+    <script>
+        const logBox = document.getElementById('logBox');
+        const statusBar = document.getElementById('statusBar');
+        const statusDot = document.getElementById('statusDot');
+        const statusText = document.getElementById('statusText');
+
+        function log(msg, cls = '') {
+            const span = document.createElement('span');
+            span.className = cls;
+            span.textContent = msg + '\n';
+            logBox.appendChild(span);
+            logBox.scrollTop = logBox.scrollHeight;
+        }
+
+        function clearLog() { logBox.innerHTML = ''; }
+
+        function setStatus(text, color) {
+            statusBar.style.display = 'flex';
+            statusDot.className = 'dot ' + color;
+            statusText.textContent = text;
+        }
+
+        function getUrl() {
+            let val = document.getElementById('urlInput').value.trim();
+            if (!val) return null;
+            if (!val.startsWith('http')) {
+                val = 'https://www.youtube.com/watch?v=' + val;
+            }
+            return val;
+        }
+
+        // Health check on load
+        (async function checkHealth() {
+            try {
+                const r = await fetch('/api/health');
+                const d = await r.json();
+                document.getElementById('healthInfo').innerHTML =
+                    `<span style="color:#10b981">&#x2713;</span> Server OK — yt-dlp v${d.yt_dlp_version}`;
+            } catch (e) {
+                document.getElementById('healthInfo').innerHTML =
+                    `<span style="color:#ef4444">&#x2717;</span> Server no responde`;
+            }
+        })();
+
+        async function runTest() {
+            const url = getUrl();
+            if (!url) { alert('Ingresa una URL'); return; }
+
+            clearLog();
+            setStatus('Extrayendo info...', 'yellow');
+            log('[TEST] URL: ' + url, 'info');
+            log('[TEST] Endpoint: /api/test', 'info');
+            log('');
+
+            const start = Date.now();
+            try {
+                const r = await fetch('/api/test', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({url})
+                });
+                const elapsed = ((Date.now() - start) / 1000).toFixed(2);
+                const d = await r.json();
+
+                if (d.status === 'ok') {
+                    setStatus('Extracción exitosa (' + elapsed + 's)', 'green');
+                    log('[OK] Extracción exitosa en ' + elapsed + 's', 'ok');
+                    log('');
+                    log('  Título:          ' + d.title, 'ok');
+                    log('  Duración:        ' + d.duration + 's', 'ok');
+                    log('  Extensión:       ' + d.ext, 'ok');
+                    log('  URL directa:     ' + (d.has_direct_url ? 'SI' : 'NO'), d.has_direct_url ? 'ok' : 'err');
+                    log('  Formatos total:  ' + d.total_formats, 'info');
+                    log('  Audio-only:      ' + d.audio_only_formats, 'info');
+                    if (d.sample_url_prefix) {
+                        log('  URL prefix:      ' + d.sample_url_prefix + '...', 'info');
+                    }
+                    log('');
+                    log('[INFO] La descarga debería funcionar. Pulsa "Descargar a PC".', 'info');
+                } else if (d.status === 'error') {
+                    setStatus('Error en extracción (' + elapsed + 's)', 'red');
+                    log('[ERROR] ' + d.error_type + ': ' + d.error_message, 'err');
+                    log('', '');
+                    log('[TRACEBACK]', 'warn');
+                    log(d.traceback, 'warn');
+                } else {
+                    setStatus('Fallo (' + elapsed + 's)', 'red');
+                    log('[FAIL] ' + JSON.stringify(d), 'err');
+                }
+            } catch (e) {
+                setStatus('Error de red', 'red');
+                log('[NETWORK ERROR] ' + e.message, 'err');
+            }
+        }
+
+        async function runDownload() {
+            const url = getUrl();
+            if (!url) { alert('Ingresa una URL'); return; }
+
+            clearLog();
+            setStatus('Descargando...', 'yellow');
+            log('[DOWNLOAD] URL: ' + url, 'info');
+            log('[DOWNLOAD] Enviando a /api/video...', 'info');
+            log('');
+
+            const start = Date.now();
+            try {
+                const r = await fetch('/api/video', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({url})
+                });
+
+                const elapsed = ((Date.now() - start) / 1000).toFixed(2);
+
+                if (!r.ok) {
+                    setStatus('Error HTTP ' + r.status + ' (' + elapsed + 's)', 'red');
+                    const text = await r.text();
+                    log('[ERROR] HTTP ' + r.status, 'err');
+                    log(text, 'err');
+                    return;
+                }
+
+                const blob = await r.blob();
+                const size = blob.size;
+
+                if (size < 50000) {
+                    setStatus('Archivo muy pequeño (' + size + ' bytes)', 'red');
+                    log('[WARN] Descarga de solo ' + size + ' bytes — probablemente inválida', 'err');
+                    return;
+                }
+
+                // Trigger browser download
+                const cd = r.headers.get('Content-Disposition') || '';
+                let filename = 'download.m4a';
+                const match = cd.match(/filename="?([^"]+)"?/);
+                if (match) filename = match[1];
+
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(blob);
+                a.download = filename;
+                a.click();
+                URL.revokeObjectURL(a.href);
+
+                setStatus('Descarga completa (' + elapsed + 's)', 'green');
+                log('[OK] Descargado: ' + filename, 'ok');
+                log('     Tamaño: ' + (size / 1024 / 1024).toFixed(2) + ' MB', 'ok');
+                log('     Tiempo: ' + elapsed + 's', 'ok');
+                log('');
+                log('[INFO] Archivo guardado en tu carpeta de Descargas', 'info');
+            } catch (e) {
+                setStatus('Error de red', 'red');
+                log('[NETWORK ERROR] ' + e.message, 'err');
+            }
+        }
+
+        function runStream() {
+            const url = getUrl();
+            if (!url) { alert('Ingresa una URL'); return; }
+
+            clearLog();
+            setStatus('Iniciando Stream...', 'yellow');
+            log('[STREAM] URL: ' + url, 'info');
+            log('[STREAM] Conectando a /api/streaming...', 'info');
+            
+            const videoContainer = document.getElementById('videoContainer');
+            const videoPlayer = document.getElementById('videoPlayer');
+            
+            videoContainer.style.display = 'block';
+            videoPlayer.src = '/api/streaming?url=' + encodeURIComponent(url);
+            
+            videoPlayer.onplaying = () => {
+                setStatus('Reproduciendo Stream', 'green');
+                log('[OK] Video reproduciéndose exitosamente.', 'ok');
+            };
+            videoPlayer.onerror = (e) => {
+                setStatus('Error en Stream', 'red');
+                log('[ERROR] No se pudo cargar o reproducir el stream.', 'err');
+            };
+        }
+
+        // Allow Enter key to trigger test
+        document.getElementById('urlInput').addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') runTest();
+        });
+    </script>
+</body>
+</html>

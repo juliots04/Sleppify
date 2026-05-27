@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+
+    <!-- Stitch Theme Colors -->
+    <color name="stitch_blue">#FFFFFFFF</color>
+    <color name="stitch_blue_light">#AFFFFFFF</color>
+
+    <color name="surface_dark">#000000</color>
+    <color name="surface_dark_overlay">#000000</color>
+    <color name="surface_low">#0A0A0A</color>
+    <color name="surface_high">#141414</color>
+    <color name="surface_raised">#1E1E24</color>
+    <color name="text_primary">#e2e2eb</color>
+    <color name="text_secondary">#c3c6d5</color>
+    <color name="alert_red">#FF4D4D</color>
+</resources>

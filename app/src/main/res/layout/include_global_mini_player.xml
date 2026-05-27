@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/llGlobalMiniPlayer"
+    android:layout_width="0dp"
+    android:layout_height="72dp"
+    android:background="@drawable/bg_playlist_footer_extension"
+    android:orientation="vertical"
+    android:paddingStart="0dp"
+    android:paddingTop="4dp"
+    android:paddingEnd="0dp"
+    android:paddingBottom="0dp"
+    android:visibility="gone"
+    android:elevation="33dp"
+    app:layout_constraintBottom_toTopOf="@id/bottomNavigation"
+    app:layout_constraintEnd_toEndOf="parent"
+    app:layout_constraintStart_toStartOf="parent">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="12dp"
+        android:paddingEnd="12dp">
+
+        <FrameLayout
+            android:id="@+id/flMiniPlayerVideoContainer"
+            android:layout_width="50dp"
+            android:layout_height="50dp">
+
+            <ImageView
+                android:id="@+id/ivGlobalMiniPlayerArt"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:background="@color/surface_high"
+                android:scaleType="centerCrop" />
+
+
+            <ProgressBar
+                android:id="@+id/pbMiniPlayerLoading"
+                android:layout_width="34dp"
+                android:layout_height="34dp"
+                android:layout_gravity="center"
+                android:indeterminate="true"
+                android:indeterminateTint="@android:color/white"
+                android:visibility="gone" />
+        </FrameLayout>
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="10dp"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/tvGlobalMiniPlayerTitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="16dp"
+                android:ellipsize="end"
+                android:fontFamily="sans-serif-black"
+                android:maxLines="2"
+                android:text="Selecciona una canción"
+                android:textColor="@color/text_primary"
+                android:textSize="14sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/tvGlobalMiniPlayerSubtitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:ellipsize="end"
+                android:fontFamily="@font/inter_variable"
+                android:maxLines="1"
+                android:text=""
+                android:textColor="@color/text_secondary"
+                android:textSize="14sp" />
+        </LinearLayout>
+
+        <ImageButton
+            android:id="@+id/btnGlobalMiniPlayPause"
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:background="@drawable/bg_mini_play_ripple"
+            android:padding="8dp"
+            android:src="@drawable/ic_mini_play"
+            app:tint="@color/stitch_blue" />
+    </LinearLayout>
+
+    <SeekBar
+        android:id="@+id/sbGlobalMiniPlayerProgress"
+        android:layout_width="match_parent"
+        android:layout_height="16dp"
+        android:layout_marginTop="0dp"
+        android:clickable="false"
+        android:enabled="false"
+        android:focusable="false"
+        android:max="1000"
+        android:paddingStart="0dp"
+        android:paddingEnd="0dp"
+        android:progress="0"
+        android:progressTint="@color/stitch_blue"
+        android:splitTrack="false"
+        android:thumb="@null"
+        android:thumbTint="@android:color/transparent" />
+</LinearLayout>

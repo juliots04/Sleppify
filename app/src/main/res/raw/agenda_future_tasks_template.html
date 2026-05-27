@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html class="dark" lang="es">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title></title>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<style>
+    :root {
+        --surface: #111319;
+        --surface-low: #191b22;
+        --surface-high: #2c2f38;
+        --text-primary: #e2e2eb;
+        --text-secondary: #c3c6d5;
+        --stitch-blue: #AEC7FD;
+        --stitch-blue-soft: #AEC7FD;
+    }
+    .material-symbols-outlined {
+        font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+    }
+    body {
+        background-color: var(--surface);
+        color: var(--text-primary);
+        font-family: "Segoe UI", "Roboto", sans-serif;
+    }
+    main {
+        width: 100%;
+        padding: 20px 0;
+        min-height: 100vh;
+    }
+    section {
+        margin-bottom: 40px;
+    }
+    section header {
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+        margin-bottom: 16px;
+    }
+    h2 {
+        margin: 0;
+        font-size: 28px;
+        line-height: 1.1;
+        letter-spacing: -0.02em;
+        font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+    }
+    .cycle-label {
+        color: #9cb6ff;
+        font-size: 11px;
+        font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+        font-weight: 600;
+        letter-spacing: 0.22em;
+        text-transform: uppercase;
+        line-height: 1;
+    }
+    .task-list > * + * {
+        margin-top: 12px;
+    }
+    .task-row {
+        display: flex;
+        align-items: stretch;
+        gap: 14px;
+    }
+    .task-timeline {
+        width: 14px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+    }
+    .task-line {
+        width: 2px;
+        flex: 1;
+        background: #2f394a;
+        border-radius: 999px;
+    }
+    .task-line-hidden {
+        visibility: hidden;
+    }
+    .task-dot {
+        width: 10px;
+        height: 10px;
+        margin: 6px 0;
+        border-radius: 999px;
+        background: #aec7fd;
+        box-shadow: 0 0 0 3px rgba(174, 199, 253, 0.18);
+    }
+    .task-card {
+        flex: 1;
+        background: #191b22;
+        border-radius: 20px;
+        padding: 20px;
+        border: none;
+        transition: transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1), background 0.2s ease;
+        -webkit-user-select: none;
+        user-select: none;
+        -webkit-tap-highlight-color: transparent;
+    }
+    .task-card:active {
+        transform: scale(0.96);
+        background: #1e212b;
+    }
+    .task-card.long-pressing {
+        transform: scale(0.92);
+        background: #252833;
+    }
+    .task-card-head {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 10px;
+    }
+    .task-meta {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+    }
+    .task-title {
+        margin: 0;
+        font-size: 22px;
+        line-height: 1.15;
+        letter-spacing: -0.01em;
+        color: #e2e2eb;
+        font-weight: 700;
+    }
+    .task-time {
+        display: inline-flex;
+        align-items: center;
+        padding: 4px 10px;
+        border-radius: 999px;
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        white-space: nowrap;
+    }
+    .task-time-day {
+        background: rgba(174, 199, 253, 0.12);
+        color: #bcd0ff;
+    }
+    .task-time-night {
+        background: rgba(255, 181, 154, 0.12);
+        color: #ffc5ad;
+    }
+    .task-category {
+        display: inline-flex;
+        align-items: center;
+        padding: 4px 10px;
+        border-radius: 999px;
+        background: rgba(174, 199, 253, 0.2);
+        color: #d3e1ff;
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        white-space: nowrap;
+    }
+    .task-description {
+        margin: 0;
+        color: #c3c6d5;
+        font-size: 14px;
+        line-height: 1.55;
+    }
+    section p {
+        margin: 0;
+    }
+    button {
+        border: 0;
+        background: #b1c5ff;
+        color: #002c70;
+        font-weight: 700;
+        padding: 10px 16px;
+        border-radius: 999px;
+    }
+    .editorial-shadow {
+        box-shadow: none;
+    }
+    .glass-card {
+        background: rgba(25, 27, 34, 0.8);
+        backdrop-filter: blur(20px);
+    }
+    .future-insight-card {
+        position: relative;
+        overflow: hidden;
+        margin-top: 20px;
+        padding: 24px;
+        border-radius: 16px;
+        border: 1px solid rgba(161, 185, 255, 0.2);
+        background: linear-gradient(145deg, rgba(25, 27, 34, 0.95), rgba(18, 20, 28, 0.96));
+        box-shadow: 0 12px 28px rgba(0, 0, 0, 0.28);
+    }
+    .future-insight-mark {
+        position: absolute;
+        top: 8px;
+        right: 12px;
+        color: rgba(177, 197, 255, 0.15);
+        font-family: "Material Symbols Outlined", sans-serif;
+        font-size: 74px;
+        line-height: 1;
+        pointer-events: none;
+        user-select: none;
+    }
+    .future-insight-head {
+        position: relative;
+        z-index: 1;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 14px;
+    }
+    .future-insight-icon {
+        color: #b1c5ff;
+        font-size: 20px;
+        line-height: 1;
+    }
+    .future-insight-label {
+        color: #b1c5ff;
+        font-size: 11px;
+        letter-spacing: 0.2em;
+        text-transform: uppercase;
+        font-weight: 700;
+    }
+    .future-insight-title {
+        position: relative;
+        z-index: 1;
+        margin: 0;
+        color: #e2e2eb;
+        font-size: 24px;
+        line-height: 1.2;
+        letter-spacing: -0.01em;
+        font-weight: 800;
+    }
+    .future-insight-text {
+        position: relative;
+        z-index: 1;
+        margin: 14px 0 18px;
+        color: #c3c6d5;
+        font-size: 14px;
+        line-height: 1.6;
+        max-width: 560px;
+    }
+    .future-insight-action {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        position: relative;
+        z-index: 1;
+        border: 0;
+        background: #b1c5ff;
+        color: #002c70;
+        font-weight: 700;
+        font-size: 12px;
+        letter-spacing: 0.04em;
+        padding: 11px 18px;
+        border-radius: 999px;
+        text-decoration: none;
+    }
+    body {
+        min-height: max(884px, 100dvh);
+    }
+
+    .future-empty-section {
+        margin-bottom: 64px;
+    }
+    .future-empty-shell {
+        position: relative;
+        overflow: hidden;
+        padding: 26px;
+        border-radius: 24px;
+        background:
+            radial-gradient(120% 90% at 12% 8%, rgba(177, 197, 255, 0.2) 0%, rgba(17, 19, 25, 0) 60%),
+            linear-gradient(142deg, rgba(28, 32, 42, 0.9) 0%, rgba(17, 19, 25, 0.96) 55%, rgba(0, 71, 171, 0.15) 100%);
+        backdrop-filter: blur(20px);
+        box-shadow: 0 12px 32px rgba(0, 71, 171, 0.08);
+    }
+    .future-empty-shell::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background: linear-gradient(120deg, rgba(255, 255, 255, 0.04) 0%, rgba(255, 255, 255, 0) 35%);
+        pointer-events: none;
+    }
+    .future-empty-title {
+        margin: 0;
+        font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+        font-size: 28px;
+        line-height: 1.15;
+        letter-spacing: -0.02em;
+        color: var(--text-primary);
+    }
+    .future-empty-copy {
+        margin: 12px 0 0;
+        max-width: 560px;
+        color: var(--text-secondary);
+        font-size: 14px;
+        line-height: 1.6;
+    }
+    .future-empty-cta {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        margin-top: 18px;
+        padding: 12px 18px;
+        border-radius: 999px;
+        background: linear-gradient(135deg, #b1c5ff 0%, #0047ab 100%);
+        color: #f5f8ff;
+        font-size: 12px;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        text-decoration: none;
+        transition: transform 160ms ease, filter 160ms ease;
+    }
+    .future-empty-cta:active {
+        transform: scale(0.98);
+        filter: brightness(0.95);
+    }
+
+    body.amoled {
+        --surface: #000000;
+        --surface-low: #000000;
+        --surface-high: #000000;
+        background-color: #000000;
+    }
+    body.amoled .task-card {
+        background: #000000;
+        box-shadow: inset 0 0 0 1px rgba(161, 185, 255, 0.14);
+    }
+    body.amoled .task-card:active {
+        background: #060606;
+    }
+    body.amoled .task-card.long-pressing {
+        background: #0b0b0b;
+    }
+    body.amoled .task-line {
+        background: #1a2230;
+    }
+    body.amoled .future-insight-card {
+        background: linear-gradient(145deg, rgba(0, 0, 0, 0.98), rgba(0, 0, 0, 0.98));
+        box-shadow: 0 12px 28px rgba(0, 0, 0, 0.55);
+    }
+    body.amoled .future-empty-shell {
+        background:
+            radial-gradient(120% 90% at 12% 8%, rgba(177, 197, 255, 0.14) 0%, rgba(0, 0, 0, 0) 60%),
+            linear-gradient(142deg, rgba(0, 0, 0, 0.98) 0%, rgba(0, 0, 0, 0.98) 55%, rgba(0, 71, 171, 0.18) 100%);
+    }
+</style>
+<script>
+    document.addEventListener('DOMContentLoaded', () => {
+        let pressTimer;
+        let lastX = 0;
+        let lastY = 0;
+
+        function handleStart(card, e) {
+            card.classList.add('long-pressing');
+            const date = card.getAttribute('data-date');
+            const title = card.getAttribute('data-title');
+            const time = card.getAttribute('data-time');
+
+            // Get coordinates relative to the WebView viewport
+            const touch = e.touches ? e.touches[0] : e;
+            lastX = touch.clientX;
+            lastY = touch.clientY;
+
+            pressTimer = setTimeout(() => {
+                card.classList.remove('long-pressing');
+                // Trigger the Android action with viewport-relative coordinates
+                window.location.href = `sleppify://future-task/menu?date=${encodeURIComponent(date)}&task=${encodeURIComponent(title)}&time=${encodeURIComponent(time)}&x=${lastX}&y=${lastY}`;
+            }, 400);
+        }
+
+        function handleEnd(card) {
+            clearTimeout(pressTimer);
+            card.classList.remove('long-pressing');
+        }
+
+        const cards = document.querySelectorAll('.task-card');
+        cards.forEach(card => {
+            card.addEventListener('touchstart', (e) => handleStart(card, e), { passive: true });
+            card.addEventListener('touchend', () => handleEnd(card));
+            card.addEventListener('touchcancel', () => handleEnd(card));
+            card.addEventListener('touchmove', () => handleEnd(card), { passive: true });
+            
+            // Mouse support for testing
+            card.addEventListener('mousedown', (e) => handleStart(card, e));
+            card.addEventListener('mouseup', () => handleEnd(card));
+            card.addEventListener('mouseleave', () => handleEnd(card));
+        });
+    });
+</script>
+</head>
+<body class="bg-surface selection:bg-primary-container selection:text-on-primary-container __THEME_BODY_CLASS__">
+<main class="w-full px-0 py-10 min-h-screen">
+__DYNAMIC_SECTIONS__
+</main>
+<div class="fixed top-0 left-0 w-full h-full pointer-events-none -z-10 opacity-[0.03]">
+    <div class="absolute top-[-10%] right-[-10%] w-[60%] h-[60%] bg-primary-container rounded-full blur-[120px]"></div>
+    <div class="absolute bottom-[-10%] left-[-10%] w-[50%] h-[50%] bg-tertiary-container rounded-full blur-[120px]"></div>
+</div>
+</body>
+</html>

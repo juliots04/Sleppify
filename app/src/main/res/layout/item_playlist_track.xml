@@ -1,0 +1,144 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- OPTIMIZADO: Cambio de RelativeLayout a ConstraintLayout para mejor rendimiento -->
+<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/rootTrackRow"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:background="@drawable/bg_playlist_track_default"
+    android:clickable="true"
+    android:longClickable="true"
+    android:focusable="true"
+    android:foreground="?attr/selectableItemBackground"
+    android:layout_marginTop="6dp"
+    android:layout_marginBottom="6dp"
+    android:minHeight="60dp"
+    android:paddingStart="8dp"
+    android:paddingEnd="8dp">
+
+    <!-- Artwork container -->
+    <FrameLayout
+        android:id="@+id/flArtworkContainer"
+        android:layout_width="50dp"
+        android:layout_height="50dp"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintBottom_toBottomOf="parent">
+
+        <ImageView
+            android:id="@+id/ivTrackArt"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:background="@color/surface_high"
+            android:scaleType="centerCrop" />
+
+        <!-- Now playing overlay -->
+        <FrameLayout
+            android:id="@+id/llNowPlayingOverlay"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:background="@drawable/bg_now_playing_overlay"
+            android:visibility="gone">
+
+            <com.example.sleppify.AnimatedEqualizerView
+                android:id="@+id/animatedEq"
+                android:layout_width="16dp"
+                android:layout_height="16dp"
+                android:layout_gravity="bottom|end"
+                android:layout_margin="2dp"
+                app:barColor="@color/stitch_blue" />
+        </FrameLayout>
+    </FrameLayout>
+
+    <!-- Title text - OPTIMIZADO: sin LayoutLinear anidado innecesario -->
+    <TextView
+        android:id="@+id/tvTrackTitle"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="12dp"
+        android:layout_marginEnd="30dp"
+        android:ellipsize="end"
+        android:fontFamily="sans-serif-black"
+        android:maxLines="2"
+        android:text="Canción"
+        android:textColor="@color/text_primary"
+        android:textSize="14sp"
+        android:textStyle="bold"
+        android:includeFontPadding="false"
+        app:layout_constraintStart_toEndOf="@id/flArtworkContainer"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintEnd_toStartOf="@id/llRightActions"
+        app:layout_constraintBottom_toTopOf="@id/tvTrackSubtitle"
+        app:layout_constraintVertical_chainStyle="packed" />
+
+    <!-- Subtitle text -->
+    <TextView
+        android:id="@+id/tvTrackSubtitle"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:ellipsize="end"
+        android:fontFamily="@font/inter_variable"
+        android:maxLines="1"
+        android:text="Artista • 3:42"
+        android:textColor="@color/text_secondary"
+        android:textSize="14sp"
+        android:includeFontPadding="false"
+        app:layout_constraintStart_toStartOf="@id/tvTrackTitle"
+        app:layout_constraintTop_toBottomOf="@id/tvTrackTitle"
+        app:layout_constraintEnd_toEndOf="@id/tvTrackTitle"
+        app:layout_constraintBottom_toBottomOf="parent" />
+
+    <!-- Right actions container (offline + more) -->
+    <LinearLayout
+        android:id="@+id/llRightActions"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintBottom_toBottomOf="parent">
+
+        <ImageView
+            android:id="@+id/ivOfflineState"    
+            android:layout_width="20dp"
+            android:layout_height="20dp"
+            android:background="@drawable/bg_offline_state_outline_muted"
+            android:padding="4dp"
+            android:src="@drawable/ic_check_small"
+            app:tint="@color/text_secondary" />
+
+        <ImageView
+            android:id="@+id/ivMore"
+            android:layout_width="36dp"
+            android:layout_height="36dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:clickable="true"
+            android:focusable="true"
+            android:padding="8dp"
+            android:src="@drawable/ic_more_vert"
+            app:tint="@color/text_secondary" />
+    </LinearLayout>
+
+    <!-- Offline download progress bar - OPTIMIZADO: constraint layout más eficiente -->
+    <FrameLayout
+        android:id="@+id/flOfflineProgress"
+        android:layout_width="0dp"
+        android:layout_height="2dp"
+        android:layout_marginEnd="8dp"
+        android:background="@color/surface_high"
+        android:visibility="gone"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintBottom_toBottomOf="parent">
+
+        <View
+            android:id="@+id/vOfflineProgressFill"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:background="@color/stitch_blue"
+            android:scaleX="0" />
+    </FrameLayout>
+
+</androidx.constraintlayout.widget.ConstraintLayout>

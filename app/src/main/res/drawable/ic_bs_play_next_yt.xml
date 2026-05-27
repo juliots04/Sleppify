@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- Left column: vertical bar + play wedge -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M6,2.86 L6,5 L3,5 C2.448,5 2,5.448 2,6 L2,18 C2,18.552 2.448,19 3,19 C3.552,19 4,18.552 4,18 L4,7 L6,7 L6,9.137 C6,9.334 6.205,9.461 6.374,9.368 L13,5.998 L6.374,2.434 C6.205,2.341 6,2.468 6,2.86 Z"/>
+    <!-- Row 1: short -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M21,5 L16,5 C15.448,5 15,5.448 15,6 C15,6.552 15.448,7 16,7 L21,7 C21.552,7 22,6.552 22,6 C22,5.448 21.552,5 21,5 Z"/>
+    <!-- Row 2: long -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M21,11 L9,11 C8.448,11 8,11.448 8,12 C8,12.552 8.448,13 9,13 L21,13 C21.552,13 22,12.552 22,12 C22,11.448 21.552,11 21,11 Z"/>
+    <!-- Row 3: long -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M21,17 L9,17 C8.448,17 8,17.448 8,18 C8,18.552 8.448,19 9,19 L21,19 C21.552,19 22,18.552 22,18 C22,17.448 21.552,17 21,17 Z"/>
+</vector>
