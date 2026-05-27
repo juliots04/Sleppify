@@ -11,27 +11,17 @@
 
 ---
 
-## 📸 Capturas de Pantalla
+<table>
+  <tr>
+    <td>
+      <img width="480" height="1066" alt="WhatsApp Image 2026-05-27 at 11 55 24 AM (2)" src="https://github.com/user-attachments/assets/e9da425a-6cf0-446f-bc55-d2778118ef16" />  
+    </td>
+    <td>
+      <img width="480" height="1066" alt="WhatsApp Image 2026-05-27 at 11 55 24 AM" src="https://github.com/user-attachments/assets/d5d3ede6-c1b7-4387-aae6-79a7f7498bd9" />
+    </td>
+  </tr>
+</table>
 
-<details>
-<summary><b>👀 Ver Capturas de la Interfaz</b></summary>
-<br/>
-
-### Lista de Playlists
-![Lista de Playlists](lista_playlists.png)
-
-### Detalles de la Playlist
-![Detalles de la Playlist](detalles_playlist.png)
-
-### Buscador de Música
-![Buscador de Música](buscador_musica.png)
-
-### Ecualizador Avanzado
-![Módulo Equalizer](modulo_equalizer.png)
-
-</details>
-
----
 
 ## ✨ Funcionalidades Principales
 
@@ -44,6 +34,17 @@
 * **Acceso a tu Cuenta:** Cuenta con una pantalla de inicio de sesión que te permite conectar tu cuenta de Google de forma segura.
 * **Soporte de Cookies de Sesión:** Extrae y utiliza de manera segura tus cookies de autenticación para que puedas acceder a tus playlists privadas de YouTube Music, mixes personalizados, recomendaciones basadas en tus gustos y flujos de audio de máxima calidad.
 
+<table>
+  <tr>
+    <td>
+      <img width="480" height="1066" alt="WhatsApp Image 2026-05-27 at 11 55 25 AM" src="https://github.com/user-attachments/assets/c095b817-171f-4d92-932f-298183221a9b" />
+    </td>
+    <td>
+      <img width="480" height="1066" alt="WhatsApp Image 2026-05-27 at 11 55 24 AM (1)" src="https://github.com/user-attachments/assets/56860267-a7ff-41e7-b871-dd73d94bcf90" />
+    </td>
+  </tr>
+</table>
+
 ### 🔋 Reproducción Multimedia Eficiente y Ahorro de Batería
 * **Música en Segundo Plano:** Disfruta de la reproducción continua de tus canciones mientras usas otras aplicaciones o con la pantalla apagada.
 * **Detección de Video Estático:** Si estás reproduciendo un video musical descargado que solo muestra una carátula o imagen estática en pantalla, la aplicación detecta esto automáticamente y detiene la decodificación visual para ahorrar batería y recursos de tu dispositivo.
@@ -51,6 +52,11 @@
 ### 🔄 Reemplazo de Canciones en Caliente (Hot-Swapping)
 * **Alternativas al Instante:** Si algún enlace o video musical deja de estar disponible o no se puede reproducir, puedes presionar la canción para buscar versiones alternativas (covers, directos, videos de letras o remixes) y reemplazarla al vuelo.
 * **Sincronización Permanente:** Tu elección de reemplazo se guarda de forma permanente para esa lista de reproducción, y puedes restaurar la canción original en cualquier momento.
+
+---
+<img width="480" height="728" alt="WhatsApp Image 2026-05-27 at 12 02 25 PM" src="https://github.com/user-attachments/assets/40f49cb3-713a-406e-a74d-043295960a90" />
+
+---
 
 ### 🔍 Lector de Códigos QR Integrado
 * **Escaneo Instantáneo:** Usa la cámara de tu dispositivo para leer códigos QR y códigos de barras de manera rápida.
@@ -62,6 +68,9 @@
 ### 🎛️ Ajustes de Audio y Ecualización (Extra)
 * **Personalización del Sonido:** Ajusta frecuencias específicas usando un ecualizador interactivo, en el cual puedes dibujar las curvas de sonido a mano alzada.
 * **Perfiles Automáticos:** Guarda ajustes automáticos que se activan según estés escuchando por el altavoz de tu móvil o por tus auriculares Bluetooth.
+
+---
+<img width="480" height="1066" alt="WhatsApp Image 2026-05-27 at 12 05 07 PM" src="https://github.com/user-attachments/assets/44e01063-0858-4c74-ace6-9c626850f6a3" />
 
 ---
 
@@ -149,14 +158,6 @@ Ejecuta los siguientes comandos desde tu terminal para compilar e instalar la ap
 # Compilar e instalar directamente en el dispositivo conectado
 .\gradlew.bat installDebug
 ```
-
----
-
-## 🔒 Seguridad y Pautas de Desarrollo
-
-* ⚠️ **Gestión de Secretos:** Nunca subas el archivo `google-services.json` ni expongas tu clave de API `YOUTUBE_DATA_API_KEY` en commits públicos. Ambos están incluidos en el archivo `.gitignore` para evitar filtraciones.
-* 🌿 **Políticas de Ramas:** La rama de desarrollo principal es `sleppy`. Dirige tus pull requests directamente a ella.
-* 🎛️ **Consistencia de Módulos:** Todas las actividades e interfaces de usuario comparten el mismo módulo. Al modificar contratos, Intents o bases de datos locales, asegúrate de actualizar las referencias cruzadas para evitar fallos de ejecución.
 
 ---
 
