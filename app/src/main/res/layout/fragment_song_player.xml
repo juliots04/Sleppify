@@ -259,6 +259,23 @@
             </LinearLayout>
 
             <LinearLayout
+                android:id="@+id/actionGoToArtist"
+                android:layout_width="wrap_content"
+                android:layout_height="37dp"
+                android:layout_marginStart="8dp"
+                android:background="@drawable/bg_player_social_chip"
+                android:clickable="true"
+                android:focusable="true"
+                android:foreground="?attr/selectableItemBackground"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingHorizontal="14dp"
+                android:visibility="gone">
+                <ImageView android:layout_width="19dp" android:layout_height="19dp" android:src="@drawable/ic_search" app:tint="@color/text_primary" />
+                <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginStart="6dp" android:fontFamily="@font/inter_variable" android:text="Ir a artista" android:textColor="@color/text_primary" android:textSize="14sp" android:textStyle="bold" />
+            </LinearLayout>
+
+            <LinearLayout
                 android:id="@+id/actionShare"
                 android:layout_width="wrap_content"
                 android:layout_height="37dp"

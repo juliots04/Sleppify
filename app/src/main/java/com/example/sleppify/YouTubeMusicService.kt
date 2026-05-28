@@ -228,7 +228,7 @@ class YouTubeMusicService @JvmOverloads constructor(
     }
 
     /** Primary search via YouTube Music Innertube API — no API key needed, no quota. */
-    fun searchTracksViaInnertube(query: String, maxResults: Int, callback: SearchPageCallback) {
+    fun searchTracksViaInnertube(query: String, maxResults: Int, cookieHeader: String = "", callback: SearchPageCallback) {
         val normalized = query.trim()
         if (normalized.isEmpty()) {
             callback.onError("Escribe algo para buscar.")
@@ -236,7 +236,7 @@ class YouTubeMusicService @JvmOverloads constructor(
         }
         executor.execute {
             try {
-                val pageResult = performInnertubeSearchRequest(normalized, maxResults)
+                val pageResult = performInnertubeSearchRequest(normalized, maxResults, cookieHeader)
                 mainHandler.post { callback.onSuccess(pageResult) }
             } catch (e: Exception) {
                 val error = e.message ?: "No se pudo completar la busqueda."
@@ -246,7 +246,7 @@ class YouTubeMusicService @JvmOverloads constructor(
     }
 
     /** Continue an Innertube search using a previously returned continuation token. */
-    fun continueInnertubeSearch(continuationToken: String, maxResults: Int, callback: SearchPageCallback) {
+    fun continueInnertubeSearch(continuationToken: String, maxResults: Int, cookieHeader: String = "", callback: SearchPageCallback) {
         if (continuationToken.isEmpty()) {
             callback.onSuccess(SearchPageResult(emptyList(), ""))
             return
@@ -274,6 +274,9 @@ class YouTubeMusicService @JvmOverloads constructor(
                 conn.setRequestProperty("User-Agent", "Mozilla/5.0")
                 conn.setRequestProperty("Origin", "https://music.youtube.com")
                 conn.setRequestProperty("Referer", "https://music.youtube.com/")
+                if (cookieHeader.isNotEmpty()) {
+                    conn.setRequestProperty("Cookie", cookieHeader)
+                }
                 val contJson: JSONObject
                 try {
                     conn.outputStream.use { it.write(body) }
@@ -297,7 +300,7 @@ class YouTubeMusicService @JvmOverloads constructor(
     }
 
     @Throws(Exception::class)
-    private fun performInnertubeSearchRequest(query: String, maxResults: Int): SearchPageResult {
+    private fun performInnertubeSearchRequest(query: String, maxResults: Int, cookieHeader: String = ""): SearchPageResult {
         val endpoint = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false"
         
         // Detectar si el usuario busca contenido tipo video (subtítulos, letras, en vivo, covers, karaoke, etc.)
@@ -317,8 +320,10 @@ class YouTubeMusicService @JvmOverloads constructor(
                            lower.contains("subtitulado") || 
                            lower.contains("traduccion")
 
-        // Always use a filter to get 20+ results per page with proper continuation.
-        // Without filter, YTMusic only returns ~3 items per category (~12 total playable).
+        val isAuthenticated = cookieHeader.isNotEmpty()
+
+        // When authenticated, use Songs filter always (YTM returns proper top result + ranked songs).
+        // When unauthenticated, use filter to get 20+ results per page with proper continuation.
         // Params from ytmusicapi reference (no URL-encoding needed — body is JSON):
         //   songs:  EgWKAQIIAWoMEA4QChADEAQQCRAF
         //   videos: EgWKAQIQAWoMEA4QChADEAQQCRAF
@@ -334,11 +339,12 @@ class YouTubeMusicService @JvmOverloads constructor(
             put("hl", "en")
         }
 
-        val body = JSONObject().apply {
+        val bodyJson = JSONObject().apply {
             put("context", JSONObject().apply { put("client", clientContext) })
             put("query", query)
             put("params", searchParams)
-        }.toString().toByteArray(StandardCharsets.UTF_8)
+        }
+        val body = bodyJson.toString().toByteArray(StandardCharsets.UTF_8)
 
         val url = URL(endpoint)
         val connection = url.openConnection() as HttpURLConnection
@@ -351,6 +357,9 @@ class YouTubeMusicService @JvmOverloads constructor(
         connection.setRequestProperty("User-Agent", "Mozilla/5.0")
         connection.setRequestProperty("Origin", "https://music.youtube.com")
         connection.setRequestProperty("Referer", "https://music.youtube.com/")
+        if (isAuthenticated) {
+            connection.setRequestProperty("Cookie", cookieHeader)
+        }
         val rootJson: JSONObject
         try {
             connection.outputStream.use { it.write(body) }
@@ -453,7 +462,11 @@ class YouTubeMusicService @JvmOverloads constructor(
                             ?.optJSONObject("text")
                             ?.optJSONArray("runs")
                         if (runs != null && runs.length() > 0) {
-                            artist = runs.optJSONObject(0)?.optString("text", "") ?: ""
+                            val sb = StringBuilder()
+                            for (r in 0 until runs.length()) {
+                                sb.append(runs.optJSONObject(r)?.optString("text", "") ?: "")
+                            }
+                            artist = sb.toString()
                         }
                     }
                 }
@@ -2114,10 +2127,15 @@ class YouTubeMusicService @JvmOverloads constructor(
                                 ?.optJSONArray("runs")
                                 ?.optJSONObject(0)
                                 ?.optString("text", "") ?: ""
-                            val subtitle = cardShelf.optJSONObject("subtitle")
+                            val subtitleRuns = cardShelf.optJSONObject("subtitle")
                                 ?.optJSONArray("runs")
-                                ?.optJSONObject(0)
-                                ?.optString("text", "") ?: ""
+                            val subtitle = buildString {
+                                if (subtitleRuns != null) {
+                                    for (r in 0 until subtitleRuns.length()) {
+                                        append(subtitleRuns.optJSONObject(r)?.optString("text", "") ?: "")
+                                    }
+                                }
+                            }
                             val thumbs = cardShelf.optJSONObject("thumbnail")
                                 ?.optJSONObject("musicThumbnailRenderer")
                                 ?.optJSONObject("thumbnail")
@@ -2144,10 +2162,16 @@ class YouTubeMusicService @JvmOverloads constructor(
                                         ?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")
                                         ?.optJSONObject("text")?.optJSONArray("runs")
                                         ?.optJSONObject(0)?.optString("text", "") ?: ""
-                                    val trackArtist = flexColumns?.optJSONObject(1)
+                                    val trackArtistRuns = flexColumns?.optJSONObject(1)
                                         ?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")
                                         ?.optJSONObject("text")?.optJSONArray("runs")
-                                        ?.optJSONObject(0)?.optString("text", "") ?: ""
+                                    val trackArtist = buildString {
+                                        if (trackArtistRuns != null) {
+                                            for (r in 0 until trackArtistRuns.length()) {
+                                                append(trackArtistRuns.optJSONObject(r)?.optString("text", "") ?: "")
+                                            }
+                                        }
+                                    }
                                     val thumbs2 = renderer.optJSONObject("thumbnail")
                                         ?.optJSONObject("musicThumbnailRenderer")
                                         ?.optJSONObject("thumbnail")?.optJSONArray("thumbnails")
@@ -2162,15 +2186,28 @@ class YouTubeMusicService @JvmOverloads constructor(
                         }
                     }
                     
-                    // 2. Procesar las listas estándares (musicShelfRenderer)
+                    // 2. Procesar las listas estándares (musicShelfRenderer or itemSectionRenderer)
                     val shelf = section.optJSONObject("musicShelfRenderer")
-                        ?.optJSONArray("contents") ?: continue
+                        ?.optJSONArray("contents")
+                        ?: section.optJSONObject("itemSectionRenderer")
+                            ?.optJSONArray("contents")
+                        ?: continue
                     for (i in 0 until shelf.length()) {
                         if (results.size >= maxResults) return results
                         val renderer = shelf.optJSONObject(i)
                             ?.optJSONObject("musicResponsiveListItemRenderer") ?: continue
-                        val videoId = renderer.optJSONObject("playlistItemData")
+                        var videoId = renderer.optJSONObject("playlistItemData")
                             ?.optString("videoId", "")?.trim() ?: ""
+                        if (videoId.isEmpty()) {
+                            // Fallback: extract from overlay play button watchEndpoint
+                            videoId = renderer.optJSONObject("overlay")
+                                ?.optJSONObject("musicItemThumbnailOverlayRenderer")
+                                ?.optJSONObject("content")
+                                ?.optJSONObject("musicPlayButtonRenderer")
+                                ?.optJSONObject("playNavigationEndpoint")
+                                ?.optJSONObject("watchEndpoint")
+                                ?.optString("videoId", "")?.trim() ?: ""
+                        }
                         if (videoId.isEmpty()) continue
  
                         val flexColumns = renderer.optJSONArray("flexColumns")
@@ -2189,7 +2226,11 @@ class YouTubeMusicService @JvmOverloads constructor(
                                     ?.optJSONObject("text")
                                     ?.optJSONArray("runs")
                                 if (runs != null && runs.length() > 0) {
-                                    artist = runs.optJSONObject(0)?.optString("text", "") ?: ""
+                                    val sb = StringBuilder()
+                                    for (r in 0 until runs.length()) {
+                                        sb.append(runs.optJSONObject(r)?.optString("text", "") ?: "")
+                                    }
+                                    artist = sb.toString()
                                 }
                             }
                         }

@@ -3495,6 +3495,19 @@ public class PlaylistDetailFragment extends Fragment
             startRadioForTrack(selectedTrack);
         });
 
+        // Row: Ir a artista
+        View btnGoToArtist = view.findViewById(R.id.btnBsGoToArtist);
+        boolean hasArtist = !TextUtils.isEmpty(selectedTrack.artist);
+        btnGoToArtist.setVisibility(hasArtist ? View.VISIBLE : View.GONE);
+        if (hasArtist) {
+            btnGoToArtist.setOnClickListener(v -> {
+                dialog.dismiss();
+                if (getActivity() instanceof MainActivity) {
+                    ((MainActivity) getActivity()).openSearchFragmentWithQuery(selectedTrack.artist);
+                }
+            });
+        }
+
         // Row: Agregar a la fila
         btnAddToQueue.setVisibility(View.VISIBLE);
         ImageView ivAddToQueue = btnAddToQueue.findViewById(R.id.ivBsAddToQueue);

@@ -178,6 +178,7 @@ public class SongPlayerFragment extends Fragment {
     private View actionShare;
     private View actionDownloadTrack;
     private View actionSearchOnline;
+    private View actionGoToArtist;
     // lastSavedPlaylistKey/Name now read from CustomPlaylistsStore (global persistent)
     private ImageView ivActionDownloadIcon;
     private TextView tvActionDownloadLabel;
@@ -564,6 +565,7 @@ public class SongPlayerFragment extends Fragment {
         actionShare = view.findViewById(R.id.actionShare);
         actionDownloadTrack = view.findViewById(R.id.actionDownloadTrack);
         actionSearchOnline = view.findViewById(R.id.actionSearchOnline);
+        actionGoToArtist = view.findViewById(R.id.actionGoToArtist);
         ivActionDownloadIcon = view.findViewById(R.id.ivActionDownloadIcon);
         tvActionDownloadLabel = view.findViewById(R.id.tvActionDownloadLabel);
         tvActionLikeCount = view.findViewById(R.id.tvActionLikeCount);
@@ -2774,7 +2776,8 @@ public class SongPlayerFragment extends Fragment {
         if (actionRadio != null) actionRadio.setVisibility(isLocalFile ? View.GONE : View.VISIBLE);
         if (actionShare != null) actionShare.setVisibility(isLocalFile ? View.GONE : View.VISIBLE);
         if (actionDownloadTrack != null) actionDownloadTrack.setVisibility(isLocalFile ? View.GONE : View.VISIBLE);
-        if (actionSearchOnline != null) actionSearchOnline.setVisibility(isLocalFile ? View.VISIBLE : View.GONE);
+        if (actionSearchOnline != null) actionSearchOnline.setVisibility(View.VISIBLE);
+        if (actionGoToArtist != null) actionGoToArtist.setVisibility(!TextUtils.isEmpty(track.artist) ? View.VISIBLE : View.GONE);
         if (llSimilarTrigger != null) llSimilarTrigger.setVisibility(isLocalFile ? View.GONE : View.VISIBLE);
 
         refreshSocialActionsForCurrentTrack(track);
@@ -2854,6 +2857,9 @@ public class SongPlayerFragment extends Fragment {
         if (actionSearchOnline != null) {
             actionSearchOnline.setOnClickListener(v -> searchCurrentTrackOnline());
         }
+        if (actionGoToArtist != null) {
+            actionGoToArtist.setOnClickListener(v -> goToArtistForCurrentTrack());
+        }
         refreshFavoriteActionForCurrentTrack();
         refreshDownloadChipState();
         observeManualDownloadWork();
@@ -2875,6 +2881,16 @@ public class SongPlayerFragment extends Fragment {
         collapseToMiniMode(true);
         if (getActivity() instanceof MainActivity) {
             ((MainActivity) getActivity()).openSearchFragmentWithQuery(query);
+        }
+    }
+
+    private void goToArtistForCurrentTrack() {
+        if (!isAdded() || tracks.isEmpty() || currentIndex < 0 || currentIndex >= tracks.size()) return;
+        PlayerTrack track = tracks.get(currentIndex);
+        if (TextUtils.isEmpty(track.artist)) return;
+        collapseToMiniMode(true);
+        if (getActivity() instanceof MainActivity) {
+            ((MainActivity) getActivity()).openSearchFragmentWithQuery(track.artist);
         }
     }
 

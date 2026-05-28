@@ -510,7 +510,7 @@ class SearchFragment : Fragment() {
         if (append && useInnertubePagination && innertubeNextToken.isNotEmpty()) {
             Log.d(TAG, "[SEARCH] CONTINUATION start reqId=$requestId")
             val tCont = android.os.SystemClock.elapsedRealtime()
-            youTubeMusicService.continueInnertubeSearch(innertubeNextToken, SEARCH_PAGE_SIZE, object : YouTubeMusicService.SearchPageCallback {
+            youTubeMusicService.continueInnertubeSearch(innertubeNextToken, SEARCH_PAGE_SIZE, getCookieHeader(), object : YouTubeMusicService.SearchPageCallback {
                 override fun onSuccess(pageResult: YouTubeMusicService.SearchPageResult) {
                     if (activity == null || !isAdded || requestId != latestSearchRequestId) return
                     Log.d(TAG, "[SEARCH] CONTINUATION ok in ${android.os.SystemClock.elapsedRealtime() - tCont}ms — ${pageResult.tracks.size} tracks hasMore=${pageResult.nextPageToken.isNotEmpty()}")
@@ -532,7 +532,7 @@ class SearchFragment : Fragment() {
 
         Log.d(TAG, "[SEARCH] INNERTUBE start maxResults=$maxResultsToFetch reqId=$requestId")
         val tInnertube = android.os.SystemClock.elapsedRealtime()
-        youTubeMusicService.searchTracksViaInnertube(query, maxResultsToFetch, object : YouTubeMusicService.SearchPageCallback {
+        youTubeMusicService.searchTracksViaInnertube(query, maxResultsToFetch, getCookieHeader(), object : YouTubeMusicService.SearchPageCallback {
             override fun onSuccess(pageResult: YouTubeMusicService.SearchPageResult) {
                 if (activity == null || !isAdded || requestId != latestSearchRequestId) return
                 Log.d(TAG, "[SEARCH] INNERTUBE ok in ${android.os.SystemClock.elapsedRealtime() - tInnertube}ms — ${pageResult.tracks.size} tracks hasMore=${pageResult.nextPageToken.isNotEmpty()} totalElapsed=${android.os.SystemClock.elapsedRealtime() - t0}ms")
@@ -543,7 +543,20 @@ class SearchFragment : Fragment() {
                 useInnertubePagination = innertubeNextToken.isNotEmpty()
                 hasMoreSearchPages = useInnertubePagination
 
-                appendUniqueTracks(pageResult.tracks)
+                if (!append && getCookieHeader().isNotEmpty()) {
+                    // Authenticated: Innertube results come in YTM's correct order.
+                    // Put them first, then append unique local results after.
+                    val onlineKeys = pageResult.tracks.map { "${it.resultType}|${it.contentId}" }.toSet()
+                    val localOnly = allTracks.filterNot { "${it.resultType}|${it.contentId}" in onlineKeys }
+                    allTracks.clear()
+                    allTracks.addAll(pageResult.tracks)
+                    allTracks.addAll(localOnly)
+                    Log.d(TAG, "[SEARCH] AUTH MERGE: online=${pageResult.tracks.size} localOnly=${localOnly.size} total=${allTracks.size}")
+                    // Log first 5 track titles for debugging
+                    allTracks.take(5).forEachIndexed { i, t -> Log.d(TAG, "[SEARCH] allTracks[$i]: \"${t.title}\" sub=\"${t.subtitle?.take(40)}\"") }
+                } else {
+                    appendUniqueTracks(pageResult.tracks)
+                }
                 applyActiveFilter(query, forceSort = true)
 
                 if (allTracks.isEmpty() && !append) {
@@ -854,7 +867,9 @@ class SearchFragment : Fragment() {
         val normalizedQuery = query?.trim() ?: ""
         val filtered = allTracks.toMutableList()
 
-        if (forceSort && normalizedQuery.isNotEmpty() && filtered.size > 1) {
+        // When authenticated, trust YTM's ranking for online results — only sort if no cookie
+        val hasSession = getCookieHeader().isNotEmpty()
+        if (forceSort && normalizedQuery.isNotEmpty() && filtered.size > 1 && !hasSession) {
             val signals = loadUserSignals()
             sortResults(filtered, normalizedQuery, signals)
         }
@@ -868,6 +883,7 @@ class SearchFragment : Fragment() {
             llFeaturedResult.visibility = View.VISIBLE
             if (filtered.size > 1) tracks.addAll(filtered.subList(1, filtered.size))
         }
+        Log.d(TAG, "[SEARCH] applyFilter: allTracks=${allTracks.size} filtered=${filtered.size} tracksForAdapter=${tracks.size} featured=${featuredTrack?.title}")
         adapter?.submitResults(tracks.toList())
 
         view?.requestLayout()
@@ -877,82 +893,218 @@ class SearchFragment : Fragment() {
         val normalized = normalizeForFilter(query)
         val tokens = normalized.split(WHITESPACE_REGEX).filter { it.isNotEmpty() }
         val totalSize = list.size
+
+        // --- Detect "artist mode": if query tokens match the artist of top results ---
+        val detectedArtist = detectDominantArtist(list, tokens)
+        Log.d(TAG, "[SORT] query=\"$query\" tokens=$tokens detectedArtist=\"$detectedArtist\" totalItems=$totalSize")
+
         val indexed = list.mapIndexed { idx, track -> track to idx }
-        val scored = indexed.map { (track, apiIndex) -> track to computeScore(track, normalized, tokens, signals, apiIndex, totalSize) }
+        val scored = indexed.map { (track, apiIndex) -> track to computeScore(track, normalized, tokens, signals, apiIndex, totalSize, detectedArtist) }
         val sorted = scored.sortedByDescending { it.second }.map { it.first }
+
+        // Log top 5 scores for debugging
+        scored.sortedByDescending { it.second }.take(5).forEachIndexed { i, (track, score) ->
+            val artist = extractArtistFromSubtitle(track.subtitle)
+            Log.d(TAG, "[SORT] #$i score=$score title=\"${track.title}\" artist=\"$artist\" subtitle=\"${track.subtitle?.take(60)}\"")
+        }
+
         list.clear()
         list.addAll(sorted)
     }
 
-    private fun computeScore(track: YouTubeMusicService.TrackResult, query: String, tokens: List<String>, signals: UserSignals, apiIndex: Int, totalResults: Int): Int {
+    /**
+     * Detect if the query is targeting a specific artist.
+     * If multiple top results share the same artist AND query tokens match that artist name,
+     * we enter "artist mode" where other songs by that artist get a boost.
+     */
+    private fun detectDominantArtist(list: List<YouTubeMusicService.TrackResult>, queryTokens: List<String>): String {
+        if (list.size < 2 || queryTokens.isEmpty()) return ""
+        // Extract artist from subtitle (first segment before " • ")
+        val artistCounts = HashMap<String, Int>()
+        for (track in list.take(10)) {
+            val artist = extractArtistFromSubtitle(track.subtitle)
+            if (artist.isNotEmpty()) {
+                artistCounts[artist] = (artistCounts[artist] ?: 0) + 1
+            }
+        }
+        // Find the most frequent artist in top results
+        val topArtistEntry = artistCounts.entries.maxByOrNull { it.value } ?: return ""
+        if (topArtistEntry.value < 2) return ""
+
+        // Check if query tokens match this artist name
+        val normalizedArtist = normalizeForFilter(topArtistEntry.key)
+        val artistWords = normalizedArtist.split(WHITESPACE_REGEX).filter { it.isNotEmpty() }
+        val matchCount = queryTokens.count { tok ->
+            artistWords.any { it == tok || it.startsWith(tok) || tok.startsWith(it) || fuzzyMatch(tok, it) }
+        }
+        // At least one query token must match the artist
+        return if (matchCount >= 1) normalizedArtist else ""
+    }
+
+    /** Extract the artist name from a YTM subtitle like "Song • Artist • Album • 3:22 • 500 M reproducciones" */
+    private fun extractArtistFromSubtitle(subtitle: String?): String {
+        if (subtitle.isNullOrEmpty()) return ""
+        val parts = subtitle.split(" \u2022 ").map { it.trim() }
+        if (parts.isEmpty()) return ""
+        // YTM subtitle format with filter: "Song • Artist • Album • Duration" or "Video • Artist • Duration"
+        // Without filter or Topic channels: "Artist • Album • Duration"
+        val typeLabels = setOf("song", "video", "album", "playlist", "single", "ep", "canción", "cancion", "álbum")
+        val firstLower = parts[0].lowercase(Locale.ROOT)
+        return if (firstLower in typeLabels && parts.size > 1) {
+            parts[1]
+        } else {
+            // Subtitle starts with artist directly (e.g. "Bad Bunny - Topic" or "The Weeknd • Album • ...")
+            // Also handle "Artist - Topic" format
+            val raw = parts[0]
+            if (raw.endsWith(" - Topic")) raw.removeSuffix(" - Topic") else raw
+        }
+    }
+
+    /** Extract play count as a numeric value from subtitle for popularity tiebreaking */
+    private fun extractPlayCount(subtitle: String?): Long {
+        if (subtitle.isNullOrEmpty()) return 0L
+        val parts = subtitle.split(" \u2022 ")
+        for (part in parts) {
+            val trimmed = part.trim().lowercase(Locale.ROOT)
+            if (trimmed.contains("reproducciones") || trimmed.contains("plays") || trimmed.contains("views")) {
+                // Handle "10 mil M reproducciones" = 10,000 M = 10 billion
+                val milMMatch = Regex("([\\d,.]+)\\s*mil\\s+m", RegexOption.IGNORE_CASE).find(trimmed)
+                if (milMMatch != null) {
+                    val num = milMMatch.groupValues[1].replace(",", ".").toDoubleOrNull() ?: 0.0
+                    return (num * 1_000_000_000L).toLong()
+                }
+                // Handle "3570 M reproducciones", "459 k reproducciones", "28 reproducciones"
+                val numMatch = Regex("([\\d,.]+)\\s*(m|k|b|mil)?\\s*reproducciones", RegexOption.IGNORE_CASE).find(trimmed)
+                    ?: Regex("([\\d,.]+)\\s*(m|k|b|mil)?\\s*(plays|views)", RegexOption.IGNORE_CASE).find(trimmed)
+                    ?: Regex("([\\d,.]+)\\s*(m|k|b|mil)?", RegexOption.IGNORE_CASE).find(trimmed)
+                if (numMatch != null) {
+                    val numStr = numMatch.groupValues[1].replace(",", ".")
+                    val multiplier = when (numMatch.groupValues[2].lowercase(Locale.ROOT)) {
+                        "b" -> 1_000_000_000L
+                        "m" -> 1_000_000L
+                        "mil" -> 1_000L
+                        "k" -> 1_000L
+                        else -> 1L
+                    }
+                    val num = numStr.toDoubleOrNull() ?: 0.0
+                    return (num * multiplier).toLong()
+                }
+            }
+        }
+        return 0L
+    }
+
+    private fun computeScore(track: YouTubeMusicService.TrackResult, query: String, tokens: List<String>, signals: UserSignals, apiIndex: Int, totalResults: Int, detectedArtist: String): Int {
         val t = normalizeForFilter(track.title)
         val s = normalizeForFilter(track.subtitle)
+        val artistName = normalizeForFilter(extractArtistFromSubtitle(track.subtitle))
         var score = 0
 
-        // --- API position score (trust YouTube's relevance) ---
-        score += maxOf(0, (totalResults - apiIndex) * 80)
+        // --- API position score (trust YouTube's relevance but allow re-ranking) ---
+        score += maxOf(0, (totalResults - apiIndex) * 50)
 
         // --- Result type priority ---
         val type = track.resultType?.lowercase() ?: ""
         when {
-            type == "track" || type == "video" || type == "song" -> score += 3000
+            type == "track" || type == "video" || type == "song" -> score += 2000
             type == "artist" -> score += 500
             type == "album" -> score += 200
             type == "playlist" -> score -= 2000
         }
 
-        // --- Exact and prefix title matches ---
-        if (t == query) {
-            score += 10000
-        } else if (t.startsWith("$query ")) {
-            score += 8000
-        } else if (t.startsWith(query)) {
-            score += 6000
-        } else if (t.contains(query)) {
-            score += 4000
+        // --- Artist detection from query ---
+        val artistWords = artistName.split(WHITESPACE_REGEX).filter { it.isNotEmpty() }
+        var artistTokenHits = 0
+        val nonArtistTokens = mutableListOf<String>()
+
+        tokens.forEach { tok ->
+            val hitsArtist = artistWords.any { it == tok || it.startsWith(tok) || tok.startsWith(it) || fuzzyMatch(tok, it) }
+            if (hitsArtist) {
+                artistTokenHits++
+            } else {
+                nonArtistTokens.add(tok)
+            }
         }
 
-        val titleWords = t.split(WHITESPACE_REGEX).filter { it.isNotEmpty() }
-        val subtitleWords = s.split(WHITESPACE_REGEX).filter { it.isNotEmpty() }
+        val queryMatchesArtist = artistTokenHits > 0
 
+        // --- Combined Artist + Title match (highest priority, like "bad bunny monaco") ---
+        val titleWords = t.split(WHITESPACE_REGEX).filter { it.isNotEmpty() }
+        var titleHitsFromNonArtist = 0
+        nonArtistTokens.forEach { tok ->
+            if (titleWords.any { it == tok || it.startsWith(tok) || tok.startsWith(it) || fuzzyMatch(tok, it) }) {
+                titleHitsFromNonArtist++
+            }
+        }
+
+        if (queryMatchesArtist && nonArtistTokens.isNotEmpty() && titleHitsFromNonArtist >= nonArtistTokens.size) {
+            // Artist matches AND all remaining query words match the title → perfect match
+            score += 25000
+        } else if (queryMatchesArtist && nonArtistTokens.isNotEmpty() && titleHitsFromNonArtist > 0) {
+            // Partial title match with artist match
+            score += 18000
+        } else if (queryMatchesArtist && nonArtistTokens.isEmpty()) {
+            // Query is ONLY an artist name — boost all tracks by this artist
+            score += 12000
+        }
+
+        // --- Exact and prefix title matches (full query in title) ---
+        if (t == query) {
+            score += 15000
+        } else if (t.startsWith("$query ") || t.startsWith(query)) {
+            score += 10000
+        } else if (t.contains(query)) {
+            score += 6000
+        }
+
+        // --- Token-level title matching ---
         var titleHits = 0
         var subtitleHits = 0
+        val subtitleWords = s.split(WHITESPACE_REGEX).filter { it.isNotEmpty() }
 
         tokens.forEach { tok ->
             if (titleWords.contains(tok)) {
                 titleHits++
-                score += 500
+                score += 400
             } else if (titleWords.any { it.startsWith(tok) }) {
                 titleHits++
-                score += 350
-            } else if (titleWords.any { tok.startsWith(it) }) {
-                // Token is longer than word but word is prefix of token (e.g. "her" prefix of "hear")
-                titleHits++
                 score += 300
-            } else if (titleWords.any { fuzzyMatch(tok, it) }) {
-                // Levenshtein distance ≤ 1
+            } else if (titleWords.any { tok.startsWith(it) }) {
                 titleHits++
                 score += 250
+            } else if (titleWords.any { fuzzyMatch(tok, it) }) {
+                titleHits++
+                score += 200
             }
             if (subtitleWords.contains(tok)) {
                 subtitleHits++
-                score += 100
+                score += 80
             } else if (subtitleWords.any { it.startsWith(tok) || tok.startsWith(it) || fuzzyMatch(tok, it) }) {
                 subtitleHits++
-                score += 60
+                score += 50
             }
         }
 
         if (titleHits >= tokens.size && tokens.isNotEmpty()) {
-            score += 2000
+            score += 3000
         } else if (titleHits + subtitleHits >= tokens.size && tokens.isNotEmpty()) {
-            score += 1000
+            score += 1500
         }
 
-        if (s == query) score += 200
-        else if (s.contains(query)) score += 100
+        // --- "Artist mode" bonus: same artist as detected dominant artist ---
+        if (detectedArtist.isNotEmpty() && artistName.isNotEmpty()) {
+            if (artistName == detectedArtist || artistName.contains(detectedArtist) || detectedArtist.contains(artistName)) {
+                score += 5000
+            }
+        }
 
-        // --- User signals (light boost — don't overwhelm API relevance) ---
+        // --- Popularity tiebreaker (logarithmic so it doesn't overwhelm relevance) ---
+        val plays = extractPlayCount(track.subtitle)
+        if (plays > 0) {
+            score += (kotlin.math.ln(plays.toDouble()) * 15).toInt()
+        }
+
+        // --- User signals (light boost) ---
         val vid = track.videoId ?: ""
         if (vid.isNotEmpty()) {
             if (vid in signals.favoriteIds) score += 300
@@ -1368,6 +1520,19 @@ class SearchFragment : Fragment() {
         btnPlay.setOnClickListener {
             dialog.dismiss()
             startRadioForTrack(track)
+        }
+
+        // Row: Ir a artista
+        val btnGoToArtist = view.findViewById<View>(R.id.btnBsGoToArtist)
+        val artistName = track.subtitle ?: ""
+        if (artistName.isNotEmpty()) {
+            btnGoToArtist.visibility = View.VISIBLE
+            btnGoToArtist.setOnClickListener {
+                dialog.dismiss()
+                externalSearchQuery(artistName)
+            }
+        } else {
+            btnGoToArtist.visibility = View.GONE
         }
 
         // Row: Agregar a la fila
@@ -2294,6 +2459,12 @@ class SearchFragment : Fragment() {
         val cm = requireContext().getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
         val caps = cm.getNetworkCapabilities(cm.activeNetwork) ?: return false
         return caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) || caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) || caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+    }
+
+    private fun getCookieHeader(): String {
+        if (!isAdded) return ""
+        val prefs = requireContext().getSharedPreferences("player_state", android.app.Activity.MODE_PRIVATE)
+        return (prefs.getString("stream_last_youtube_web_cookie", "") ?: "").trim()
     }
 
     private fun hideKeyboard() {

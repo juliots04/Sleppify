@@ -314,6 +314,35 @@
                 android:fontFamily="@font/inter_variable"/>
         </LinearLayout>
 
+        <!-- 4b. Ir a artista -->
+        <LinearLayout
+            android:id="@+id/btnBsGoToArtist"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:paddingVertical="14dp"
+            android:background="?attr/selectableItemBackground"
+            android:clickable="true"
+            android:focusable="true"
+            android:visibility="gone">
+            <ImageView
+                android:id="@+id/ivBsGoToArtist"
+                android:layout_width="22dp"
+                android:layout_height="22dp"
+                android:src="@drawable/ic_search"
+                app:tint="@android:color/white"/>
+            <TextView
+                android:id="@+id/tvBsGoToArtist"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="16dp"
+                android:text="Ir a artista"
+                android:textColor="@color/text_primary"
+                android:textSize="15sp"
+                android:fontFamily="@font/inter_variable"/>
+        </LinearLayout>
+
         <!-- 5. Reemplazar -->
         <LinearLayout
             android:id="@+id/btnBsReplace"
