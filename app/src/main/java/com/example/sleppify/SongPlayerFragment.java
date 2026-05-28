@@ -740,6 +740,7 @@ public class SongPlayerFragment extends Fragment {
             getView().setVisibility(View.VISIBLE);
         }
         appInBackground = false;
+        if (crossfadeManager != null) crossfadeManager.invalidateDurationCache();
         updateBackPressedCallbackEnabled(isHidden());
         ensureActivePlaybackIfExpected("onResume");
         persistPlaybackSnapshot(false);
