@@ -10,8 +10,6 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.audio.DefaultAudioSink
-import androidx.media3.exoplayer.audio.MediaCodecAudioRenderer
 
 /**
  * Singleton manager para una instancia compartida de ExoPlayer.
@@ -67,18 +65,8 @@ object ExoPlayerManager {
                             .setPrioritizeTimeOverSizeThresholds(true)
                             .build()
 
-                        val renderersFactory = object : DefaultRenderersFactory(appContext) {
-                            override fun buildVideoRenderers(
-                                context: Context,
-                                extensionRendererMode: Int,
-                                mediaCodecSelector: androidx.media3.exoplayer.mediacodec.MediaCodecSelector,
-                                enableDecoderFallback: Boolean,
-                                eventHandler: android.os.Handler,
-                                eventListener: androidx.media3.exoplayer.video.VideoRendererEventListener,
-                                allowedVideoJoiningTimeMs: Long,
-                                out: java.util.ArrayList<androidx.media3.exoplayer.Renderer>
-                            ) { /* no-op: audio-only app */ }
-                        }.setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_OFF)
+                        val renderersFactory = DefaultRenderersFactory(appContext)
+                            .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_OFF)
 
                         sharedExoPlayer = ExoPlayer.Builder(appContext, renderersFactory)
                             .setLoadControl(loadControl)

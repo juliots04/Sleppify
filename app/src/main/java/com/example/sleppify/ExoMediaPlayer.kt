@@ -167,18 +167,8 @@ class ExoMediaPlayer {
             }
         }
 
-        val renderersFactory = object : DefaultRenderersFactory(appContext) {
-            override fun buildVideoRenderers(
-                context: Context,
-                extensionRendererMode: Int,
-                mediaCodecSelector: androidx.media3.exoplayer.mediacodec.MediaCodecSelector,
-                enableDecoderFallback: Boolean,
-                eventHandler: android.os.Handler,
-                eventListener: androidx.media3.exoplayer.video.VideoRendererEventListener,
-                allowedVideoJoiningTimeMs: Long,
-                out: java.util.ArrayList<androidx.media3.exoplayer.Renderer>
-            ) { /* no-op: audio-only app */ }
-        }.setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_OFF)
+        val renderersFactory = DefaultRenderersFactory(appContext)
+            .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_OFF)
 
         val player = ExoPlayer.Builder(appContext, renderersFactory)
             .setLoadControl(loadControl)
@@ -313,8 +303,8 @@ class ExoMediaPlayer {
             // por el CDN de YouTube causando 403, mientras que HttpURLConnection
             // tiene un fingerprint consistente con el de una app Android real.
             val httpFactory = DefaultHttpDataSource.Factory()
-                .setConnectTimeoutMs(8_000)
-                .setReadTimeoutMs(8_000)
+                .setConnectTimeoutMs(20_000)
+                .setReadTimeoutMs(20_000)
                 .setAllowCrossProtocolRedirects(true)
 
             pendingHeaders?.let { headers ->
@@ -336,6 +326,7 @@ class ExoMediaPlayer {
         val source = ProgressiveMediaSource.Factory(factory)
             .createMediaSource(mediaItem)
 
+        player.stop()
         player.setMediaSource(source)
         player.volume = Math.max(leftVolume, rightVolume)
         player.prepare()
@@ -376,6 +367,11 @@ class ExoMediaPlayer {
         return player.isPlaying || (player.playWhenReady &&
                 player.playbackState != Player.STATE_IDLE &&
                 player.playbackState != Player.STATE_ENDED)
+    }
+
+    fun getPlayWhenReady(): Boolean {
+        if (released) return false
+        return exoPlayer?.playWhenReady ?: false
     }
 
     fun seekTo(msec: Int) {
@@ -434,13 +430,15 @@ class ExoMediaPlayer {
             try {
                 player.removeListener(playerListener)
                 if (ownsPlayer) {
+                    Log.d(TAG, "[PLAYBACK_DBG] release: OWNED player — stop+release hash=${this.hashCode()}")
                     player.stop()
                     player.clearMediaItems()
                     player.release()
                 } else {
-                    // For shared player: just pause it.
-                    // DO NOT clear media items or stop aggressively, so decoders remain warm
-                    // and transitions to the next track are nearly instantaneous.
+                    // For shared player: stop and clear to prevent stale audio from continuing
+                    Log.d(TAG, "[PLAYBACK_DBG] release: SHARED player — stop+clear hash=${this.hashCode()}")
+                    player.stop()
+                    player.clearMediaItems()
                     player.playWhenReady = false
                 }
             } catch (e: Exception) {

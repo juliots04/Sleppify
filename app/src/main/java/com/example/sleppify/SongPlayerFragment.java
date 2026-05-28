@@ -121,10 +121,10 @@ public class SongPlayerFragment extends Fragment {
     private static final long TRACK_ERROR_RETRY_DELAY_MS = 750L;
     private static final int CONNECT_TIMEOUT_MS = 8000;
     private static final int READ_TIMEOUT_MS = 15000;
-    private static final long SOURCE_PREPARE_TIMEOUT_MS = 15000L;
+    private static final long SOURCE_PREPARE_TIMEOUT_MS = 30000L;
     private static final long SOCIAL_STATS_FETCH_DEFER_MS = 1800L;
     private static final long PLAYBACK_BOOTSTRAP_GRACE_MS = 1800L;
-    private static final int MAX_PLAYBACK_SOURCE_RETRY = 1;
+    private static final int MAX_PLAYBACK_SOURCE_RETRY = 2;
     private static final long PLAYBACK_SOURCE_RETRY_DELAY_MS = 350L;
     private static final String STREAM_HTTP_USER_AGENT = "Mozilla/5.0 (Linux; Android 11; Pixel 4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
     private static final String AUDIUS_API_BASE_URL = "https://discoveryprovider.audius.co/v1";
@@ -643,9 +643,12 @@ public class SongPlayerFragment extends Fragment {
                     userSeeking = false;
                     if (localExoMediaPlayer != null) {
                         try {
-                            // Show loading spinner until playback resumes after seek
+                            // Show loading spinners until playback resumes after seek
                             if (pbVideoLoading != null && !usingOfflineSource) {
                                 pbVideoLoading.setVisibility(View.VISIBLE);
+                            }
+                            if (!usingOfflineSource && !loadedVideoId.isEmpty()) {
+                                PlaybackLoadingBus.notifyLoadingStarted(loadedVideoId);
                             }
                             localExoMediaPlayer.seekTo(currentSeconds * 1000);
                         } catch (Exception ignored) {
@@ -754,7 +757,9 @@ public class SongPlayerFragment extends Fragment {
         Log.d(TAG, "[PLAYBACK_DBG] ensureActive reason=" + reason + " localPlayer=" + (localExoMediaPlayer != null) + " preparing=" + localSourcePreparing + " bootstrap=" + bootstrapWindow + " pending=" + hasPendingStreamResolution());
 
         if (localExoMediaPlayer != null) {
-            if (localSourcePreparing && bootstrapWindow) {
+            if (localSourcePreparing) {
+                // Player is still preparing — onPrepared will call start() when ready.
+                // Don't call start() prematurely as it sets playWhenReady without syncing isPlaying.
                 return;
             }
 
@@ -917,6 +922,12 @@ public class SongPlayerFragment extends Fragment {
                 currentSeconds = Math.max(0, (int) (pos / 1000L));
                 if (localExoMediaPlayer != null) {
                     try {
+                        if (!usingOfflineSource && pbVideoLoading != null) {
+                            pbVideoLoading.setVisibility(View.VISIBLE);
+                        }
+                        if (!usingOfflineSource && !loadedVideoId.isEmpty()) {
+                            PlaybackLoadingBus.notifyLoadingStarted(loadedVideoId);
+                        }
                         localExoMediaPlayer.seekTo(currentSeconds * 1000);
                     } catch (Exception ignored) {
                     }
@@ -1226,6 +1237,7 @@ public class SongPlayerFragment extends Fragment {
         }
 
         if (isPlaying) {
+            Log.d(TAG, "[PLAYBACK_DBG] togglePlayback: PAUSING (isPlaying was true)");
             pauseRequestedByUser = true;
             isPlaying = false;
             if (localExoMediaPlayer != null) {
@@ -1244,6 +1256,69 @@ public class SongPlayerFragment extends Fragment {
 
         pauseRequestedByUser = false;
         isPlaying = true;
+
+        // If the player is already preparing the current track, don't destroy and recreate it.
+        // Just let the existing preparation finish — it will call start() in onPrepared.
+        if (localSourcePreparing && localExoMediaPlayer != null) {
+            Log.d(TAG, "[PLAYBACK_DBG] togglePlayback: already preparing, skipping playCurrentTrack");
+            updatePlayPauseIcon();
+            updateMediaSessionState();
+            updateMediaNotification();
+            syncMiniStateWithPlaylist();
+            persistPlaybackSnapshot(false);
+            return;
+        }
+
+        // If the player already exists and is actively playing, just resume the ticker
+        // instead of destroying and recreating (handles state restore where isPlaying was false
+        // but the player was already started).
+        if (localExoMediaPlayer != null && localExoMediaPlayer.isPlaying()) {
+            Log.d(TAG, "[PLAYBACK_DBG] togglePlayback: player already playing, resuming ticker");
+            startLocalProgressTicker();
+            updatePlayPauseIcon();
+            updateMediaSessionState();
+            updateMediaNotification();
+            syncMiniStateWithPlaylist();
+            persistPlaybackSnapshot(false);
+            return;
+        }
+
+        // If the player exists, is prepared, is truly paused (not just buffering after a seek),
+        // just call start() instead of destroying and recreating everything.
+        if (localExoMediaPlayer != null && !localSourcePreparing
+                && !localExoMediaPlayer.getPlayWhenReady()) {
+            Log.d(TAG, "[PLAYBACK_DBG] togglePlayback: player prepared but paused, calling start()");
+            try {
+                localExoMediaPlayer.setVolume(1f, 1f);
+                localExoMediaPlayer.start();
+                startLocalProgressTicker();
+                if (pbVideoLoading != null) pbVideoLoading.setVisibility(View.GONE);
+                if (!loadedVideoId.isEmpty()) PlaybackLoadingBus.notifyAudioConfirmed(loadedVideoId);
+            } catch (Exception e) {
+                Log.e(TAG, "togglePlayback: start() failed, falling through to playCurrentTrack", e);
+                playCurrentTrack();
+            }
+            updatePlayPauseIcon();
+            updateMediaSessionState();
+            updateMediaNotification();
+            syncMiniStateWithPlaylist();
+            persistPlaybackSnapshot(false);
+            return;
+        }
+
+        // If the player exists with playWhenReady=true, it's already started but buffering
+        // (e.g. after a seek). Don't destroy it — just ensure ticker is running.
+        if (localExoMediaPlayer != null && localExoMediaPlayer.getPlayWhenReady()) {
+            Log.d(TAG, "[PLAYBACK_DBG] togglePlayback: player started but buffering, waiting");
+            startLocalProgressTicker();
+            updatePlayPauseIcon();
+            updateMediaSessionState();
+            updateMediaNotification();
+            syncMiniStateWithPlaylist();
+            persistPlaybackSnapshot(false);
+            return;
+        }
+
         playCurrentTrack();
         updatePlayPauseIcon();
         updateMediaSessionState();
@@ -1858,6 +1933,11 @@ public class SongPlayerFragment extends Fragment {
         localSourcePreparing = true;
         updatePlayerSurfaceForSource();
 
+        // Show player loading spinner immediately for network sources
+        if (networkSource && pbVideoLoading != null) {
+            pbVideoLoading.setVisibility(View.VISIBLE);
+        }
+
         Context playbackAppContext = getPlaybackAppContext();
         if (playbackAppContext == null) {
             Log.w(TAG, "startMediaPlaybackFromSource: missing app context, aborting playback start");
@@ -1873,12 +1953,15 @@ public class SongPlayerFragment extends Fragment {
         if (sharedExoPlayer != null) {
             try {
                 player = new ExoMediaPlayer(playbackAppContext, sharedExoPlayer);
+                Log.d(TAG, "[PLAYBACK_DBG] using SHARED ExoPlayer for videoId=" + track.videoId + " token=" + requestToken);
             } catch (Exception e) {
                 Log.w(TAG, "Failed to use shared ExoPlayer, falling back", e);
                 player = new ExoMediaPlayer(playbackAppContext);
+                Log.d(TAG, "[PLAYBACK_DBG] using OWN ExoPlayer (shared failed) for videoId=" + track.videoId);
             }
         } else {
             player = new ExoMediaPlayer(playbackAppContext);
+            Log.d(TAG, "[PLAYBACK_DBG] using OWN ExoPlayer (no shared) for videoId=" + track.videoId);
         }
         localExoMediaPlayer = player;
         player.setAudioAttributes(new AudioAttributes.Builder()
@@ -1895,10 +1978,17 @@ public class SongPlayerFragment extends Fragment {
         // Attach video surface
         videoRouter.onTrackStarted(player, track.videoId);
 
-        // Hide loading spinner when ExoPlayer finishes buffering (e.g. after seek)
+        // Show/hide loading spinner based on buffering state, but only hide when
+        // audio is actually playing (not just when prepare finishes with isPlaying=false).
         player.setOnBufferingListener((mp, isBuffering) -> {
             if (mp == localExoMediaPlayer && pbVideoLoading != null) {
-                pbVideoLoading.setVisibility(isBuffering ? View.VISIBLE : View.GONE);
+                if (isBuffering) {
+                    pbVideoLoading.setVisibility(View.VISIBLE);
+                } else if (mp.isPlaying()) {
+                    // Only hide when audio is truly playing
+                    pbVideoLoading.setVisibility(View.GONE);
+                    PlaybackLoadingBus.notifyAudioConfirmed(track.videoId);
+                }
             }
         });
 
@@ -1906,10 +1996,21 @@ public class SongPlayerFragment extends Fragment {
             cancelSourcePrepareTimeout();
             localSourcePreparing = false;
 
+            Log.d(TAG, "[PLAYBACK_DBG] onPrepared fired for videoId=" + track.videoId
+                    + " isAdded=" + isAdded()
+                    + " samePlayer=" + (localExoMediaPlayer == mp)
+                    + " tokenMatch=" + (requestToken == activePlaybackRequestToken)
+                    + " videoIdMatch=" + TextUtils.equals(track.videoId, loadedVideoId)
+                    + " isPlaying=" + isPlaying
+                    + " requestToken=" + requestToken
+                    + " activeToken=" + activePlaybackRequestToken
+                    + " loadedVideoId=" + loadedVideoId);
+
             if (!isAdded()
                     || localExoMediaPlayer != mp
                     || requestToken != activePlaybackRequestToken
                     || !TextUtils.equals(track.videoId, loadedVideoId)) {
+                Log.w(TAG, "[PLAYBACK_DBG] onPrepared REJECTED — releasing mp for videoId=" + track.videoId);
                 releaseSingleExoMediaPlayer(mp);
                 return;
             }
@@ -1927,12 +2028,21 @@ public class SongPlayerFragment extends Fragment {
 
             totalSeconds = resolvedTotal;
 
-            if (isPlaying) {
+            // Also start if ExoPlayer's playWhenReady was already set (e.g. by ensureActive)
+            boolean shouldStart = isPlaying || mp.getPlayWhenReady();
+            if (shouldStart) {
+                if (!isPlaying) {
+                    Log.d(TAG, "[PLAYBACK_DBG] onPrepared: isPlaying=false but playWhenReady=true, correcting");
+                    isPlaying = true;
+                    pauseRequestedByUser = false;
+                }
                 try {
                     mp.setVolume(1f, 1f);
                     mp.start();
                     Log.d(TAG, "[PLAYBACK_FLOW] mp.start() called, AUDIO PLAYING for videoId=" + track.videoId);
                     PlaybackLoadingBus.notifyAudioConfirmed(track.videoId);
+                    if (networkSource) ProxyStreamResolver.markSuccess(track.videoId);
+                    if (pbVideoLoading != null) pbVideoLoading.setVisibility(View.GONE);
                     consecutiveStreamFailures = 0; // Reset counter on successful playback
                     audioTrackReinitToken = -1;
                     startLocalProgressTicker();
@@ -1983,6 +2093,38 @@ public class SongPlayerFragment extends Fragment {
                     + " videoId=" + track.videoId
                     + " token=" + requestToken);
 
+            // Codec/renderer errors (not proxy/network issues) — device codec crashed
+            boolean isCodecError = (what == 4003 || what == 4006);
+
+            // Codec crash (DEAD_OBJECT / MediaCodecRenderer error): error codes 4003, 4006.
+            // The device codec process died — NOT a network/proxy issue. Don't destroy the
+            // player; just call start() which triggers ExoPlayer's internal prepare() from
+            // STATE_IDLE, reinitializing codecs without losing position or media source.
+            if (isCodecError && localExoMediaPlayer == mp && isAdded()) {
+                Log.w(TAG, "Codec error (" + what + ") — retrying start() to reinit codecs for videoId=" + track.videoId);
+                localProgressHandler.postDelayed(() -> {
+                    if (!isAdded() || requestToken != activePlaybackRequestToken) return;
+                    if (localExoMediaPlayer == mp) {
+                        try {
+                            mp.start();
+                            startLocalProgressTicker();
+                            Log.d(TAG, "Codec recovery: start() succeeded for videoId=" + track.videoId);
+                        } catch (Exception e) {
+                            Log.e(TAG, "Codec recovery: start() failed, falling back to full reload", e);
+                            releaseLocalExoMediaPlayer();
+                            usingOfflineSource = false;
+                            playCurrentTrack();
+                        }
+                    }
+                }, 500L);
+                return true;
+            }
+
+            // Only mark the proxy server as failed for network/source errors, not codec crashes
+            if (networkSource && !isCodecError) {
+                ProxyStreamResolver.markFailed(track.videoId);
+            }
+
             if (localExoMediaPlayer == mp) {
                 stopLocalProgressTicker();
                 releaseLocalExoMediaPlayer();
@@ -2013,28 +2155,6 @@ public class SongPlayerFragment extends Fragment {
                     }
                     return true;
                 }
-            }
-
-            // Codec crash (DEAD_OBJECT from mediaserver): error code 4003.
-            // The system codec process died — this is external to the app. Reinitialize
-            // the shared ExoPlayer and resume from the saved position instead of restarting
-            // from 0 via onFailure (which would invalidate the URL and lose the position).
-            if (what == 4003 && isAdded()) {
-                final int savedPositionMs = currentSeconds * 1000;
-                Log.w(TAG, "Codec DEAD_OBJECT (4003) — reinitializing ExoPlayer and resuming from "
-                        + savedPositionMs + "ms for videoId=" + track.videoId);
-                ExoPlayerManager.INSTANCE.reinitialize(requireContext().getApplicationContext());
-                if (requestToken == activePlaybackRequestToken) {
-                    localProgressHandler.postDelayed(() -> {
-                        if (!isAdded() || requestToken != activePlaybackRequestToken) return;
-                        // Resume from saved position: temporarily override currentSeconds so
-                        // the seek is applied after prepare in attemptPlaybackFromSources.
-                        int resumeSec = savedPositionMs / 1000;
-                        currentSeconds = resumeSec;
-                        onFailure.run();
-                    }, 800L);
-                }
-                return true;
             }
 
             if (requestToken != activePlaybackRequestToken || !isAdded()) {
@@ -4307,11 +4427,12 @@ public class SongPlayerFragment extends Fragment {
         android.app.Notification notification = builder.build();
         NotificationManagerCompat.from(persistentAppContext).notify(MEDIA_NOTIFICATION_ID, notification);
 
-        // Keep process alive while playing so the MediaSession binder stays valid in background
+        // Keep process alive while playing so the MediaSession binder stays valid in background.
+        // When paused, downgrade from foreground but keep notification visible (dismissable).
         if (isPlaying) {
             PlaybackKeepAliveService.start(persistentAppContext, notification);
         } else {
-            PlaybackKeepAliveService.stop(persistentAppContext);
+            PlaybackKeepAliveService.stopForegroundKeepNotification(persistentAppContext);
         }
     }
 
@@ -5500,8 +5621,10 @@ public class SongPlayerFragment extends Fragment {
     private void releaseLocalExoMediaPlayer() {
         cancelOfflineCrossfade();
         if (localExoMediaPlayer == null) {
+            Log.d(TAG, "[PLAYBACK_DBG] releaseLocalExoMediaPlayer: already null");
             return;
         }
+        Log.d(TAG, "[PLAYBACK_DBG] releaseLocalExoMediaPlayer: releasing player=" + localExoMediaPlayer.hashCode());
         // Release video surface from router
         videoRouter.onPlayerReleased();
         try {
