@@ -271,7 +271,7 @@
                 android:orientation="horizontal"
                 android:paddingHorizontal="14dp"
                 android:visibility="gone">
-                <ImageView android:layout_width="19dp" android:layout_height="19dp" android:src="@drawable/ic_search" app:tint="@color/text_primary" />
+                <ImageView android:layout_width="19dp" android:layout_height="19dp" android:src="@drawable/ic_person" app:tint="@color/text_primary" />
                 <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginStart="6dp" android:fontFamily="@font/inter_variable" android:text="Ir a artista" android:textColor="@color/text_primary" android:textSize="14sp" android:textStyle="bold" />
             </LinearLayout>
 

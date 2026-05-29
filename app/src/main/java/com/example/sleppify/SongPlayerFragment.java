@@ -5425,6 +5425,12 @@ public class SongPlayerFragment extends Fragment {
                 bottomSheet.setBackgroundResource(android.R.color.transparent);
                 BottomSheetBehavior<View> behavior = BottomSheetBehavior.from(bottomSheet);
                 behavior.setSkipCollapsed(true);
+                // Aumentar la fricción para que requiera deslizar más abajo para cerrarlo (ej. 50%)
+                try {
+                    behavior.setHideFriction(0.5f);
+                } catch (Throwable ignored) {
+                    // Ignorar si la versión de Material Design no soporta setHideFriction
+                }
                 bottomSheet.setAlpha(0f);
                 bottomSheet.setVisibility(View.INVISIBLE);
                 bottomSheet.post(() -> {

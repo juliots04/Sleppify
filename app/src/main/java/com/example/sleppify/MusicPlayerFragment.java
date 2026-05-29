@@ -4519,6 +4519,10 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         String primaryPlaylistId = "";
         String primaryPlaylistTitle = "";
         for (PendingOfflinePlaylistCandidate candidate : candidates) {
+            // ONLY ALLOW ONE PLAYLIST PER BATCH so that progress metrics perfectly align!
+            if (!TextUtils.isEmpty(primaryPlaylistId) && !candidate.playlistId.equals(primaryPlaylistId)) {
+                break;
+            }
             int addedFromPlaylist = 0;
             for (CachedPlaylistTrack track : candidate.cachedTracks) {
                 if (track == null || TextUtils.isEmpty(track.videoId)) {
@@ -4550,11 +4554,25 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         if (batchTracks.isEmpty() || TextUtils.isEmpty(primaryPlaylistId)) {
             return null;
         }
+        // compute totals for this one playlist
+        int totalTracks = 0;
+        int pendingTracks = 0;
+        for (PendingOfflinePlaylistCandidate candidate : candidates) {
+            if (candidate.playlistId.equals(primaryPlaylistId)) {
+                totalTracks = candidate.cachedTracks.size();
+                pendingTracks = candidate.pendingCount;
+                break;
+            }
+        }
+        int alreadyOffline = Math.max(0, totalTracks - pendingTracks);
+
         return new PendingOfflineBatchCandidate(
                 primaryPlaylistId,
                 primaryPlaylistTitle,
                 batchPlaylistIds,
-                batchTracks
+                batchTracks,
+                alreadyOffline,
+                totalTracks
         );
     }
     private boolean enqueueOfflineAutoBatchDownloadInternal(@NonNull PendingOfflineBatchCandidate candidate) {
@@ -4578,8 +4596,8 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 .putStringArray(OfflinePlaylistDownloadWorker.INPUT_TITLES, titles.toArray(new String[0]))
                 .putStringArray(OfflinePlaylistDownloadWorker.INPUT_ARTISTS, artists.toArray(new String[0]))
                 .putStringArray(OfflinePlaylistDownloadWorker.INPUT_DURATIONS, durations.toArray(new String[0]))
-                .putInt(OfflinePlaylistDownloadWorker.INPUT_ALREADY_OFFLINE_COUNT, 0)
-                .putInt(OfflinePlaylistDownloadWorker.INPUT_TOTAL_WITH_VIDEO_ID, ids.size())
+                .putInt(OfflinePlaylistDownloadWorker.INPUT_ALREADY_OFFLINE_COUNT, candidate.alreadyOfflineCount)
+                .putInt(OfflinePlaylistDownloadWorker.INPUT_TOTAL_WITH_VIDEO_ID, candidate.totalTracks)
                 .putBoolean(OfflinePlaylistDownloadWorker.INPUT_USER_INITIATED, false)
                 .putBoolean(OfflinePlaylistDownloadWorker.INPUT_MANUAL_QUEUE, false)
                 .build();
@@ -5471,24 +5489,26 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         }
     }
     private static final class PendingOfflineBatchCandidate {
-        @NonNull
         final String primaryPlaylistId;
-        @NonNull
         final String primaryPlaylistTitle;
-        @NonNull
         final List<String> playlistIds;
-        @NonNull
         final List<PendingOfflineTrackCandidate> tracks;
-        private PendingOfflineBatchCandidate(
+        final int alreadyOfflineCount;
+        final int totalTracks;
+        PendingOfflineBatchCandidate(
                 @NonNull String primaryPlaylistId,
                 @NonNull String primaryPlaylistTitle,
                 @NonNull List<String> playlistIds,
-                @NonNull List<PendingOfflineTrackCandidate> tracks
+                @NonNull List<PendingOfflineTrackCandidate> tracks,
+                int alreadyOfflineCount,
+                int totalTracks
         ) {
             this.primaryPlaylistId = primaryPlaylistId;
             this.primaryPlaylistTitle = primaryPlaylistTitle;
             this.playlistIds = playlistIds;
             this.tracks = tracks;
+            this.alreadyOfflineCount = alreadyOfflineCount;
+            this.totalTracks = totalTracks;
         }
     }
     private final class MusicResultsAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
@@ -5502,6 +5522,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         private final OnLibraryTrackClick onTrackClick;
         private final OnLibraryTrackMoreClick onTrackMoreClick;
         private final Map<String, Boolean> playlistOfflineCompleteCache = new HashMap<>();
+        private final Map<String, Float> playlistRealFractionCache = new HashMap<>();
         private final Map<String, Integer> playlistPositionCache = new HashMap<>();  // Cache for O(1) lookups
         private final Set<String> playlistOfflineRefreshInFlight = new HashSet<>();
         private final Map<String, Float> playlistDownloadProgressCache = new HashMap<>();
@@ -6025,8 +6046,13 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
 
             boolean isDownloading = playlistsCurrentlyDownloading.contains(playlistId);
             float downloadFraction = 0f;
-            if (isDownloading && playlistDownloadProgressCache.containsKey(playlistId)) {
-                downloadFraction = playlistDownloadProgressCache.get(playlistId);
+            if (isDownloading) {
+                float workerFraction = playlistDownloadProgressCache.containsKey(playlistId) 
+                        ? playlistDownloadProgressCache.get(playlistId) : 0f;
+                float realFraction = playlistRealFractionCache.containsKey(playlistId) 
+                        ? playlistRealFractionCache.get(playlistId) : 0f;
+                // Use max, because worker fraction may be 0 if it's just ENQUEUED.
+                downloadFraction = Math.max(workerFraction, realFraction);
             }
             Context ctx = holder.itemView.getContext();
 
@@ -6051,9 +6077,11 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             } else if (offlineAutoEnabled) {
                 // State: queued (auto-offline enabled, waiting for worker)
                 // Show empty circular track + download icon (like downloading at 0%)
+                float realFraction = playlistRealFractionCache.containsKey(playlistId) 
+                        ? playlistRealFractionCache.get(playlistId) : 0f;
                 holder.flPlaylistOfflineContainer.setVisibility(View.VISIBLE);
                 holder.circularProgress.setVisibility(View.VISIBLE);
-                holder.circularProgress.setProgressImmediate(0f);
+                holder.circularProgress.setProgressImmediate(realFraction);
                 holder.ivPlaylistOfflineAll.setImageResource(R.drawable.ic_download_bold);
                 holder.ivPlaylistOfflineAll.setBackground(null);
                 holder.ivPlaylistOfflineAll.setColorFilter(ContextCompat.getColor(ctx, R.color.text_secondary));
@@ -6185,18 +6213,25 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 // If forcing recalculation, bypass cache and persisted state
                 // and check actual offline files
                 boolean computed;
+                float fraction = 0f;
                 if (forceRecalculate && isAdded()) {
-                    computed = computePlaylistOfflineStateFromFiles(requireContext().getApplicationContext(), playlistId);
+                    float[] results = computePlaylistOfflineProgressFromFiles(requireContext().getApplicationContext(), playlistId);
+                    computed = results[0] > 0.5f;
+                    fraction = results[1];
                 } else {
                     computed = isPlaylistFullyOffline(playlistId);
+                    float[] results = computePlaylistOfflineProgressFromFiles(requireContext().getApplicationContext(), playlistId);
+                    fraction = results[1];
                 }
+                final float finalFraction = fraction;
                 mainHandler.post(() -> {
                     playlistOfflineRefreshInFlight.remove(playlistId);
                     if (!isAdded() || generation != playlistOfflineStateGeneration) {
                         return;
                     }
                     Boolean previous = playlistOfflineCompleteCache.put(playlistId, computed);
-                    if (previous != null && previous == computed) {
+                    Float previousFraction = playlistRealFractionCache.put(playlistId, finalFraction);
+                    if (previous != null && previous == computed && previousFraction != null && Math.abs(previousFraction - finalFraction) < 0.001f) {
                         return;
                     }
                     int updatedPosition = findPlaylistPositionById(playlistId);
@@ -6211,18 +6246,19 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         
         /**
          * Compute playlist offline state by checking actual offline files.
-         * This bypasses cache and persisted state to give the ground truth.
+         * Returns an array [isComplete (1f or 0f), fraction (0f-1f)]
          */
-        private boolean computePlaylistOfflineStateFromFiles(@NonNull Context appContext, @NonNull String playlistId) {
+        private float[] computePlaylistOfflineProgressFromFiles(@NonNull Context appContext, @NonNull String playlistId) {
             if (TextUtils.isEmpty(playlistId)) {
-                return false;
+                return new float[]{0f, 0f};
             }
             ArrayList<CachedPlaylistTrack> cachedTracks = loadCachedPlaylistTracksForOffline(appContext, playlistId);
             if (cachedTracks.isEmpty()) {
                 // Track list was wiped (e.g. by pull-to-refresh) and prefetch hasn't finished yet.
                 // Do NOT write false to SharedPreferences â€” that would corrupt a correct persisted
                 // true value. Return the persisted state as-is and wait for the prefetch to repopulate.
-                return isPersistedPlaylistOfflineComplete(appContext, playlistId);
+                boolean persisted = isPersistedPlaylistOfflineComplete(appContext, playlistId);
+                return new float[]{persisted ? 1f : 0f, persisted ? 1f : 0f};
             }
             HashSet<String> seen = new HashSet<>();
             int eligibleCount = 0;
@@ -6245,7 +6281,8 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             boolean complete = eligibleCount > 0 && offlineCount >= eligibleCount;
             // Update persisted state with the computed truth
             persistPlaylistOfflineComplete(appContext, playlistId, complete);
-            return complete;
+            float fraction = eligibleCount > 0 ? (float) offlineCount / eligibleCount : 0f;
+            return new float[]{complete ? 1f : 0f, fraction};
         }
         private int findPlaylistPositionById(@NonNull String playlistId) {
             // âœ… O(1) HashMap lookup instead of O(n) linear search

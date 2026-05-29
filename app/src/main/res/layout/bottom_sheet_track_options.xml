@@ -330,7 +330,7 @@
                 android:id="@+id/ivBsGoToArtist"
                 android:layout_width="22dp"
                 android:layout_height="22dp"
-                android:src="@drawable/ic_search"
+                android:src="@drawable/ic_person"
                 app:tint="@android:color/white"/>
             <TextView
                 android:id="@+id/tvBsGoToArtist"

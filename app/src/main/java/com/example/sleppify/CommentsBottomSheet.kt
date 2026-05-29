@@ -77,6 +77,20 @@ class CommentsBottomSheet(
     init {
         dialog.setContentView(bsv)
 
+        val sheet = dialog.findViewById<View>(com.google.android.material.R.id.design_bottom_sheet)
+        if (sheet != null) {
+            sheet.setBackgroundResource(android.R.color.transparent)
+            val behavior = BottomSheetBehavior.from(sheet)
+            
+            val screenHeight = context.resources.displayMetrics.heightPixels
+            sheet.layoutParams.height = screenHeight
+            
+            behavior.isFitToContents = false
+            behavior.halfExpandedRatio = 0.55f
+            behavior.skipCollapsed = true
+            behavior.state = BottomSheetBehavior.STATE_HALF_EXPANDED
+        }
+
         if (commentCountLabel.isNotEmpty() && commentCountLabel != "0") {
             tvCount.text = commentCountLabel
         }
@@ -90,25 +104,6 @@ class CommentsBottomSheet(
                 }
             }
         })
-
-        dialog.setOnShowListener { d ->
-            val bsd = d as BottomSheetDialog
-            val sheet = bsd.findViewById<View>(com.google.android.material.R.id.design_bottom_sheet)
-            if (sheet != null) {
-                sheet.setBackgroundResource(android.R.color.transparent)
-                val behavior = BottomSheetBehavior.from(sheet)
-                behavior.skipCollapsed = true
-                sheet.alpha = 0f
-                sheet.visibility = View.INVISIBLE
-                sheet.post {
-                    behavior.state = BottomSheetBehavior.STATE_EXPANDED
-                    sheet.post {
-                        sheet.visibility = View.VISIBLE
-                        sheet.animate().alpha(1f).setDuration(120L).start()
-                    }
-                }
-            }
-        }
 
         dialog.setOnDismissListener { executor.shutdownNow() }
     }
@@ -132,26 +127,60 @@ class CommentsBottomSheet(
         if (apiKey.isEmpty()) { showEmpty(); isLoading = false; return }
 
         executor.execute {
-            val result = fetchComments(videoId, apiKey, pageToken)
+            var cacheLoaded = false
+            if (pageToken == null && comments.isEmpty()) {
+                val cachedBody = CommentsCacheManager.getFirstPageCache(context, videoId)
+                if (cachedBody != null) {
+                    val parsed = parseCommentsResponse(cachedBody)
+                    if (parsed.first.isNotEmpty()) {
+                        bsv.post {
+                            if (!dialog.isShowing) return@post
+                            nextPageToken = parsed.second
+                            comments.addAll(parsed.first)
+                            adapter.rebuildRows()
+                            adapter.notifyDataSetChanged()
+                            showLoading(false)
+                        }
+                        cacheLoaded = true
+                    }
+                }
+            }
+
+            val resultAndBody = fetchComments(videoId, apiKey, pageToken)
+            val result = resultAndBody?.first
+            val body = resultAndBody?.second
+
             bsv.post {
                 if (!dialog.isShowing) return@post
                 isLoading = false
                 flPagingLoader.visibility = View.GONE
-                showLoading(false)
+                
                 if (result == null) {
-                    if (comments.isEmpty()) showError()
+                    if (comments.isEmpty()) {
+                        showLoading(false)
+                        showError()
+                    }
                 } else {
-                    nextPageToken = result.second
-                    comments.addAll(result.first)
-                    adapter.rebuildRows()
-                    adapter.notifyDataSetChanged()
+                    showLoading(false)
+                    if (pageToken == null && body != null) {
+                        CommentsCacheManager.saveFirstPageCache(context, videoId, body)
+                        if (cacheLoaded) {
+                            comments.clear()
+                        }
+                    }
+                    if (!cacheLoaded || pageToken == null) {
+                        nextPageToken = result.second
+                        comments.addAll(result.first)
+                        adapter.rebuildRows()
+                        adapter.notifyDataSetChanged()
+                    }
                     if (comments.isEmpty()) showEmpty()
                 }
             }
         }
     }
 
-    private fun fetchComments(videoId: String, apiKey: String, pageToken: String?): Pair<List<CommentItem>, String?>? {
+    private fun fetchComments(videoId: String, apiKey: String, pageToken: String?): Pair<Pair<List<CommentItem>, String?>, String>? {
         return try {
             val url = StringBuilder()
                 .append("https://www.googleapis.com/youtube/v3/commentThreads")
@@ -169,7 +198,9 @@ class CommentsBottomSheet(
             conn.setRequestProperty("Accept", "application/json")
             try {
                 if (conn.responseCode != HttpURLConnection.HTTP_OK) return null
-                parseCommentsResponse(conn.inputStream.bufferedReader().readText())
+                val body = conn.inputStream.bufferedReader().readText()
+                val parsed = parseCommentsResponse(body)
+                Pair(parsed, body)
             } finally { conn.disconnect() }
         } catch (e: Exception) { null }
     }

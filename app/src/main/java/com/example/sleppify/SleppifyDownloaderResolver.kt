@@ -48,78 +48,131 @@ object SleppifyDownloaderResolver {
         if (videoId.isBlank()) return false
         val endpoint = VIDEO_ENDPOINTS[serverIndex.coerceIn(0, VIDEO_ENDPOINTS.size - 1)]
         val serverLabel = "vs$serverIndex"
+        val urlString = endpoint.replace("/api/video", "/api/stream/$videoId")
 
-        val body = JSONObject()
-            .apply { put("url", "https://www.youtube.com/watch?v=$videoId") }
-            .toString()
-            .toByteArray(StandardCharsets.UTF_8)
-
-        val existingBytes = if (targetFile.isFile) targetFile.length() else 0L
+        val tempFile = File(targetFile.absolutePath + ".tmp")
+        val existingBytes = if (tempFile.isFile) tempFile.length() else 0L
         val isResume = existingBytes >= MIN_VALID_VIDEO_BYTES / 2
 
         val startMs = System.currentTimeMillis()
 
-        var connection: HttpURLConnection? = null
-        return try {
-            connection = (URL(endpoint).openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                connectTimeout = CONNECT_TIMEOUT_MS
-                readTimeout = VIDEO_READ_TIMEOUT_MS
-                doOutput = true
-                setRequestProperty("Content-Type", "application/json; charset=utf-8")
-                setRequestProperty("Accept", "video/mp4, */*")
-                setRequestProperty("User-Agent", "Sleppify-Android/1.0")
-                if (isResume) {
-                    setRequestProperty("Range", "bytes=$existingBytes-")
-                }
-                outputStream.use { it.write(body) }
-            }
+        var totalBytes = if (isResume) existingBytes else 0L
+        if (!isResume && tempFile.isFile) {
+            tempFile.delete()
+        }
 
-            val code = connection.responseCode
-            val resuming = isResume && code == HttpURLConnection.HTTP_PARTIAL
-            val freshStart = code == HttpURLConnection.HTTP_OK
+        var retryCount = 0
+        val MAX_RETRIES = 5
+        var success = false
+        var lastException: Exception? = null
 
-            if (!resuming && !freshStart) {
-                val errBody = try { connection.errorStream?.bufferedReader()?.readText()?.take(300) } catch (_: Exception) { null }
-                Log.w(TAG, "video_proxy_fail id=$videoId $serverLabel http=$code elapsed=${System.currentTimeMillis() - startMs}ms err=$errBody")
-                return false
-            }
-
-            targetFile.parentFile?.let { if (!it.exists()) it.mkdirs() }
-
-            var totalBytes = if (resuming) existingBytes else 0L
-            if (!resuming && targetFile.isFile) {
-                targetFile.delete()
-            }
-
-            val appendMode = resuming
-            connection.inputStream.use { input ->
-                FileOutputStream(targetFile, appendMode).use { output ->
-                    val buf = ByteArray(16384)
-                    var n: Int
-                    while (input.read(buf).also { n = it } != -1) {
-                        output.write(buf, 0, n)
-                        totalBytes += n
-                        onProgress?.invoke(totalBytes)
+        while (retryCount <= MAX_RETRIES && !success) {
+            var connection: HttpURLConnection? = null
+            try {
+                val isAppend = totalBytes > 0
+                connection = (URL(urlString).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    connectTimeout = CONNECT_TIMEOUT_MS
+                    // Use a shorter read timeout since we will retry on timeout
+                    readTimeout = 30000
+                    doOutput = false
+                    setRequestProperty("Accept", "video/mp4, */*")
+                    setRequestProperty("User-Agent", "Sleppify-Android/1.0")
+                    if (isAppend) {
+                        setRequestProperty("Range", "bytes=$totalBytes-")
                     }
                 }
-            }
 
-            val elapsed = System.currentTimeMillis() - startMs
-            if (totalBytes < MIN_VALID_VIDEO_BYTES) {
-                Log.w(TAG, "video_proxy_fail id=$videoId $serverLabel reason=too_small bytes=$totalBytes elapsed=${elapsed}ms")
-                targetFile.delete()
-                return false
-            }
+                val code = connection.responseCode
+                if (code == 416) {
+                    // Range Not Satisfiable -> we already downloaded the whole file!
+                    success = true
+                    break
+                }
+                
+                val resumingNow = isAppend && code == HttpURLConnection.HTTP_PARTIAL
+                val freshStart = code == HttpURLConnection.HTTP_OK
 
-            Log.d(TAG, "video_proxy_ok id=$videoId $serverLabel bytes=$totalBytes elapsed=${elapsed}ms")
-            true
-        } catch (e: Exception) {
-            Log.w(TAG, "video_proxy_exception id=$videoId $serverLabel reason=${e.javaClass.simpleName} msg=${e.message} elapsed=${System.currentTimeMillis() - startMs}ms")
-            false
-        } finally {
-            connection?.disconnect()
+                if (!resumingNow && !freshStart) {
+                    val errBody = try { connection.errorStream?.bufferedReader()?.readText()?.take(300) } catch (_: Exception) { null }
+                    Log.w(TAG, "video_proxy_fail id=$videoId $serverLabel http=$code elapsed=${System.currentTimeMillis() - startMs}ms err=$errBody")
+                    return false
+                }
+
+                tempFile.parentFile?.let { if (!it.exists()) it.mkdirs() }
+
+                connection.inputStream.use { input ->
+                    FileOutputStream(tempFile, isAppend).use { output ->
+                        val buf = ByteArray(16384)
+                        var n: Int
+                        while (input.read(buf).also { n = it } != -1) {
+                            output.write(buf, 0, n)
+                            totalBytes += n
+                            onProgress?.invoke(totalBytes)
+                        }
+                    }
+                }
+                
+                // If it reached here without exception, stream finished successfully.
+                success = true
+            } catch (e: Exception) {
+                lastException = e
+                retryCount++
+                Log.w(TAG, "video_proxy_exception id=$videoId $serverLabel attempt=$retryCount reason=${e.javaClass.simpleName} msg=${e.message}")
+                if (retryCount <= MAX_RETRIES) {
+                    try { Thread.sleep(2000) } catch (ie: InterruptedException) { Thread.currentThread().interrupt(); break }
+                }
+            } finally {
+                connection?.disconnect()
+            }
         }
+
+        val elapsed = System.currentTimeMillis() - startMs
+        if (!success) {
+            Log.w(TAG, "video_proxy_fail id=$videoId $serverLabel failed_after_retries last_err=${lastException?.javaClass?.simpleName} bytes=$totalBytes elapsed=${elapsed}ms")
+            return false
+        }
+
+        if (totalBytes < MIN_VALID_VIDEO_BYTES) {
+            Log.w(TAG, "video_proxy_fail id=$videoId $serverLabel reason=too_small bytes=$totalBytes elapsed=${elapsed}ms")
+            tempFile.delete()
+            return false
+        }
+
+        var isPlayable = false
+        try {
+            val extractor = android.media.MediaExtractor()
+            extractor.setDataSource(tempFile.absolutePath)
+            for (i in 0 until extractor.trackCount) {
+                val format = extractor.getTrackFormat(i)
+                val mime = format.getString(android.media.MediaFormat.KEY_MIME)
+                if (mime != null && (mime.startsWith("audio/") || mime.startsWith("video/"))) {
+                    isPlayable = true
+                    break
+                }
+            }
+            extractor.release()
+        } catch (e: Exception) {
+            // Not playable or corrupt
+        }
+
+        if (!isPlayable) {
+            Log.w(TAG, "video_proxy_fail id=$videoId reason=corrupt_or_not_playable")
+            tempFile.delete()
+            return false
+        }
+
+        if (targetFile.exists()) {
+            targetFile.delete()
+        }
+        val renamed = tempFile.renameTo(targetFile)
+        if (!renamed) {
+            Log.w(TAG, "video_proxy_fail id=$videoId reason=rename_failed")
+            return false
+        }
+
+        Log.d(TAG, "video_proxy_ok id=$videoId $serverLabel bytes=$totalBytes elapsed=${elapsed}ms")
+        return true
     }
 
 }

@@ -2195,6 +2195,15 @@ public class PlaylistDetailFragment extends Fragment
                 if (safeTotal > 0) {
                     safeDownloaded = Math.min(safeDownloaded, safeTotal);
                 }
+                if (safeDownloaded == 0 && safeTotal > 0 && trackAdapter != null) {
+                    int cachedOfflineCount = 0;
+                    for (PlaylistTrack t : currentTracks) {
+                        if (Boolean.TRUE.equals(trackAdapter.offlineAvailabilityCache.get(t.videoId))) {
+                            cachedOfflineCount++;
+                        }
+                    }
+                    safeDownloaded = cachedOfflineCount;
+                }
 
                 // Only update track-level visual state if worker has emitted real progress
                 if (total > 0 || activeIds.length > 0) {
@@ -2212,11 +2221,11 @@ public class PlaylistDetailFragment extends Fragment
                     return;
                 }
 
-                String playlistNameMarkup = " <b>" + TextUtils.htmlEncode(effectivePlaylistTitle) + "</b>";
-                String status = "Descargando playlist" + playlistNameMarkup + " " + safeDownloaded + "/" + safeTotal;
+                String status = "Descargando playlist • " + safeDownloaded + "/" + safeTotal;
                 if (done > safeDownloaded) {
                     status += " • " + done + " revisadas";
                 }
+                headerPlaylistInfo = status;
                 notifyHeaderChanged();
                 return;
             }
@@ -2245,6 +2254,9 @@ public class PlaylistDetailFragment extends Fragment
                     resetBlockedOfflineQueues();
 
                     offlineDownloadQueued = false;
+                    if (currentMeta != null) {
+                        headerPlaylistInfo = buildPlaylistInfoLine(currentMeta, currentTracks.size());
+                    }
                     notifyHeaderChanged();
                     return;
                 }
@@ -2254,6 +2266,16 @@ public class PlaylistDetailFragment extends Fragment
                     return;
                 }
 
+                int safeTotal = Math.max(0, currentTracks.size());
+                int cachedOfflineCount = 0;
+                if (trackAdapter != null) {
+                    for (PlaylistTrack t : currentTracks) {
+                        if (Boolean.TRUE.equals(trackAdapter.offlineAvailabilityCache.get(t.videoId))) {
+                            cachedOfflineCount++;
+                        }
+                    }
+                }
+                headerPlaylistInfo = "Descargando playlist (En cola) • " + cachedOfflineCount + "/" + safeTotal;
                 notifyHeaderChanged();
                 return;
             }
@@ -2262,6 +2284,9 @@ public class PlaylistDetailFragment extends Fragment
 
             if (terminalInfo == null) {
                 setOfflineDownloadVisualState(false, "");
+                if (currentMeta != null) {
+                    headerPlaylistInfo = buildPlaylistInfoLine(currentMeta, currentTracks.size());
+                }
                 notifyHeaderChanged();
                 return;
             }
@@ -2280,6 +2305,9 @@ public class PlaylistDetailFragment extends Fragment
                     return;
                 }
 
+                if (currentMeta != null) {
+                    headerPlaylistInfo = buildPlaylistInfoLine(currentMeta, currentTracks.size());
+                }
                 notifyHeaderChanged();
                 stopObservingOfflineDownload();
                 refreshVisibleTrackRows();
@@ -2302,6 +2330,9 @@ public class PlaylistDetailFragment extends Fragment
                     return;
                 }
 
+                if (currentMeta != null) {
+                    headerPlaylistInfo = buildPlaylistInfoLine(currentMeta, currentTracks.size());
+                }
                 if (offlineObserverNotifyTerminalToasts) {
                     notifyHeaderChanged();
                 }

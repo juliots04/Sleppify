@@ -323,7 +323,21 @@ class ExoMediaPlayer {
 
         val mediaItem = MediaItem.fromUri(uri)
 
+        val loadErrorPolicy = object : androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy() {
+            override fun getRetryDelayMsFor(loadErrorInfo: androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy.LoadErrorInfo): Long {
+                val e = loadErrorInfo.exception
+                if (e is java.io.EOFException || e is java.net.SocketTimeoutException || e.cause is java.io.EOFException) {
+                    val retryCount = loadErrorInfo.errorCount
+                    if (retryCount < 15) {
+                        return Math.min((retryCount - 1) * 1000L + 500L, 5000L)
+                    }
+                }
+                return super.getRetryDelayMsFor(loadErrorInfo)
+            }
+        }
+
         val source = ProgressiveMediaSource.Factory(factory)
+            .setLoadErrorHandlingPolicy(loadErrorPolicy)
             .createMediaSource(mediaItem)
 
         player.stop()

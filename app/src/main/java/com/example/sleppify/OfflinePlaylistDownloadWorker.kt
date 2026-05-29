@@ -366,7 +366,6 @@ class OfflinePlaylistDownloadWorker(
             return true
         }
 
-        if (videoTarget.isFile) videoTarget.delete()
         return false
     }
 
