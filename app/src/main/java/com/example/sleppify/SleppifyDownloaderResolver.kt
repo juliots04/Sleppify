@@ -1,5 +1,6 @@
 package com.example.sleppify
 
+import android.content.Context
 import android.util.Log
 import org.json.JSONObject
 import java.io.File
@@ -32,7 +33,7 @@ object SleppifyDownloaderResolver {
 
     private const val CONNECT_TIMEOUT_MS = 10000
     private const val VIDEO_READ_TIMEOUT_MS = 120000
-    private const val MIN_VALID_VIDEO_BYTES = 500_000L
+    private const val MIN_VALID_VIDEO_BYTES = 24L * 1024L // 24KB to match worker limit
 
     /**
      * Downloads 720p mp4 video (fallback 360p) for [videoId] via server [serverIndex] into [targetFile].
@@ -40,21 +41,26 @@ object SleppifyDownloaderResolver {
      * Returns true on success, false on any failure.
      */
     fun downloadVideoViaProxy(
+        context: Context,
         videoId: String,
         targetFile: File,
         serverIndex: Int = 0,
         onProgress: ((Long) -> Unit)? = null
     ): Boolean {
         if (videoId.isBlank()) return false
-        val endpoint = VIDEO_ENDPOINTS[serverIndex.coerceIn(0, VIDEO_ENDPOINTS.size - 1)]
-        val serverLabel = "vs$serverIndex"
-        val urlString = endpoint.replace("/api/video", "/api/stream/$videoId")
 
-        val tempFile = File(targetFile.absolutePath + ".tmp")
-        val existingBytes = if (tempFile.isFile) tempFile.length() else 0L
-        val isResume = existingBytes >= MIN_VALID_VIDEO_BYTES / 2
+        synchronized(videoId.intern()) {
+            // Re-check if another concurrent thread just finished downloading this exact file
+            if (targetFile.exists() && targetFile.length() >= MIN_VALID_VIDEO_BYTES) {
+                Log.d(TAG, "video_proxy_ok id=$videoId reason=already_downloaded_concurrently")
+                return true
+            }
 
-        val startMs = System.currentTimeMillis()
+            val tempFile = File(targetFile.absolutePath + ".tmp")
+            val existingBytes = if (tempFile.isFile) tempFile.length() else 0L
+            val isResume = existingBytes >= MIN_VALID_VIDEO_BYTES / 2
+
+            val startMs = System.currentTimeMillis()
 
         var totalBytes = if (isResume) existingBytes else 0L
         if (!isResume && tempFile.isFile) {
@@ -65,8 +71,17 @@ object SleppifyDownloaderResolver {
         val MAX_RETRIES = 5
         var success = false
         var lastException: Exception? = null
+        var serverLabel = "unknown"
 
         while (retryCount <= MAX_RETRIES && !success) {
+            val urlString = InnertubeResolver.resolveStreamUrl(context, videoId)
+            if (urlString == null) {
+                Log.w(TAG, "No stream url resolved for $videoId")
+                return false
+            }
+            val isDirectGooglevideo = urlString.contains("googlevideo.com")
+            serverLabel = if (isDirectGooglevideo) "innertube" else "proxy_fallback"
+
             var connection: HttpURLConnection? = null
             try {
                 val isAppend = totalBytes > 0
@@ -77,7 +92,7 @@ object SleppifyDownloaderResolver {
                     readTimeout = 30000
                     doOutput = false
                     setRequestProperty("Accept", "video/mp4, */*")
-                    setRequestProperty("User-Agent", "Sleppify-Android/1.0")
+                    InnertubeResolver.getHeadersFor(videoId).forEach { (k, v) -> setRequestProperty(k, v) }
                     if (isAppend) {
                         setRequestProperty("Range", "bytes=$totalBytes-")
                     }
@@ -96,29 +111,50 @@ object SleppifyDownloaderResolver {
                 if (!resumingNow && !freshStart) {
                     val errBody = try { connection.errorStream?.bufferedReader()?.readText()?.take(300) } catch (_: Exception) { null }
                     Log.w(TAG, "video_proxy_fail id=$videoId $serverLabel http=$code elapsed=${System.currentTimeMillis() - startMs}ms err=$errBody")
+                    InnertubeResolver.invalidate(videoId)
+                    if (code == 403 || code == 404) {
+                        retryCount++
+                        continue // Retry with newly resolved URL (maybe proxy)
+                    }
                     return false
+                }
+
+                // If we tried to resume but the server sent the full file (200 OK), we MUST overwrite, not append.
+                var actualAppend = isAppend
+                if (isAppend && freshStart) {
+                    actualAppend = false
+                    totalBytes = 0
+                    if (tempFile.isFile) tempFile.delete()
                 }
 
                 tempFile.parentFile?.let { if (!it.exists()) it.mkdirs() }
 
+                var bytesReadThisSession = 0L
                 connection.inputStream.use { input ->
-                    FileOutputStream(tempFile, isAppend).use { output ->
+                    FileOutputStream(tempFile, actualAppend).use { output ->
                         val buf = ByteArray(16384)
                         var n: Int
                         while (input.read(buf).also { n = it } != -1) {
                             output.write(buf, 0, n)
                             totalBytes += n
+                            bytesReadThisSession += n
                             onProgress?.invoke(totalBytes)
                         }
                     }
                 }
                 
+                val expectedContentLength = connection.getHeaderField("Content-Length")?.toLongOrNull() ?: -1L
+                if (expectedContentLength > 0L && bytesReadThisSession < expectedContentLength) {
+                    throw java.io.IOException("Truncated stream: expected $expectedContentLength bytes but got $bytesReadThisSession")
+                }
+
                 // If it reached here without exception, stream finished successfully.
                 success = true
             } catch (e: Exception) {
                 lastException = e
                 retryCount++
                 Log.w(TAG, "video_proxy_exception id=$videoId $serverLabel attempt=$retryCount reason=${e.javaClass.simpleName} msg=${e.message}")
+                InnertubeResolver.invalidate(videoId)
                 if (retryCount <= MAX_RETRIES) {
                     try { Thread.sleep(2000) } catch (ie: InterruptedException) { Thread.currentThread().interrupt(); break }
                 }
@@ -173,6 +209,7 @@ object SleppifyDownloaderResolver {
 
         Log.d(TAG, "video_proxy_ok id=$videoId $serverLabel bytes=$totalBytes elapsed=${elapsed}ms")
         return true
+        } // end synchronized block
     }
 
 }

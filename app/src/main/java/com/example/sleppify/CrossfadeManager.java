@@ -320,6 +320,11 @@ public final class CrossfadeManager {
                 Map<String, String> headers = new HashMap<>();
                 headers.put("User-Agent", STREAM_HTTP_USER_AGENT);
                 headers.put("Accept", "*/*");
+                // Inject InnerTube-specific headers for direct googlevideo.com URLs
+                if (source.contains("googlevideo.com")) {
+                    headers.put("Origin", "https://music.youtube.com");
+                    headers.put("Referer", "https://music.youtube.com/");
+                }
                 incoming.setDataSource(appContext, Uri.parse(source), headers);
             } else if (source.startsWith("content://")) {
                 incoming.setDataSource(appContext, Uri.parse(source), null);

@@ -1769,8 +1769,6 @@ class SearchFragment : Fragment() {
         if (!isAdded) return
         val activity = requireActivity() as? MainActivity ?: return
         val rootView = activity.findViewById<android.view.ViewGroup>(android.R.id.content) ?: return
-        val existing = rootView.findViewWithTag<View>("saved_bar")
-        if (existing != null) rootView.removeView(existing)
 
         val density = resources.displayMetrics.density
 
@@ -1797,7 +1795,8 @@ class SearchFragment : Fragment() {
         }
         bar.addView(tvMsg)
 
-        if (onChangeClick != null) {
+        val changeClick = onChangeClick
+        if (changeClick != null) {
             val btnChange = TextView(requireContext()).apply {
                 text = "Cambiar"
                 setTextColor(android.graphics.Color.parseColor("#8AB4F8"))
@@ -1805,8 +1804,9 @@ class SearchFragment : Fragment() {
                 setTypeface(null, android.graphics.Typeface.BOLD)
                 setPadding((16 * density).toInt(), 0, 0, 0)
                 setOnClickListener {
-                    rootView.removeView(bar)
-                    onChangeClick()
+                    TransientBottomBarAnimator.dismiss(bar) {
+                        changeClick()
+                    }
                 }
             }
             bar.addView(btnChange)
@@ -1820,13 +1820,7 @@ class SearchFragment : Fragment() {
             gravity = android.view.Gravity.BOTTOM
             this.bottomMargin = barBottomMargin
         }
-        rootView.addView(bar, flp)
-
-        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-            if (bar.parent != null) {
-                (bar.parent as android.view.ViewGroup).removeView(bar)
-            }
-        }, 4000L)
+        TransientBottomBarAnimator.show(rootView, bar, flp, "saved_bar", 4000L)
     }
 
     private fun computeSnackbarBottomMargin(activity: android.app.Activity, density: Float): Int {
@@ -1856,8 +1850,6 @@ class SearchFragment : Fragment() {
         if (!isAdded) return
         val activity = requireActivity() as? MainActivity ?: return
         val rootView = activity.findViewById<android.view.ViewGroup>(android.R.id.content) ?: return
-        val existing = rootView.findViewWithTag<View>("saved_bar")
-        if (existing != null) rootView.removeView(existing)
 
         val density = resources.displayMetrics.density
 
@@ -1891,9 +1883,10 @@ class SearchFragment : Fragment() {
             setTypeface(null, android.graphics.Typeface.BOLD)
             setPadding((16 * density).toInt(), 0, 0, 0)
             setOnClickListener {
-                rootView.removeView(bar)
-                addTrackToPlaylistByKey(playlistKey, track)
-                Toast.makeText(requireContext(), "Restaurado en ${resolvePlaylistName(playlistKey)}", Toast.LENGTH_SHORT).show()
+                TransientBottomBarAnimator.dismiss(bar) {
+                    addTrackToPlaylistByKey(playlistKey, track)
+                    Toast.makeText(requireContext(), "Restaurado en ${resolvePlaylistName(playlistKey)}", Toast.LENGTH_SHORT).show()
+                }
             }
         }
         bar.addView(btnUndo)
@@ -1906,13 +1899,7 @@ class SearchFragment : Fragment() {
             gravity = android.view.Gravity.BOTTOM
             this.bottomMargin = barBottomMargin
         }
-        rootView.addView(bar, flp)
-
-        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-            if (bar.parent != null) {
-                (bar.parent as android.view.ViewGroup).removeView(bar)
-            }
-        }, 4000L)
+        TransientBottomBarAnimator.show(rootView, bar, flp, "saved_bar", 4000L)
     }
 
     private fun isTrackInPlaylist(ctx: android.content.Context, videoId: String, playlistKey: String): Boolean {

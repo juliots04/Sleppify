@@ -1738,37 +1738,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         tracks.clear();
         List<YouTubeMusicService.TrackResult> displayList = buildDisplayLibrary();
         List<YouTubeMusicService.TrackResult> visibleLibraryTracks = displayList;
-        boolean isOfflineMode = isAdded() && requireContext()
-                .getSharedPreferences(CloudSyncManager.PREFS_SETTINGS, Activity.MODE_PRIVATE)
-                .getBoolean(CloudSyncManager.KEY_OFFLINE_MODE_ENABLED, false);
-        if (isOfflineMode) {
-            Context offlineCtx = requireContext().getApplicationContext();
-            visibleLibraryTracks = new ArrayList<>();
-            for (YouTubeMusicService.TrackResult playlist : displayList) {
-                if (playlist == null || !"playlist".equals(playlist.resultType)) {
-                    visibleLibraryTracks.add(playlist);
-                    continue;
-                }
-                String pid = playlist.contentId == null ? "" : playlist.contentId.trim();
-                if (pid.isEmpty()) continue;
-                if (LocalFilesStore.PLAYLIST_ID.equals(pid)) {
-                    visibleLibraryTracks.add(playlist);
-                    continue;
-                }
-                ArrayList<CachedPlaylistTrack> cachedTracks = loadCachedPlaylistTracksForOffline(offlineCtx, pid);
-                boolean hasDownload = false;
-                for (CachedPlaylistTrack t : cachedTracks) {
-                    if (t != null && !TextUtils.isEmpty(t.videoId)
-                            && OfflineAudioStore.hasOfflineAudio(offlineCtx, t.videoId)) {
-                        hasDownload = true;
-                        break;
-                    }
-                }
-                if (hasDownload) {
-                    visibleLibraryTracks.add(playlist);
-                }
-            }
-        }
+
         adapter.submitResults(new ArrayList<>(visibleLibraryTracks));
         if (visibleLibraryTracks.isEmpty()) {
             tvMusicState.setText("");
@@ -4914,8 +4884,8 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         YouTubeMusicService.TrackResult track = new YouTubeMusicService.TrackResult(
                 resultType, contentId, title, subtitle, thumbnailUrl);
 
-        // Parse fallback queue from local playlists (used only if radio fetch fails)
-        final List<YouTubeMusicService.TrackResult> fallbackTracks = new ArrayList<>();
+        // Parse optional queue tracks from the search result payload
+        final List<YouTubeMusicService.TrackResult> queueTracks = new ArrayList<>();
         try {
             if (queueJson != null) {
                 org.json.JSONArray array = new org.json.JSONArray(queueJson);
@@ -4928,7 +4898,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                             obj.optString("subtitle", ""),
                             obj.optString("thumbnailUrl", "")
                     );
-                    fallbackTracks.add(qTrack);
+                    queueTracks.add(qTrack);
                 }
             }
         } catch (Exception ignored) {
@@ -4938,7 +4908,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         if ("playlist".equals(resultType)) {
             tracks.clear();
             featuredTrack = track;
-            tracks.addAll(fallbackTracks);
+            tracks.addAll(queueTracks);
             openTrack(track, true);
             return;
         }
@@ -4960,12 +4930,11 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             String radioPlaylistId = "RDAMVM" + videoId;
             final String selectedVideoId = videoId;
             final YouTubeMusicService.TrackResult selectedTrack = track;
-            final List<YouTubeMusicService.TrackResult> localFallback = fallbackTracks;
             youTubeMusicService.fetchMixTracks(cookie, radioPlaylistId, new YouTubeMusicService.MixTracksCallback() {
                 @Override
                 public void onSuccess(@NonNull List<YouTubeMusicService.TrackResult> radioTracks) {
                     if (!isAdded() || radioTracks.isEmpty()) {
-                        applyFallbackQueue(selectedTrack, localFallback);
+                        android.widget.Toast.makeText(requireContext(), "No se pudo cargar la radio. Inténtalo más tarde.", android.widget.Toast.LENGTH_SHORT).show();
                         return;
                     }
                     // Build radio queue: selected track first, then radio tracks (deduplicated)
@@ -5021,41 +4990,14 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 @Override
                 public void onError(@NonNull String error) {
                     if (!isAdded()) return;
-                    applyFallbackQueue(selectedTrack, localFallback);
+                    android.widget.Toast.makeText(requireContext(),
+                            "No se pudo cargar la radio. Inténtalo más tarde.",
+                            android.widget.Toast.LENGTH_SHORT).show();
                 }
             });
         }
     }
 
-    private void applyFallbackQueue(
-            @NonNull YouTubeMusicService.TrackResult selectedTrack,
-            @NonNull List<YouTubeMusicService.TrackResult> fallbackTracks
-    ) {
-        if (!isAdded() || fallbackTracks.isEmpty()) return;
-        ArrayList<String> ids = new ArrayList<>();
-        ArrayList<String> titles = new ArrayList<>();
-        ArrayList<String> artists = new ArrayList<>();
-        ArrayList<String> durations = new ArrayList<>();
-        ArrayList<String> images = new ArrayList<>();
-        int selectedIndex = 0;
-        for (int i = 0; i < fallbackTracks.size(); i++) {
-            YouTubeMusicService.TrackResult t = fallbackTracks.get(i);
-            if (t == null || TextUtils.isEmpty(t.videoId)) continue;
-            if (TextUtils.equals(t.videoId, selectedTrack.videoId)) {
-                selectedIndex = ids.size();
-            }
-            ids.add(t.videoId);
-            titles.add(TextUtils.isEmpty(t.title) ? "" : t.title);
-            artists.add(t.subtitle == null ? "" : t.subtitle);
-            durations.add("--:--");
-            images.add(t.thumbnailUrl == null ? "" : t.thumbnailUrl);
-        }
-        if (ids.isEmpty()) return;
-        SongPlayerFragment sp = findSongPlayerFragment();
-        if (sp != null && sp.isAdded()) {
-            sp.externalReplaceQueue(ids, titles, artists, durations, images, selectedIndex, true);
-        }
-    }
     public void playNextFromSearch(@NonNull Intent data) {
         String videoId = data.getStringExtra(SearchFragment.EXTRA_RESULT_VIDEO_ID);
         String title = data.getStringExtra(SearchFragment.EXTRA_RESULT_TITLE);

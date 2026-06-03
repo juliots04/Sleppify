@@ -1702,7 +1702,7 @@ public class SongPlayerFragment extends Fragment {
                 int serverIndex = Math.abs(normalized.hashCode()) % SleppifyDownloaderResolver.SERVER_COUNT;
 
                 boolean ok = SleppifyDownloaderResolver.INSTANCE.downloadVideoViaProxy(
-                        normalized, targetFile, serverIndex, null);
+                        appContext, normalized, targetFile, serverIndex, null);
 
                 if (ok) {
                     OfflineAudioStore.markOfflineAudioState(normalized, true);
@@ -1817,6 +1817,9 @@ public class SongPlayerFragment extends Fragment {
             Map<String, String> headers = new HashMap<>();
             headers.put("User-Agent", STREAM_HTTP_USER_AGENT);
             headers.put("Accept", "*/*");
+            // Inject InnerTube-specific headers for direct googlevideo.com URLs
+            Map<String, String> innertubeHeaders = InnertubeResolver.getHeadersFor(nextTrack.videoId);
+            headers.putAll(innertubeHeaders);
             player.setDataSource(appCtx, Uri.parse(url), headers);
             player.setVolume(0f, 0f);
 
@@ -2171,6 +2174,9 @@ public class SongPlayerFragment extends Fragment {
                 Map<String, String> headers = new HashMap<>();
                 headers.put("User-Agent", STREAM_HTTP_USER_AGENT);
                 headers.put("Accept", "*/*");
+                // Inject InnerTube-specific headers for direct googlevideo.com URLs
+                Map<String, String> innertubeHeaders = InnertubeResolver.getHeadersFor(track.videoId);
+                headers.putAll(innertubeHeaders);
                 player.setDataSource(playbackAppContext, Uri.parse(source), headers);
             } else if (source.startsWith("content://") && isAdded()) {
                 player.setDataSource(playbackAppContext, Uri.parse(source), null);
@@ -5302,8 +5308,6 @@ public class SongPlayerFragment extends Fragment {
         if (!isAdded() || getView() == null) return;
 
         android.view.ViewGroup rootView = (android.view.ViewGroup) getView();
-        View existing = rootView.findViewWithTag("saved_bar");
-        if (existing != null) rootView.removeView(existing);
 
         float density = getResources().getDisplayMetrics().density;
 
@@ -5337,8 +5341,7 @@ public class SongPlayerFragment extends Fragment {
         btnAction.setTypeface(null, android.graphics.Typeface.BOLD);
         btnAction.setPadding((int) (16 * density), 0, 0, 0);
         btnAction.setOnClickListener(v -> {
-            rootView.removeView(bar);
-            actionClick.onClick(v);
+            TransientBottomBarAnimator.dismiss(bar, () -> actionClick.onClick(v));
         });
         bar.addView(btnAction);
 
@@ -5352,21 +5355,15 @@ public class SongPlayerFragment extends Fragment {
             clp.bottomMargin = barBottomMargin;
             clp.startToStart = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.PARENT_ID;
             clp.endToEnd = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.PARENT_ID;
-            rootView.addView(bar, clp);
+            TransientBottomBarAnimator.show(rootView, bar, clp, "saved_bar", 4000L);
         } else {
             FrameLayout.LayoutParams flp = new FrameLayout.LayoutParams(
                     android.view.ViewGroup.LayoutParams.MATCH_PARENT,
                     android.view.ViewGroup.LayoutParams.WRAP_CONTENT);
             flp.gravity = android.view.Gravity.BOTTOM;
             flp.bottomMargin = barBottomMargin;
-            rootView.addView(bar, flp);
+            TransientBottomBarAnimator.show(rootView, bar, flp, "saved_bar", 4000L);
         }
-
-        new Handler(Looper.getMainLooper()).postDelayed(() -> {
-            if (bar.getParent() != null) {
-                ((android.view.ViewGroup) bar.getParent()).removeView(bar);
-            }
-        }, 4000L);
     }
 
     private void showQueueBottomSheet() {

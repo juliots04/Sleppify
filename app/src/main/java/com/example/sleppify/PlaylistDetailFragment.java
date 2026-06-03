@@ -153,6 +153,7 @@ public class PlaylistDetailFragment extends Fragment
     private ProgressBar pbPlaylistLoading;
     private View flNoConnectionState;
     private View btnRetryConnection;
+    private TextView tvNoConnectionMessage;
 
     // Playlist toolbar members (back + search + scroll-aware title)
     private View llPlaylistToolbar;
@@ -292,6 +293,7 @@ public class PlaylistDetailFragment extends Fragment
         pbPlaylistLoading = view.findViewById(R.id.pbPlaylistLoading);
         flNoConnectionState = view.findViewById(R.id.flNoConnectionState);
         btnRetryConnection = view.findViewById(R.id.btnRetryConnection);
+        tvNoConnectionMessage = view.findViewById(R.id.tvNoConnectionMessage);
 
         // Playlist toolbar initialization (back + search + scroll title)
         llPlaylistToolbar = view.findViewById(R.id.llPlaylistToolbar);
@@ -707,11 +709,15 @@ public class PlaylistDetailFragment extends Fragment
             @NonNull String playlistId,
             @NonNull String accessToken,
             boolean forceRefresh,
-            boolean loadMore
+            boolean loadMore,
+            @NonNull String message
     ) {
         revealPlaylistContentIfNeeded(true);
         if (flNoConnectionState != null) {
             flNoConnectionState.setVisibility(View.VISIBLE);
+        }
+        if (tvNoConnectionMessage != null) {
+            tvNoConnectionMessage.setText(message);
         }
         if (btnRetryConnection != null) {
             btnRetryConnection.setOnClickListener(v -> {
@@ -1545,15 +1551,9 @@ public class PlaylistDetailFragment extends Fragment
         if (playlistId.startsWith("RDAMVM") || playlistId.startsWith("RDEM") || playlistId.startsWith("RDTMAK")) {
             // Check no-internet before attempting network fetch
             if (!hasValidatedInternet(requireContext())) {
-                List<PlaylistTrack> cached = sanitizeTracksForPlaylist(
-                        playlistId, loadCachedTracks(playlistId));
-                if (!cached.isEmpty()) {
-                    playlistTracksLoadMoreInFlight = false;
-                    renderTracks(cached, playlistId, true);
-                    return;
-                }
                 playlistTracksLoadMoreInFlight = false;
-                showNoConnectionState(playlistId, effectiveAccessToken, forceRefresh, loadMore);
+                showNoConnectionState(playlistId, effectiveAccessToken, forceRefresh, loadMore,
+                        "No se pudo cargar la radio. Inténtalo más tarde.");
                 return;
             }
             String cookie = requireContext().getSharedPreferences(PREFS_PLAYER_STATE, Activity.MODE_PRIVATE)
@@ -1586,7 +1586,8 @@ public class PlaylistDetailFragment extends Fragment
                         ));
                     }
                     if (mapped.isEmpty()) {
-                        revealPlaylistContentIfNeeded(true);
+                        showNoConnectionState(playlistId, effectiveAccessToken, forceRefresh, loadMore,
+                                "No se pudo cargar la radio. Inténtalo más tarde.");
                         return;
                     }
                     // Prepend the source track that generated the radio at position 0
@@ -1615,14 +1616,8 @@ public class PlaylistDetailFragment extends Fragment
                 public void onError(@NonNull String error) {
                     if (!isAdded()) return;
                     playlistTracksLoadMoreInFlight = false;
-                    // Try loading from cache if available
-                    List<PlaylistTrack> cached = sanitizeTracksForPlaylist(
-                            playlistId, loadCachedTracks(playlistId));
-                    if (!cached.isEmpty()) {
-                        renderTracks(cached, playlistId, true);
-                        return;
-                    }
-                    showNoConnectionState(playlistId, effectiveAccessToken, forceRefresh, loadMore);
+                    showNoConnectionState(playlistId, effectiveAccessToken, forceRefresh, loadMore,
+                            "No se pudo cargar la radio. Inténtalo más tarde.");
                 }
             });
             return;
@@ -2729,7 +2724,7 @@ public class PlaylistDetailFragment extends Fragment
                 for (PlaylistTrack t : snapshot) {
                     if (t == null || TextUtils.isEmpty(t.videoId)) continue;
                     String vid = t.videoId.trim();
-                    if (OfflineAudioStore.hasOfflineAudio(offlineCtx, vid)) {
+                    if (LocalFilesStore.isLocalVideoId(vid) || OfflineAudioStore.hasOfflineAudio(offlineCtx, vid)) {
                         filtered.add(t);
                     }
                 }
@@ -3859,9 +3854,6 @@ public class PlaylistDetailFragment extends Fragment
         ViewGroup rootView = activity.findViewById(android.R.id.content);
         if (rootView == null) return;
 
-        View existing = rootView.findViewWithTag("saved_bar");
-        if (existing != null) rootView.removeView(existing);
-
         float density = getResources().getDisplayMetrics().density;
 
         LinearLayout bar = new LinearLayout(requireContext());
@@ -3893,9 +3885,10 @@ public class PlaylistDetailFragment extends Fragment
         btnChange.setTypeface(null, android.graphics.Typeface.BOLD);
         btnChange.setPadding((int) (16 * density), 0, 0, 0);
         btnChange.setOnClickListener(v -> {
-            rootView.removeView(bar);
-            CustomPlaylistsStore.clearLastSavedPlaylist(requireContext());
-            showSaveToPlaylistSheet(track, playlistKey);
+            TransientBottomBarAnimator.dismiss(bar, () -> {
+                CustomPlaylistsStore.clearLastSavedPlaylist(requireContext());
+                showSaveToPlaylistSheet(track, playlistKey);
+            });
         });
         bar.addView(btnChange);
 
@@ -3904,13 +3897,7 @@ public class PlaylistDetailFragment extends Fragment
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         flp.gravity = android.view.Gravity.BOTTOM;
         flp.bottomMargin = barBottomMargin;
-        rootView.addView(bar, flp);
-
-        new Handler(Looper.getMainLooper()).postDelayed(() -> {
-            if (bar.getParent() != null) {
-                ((ViewGroup) bar.getParent()).removeView(bar);
-            }
-        }, 4000L);
+        TransientBottomBarAnimator.show(rootView, bar, flp, "saved_bar", 4000L);
     }
 
     private void showRemovedFromPlaylistBar(@NonNull PlaylistTrack track, @NonNull String playlistName) {
@@ -3918,9 +3905,6 @@ public class PlaylistDetailFragment extends Fragment
         MainActivity activity = (MainActivity) requireActivity();
         ViewGroup rootView = activity.findViewById(android.R.id.content);
         if (rootView == null) return;
-
-        View existing = rootView.findViewWithTag("saved_bar");
-        if (existing != null) rootView.removeView(existing);
 
         float density = getResources().getDisplayMetrics().density;
 
@@ -3954,9 +3938,10 @@ public class PlaylistDetailFragment extends Fragment
         btnUndo.setTypeface(null, android.graphics.Typeface.BOLD);
         btnUndo.setPadding((int) (16 * density), 0, 0, 0);
         btnUndo.setOnClickListener(v -> {
-            rootView.removeView(bar);
-            undoRemoveTrackFromPlaylist(track);
-            Toast.makeText(requireContext(), "Restaurado en " + playlistName, Toast.LENGTH_SHORT).show();
+            TransientBottomBarAnimator.dismiss(bar, () -> {
+                undoRemoveTrackFromPlaylist(track);
+                Toast.makeText(requireContext(), "Restaurado en " + playlistName, Toast.LENGTH_SHORT).show();
+            });
         });
         bar.addView(btnUndo);
 
@@ -3965,13 +3950,7 @@ public class PlaylistDetailFragment extends Fragment
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         flp.gravity = android.view.Gravity.BOTTOM;
         flp.bottomMargin = barBottomMargin;
-        rootView.addView(bar, flp);
-
-        new Handler(Looper.getMainLooper()).postDelayed(() -> {
-            if (bar.getParent() != null) {
-                ((ViewGroup) bar.getParent()).removeView(bar);
-            }
-        }, 4000L);
+        TransientBottomBarAnimator.show(rootView, bar, flp, "saved_bar", 4000L);
     }
 
     private void shareTrack(PlaylistTrack track) {
@@ -5379,7 +5358,6 @@ public class PlaylistDetailFragment extends Fragment
                         .diskCacheStrategy(DiskCacheStrategy.ALL)
                         .priority(com.bumptech.glide.Priority.HIGH)
                         .override(800, 800)
-                        .transition(DrawableTransitionOptions.withCrossFade(200))
                         .into(holder.ivPlaylistCover);
                 Glide.with(holder.itemView)
                         .load(hdUrl)

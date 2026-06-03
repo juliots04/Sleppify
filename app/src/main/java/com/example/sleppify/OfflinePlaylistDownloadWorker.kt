@@ -71,87 +71,85 @@ class OfflinePlaylistDownloadWorker(
         val completionService = ExecutorCompletionService<TrackDownloadResult>(executor)
         var submittedTasks = 0
 
-        for (i in ids.indices) {
-            if (isStopped) {
-                executor.shutdownNow()
-                Log.w(TAG, "doWork: worker stopped before enqueue, retrying")
-                return Result.retry()
-            }
-
-            val trackIndex = i
-            val serverIndex = trackIndex % SleppifyDownloaderResolver.SERVER_COUNT
-            completionService.submit {
-                processSingleTrackDownload(
-                    appContext, userInitiated, trackIndex, serverIndex, ids, titles, artists, durations,
-                    activeTrackIds, activeTrackProgressFractions
-                )
-            }
-            submittedTasks++
-        }
-
-        var consecutiveFailures = 0
-
-        for (i in 0 until submittedTasks) {
-            if (isStopped) {
-                executor.shutdownNow()
-                Log.w(TAG, "doWork: worker stopped, retrying")
-                return Result.retry()
-            }
-
-            var trackResult: TrackDownloadResult? = null
-            while (trackResult == null) {
+        try {
+            for (i in ids.indices) {
                 if (isStopped) {
-                    executor.shutdownNow()
-                    Log.w(TAG, "doWork: worker stopped while waiting for result, retrying")
+                    Log.w(TAG, "doWork: worker stopped before enqueue, retrying")
                     return Result.retry()
                 }
 
-                try {
-                    val future = completionService.poll(650L, TimeUnit.MILLISECONDS)
-                    if (future == null) {
-                        val activeSnapshot = snapshotActiveProgress(activeTrackIds, activeTrackProgressFractions)
-                        val currentId = if (activeSnapshot.trackIds.isNotEmpty()) activeSnapshot.trackIds[0] else ""
-                        publishProgress(
-                            playlistTitle, done, total, downloaded, currentId,
-                            activeSnapshot.trackIds, activeSnapshot.fractions
-                        )
-                        continue
+                val trackIndex = i
+                val serverIndex = trackIndex % SleppifyDownloaderResolver.SERVER_COUNT
+                completionService.submit {
+                    processSingleTrackDownload(
+                        appContext, userInitiated, trackIndex, serverIndex, ids, titles, artists, durations,
+                        activeTrackIds, activeTrackProgressFractions
+                    )
+                }
+                submittedTasks++
+            }
+
+            var consecutiveFailures = 0
+
+            for (i in 0 until submittedTasks) {
+                if (isStopped) {
+                    Log.w(TAG, "doWork: worker stopped, retrying")
+                    return Result.retry()
+                }
+
+                var trackResult: TrackDownloadResult? = null
+                while (trackResult == null) {
+                    if (isStopped) {
+                        Log.w(TAG, "doWork: worker stopped while waiting for result, retrying")
+                        return Result.retry()
                     }
 
-                    trackResult = future.get() ?: TrackDownloadResult.failed("", "")
-                } catch (_: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    trackResult = TrackDownloadResult.failed("", "")
-                } catch (e: Exception) {
-                    Log.e(TAG, "track:future_exception message=" + e.message, e)
-                    trackResult = TrackDownloadResult.failed("", "")
-                }
-            }
+                    try {
+                        val future = completionService.poll(650L, TimeUnit.MILLISECONDS)
+                        if (future == null) {
+                            val activeSnapshot = snapshotActiveProgress(activeTrackIds, activeTrackProgressFractions)
+                            val currentId = if (activeSnapshot.trackIds.isNotEmpty()) activeSnapshot.trackIds[0] else ""
+                            publishProgress(
+                                playlistTitle, done, total, downloaded, currentId,
+                                activeSnapshot.trackIds, activeSnapshot.fractions
+                            )
+                            continue
+                        }
 
-            if (trackResult.noNetworkEncountered) encounteredNoNetwork = true
-            if (trackResult.downloaded) {
-                downloaded = minOf(total, downloaded + 1)
-                consecutiveFailures = 0
-            } else if (!trackResult.noNetworkEncountered) {
-                consecutiveFailures++
-                if (consecutiveFailures >= CONSECUTIVE_FAIL_ABORT_THRESHOLD) {
-                    Log.w(TAG, "doWork:batch_abort consecutiveFailures=$consecutiveFailures")
-                    executor.shutdownNow()
-                    encounteredNoNetwork = true
-                    break
+                        trackResult = future.get() ?: TrackDownloadResult.failed("", "")
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        trackResult = TrackDownloadResult.failed("", "")
+                    } catch (e: Exception) {
+                        Log.e(TAG, "track:future_exception message=" + e.message, e)
+                        trackResult = TrackDownloadResult.failed("", "")
+                    }
                 }
-            }
 
-            done = minOf(total, done + 1)
-            val activeSnapshot = snapshotActiveProgress(activeTrackIds, activeTrackProgressFractions)
-            val currentId = if (activeSnapshot.trackIds.isNotEmpty()) activeSnapshot.trackIds[0] else trackResult.trackId
-            publishProgress(
-                playlistTitle, done, total, downloaded, currentId,
-                activeSnapshot.trackIds, activeSnapshot.fractions
-            )
+                if (trackResult.noNetworkEncountered) encounteredNoNetwork = true
+                if (trackResult.downloaded) {
+                    downloaded = minOf(total, downloaded + 1)
+                    consecutiveFailures = 0
+                } else if (!trackResult.noNetworkEncountered) {
+                    consecutiveFailures++
+                    if (consecutiveFailures >= CONSECUTIVE_FAIL_ABORT_THRESHOLD) {
+                        Log.w(TAG, "doWork:batch_abort consecutiveFailures=$consecutiveFailures")
+                        encounteredNoNetwork = true
+                        break
+                    }
+                }
+
+                done = minOf(total, done + 1)
+                val activeSnapshot = snapshotActiveProgress(activeTrackIds, activeTrackProgressFractions)
+                val currentId = if (activeSnapshot.trackIds.isNotEmpty()) activeSnapshot.trackIds[0] else trackResult.trackId
+                publishProgress(
+                    playlistTitle, done, total, downloaded, currentId,
+                    activeSnapshot.trackIds, activeSnapshot.fractions
+                )
+            }
+        } finally {
+            executor.shutdownNow()
         }
-
-        executor.shutdownNow()
 
         val reason = when {
             encounteredNoNetwork -> OUTPUT_REASON_NO_NETWORK
@@ -351,7 +349,7 @@ class OfflinePlaylistDownloadWorker(
         val videoTarget = OfflineAudioStore.getOfflineVideoFile(context, videoId)
 
         val ok = try {
-            SleppifyDownloaderResolver.downloadVideoViaProxy(videoId, videoTarget, primaryServer, onProgress = { bytesReceived ->
+            SleppifyDownloaderResolver.downloadVideoViaProxy(context, videoId, videoTarget, primaryServer, onProgress = { bytesReceived ->
                 val fraction = (bytesReceived.toFloat() / 12_000_000L).coerceIn(0.05f, 0.90f)
                 progressReporter?.onProgress(fraction)
             })

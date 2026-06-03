@@ -14,6 +14,7 @@ import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.util.LinkedHashMap
 import java.util.Locale
+import java.util.HashSet
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -183,6 +184,12 @@ class YouTubeMusicService @JvmOverloads constructor(
     private class VideoPlaybackInfo(val rawDuration: String, val embeddable: Boolean)
 
     private class PublicVideoFilterInfo(val embeddable: Boolean, val durationSeconds: Int)
+
+    private class WatchPlaylistResult(
+        val tracks: List<TrackResult>,
+        val relatedBrowseId: String,
+        val lyricsBrowseId: String
+    )
 
     // ----- Public API -----
 
@@ -612,13 +619,13 @@ class YouTubeMusicService @JvmOverloads constructor(
     }
 
     fun fetchMixTracks(cookieHeader: String, playlistId: String, callback: MixTracksCallback) {
-        if (cookieHeader.isEmpty() || playlistId.isEmpty()) {
+        if (playlistId.isEmpty()) {
             callback.onError("Datos insuficientes para cargar tracks del mix.")
             return
         }
         executor.execute {
             try {
-                val tracks = performMixTracksRequest(cookieHeader, playlistId)
+                val tracks = performMixTracksRequest(cookieHeader.trim(), playlistId.trim())
                 mainHandler.post { callback.onSuccess(tracks) }
             } catch (e: Exception) {
                 val error = e.message ?: "No se pudieron cargar tracks del mix."
@@ -1498,7 +1505,9 @@ class YouTubeMusicService @JvmOverloads constructor(
         connection.setRequestProperty("User-Agent", "Mozilla/5.0")
         connection.setRequestProperty("Origin", "https://music.youtube.com")
         connection.setRequestProperty("Referer", "https://music.youtube.com/")
-        connection.setRequestProperty("Cookie", cookieHeader)
+        if (cookieHeader.isNotEmpty()) {
+            connection.setRequestProperty("Cookie", cookieHeader)
+        }
         try {
             connection.outputStream.use { it.write(body) }
             val statusCode = connection.responseCode
@@ -1603,8 +1612,24 @@ class YouTubeMusicService @JvmOverloads constructor(
         return mixes
     }
 
-    @Throws(Exception::class)
     private fun performMixTracksRequest(cookieHeader: String, playlistId: String): List<TrackResult> {
+        val normalizedPlaylistId = playlistId.trim()
+        if (normalizedPlaylistId.isEmpty()) return emptyList()
+
+        val seedVideoId = extractRadioSeedVideoId(normalizedPlaylistId)
+        val watchResult = performWatchPlaylistRequest(cookieHeader, normalizedPlaylistId, seedVideoId)
+        if (watchResult.tracks.isEmpty()) {
+            throw IllegalStateException("No se pudo cargar la radio. Inténtalo más tarde.")
+        }
+        return watchResult.tracks
+    }
+
+    @Throws(Exception::class)
+    private fun performWatchPlaylistRequest(
+        cookieHeader: String,
+        playlistId: String,
+        seedVideoId: String
+    ): WatchPlaylistResult {
         val endpoint = "https://music.youtube.com/youtubei/v1/next?prettyPrint=false"
         val bodyJson = JSONObject().apply {
             put("context", JSONObject().apply {
@@ -1614,13 +1639,17 @@ class YouTubeMusicService @JvmOverloads constructor(
                     put("hl", "es")
                 })
             })
-            put("playlistId", playlistId)
-            put("isAudioOnly", true)
             put("enablePersistentPlaylistPanel", true)
+            put("isAudioOnly", true)
+            put("playlistId", playlistId)
+            put("tunerSettingValue", "AUTOMIX_SETTING_NORMAL")
+            if (seedVideoId.isNotEmpty()) {
+                put("videoId", seedVideoId)
+            }
+            put("params", "wAEB")
         }.toString().toByteArray(StandardCharsets.UTF_8)
 
-        val url = URL(endpoint)
-        val connection = url.openConnection() as HttpURLConnection
+        val connection = URL(endpoint).openConnection() as HttpURLConnection
         connection.requestMethod = "POST"
         connection.connectTimeout = 14000
         connection.readTimeout = 18000
@@ -1630,7 +1659,10 @@ class YouTubeMusicService @JvmOverloads constructor(
         connection.setRequestProperty("User-Agent", "Mozilla/5.0")
         connection.setRequestProperty("Origin", "https://music.youtube.com")
         connection.setRequestProperty("Referer", "https://music.youtube.com/")
-        connection.setRequestProperty("Cookie", cookieHeader)
+        if (cookieHeader.isNotEmpty()) {
+            connection.setRequestProperty("Cookie", cookieHeader)
+        }
+
         try {
             connection.outputStream.use { it.write(bodyJson) }
             val statusCode = connection.responseCode
@@ -1638,75 +1670,268 @@ class YouTubeMusicService @JvmOverloads constructor(
             if (statusCode != HttpURLConnection.HTTP_OK) {
                 throw IllegalStateException("Mix tracks error $statusCode")
             }
-            return parseMixTracks(JSONObject(responseBody))
-        } finally {
-            connection.disconnect()
-        }
-    }
 
-    private fun parseMixTracks(root: JSONObject): List<TrackResult> {
-        val tracks = mutableListOf<TrackResult>()
-        try {
-            val playlist = root.optJSONObject("contents")
+            val root = JSONObject(responseBody)
+            val watchNextRenderer = root.optJSONObject("contents")
                 ?.optJSONObject("singleColumnMusicWatchNextResultsRenderer")
                 ?.optJSONObject("tabbedRenderer")
                 ?.optJSONObject("watchNextTabbedResultsRenderer")
-                ?.optJSONArray("tabs")
+
+            if (watchNextRenderer == null) {
+                return WatchPlaylistResult(emptyList(), "", "")
+            }
+
+            val playlistPanel = watchNextRenderer.optJSONArray("tabs")
                 ?.optJSONObject(0)
                 ?.optJSONObject("tabRenderer")
                 ?.optJSONObject("content")
                 ?.optJSONObject("musicQueueRenderer")
                 ?.optJSONObject("content")
                 ?.optJSONObject("playlistPanelRenderer")
-                ?.optJSONArray("contents")
-                ?: return tracks
 
-            for (i in 0 until playlist.length()) {
-                val renderer = playlist.optJSONObject(i)
-                    ?.optJSONObject("playlistPanelVideoRenderer") ?: continue
+            val tracks = mutableListOf<TrackResult>()
+            val firstPageItems = playlistPanel?.optJSONArray("contents")
+            tracks.addAll(parseMixTracks(firstPageItems))
 
-                val title = renderer.optJSONObject("title")
-                    ?.optJSONArray("runs")
-                    ?.optJSONObject(0)
-                    ?.optString("text", "") ?: ""
-                if (title.isEmpty()) continue
+            var continuationToken = extractPlaylistPanelContinuationToken(root, playlistPanel, firstPageItems)
+            var continuationCount = 0
+            while (continuationToken != null && continuationCount < MAX_MIX_CONTINUATIONS) {
+                continuationCount++
+                val continuationRoot = fetchWatchPlaylistContinuation(cookieHeader, continuationToken)
+                val continuationItems = extractPlaylistPanelContinuationItems(continuationRoot)
+                if (continuationItems == null || continuationItems.length() == 0) {
+                    break
+                }
+                val parsed = parseMixTracks(continuationItems)
+                if (parsed.isEmpty()) {
+                    break
+                }
+                appendUniqueTracks(tracks, parsed)
+                continuationToken = extractPlaylistPanelContinuationToken(continuationRoot, null, continuationItems)
+            }
 
-                val longBylineRuns = renderer.optJSONObject("longBylineText")?.optJSONArray("runs")
-                val artist = buildString {
-                    if (longBylineRuns != null) {
-                        for (r in 0 until longBylineRuns.length()) {
-                            val text = longBylineRuns.optJSONObject(r)?.optString("text", "") ?: ""
-                            if (text == " • " || text == " & ") {
-                                if (isNotEmpty()) break
-                            }
-                            append(text)
-                        }
-                    }
-                }.trim()
+            val relatedBrowseId = extractWatchTabBrowseId(watchNextRenderer, 2)
+            val lyricsBrowseId = extractWatchTabBrowseId(watchNextRenderer, 1)
+            return WatchPlaylistResult(tracks, relatedBrowseId, lyricsBrowseId)
+        } finally {
+            connection.disconnect()
+        }
+    }
 
-                val videoId = renderer.optString("videoId", "").trim()
-                if (videoId.isEmpty()) continue
+    @Throws(Exception::class)
+    private fun fetchWatchPlaylistContinuation(cookieHeader: String, continuationToken: String): JSONObject {
+        val endpoint = "https://music.youtube.com/youtubei/v1/next?prettyPrint=false"
+        val bodyJson = JSONObject().apply {
+            put("context", JSONObject().apply {
+                put("client", JSONObject().apply {
+                    put("clientName", "WEB_REMIX")
+                    put("clientVersion", buildClientVersion())
+                    put("hl", "es")
+                })
+            })
+            put("continuation", continuationToken)
+        }.toString().toByteArray(StandardCharsets.UTF_8)
 
-                val thumbnails = renderer.optJSONObject("thumbnail")
-                    ?.optJSONObject("thumbnails")
-                    ?.optJSONArray("thumbnails")
-                    ?: renderer.optJSONObject("thumbnail")?.optJSONArray("thumbnails")
-                val thumbUrl = thumbnails?.let {
-                    it.optJSONObject(it.length() - 1)?.optString("url", "") ?: ""
-                } ?: ""
+        val connection = URL(endpoint).openConnection() as HttpURLConnection
+        connection.requestMethod = "POST"
+        connection.connectTimeout = 14000
+        connection.readTimeout = 18000
+        connection.doOutput = true
+        connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+        connection.setRequestProperty("Accept", "application/json")
+        connection.setRequestProperty("User-Agent", "Mozilla/5.0")
+        connection.setRequestProperty("Origin", "https://music.youtube.com")
+        connection.setRequestProperty("Referer", "https://music.youtube.com/")
+        if (cookieHeader.isNotEmpty()) {
+            connection.setRequestProperty("Cookie", cookieHeader)
+        }
 
-                val duration = renderer.optJSONObject("lengthText")
-                    ?.optJSONArray("runs")?.optJSONObject(0)?.optString("text", "")
-                    ?: ""
-                // Encode duration in subtitle with tab separator for downstream parsing
-                val subtitleWithDuration = if (duration.isNotEmpty()) "$artist\t$duration" else artist
+        try {
+            connection.outputStream.use { it.write(bodyJson) }
+            val statusCode = connection.responseCode
+            val responseBody = readResponse(connection, statusCode >= 400)
+            if (statusCode != HttpURLConnection.HTTP_OK) {
+                throw IllegalStateException("Mix continuation error $statusCode")
+            }
+            return JSONObject(responseBody)
+        } finally {
+            connection.disconnect()
+        }
+    }
 
-                tracks.add(TrackResult("video", videoId, title, subtitleWithDuration, thumbUrl))
+    private fun parseMixTracks(contents: JSONArray?): List<TrackResult> {
+        val tracks = mutableListOf<TrackResult>()
+        try {
+            if (contents == null) return tracks
+
+            for (i in 0 until contents.length()) {
+                val item = contents.optJSONObject(i) ?: continue
+
+                val renderer = item.optJSONObject("playlistPanelVideoRenderer")
+                if (renderer != null) {
+                    appendPlaylistPanelTrack(renderer, tracks)
+                    continue
+                }
+
+                val wrapper = item.optJSONObject("playlistPanelVideoWrapperRenderer") ?: continue
+                val primary = wrapper.optJSONObject("primaryRenderer")
+                    ?.optJSONObject("playlistPanelVideoRenderer")
+                if (primary != null) {
+                    appendPlaylistPanelTrack(primary, tracks)
+                }
             }
         } catch (e: Exception) {
             Log.w("YouTubeMusicService", "parseMixTracks error: ${e.message}")
         }
         return tracks
+    }
+
+    private fun appendUniqueTracks(target: MutableList<TrackResult>, additions: List<TrackResult>) {
+        if (additions.isEmpty()) return
+        val seen = HashSet<String>()
+        for (item in target) {
+            if (!TextUtils.isEmpty(item.videoId)) {
+                seen.add(item.videoId)
+            }
+        }
+        for (item in additions) {
+            val videoId = item.videoId.trim()
+            if (videoId.isEmpty() || !seen.add(videoId)) continue
+            target.add(item)
+        }
+    }
+
+    private fun extractPlaylistPanelContinuationItems(root: JSONObject): JSONArray? {
+        val continuationPanel = root.optJSONObject("continuationContents")
+            ?.optJSONObject("playlistPanelContinuation")
+        val contents = continuationPanel?.optJSONArray("contents")
+        if (contents != null) return contents
+
+        return root.optJSONArray("onResponseReceivedActions")
+            ?.optJSONObject(0)
+            ?.optJSONObject("appendContinuationItemsAction")
+            ?.optJSONArray("continuationItems")
+    }
+
+    private fun extractPlaylistPanelContinuationToken(
+        root: JSONObject,
+        playlistPanel: JSONObject?,
+        contents: JSONArray?
+    ): String? {
+        val fromPanel = playlistPanel?.optJSONArray("continuations")
+            ?.optJSONObject(0)
+            ?.optJSONObject("nextContinuationData")
+            ?.optString("continuation", "")?.takeIf { it.isNotEmpty() }
+        if (fromPanel != null) return fromPanel
+
+        val fromRootContinuation = root.optJSONObject("continuationContents")
+            ?.optJSONObject("playlistPanelContinuation")
+            ?.optJSONArray("continuations")
+            ?.optJSONObject(0)
+            ?.optJSONObject("nextContinuationData")
+            ?.optString("continuation", "")?.takeIf { it.isNotEmpty() }
+        if (fromRootContinuation != null) return fromRootContinuation
+
+        val fromItems = extractContinuationTokenFromItems(contents)
+        if (fromItems != null) return fromItems
+
+        return extractContinuationTokenFromItems(extractPlaylistPanelContinuationItems(root))
+    }
+
+    private fun extractContinuationTokenFromItems(contents: JSONArray?): String? {
+        if (contents == null || contents.length() == 0) return null
+
+        for (i in contents.length() - 1 downTo 0) {
+            val item = contents.optJSONObject(i) ?: continue
+            val token = extractContinuationTokenFromItem(item)
+            if (!token.isNullOrEmpty()) return token
+        }
+        return null
+    }
+
+    private fun extractContinuationTokenFromItem(item: JSONObject): String? {
+        val continuationItem = item.optJSONObject("continuationItemRenderer") ?: return null
+
+        val directToken = continuationItem.optJSONObject("continuationEndpoint")
+            ?.optJSONObject("continuationCommand")
+            ?.optString("token", "")
+            ?.takeIf { it.isNotEmpty() }
+        if (directToken != null) return directToken
+
+        val commands = continuationItem.optJSONObject("commandExecutorCommand")
+            ?.optJSONArray("commands")
+        if (commands != null) {
+            for (i in 0 until commands.length()) {
+                val command = commands.optJSONObject(i) ?: continue
+                val continuationCommand = command.optJSONObject("continuationCommand") ?: continue
+                val request = continuationCommand.optString("request", "")
+                if (request == "CONTINUATION_REQUEST_TYPE_BROWSE") {
+                    val token = continuationCommand.optString("token", "")
+                    if (token.isNotEmpty()) return token
+                }
+            }
+        }
+        return null
+    }
+
+    private fun appendPlaylistPanelTrack(renderer: JSONObject, tracks: MutableList<TrackResult>) {
+        if (renderer.has("unplayableText")) return
+
+        val videoId = renderer.optString("videoId", "").trim()
+        if (videoId.isEmpty() || tracks.any { it.videoId == videoId }) return
+
+        val title = renderer.optJSONObject("title")
+            ?.optJSONArray("runs")
+            ?.optJSONObject(0)
+            ?.optString("text", "") ?: ""
+        if (title.isEmpty()) return
+
+        val longBylineRuns = renderer.optJSONObject("longBylineText")?.optJSONArray("runs")
+        val artist = buildString {
+            if (longBylineRuns != null) {
+                for (r in 0 until longBylineRuns.length()) {
+                    val text = longBylineRuns.optJSONObject(r)?.optString("text", "") ?: ""
+                    if (text == " • " || text == " & ") {
+                        if (isNotEmpty()) break
+                    }
+                    append(text)
+                }
+            }
+        }.trim()
+
+        val thumbnails = renderer.optJSONObject("thumbnail")
+            ?.optJSONObject("thumbnails")
+            ?.optJSONArray("thumbnails")
+            ?: renderer.optJSONObject("thumbnail")?.optJSONArray("thumbnails")
+        val thumbUrl = thumbnails?.let {
+            it.optJSONObject(it.length() - 1)?.optString("url", "") ?: ""
+        } ?: ""
+
+        val duration = renderer.optJSONObject("lengthText")
+            ?.optJSONArray("runs")?.optJSONObject(0)?.optString("text", "")
+            ?: ""
+        val subtitleWithDuration = if (duration.isNotEmpty()) "$artist\t$duration" else artist
+
+        tracks.add(TrackResult("video", videoId, title, subtitleWithDuration, thumbUrl))
+    }
+
+    private fun extractWatchTabBrowseId(watchNextRenderer: JSONObject, tabIndex: Int): String {
+        return watchNextRenderer.optJSONArray("tabs")
+            ?.optJSONObject(tabIndex)
+            ?.optJSONObject("tabRenderer")
+            ?.optJSONObject("endpoint")
+            ?.optJSONObject("browseEndpoint")
+            ?.optString("browseId", "")
+            ?.takeIf { it.isNotEmpty() }
+            ?: ""
+    }
+
+    private fun extractRadioSeedVideoId(playlistId: String): String {
+        return if (playlistId.startsWith("RDAMVM") && playlistId.length > 6) {
+            playlistId.substring(6)
+        } else {
+            ""
+        }
     }
 
     // ----- Account menu (channel name + photo) -----
@@ -1856,7 +2081,9 @@ class YouTubeMusicService @JvmOverloads constructor(
         connection.setRequestProperty("User-Agent", "Mozilla/5.0")
         connection.setRequestProperty("Origin", "https://music.youtube.com")
         connection.setRequestProperty("Referer", "https://music.youtube.com/")
-        connection.setRequestProperty("Cookie", cookieHeader)
+        if (cookieHeader.isNotEmpty()) {
+            connection.setRequestProperty("Cookie", cookieHeader)
+        }
         try {
             connection.outputStream.use { it.write(body) }
             val statusCode = connection.responseCode
@@ -2352,6 +2579,7 @@ class YouTubeMusicService @JvmOverloads constructor(
         private const val SPECIAL_LIKED_VIDEOS_TITLE = "Me gusta"
         private const val YOUTUBE_PAGE_MAX_RESULTS = 50
         private const val MIN_PUBLIC_MUSIC_DURATION_SECONDS = 70
+        private const val MAX_MIX_CONTINUATIONS = 4
 
         private val SHARED_EXECUTOR: ExecutorService = Executors.newFixedThreadPool(3)
 
