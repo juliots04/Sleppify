@@ -1910,9 +1910,7 @@ class YouTubeMusicService @JvmOverloads constructor(
         val duration = renderer.optJSONObject("lengthText")
             ?.optJSONArray("runs")?.optJSONObject(0)?.optString("text", "")
             ?: ""
-        val subtitleWithDuration = if (duration.isNotEmpty()) "$artist\t$duration" else artist
-
-        tracks.add(TrackResult("video", videoId, title, subtitleWithDuration, thumbUrl))
+        tracks.add(TrackResult("video", videoId, title, artist, thumbUrl))
     }
 
     private fun extractWatchTabBrowseId(watchNextRenderer: JSONObject, tabIndex: Int): String {

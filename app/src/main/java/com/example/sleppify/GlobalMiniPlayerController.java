@@ -2,6 +2,7 @@ package com.example.sleppify;
 
 import android.os.Handler;
 import android.os.Looper;
+import android.graphics.drawable.Drawable;
 import android.text.TextUtils;
 import android.view.View;
 import android.view.animation.PathInterpolator;
@@ -15,7 +16,10 @@ import androidx.annotation.Nullable;
 
 import com.bumptech.glide.Glide;
 import com.bumptech.glide.load.engine.DiskCacheStrategy;
+import com.bumptech.glide.load.engine.GlideException;
 import com.bumptech.glide.load.resource.drawable.DrawableTransitionOptions;
+import com.bumptech.glide.request.RequestListener;
+import com.bumptech.glide.request.target.Target;
 import com.example.sleppify.utils.YouTubeCropTransformation;
 
 /**
@@ -48,6 +52,8 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
 
     // State
     private boolean miniPlaying;
+    private boolean playbackLoading;
+    private boolean artworkLoading;
     private final Handler handler = new Handler(Looper.getMainLooper());
     @Nullable private Runnable progressTicker;
     @NonNull private String lastArtVideoId = "";
@@ -398,30 +404,31 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
     public void onPlaybackLoadingStateChanged(@NonNull String videoId, boolean loading) {
         if (activity.isFinishing() || activity.isDestroyed()) return;
         if (loading) {
-            if (pbMiniLoading != null) pbMiniLoading.setVisibility(View.VISIBLE);
-            if (ivArt != null) {
-                ivArt.animate().cancel();
-                ivArt.setAlpha(0f);
-            }
+            playbackLoading = true;
             miniPlaying = true;
             btnPlayPause.setImageResource(R.drawable.ic_mini_pause);
         } else {
-            if (pbMiniLoading != null) pbMiniLoading.setVisibility(View.GONE);
-            if (ivArt != null) {
-                ivArt.animate().cancel();
-                ivArt.animate().alpha(1f).setDuration(300).start();
-            }
+            playbackLoading = false;
         }
+        updateMiniLoadingVisibility();
     }
 
     private void syncMiniLoadingState() {
         String loadingId = PlaybackLoadingBus.getLoadingVideoId();
-        if (loadingId != null) {
-            if (pbMiniLoading != null) pbMiniLoading.setVisibility(View.VISIBLE);
-            if (ivArt != null) ivArt.setAlpha(0f);
-        } else {
-            if (pbMiniLoading != null) pbMiniLoading.setVisibility(View.GONE);
-            if (ivArt != null) ivArt.setAlpha(1f);
+        playbackLoading = loadingId != null;
+        updateMiniLoadingVisibility();
+    }
+
+    private void updateMiniLoadingVisibility() {
+        boolean show = playbackLoading || artworkLoading;
+        if (pbMiniLoading != null) pbMiniLoading.setVisibility(show ? View.VISIBLE : View.GONE);
+        if (ivArt != null) {
+            ivArt.animate().cancel();
+            if (show) {
+                ivArt.setAlpha(0f);
+            } else {
+                ivArt.animate().alpha(1f).setDuration(250).start();
+            }
         }
     }
 
@@ -430,11 +437,30 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
     private void loadArtwork(@Nullable String imageUrl) {
         if (TextUtils.isEmpty(imageUrl) || activity.isFinishing() || activity.isDestroyed()) {
             ivArt.setImageDrawable(null);
+            artworkLoading = false;
+            updateMiniLoadingVisibility();
             return;
         }
         try {
+            artworkLoading = true;
+            updateMiniLoadingVisibility();
             Glide.with(activity)
                     .load(imageUrl.trim())
+                    .listener(new RequestListener<Drawable>() {
+                        @Override
+                        public boolean onLoadFailed(@Nullable GlideException e, Object model, Target<Drawable> target, boolean isFirstResource) {
+                            artworkLoading = false;
+                            updateMiniLoadingVisibility();
+                            return false;
+                        }
+
+                        @Override
+                        public boolean onResourceReady(Drawable resource, Object model, Target<Drawable> target, com.bumptech.glide.load.DataSource dataSource, boolean isFirstResource) {
+                            artworkLoading = false;
+                            updateMiniLoadingVisibility();
+                            return false;
+                        }
+                    })
                     .transform(SHARED_YT_CROP)
                     .format(com.bumptech.glide.load.DecodeFormat.PREFER_RGB_565)
                     .diskCacheStrategy(DiskCacheStrategy.ALL)

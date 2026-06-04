@@ -54,6 +54,10 @@ class ExoMediaPlayer {
         fun onBufferingChanged(mp: ExoMediaPlayer, isBuffering: Boolean)
     }
 
+    interface OnRenderedFirstFrameListener {
+        fun onRenderedFirstFrame(mp: ExoMediaPlayer)
+    }
+
     companion object {
         private const val TAG = "ExoMediaPlayer"
 
@@ -116,6 +120,7 @@ class ExoMediaPlayer {
     private var completionListener: OnCompletionListener? = null
     private var errorListener: OnErrorListener? = null
     private var bufferingListener: OnBufferingListener? = null
+    private var renderedFirstFrameListener: OnRenderedFirstFrameListener? = null
 
     private var pendingUri: Uri? = null
     private var pendingPath: String? = null
@@ -227,6 +232,16 @@ class ExoMediaPlayer {
             }
         }
 
+        override fun onRenderedFirstFrame() {
+            renderedFirstFrameListener?.let { listener ->
+                mainHandler.post {
+                    if (!released) {
+                        listener.onRenderedFirstFrame(this@ExoMediaPlayer)
+                    }
+                }
+            }
+        }
+
         override fun onPlayerError(error: PlaybackException) {
             Log.w(TAG, "onPlayerError: code=${error.errorCode} message=${error.message}")
             errorListener?.let { listener ->
@@ -264,6 +279,10 @@ class ExoMediaPlayer {
 
     fun setOnBufferingListener(l: OnBufferingListener?) {
         this.bufferingListener = l
+    }
+
+    fun setOnRenderedFirstFrameListener(l: OnRenderedFirstFrameListener?) {
+        this.renderedFirstFrameListener = l
     }
 
     fun setDataSource(context: Context, uri: Uri, headers: Map<String, String>?) {

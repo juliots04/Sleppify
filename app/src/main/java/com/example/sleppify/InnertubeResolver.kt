@@ -69,7 +69,6 @@ object InnertubeResolver {
             val cookie = prefs.getString("stream_last_youtube_web_cookie", "") ?: ""
             if (cookie.isNotBlank()) {
                 authCookieHeader = cookie.trim()
-                Log.d(TAG, "Loaded auth cookies from prefs (length=${authCookieHeader.length})")
             }
         } catch (e: Exception) {
             Log.w(TAG, "Failed to load auth cookies from prefs", e)
@@ -85,7 +84,6 @@ object InnertubeResolver {
         if (authCookieHeader.isNotBlank()) {
             // Clear cache so new cookies are used for fresh resolutions
             urlCache.clear()
-            Log.d(TAG, "Auth cookies updated (length=${authCookieHeader.length})")
         }
     }
 
@@ -122,7 +120,6 @@ object InnertubeResolver {
         // 1. Check cache
         urlCache[videoId]?.let { cached ->
             if (System.currentTimeMillis() - cached.timestamp < CACHE_TTL_MS) {
-                Log.d(TAG, "Cache hit for $videoId")
                 return cached.url
             } else {
                 urlCache.remove(videoId)
@@ -135,7 +132,6 @@ object InnertubeResolver {
                 val nativeUrl = resolveViaInnertube(videoId)
                 if (!nativeUrl.isNullOrBlank()) {
                     urlCache[videoId] = CachedStream(nativeUrl, System.currentTimeMillis())
-                    Log.d(TAG, "Resolved $videoId via InnerTube API (direct)")
                     return nativeUrl
                 }
             } catch (e: Exception) {
@@ -144,7 +140,6 @@ object InnertubeResolver {
         }
 
         // 3. Fallback to proxy servers
-        Log.d(TAG, "Falling back to proxy for $videoId")
         return ProxyStreamResolver.resolveStreamUrl(videoId)
     }
 
@@ -304,9 +299,6 @@ object InnertubeResolver {
                     // If URL is not directly available, the stream requires signature deciphering.
                     // Skip these — the proxy fallback will handle them via yt-dlp.
                     val cipher = format.optString("signatureCipher", "")
-                    if (cipher.isNotBlank()) {
-                        Log.d(TAG, "Skipping itag $itag (requires signature deciphering)")
-                    }
                     continue
                 }
 
@@ -322,7 +314,6 @@ object InnertubeResolver {
         // Pick the best format by our preference order
         for (preferredItag in PREFERRED_ITAGS) {
             itagUrlMap[preferredItag]?.let { url ->
-                Log.d(TAG, "Selected itag $preferredItag for $videoId")
                 return url
             }
         }
@@ -334,8 +325,6 @@ object InnertubeResolver {
                 val mimeType = format.optString("mimeType", "")
                 val url = format.optString("url", "")
                 if (url.isNotBlank() && (mimeType.startsWith("audio/") || mimeType.contains("mp4"))) {
-                    val itag = format.optInt("itag", -1)
-                    Log.d(TAG, "Fallback: selected itag $itag (mime=$mimeType) for $videoId")
                     return url
                 }
             }

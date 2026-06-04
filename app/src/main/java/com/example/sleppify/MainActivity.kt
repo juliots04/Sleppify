@@ -800,7 +800,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun showMainShell() {
         // Do not force header/bottomNav visible when inside overlay screens
-        if (inSettings || inEqualizerFromSettings || inEqualizerFromPlayer || inScannerFromSettings) return
+        if (inSettings || inEqualizerFromSettings || inEqualizerFromPlayer || inScannerFromSettings || isAnyOverlayModuleVisible()) return
         if (!isSearchFragmentVisible() && !isPlaylistDetailVisible()) {
             // Music and Principal fragments own their own header — hide topAppBar for them
             val isFragOwnedHeader = currentMainNavItemId == R.id.nav_music || currentMainNavItemId == R.id.nav_principal
@@ -921,7 +921,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun configureHeaderActionForSettings() {
-        setTopAppBarExtraTopPadding(14)
+        setTopAppBarExtraTopPadding(0)
         btnProfilePhoto.visibility = View.GONE
         btnSignInHeader?.visibility = View.GONE
         btnHeaderSearch.visibility = View.GONE
@@ -939,7 +939,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun configureHeaderActionForScanner() {
-        setTopAppBarExtraTopPadding(14)
+        setTopAppBarExtraTopPadding(0)
         btnProfilePhoto.visibility = View.GONE
         btnSignInHeader?.visibility = View.GONE
         btnCamera.visibility = View.GONE
@@ -1033,12 +1033,7 @@ class MainActivity : AppCompatActivity() {
             if (isFinishing || isDestroyed) return@post
             supportFragmentManager.beginTransaction().apply {
                 setReorderingAllowed(true)
-                val current = getMainModuleFragment(currentMainNavItemId)
-                hideIfVisible(this, current, target)
-                hideIfVisible(this, supportFragmentManager.findFragmentByTag(TAG_PLAYLIST_DETAIL), target)
-                hideIfVisible(this, supportFragmentManager.findFragmentByTag(TAG_SONG_PLAYER), target)
-                hideIfVisible(this, settingsFragment, target)
-                hideIfVisible(this, searchFragment, target)
+                hideAllMainScreens(this, target)
                 if (target.isAdded) show(target) else add(R.id.fragmentContainer, target, TAG_MODULE_EQUALIZER)
                 setMaxLifecycle(target, Lifecycle.State.RESUMED)
                 commit()
@@ -1059,13 +1054,13 @@ class MainActivity : AppCompatActivity() {
         if (!inEqualizerFromPlayer) return
         inEqualizerFromPlayer = false
         val songPlayer = supportFragmentManager.findFragmentByTag(TAG_SONG_PLAYER)
+        hideEqualizerImmediately()
         setOverlayFullscreen(false)
         showModuleLoadingOverlay()
         fragmentContainer.post {
             if (isFinishing || isDestroyed) return@post
             supportFragmentManager.beginTransaction().apply {
                 setReorderingAllowed(true)
-                equalizerFragment?.let { if (it.isAdded) { hide(it); setMaxLifecycle(it, Lifecycle.State.STARTED) } }
                 if (songPlayer != null && songPlayer.isAdded) {
                     show(songPlayer)
                     setMaxLifecycle(songPlayer, Lifecycle.State.RESUMED)
@@ -1091,13 +1086,7 @@ class MainActivity : AppCompatActivity() {
             if (isFinishing || isDestroyed) return@post
             supportFragmentManager.beginTransaction().apply {
                 setReorderingAllowed(true)
-                playlistDetailFragment = supportFragmentManager.findFragmentByTag(TAG_PLAYLIST_DETAIL)
-                songPlayerFragment = supportFragmentManager.findFragmentByTag(TAG_SONG_PLAYER)
-                val current = getMainModuleFragment(currentMainNavItemId)
-                hideIfVisible(this, current, target)
-                hideIfVisible(this, playlistDetailFragment, target)
-                hideIfVisible(this, songPlayerFragment, target)
-                hideIfVisible(this, settingsFragment, target)
+                hideAllMainScreens(this, target)
                 if (target.isAdded) show(target) else add(R.id.fragmentContainer, target, TAG_MODULE_EQUALIZER)
                 setMaxLifecycle(target, Lifecycle.State.RESUMED)
                 commit()
@@ -1114,12 +1103,12 @@ class MainActivity : AppCompatActivity() {
         inEqualizerFromSettings = false
         val target = settingsFragment ?: SettingsFragment().also { settingsFragment = it }
         val isNew = !target.isAdded
+        hideEqualizerImmediately()
         showModuleLoadingOverlay()
         fragmentContainer.post {
             if (isFinishing || isDestroyed) return@post
             supportFragmentManager.beginTransaction().apply {
                 setReorderingAllowed(true)
-                equalizerFragment?.let { if (it.isAdded) { hide(it); setMaxLifecycle(it, Lifecycle.State.STARTED) } }
                 if (target.isAdded) show(target) else add(R.id.fragmentContainer, target, TAG_MODULE_SETTINGS)
                 setMaxLifecycle(target, Lifecycle.State.RESUMED)
                 commit()
@@ -1132,7 +1121,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun configureHeaderActionForEqualizer() {
-        setTopAppBarExtraTopPadding(14)
+        setTopAppBarExtraTopPadding(0)
         btnProfilePhoto.visibility = View.GONE
         btnSignInHeader?.visibility = View.GONE
         btnCamera.visibility = View.GONE
@@ -1389,6 +1378,29 @@ class MainActivity : AppCompatActivity() {
         songPlayerFragment = supportFragmentManager.findFragmentByTag(TAG_SONG_PLAYER)
     }
 
+    private fun isAnyOverlayModuleVisible(): Boolean {
+        fun Fragment?.isActuallyVisible(): Boolean = this != null && isAdded && !isHidden && !isRemoving
+        return settingsFragment.isActuallyVisible() ||
+            equalizerFragment.isActuallyVisible() ||
+            scannerFragment.isActuallyVisible() ||
+            searchFragment.isActuallyVisible()
+    }
+
+    private fun hideAllMainScreens(transaction: FragmentTransaction, target: Fragment) {
+        restoreMainModuleReferences()
+        playlistDetailFragment = supportFragmentManager.findFragmentByTag(TAG_PLAYLIST_DETAIL)
+        songPlayerFragment = supportFragmentManager.findFragmentByTag(TAG_SONG_PLAYER)
+
+        hideIfVisible(transaction, principalFragment, target)
+        hideIfVisible(transaction, musicFragment, target)
+        hideIfVisible(transaction, scannerFragment, target)
+        hideIfVisible(transaction, searchFragment, target)
+        hideIfVisible(transaction, settingsFragment, target)
+        hideIfVisible(transaction, equalizerFragment, target)
+        hideIfVisible(transaction, playlistDetailFragment, target)
+        hideIfVisible(transaction, songPlayerFragment, target)
+    }
+
     private fun getOrCreateMainModuleFragment(itemId: Int): Fragment? {
         getMainModuleFragment(itemId)?.let { return it }
         val fragment: Fragment? = when (itemId) {
@@ -1582,6 +1594,7 @@ class MainActivity : AppCompatActivity() {
         if (player.externalTryEnterMiniMode()) return true
 
         snapshotStreamingScreenBeforeNavigation()
+        hideEqualizerImmediately()
         val fallback = resolveSongPlayerReturnTarget(player.externalGetReturnTargetTag())
         supportFragmentManager.beginTransaction().apply {
             setReorderingAllowed(true)
@@ -1606,6 +1619,7 @@ class MainActivity : AppCompatActivity() {
 
 
 
+        hideEqualizerImmediately()
         val fallback = resolveSongPlayerReturnTarget(player.externalGetReturnTargetTag())
         supportFragmentManager.beginTransaction().apply {
             setReorderingAllowed(true)
@@ -1629,7 +1643,18 @@ class MainActivity : AppCompatActivity() {
         }
         supportFragmentManager.findFragmentByTag(TAG_PLAYLIST_DETAIL)?.let { if (it.isAdded) return it }
         supportFragmentManager.findFragmentByTag(TAG_MODULE_MUSIC)?.let { if (it.isAdded) return it }
-        return getMainModuleFragment(currentMainNavItemId)?.takeIf { it.isAdded }
+        val current = getMainModuleFragment(currentMainNavItemId)
+        return current?.takeIf { it.isAdded && currentMainNavItemId != R.id.nav_equalizer }
+    }
+
+    private fun hideEqualizerImmediately() {
+        val eq = equalizerFragment ?: return
+        if (!eq.isAdded || eq.isHidden || isFinishing || isDestroyed) return
+        supportFragmentManager.beginTransaction()
+            .setReorderingAllowed(true)
+            .hide(eq)
+            .setMaxLifecycle(eq, Lifecycle.State.STARTED)
+            .commitNowAllowingStateLoss()
     }
 
     private fun handlePlaylistDetailBackPressed(): Boolean {

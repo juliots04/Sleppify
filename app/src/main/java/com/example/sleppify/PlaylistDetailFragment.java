@@ -203,6 +203,7 @@ public class PlaylistDetailFragment extends Fragment
     private String headerPlaylistThumbnail = "";
     @NonNull
     private List<String> headerGridUrls = new ArrayList<>();
+    private int headerBackdropTopOverlapPx;
     private boolean isRadioContext;
     private int pendingTracksTokenRetry;
     private int playlistTracksRequestedLimit = PLAYLIST_TRACKS_INITIAL_FETCH_LIMIT;
@@ -310,6 +311,7 @@ public class PlaylistDetailFragment extends Fragment
         // Apply status bar inset to toolbar and RecyclerView top padding
         ViewCompat.setOnApplyWindowInsetsListener(view, (v, insets) -> {
             int statusBarTop = insets.getInsets(WindowInsetsCompat.Type.statusBars()).top;
+            int densityPx = (int) (6 * getResources().getDisplayMetrics().density);
             if (llPlaylistToolbar != null) {
                 llPlaylistToolbar.setPadding(
                     llPlaylistToolbar.getPaddingLeft(),
@@ -325,6 +327,10 @@ public class PlaylistDetailFragment extends Fragment
                     rvPlaylistContent.getPaddingRight(),
                     rvPlaylistContent.getPaddingBottom()
                 );
+                headerBackdropTopOverlapPx = rvPlaylistContent.getPaddingTop() + densityPx;
+                if (headerAdapter != null) {
+                    headerAdapter.notifyItemChanged(0);
+                }
             }
             return insets;
         });
@@ -2791,7 +2797,7 @@ public class PlaylistDetailFragment extends Fragment
             gridUrls = loadPersistedGridUrls(playlistId);
         }
 
-        if (gridUrls == null || gridUrls.size() < 4) {
+        if (gridUrls == null || gridUrls.isEmpty()) {
             gridUrls = new ArrayList<>(4);
             Set<String> seenUrls = new HashSet<>();
             for (PlaylistTrack track : currentTracks) {
@@ -2804,11 +2810,19 @@ public class PlaylistDetailFragment extends Fragment
                 }
             }
             // Persist for YouTube playlists so grid survives track reordering/removal
-            if (isYouTubePlaylist && gridUrls.size() >= 4 && isAdded()) {
+            if (isYouTubePlaylist && !gridUrls.isEmpty() && isAdded()) {
                 persistGridUrls(playlistId, gridUrls);
             }
         }
-        headerGridUrls = gridUrls;
+        headerGridUrls = gridUrls.size() >= 4 ? gridUrls : new ArrayList<>();
+        if (currentTracks.size() < 4) {
+            for (PlaylistTrack track : currentTracks) {
+                if (track != null && !TextUtils.isEmpty(track.imageUrl)) {
+                    headerPlaylistThumbnail = track.imageUrl.trim();
+                    break;
+                }
+            }
+        }
 
         trackAdapter.submitTracks(currentTracks);
         rebuildPlaybackQueue();
@@ -3281,7 +3295,7 @@ public class PlaylistDetailFragment extends Fragment
                 String trimmed = part.trim();
                 if (!trimmed.isEmpty()) result.add(trimmed);
             }
-            return result.size() >= 4 ? result : null;
+            return result.isEmpty() ? null : result;
         } catch (Exception e) {
             Log.w(TAG_OFFLINE_DOWNLOAD, "loadCachedGridUrls parse failed", e);
             return null;
@@ -3543,6 +3557,7 @@ public class PlaylistDetailFragment extends Fragment
         btnAddToQueue.setOnClickListener(v -> {
             dialog.dismiss();
             queueTrackAtEnd(position);
+            android.widget.Toast.makeText(requireContext(), "Agregado a la fila", android.widget.Toast.LENGTH_SHORT).show();
         });
 
         // Row: Reemplazar (hidden for local files)
@@ -3989,6 +4004,8 @@ public class PlaylistDetailFragment extends Fragment
         if (player != null && player.isAdded()) {
             player.externalInsertNext(movingTrack.videoId, movingTrack.title, movingTrack.artist, movingTrack.duration, movingTrack.imageUrl);
         }
+
+        android.widget.Toast.makeText(requireContext(), "Se reproducirá a continuación", android.widget.Toast.LENGTH_SHORT).show();
         
     }
 
@@ -5304,6 +5321,11 @@ public class PlaylistDetailFragment extends Fragment
             holder.vPlaylistBackdropScrim.setVisibility(View.VISIBLE);
             holder.vPlaylistBackdropBottomFade.setVisibility(View.VISIBLE);
             holder.vPlaylistBackdropAmoledFade.setVisibility(View.GONE);
+
+            int fallbackTopMargin = (int) (82 * holder.itemView.getResources().getDisplayMetrics().density);
+            int backdropTopMargin = headerBackdropTopOverlapPx > 0 ? -headerBackdropTopOverlapPx : -fallbackTopMargin;
+            setTopMargin(holder.ivPlaylistBackdrop, backdropTopMargin);
+            setTopMargin(holder.vPlaylistBackdropScrim, backdropTopMargin);
             
             bindOfflineState(holder);
 
@@ -5322,7 +5344,7 @@ public class PlaylistDetailFragment extends Fragment
                 holder.ivPlaylistBackdrop.setScaleType(ImageView.ScaleType.CENTER_CROP);
                 holder.ivPlaylistBackdrop.setBackgroundResource(R.drawable.bg_music_liked_gradient);
                 holder.ivPlaylistBackdrop.setImageDrawable(null);
-            } else if (headerGridUrls.size() >= 4) {
+            } else if (!headerGridUrls.isEmpty()) {
                 holder.ivPlaylistCover.setPadding(0, 0, 0, 0);
                 holder.ivPlaylistCover.setScaleType(ImageView.ScaleType.CENTER_CROP);
                 holder.ivPlaylistCover.setBackground(null);
@@ -5330,6 +5352,25 @@ public class PlaylistDetailFragment extends Fragment
                 holder.ivPlaylistBackdrop.setBackground(null);
                 PlaylistGridArtLoader.load(holder.ivPlaylistCover, headerGridUrls, 800);
                 PlaylistGridArtLoader.load(holder.ivPlaylistBackdrop, headerGridUrls, 320);
+            } else if (!TextUtils.isEmpty(headerPlaylistThumbnail)) {
+                holder.ivPlaylistCover.setPadding(0, 0, 0, 0);
+                holder.ivPlaylistCover.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                holder.ivPlaylistCover.setBackground(null);
+                holder.ivPlaylistCover.setColorFilter(null);
+                holder.ivPlaylistBackdrop.setBackground(null);
+                Glide.with(holder.itemView)
+                        .load(headerPlaylistThumbnail.trim())
+                        .diskCacheStrategy(DiskCacheStrategy.ALL)
+                        .priority(com.bumptech.glide.Priority.HIGH)
+                        .override(800, 800)
+                        .transition(DrawableTransitionOptions.withCrossFade(200))
+                        .into(holder.ivPlaylistCover);
+                Glide.with(holder.itemView)
+                        .load(headerPlaylistThumbnail.trim())
+                        .diskCacheStrategy(DiskCacheStrategy.ALL)
+                        .override(320, 320)
+                        .transition(DrawableTransitionOptions.withCrossFade(200))
+                        .into(holder.ivPlaylistBackdrop);
             } else if (isLocalFilesContext(currentPlaylistId)) {
                 // Local files: white folder icon on black background, scaled to ~50% of cover
                 float density = holder.itemView.getContext().getResources().getDisplayMetrics().density;
@@ -5396,6 +5437,14 @@ public class PlaylistDetailFragment extends Fragment
                 holder.ivGoogleProfile.setImageResource(android.R.drawable.ic_menu_myplaces);
             }
 
+        }
+
+        private void setTopMargin(@NonNull View target, int topMarginPx) {
+            ViewGroup.LayoutParams params = target.getLayoutParams();
+            if (params instanceof ViewGroup.MarginLayoutParams) {
+                ((ViewGroup.MarginLayoutParams) params).topMargin = topMarginPx;
+                target.setLayoutParams(params);
+            }
         }
 
         private void bindOfflineState(@NonNull HeaderViewHolder holder) {

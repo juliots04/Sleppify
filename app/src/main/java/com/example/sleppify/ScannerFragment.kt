@@ -120,8 +120,8 @@ class ScannerFragment : Fragment() {
         btnBack?.setOnClickListener { (activity as? MainActivity)?.returnFromScanner() }
         ViewCompat.setOnApplyWindowInsetsListener(view) { _, insets ->
             val top = insets.getInsets(WindowInsetsCompat.Type.statusBars()).top
-            btnBack?.let { it.setPadding(it.paddingLeft, it.paddingTop, it.paddingRight, it.paddingBottom); (it.layoutParams as? androidx.constraintlayout.widget.ConstraintLayout.LayoutParams)?.topMargin = top + 8 ; it.layoutParams = it.layoutParams }
-            importImages?.let { (it.layoutParams as? androidx.constraintlayout.widget.ConstraintLayout.LayoutParams)?.topMargin = top + 10 ; it.layoutParams = it.layoutParams }
+            btnBack?.let { (it.layoutParams as? androidx.constraintlayout.widget.ConstraintLayout.LayoutParams)?.topMargin = top; it.layoutParams = it.layoutParams }
+            importImages?.let { (it.layoutParams as? androidx.constraintlayout.widget.ConstraintLayout.LayoutParams)?.topMargin = top + 2 ; it.layoutParams = it.layoutParams }
             insets
         }
 

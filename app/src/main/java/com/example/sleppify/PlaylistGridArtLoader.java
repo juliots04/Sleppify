@@ -23,7 +23,7 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Loads a 2x2 grid composite image from 4 track thumbnail URLs into an ImageView.
+ * Loads a 2x2 grid composite image from 1 to 4 track thumbnail URLs into an ImageView.
  * The composite bitmap is cached in Glide's memory+disk cache via a deterministic key.
  */
 public final class PlaylistGridArtLoader {
@@ -37,8 +37,8 @@ public final class PlaylistGridArtLoader {
     private PlaylistGridArtLoader() {}
 
     /**
-     * Builds a cache key from the 4 URLs + target size so we can skip re-compositing
-     * if the same 4 images are already loaded.
+     * Builds a cache key from the provided URLs + target size so we can skip re-compositing
+     * if the same images are already loaded.
      */
     @NonNull
     public static String buildSignature(@NonNull List<String> urls, int sizePx) {
@@ -54,7 +54,7 @@ public final class PlaylistGridArtLoader {
      * Loads a 2x2 grid composite into the target ImageView.
      *
      * @param target   ImageView to load into
-     * @param urls     exactly 4 thumbnail URLs
+     * @param urls     1 to 4 thumbnail URLs
      * @param sizePx   the total output bitmap size in pixels (e.g. 60dp * density)
      */
     public static void load(
@@ -62,10 +62,11 @@ public final class PlaylistGridArtLoader {
             @NonNull List<String> urls,
             int sizePx
     ) {
-        if (urls.size() < 4 || sizePx <= 0) return;
+        if (urls.isEmpty() || sizePx <= 0) return;
         Context context = target.getContext();
         if (context == null) return;
 
+        int count = Math.min(4, urls.size());
         String signature = buildSignature(urls, sizePx);
         Object prev = target.getTag(R.id.tag_artwork_signature);
         if (prev instanceof String && signature.equals(prev)) {
@@ -81,6 +82,12 @@ public final class PlaylistGridArtLoader {
 
         for (int i = 0; i < 4; i++) {
             final int index = i;
+            if (i >= count) {
+                if (loaded.incrementAndGet() == 4) {
+                    compositeAndSet(target, cells, sizePx, half);
+                }
+                continue;
+            }
             String url = urls.get(i);
             if (url == null || url.trim().isEmpty()) {
                 if (loaded.incrementAndGet() == 4) {

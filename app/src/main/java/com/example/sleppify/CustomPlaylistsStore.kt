@@ -53,6 +53,7 @@ object CustomPlaylistsStore {
     fun addTrackToPlaylist(context: Context, playlistName: String, videoId: String, title: String, subtitle: String, duration: String, thumbnailUrl: String) {
         val prefs = getPrefs(context)
         val key = CUSTOM_PLAYLIST_PREFIX + playlistName
+        ensurePlaylistNameRegistered(context, playlistName)
         val existingJson = prefs.getString(key, "[]")
         val arr = try { JSONArray(existingJson) } catch (e: JSONException) { JSONArray() }
         
@@ -136,6 +137,7 @@ object CustomPlaylistsStore {
     fun savePlaylist(context: Context, playlistName: String, tracks: List<FavoritesPlaylistStore.FavoriteTrack>) {
         val prefs = getPrefs(context)
         val key = CUSTOM_PLAYLIST_PREFIX + playlistName
+        ensurePlaylistNameRegistered(context, playlistName)
         val newArr = JSONArray()
         for (track in tracks) {
             val trackObj = JSONObject()
@@ -151,6 +153,17 @@ object CustomPlaylistsStore {
         if (AuthManager.getInstance(context).isSignedIn()) {
             CloudSyncManager.getInstance(context).syncPlaylistToCloud(playlistName, tracks)
         }
+    }
+
+    private fun ensurePlaylistNameRegistered(context: Context, playlistName: String) {
+        val trimmed = playlistName.trim()
+        if (TextUtils.isEmpty(trimmed)) return
+
+        val names = getAllPlaylistNames(context).toMutableList()
+        if (names.any { it.equals(trimmed, ignoreCase = true) }) return
+
+        names.add(trimmed)
+        getPrefs(context).edit().putString(KEY_PLAYLIST_NAMES, JSONArray(names).toString()).apply()
     }
 
     fun deletePlaylist(context: Context, name: String): Boolean {

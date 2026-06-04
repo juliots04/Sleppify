@@ -131,6 +131,8 @@ class SearchFragment : Fragment() {
     private lateinit var ivFeaturedOfflineIndicator: ImageView
     private var adapter: SearchResultsAdapter? = null
     private var featuredTrack: YouTubeMusicService.TrackResult? = null
+    private var searchResultsBaseBottomPadding = 0
+    private var searchContentBaseBottomPadding = 0
     
     private var searching = false
     private var searchPaginationInFlight = false
@@ -193,6 +195,8 @@ class SearchFragment : Fragment() {
         tvFeaturedTitle = root.findViewById(R.id.tvFeaturedTitle)
         tvFeaturedSubtitle = root.findViewById(R.id.tvFeaturedSubtitle)
         ivFeaturedOfflineIndicator = root.findViewById(R.id.ivFeaturedOfflineIndicator)
+        searchResultsBaseBottomPadding = rvSearchResults.paddingBottom
+        searchContentBaseBottomPadding = nsvSearchContent.paddingBottom
         ivSearchClear.setOnClickListener {
             etSearchQuery.setText("")
             showSuggestionsMode()
@@ -221,6 +225,7 @@ class SearchFragment : Fragment() {
         
         ViewCompat.setOnApplyWindowInsetsListener(root) { _, insets ->
             val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
             root.setPadding(systemBars.left, 0, systemBars.right, 0)
             val llSearchBar = root.findViewById<View>(R.id.llSearchBar)
             llSearchBar?.setPadding(
@@ -228,6 +233,19 @@ class SearchFragment : Fragment() {
                 systemBars.top,
                 llSearchBar.paddingRight,
                 llSearchBar.paddingBottom
+            )
+            val bottomInset = maxOf(systemBars.bottom, ime.bottom)
+            nsvSearchContent.setPadding(
+                nsvSearchContent.paddingLeft,
+                nsvSearchContent.paddingTop,
+                nsvSearchContent.paddingRight,
+                searchContentBaseBottomPadding + bottomInset
+            )
+            rvSearchResults.setPadding(
+                rvSearchResults.paddingLeft,
+                rvSearchResults.paddingTop,
+                rvSearchResults.paddingRight,
+                searchResultsBaseBottomPadding + bottomInset
             )
             insets
         }
@@ -275,7 +293,7 @@ class SearchFragment : Fragment() {
             onMoreClick = { track, anchor -> showTrackOptionsBottomSheet(track, anchor) }
         )
         rvSearchResults.adapter = adapter
-        rvSearchResults.setHasFixedSize(true)
+        rvSearchResults.setHasFixedSize(false)
         rvSearchResults.itemAnimator = null
         rvSearchResults.setItemViewCacheSize(15)
 

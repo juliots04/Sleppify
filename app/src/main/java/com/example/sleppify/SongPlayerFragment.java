@@ -793,8 +793,7 @@ public class SongPlayerFragment extends Fragment {
                     localProgressHandler.postDelayed(() -> ensureActivePlaybackIfExpected("retry-" + retryReason), 500L);
                     return;
                 }
-                Log.w(TAG, "ensureActivePlaybackIfExpected: local restart failed, reloading track. reason=" + reason, e);
-                playCurrentTrack();
+                Log.w(TAG, "ensureActivePlaybackIfExpected: player lost, not restarting automatically. reason=" + reason, e);
             }
             return;
         }
@@ -803,7 +802,7 @@ public class SongPlayerFragment extends Fragment {
             if (bootstrapWindow || localSourcePreparing) {
                 return;
             }
-            playCurrentTrack();
+            Log.d(TAG, "ensureActivePlaybackIfExpected: player missing, waiting for user action. reason=" + reason);
         }
     }
 
@@ -1014,10 +1013,10 @@ public class SongPlayerFragment extends Fragment {
         }
 
         if (fromCompletion && repeatMode == REPEAT_MODE_ONE) {
-            currentSeconds = 0;
-            isPlaying = true;
-            playCurrentTrack();
-            scheduleAutoplayRecoveryForCurrentTrack();
+            currentSeconds = Math.max(0, totalSeconds);
+            isPlaying = false;
+            updatePlayPauseIcon();
+            updateMediaSessionState();
             syncMiniStateWithPlaylist();
             return;
         }
@@ -1081,6 +1080,37 @@ public class SongPlayerFragment extends Fragment {
         syncMiniStateWithPlaylist();
     }
 
+    private void advanceToNextTrackAfterFailure() {
+        if (!isAdded()) {
+            return;
+        }
+
+        cancelAutoplayRecovery();
+        cancelPlaybackErrorRetry();
+        cancelSourcePrepareTimeout();
+        cancelPendingStreamResolver();
+
+        if (tracks.isEmpty()) {
+            isPlaying = false;
+            updatePlayPauseIcon();
+            updateMediaSessionState();
+            syncMiniStateWithPlaylist();
+            return;
+        }
+
+        if (currentIndex + 1 < tracks.size()) {
+            currentIndex++;
+            currentSeconds = 0;
+            isPlaying = true;
+            playCurrentTrack();
+        } else {
+            isPlaying = false;
+            updatePlayPauseIcon();
+            updateMediaSessionState();
+            syncMiniStateWithPlaylist();
+        }
+    }
+
 
     private void handleTrackEnded() {
         if (TextUtils.isEmpty(loadedVideoId)) {
@@ -1114,35 +1144,8 @@ public class SongPlayerFragment extends Fragment {
     }
 
     private void scheduleAutoplayRecoveryForCurrentTrack() {
+        // Disabled: never auto-restart the same track after completion.
         cancelAutoplayRecovery();
-        if (!isAdded() || usingOfflineSource || !isPlaying || tracks.isEmpty()) {
-            return;
-        }
-        if (currentIndex < 0 || currentIndex >= tracks.size()) {
-            return;
-        }
-
-        autoplayRecoveryVideoId = tracks.get(currentIndex).videoId;
-        autoplayRecoveryRunnable = new Runnable() {
-            @Override
-            public void run() {
-                autoplayRecoveryRunnable = null;
-                if (!isAdded() || usingOfflineSource || !isPlaying || tracks.isEmpty()) {
-                    return;
-                }
-                if (currentIndex < 0 || currentIndex >= tracks.size()) {
-                    return;
-                }
-
-                String currentVideoId = tracks.get(currentIndex).videoId;
-                if (!TextUtils.equals(currentVideoId, autoplayRecoveryVideoId)) {
-                    return;
-                }
-
-                playCurrentTrack();
-            }
-        };
-        localProgressHandler.postDelayed(autoplayRecoveryRunnable, AUTOPLAY_RECOVERY_DELAY_MS);
     }
 
     private void cancelAutoplayRecovery() {
@@ -1155,30 +1158,8 @@ public class SongPlayerFragment extends Fragment {
 
 
     private void schedulePlaybackRetry(@NonNull String videoId) {
+        // Disabled: never auto-retry the same track after a playback error.
         cancelPlaybackErrorRetry();
-        playbackErrorRetryVideoId = videoId;
-        playbackErrorRetryRunnable = new Runnable() {
-            @Override
-            public void run() {
-                playbackErrorRetryRunnable = null;
-                if (!isAdded() || usingOfflineSource || !isPlaying) {
-                    return;
-                }
-
-                if (currentIndex < 0 || currentIndex >= tracks.size()) {
-                    return;
-                }
-
-                String currentVideoId = tracks.get(currentIndex).videoId;
-                if (!TextUtils.equals(currentVideoId, playbackErrorRetryVideoId)) {
-                    return;
-                }
-
-                playCurrentTrack();
-            }
-        };
-
-        localProgressHandler.postDelayed(playbackErrorRetryRunnable, TRACK_ERROR_RETRY_DELAY_MS);
     }
 
     private void cancelPlaybackErrorRetry() {
@@ -1289,16 +1270,14 @@ public class SongPlayerFragment extends Fragment {
         if (localExoMediaPlayer != null && !localSourcePreparing
                 && !localExoMediaPlayer.getPlayWhenReady()) {
             Log.d(TAG, "[PLAYBACK_DBG] togglePlayback: player prepared but paused, calling start()");
-            try {
-                localExoMediaPlayer.setVolume(1f, 1f);
-                localExoMediaPlayer.start();
-                startLocalProgressTicker();
-                if (pbVideoLoading != null) pbVideoLoading.setVisibility(View.GONE);
-                if (!loadedVideoId.isEmpty()) PlaybackLoadingBus.notifyAudioConfirmed(loadedVideoId);
-            } catch (Exception e) {
-                Log.e(TAG, "togglePlayback: start() failed, falling through to playCurrentTrack", e);
-                playCurrentTrack();
-            }
+                try {
+                    localExoMediaPlayer.setVolume(1f, 1f);
+                    localExoMediaPlayer.start();
+                    startLocalProgressTicker();
+                } catch (Exception e) {
+                    Log.e(TAG, "togglePlayback: start() failed, falling through to playCurrentTrack", e);
+                    playCurrentTrack();
+                }
             updatePlayPauseIcon();
             updateMediaSessionState();
             updateMediaNotification();
@@ -1988,12 +1967,15 @@ public class SongPlayerFragment extends Fragment {
             if (mp == localExoMediaPlayer && pbVideoLoading != null) {
                 if (isBuffering) {
                     pbVideoLoading.setVisibility(View.VISIBLE);
-                } else if (mp.isPlaying()) {
-                    // Only hide when audio is truly playing
-                    pbVideoLoading.setVisibility(View.GONE);
-                    PlaybackLoadingBus.notifyAudioConfirmed(track.videoId);
                 }
             }
+        });
+
+        player.setOnRenderedFirstFrameListener(mp -> {
+            if (!isAdded() || requestToken != activePlaybackRequestToken) return;
+            if (localExoMediaPlayer != mp || !TextUtils.equals(track.videoId, loadedVideoId)) return;
+            PlaybackLoadingBus.notifyAudioConfirmed(track.videoId);
+            if (pbVideoLoading != null) pbVideoLoading.setVisibility(View.GONE);
         });
 
         player.setOnPreparedListener(mp -> {
@@ -2044,9 +2026,7 @@ public class SongPlayerFragment extends Fragment {
                     mp.setVolume(1f, 1f);
                     mp.start();
                     Log.d(TAG, "[PLAYBACK_FLOW] mp.start() called, AUDIO PLAYING for videoId=" + track.videoId);
-                    PlaybackLoadingBus.notifyAudioConfirmed(track.videoId);
                     if (networkSource) ProxyStreamResolver.markSuccess(track.videoId);
-                    if (pbVideoLoading != null) pbVideoLoading.setVisibility(View.GONE);
                     consecutiveStreamFailures = 0; // Reset counter on successful playback
                     audioTrackReinitToken = -1;
                     startLocalProgressTicker();
@@ -2114,10 +2094,10 @@ public class SongPlayerFragment extends Fragment {
                             startLocalProgressTicker();
                             Log.d(TAG, "Codec recovery: start() succeeded for videoId=" + track.videoId);
                         } catch (Exception e) {
-                            Log.e(TAG, "Codec recovery: start() failed, falling back to full reload", e);
+                            Log.e(TAG, "Codec recovery: start() failed, skipping track", e);
                             releaseLocalExoMediaPlayer();
                             usingOfflineSource = false;
-                            playCurrentTrack();
+                            advanceToNextTrackAfterFailure();
                         }
                     }
                 }, 500L);
@@ -2305,36 +2285,12 @@ public class SongPlayerFragment extends Fragment {
             return false;
         }
 
-        // If this video already consumed its single re-resolution retry, skip to next track.
-        if (TextUtils.equals(lastReresolveVideoId, track.videoId)) {
-            Log.w(TAG, "tryYouTubeFallbackForCurrentTrack: re-resolve already attempted for "
-                    + track.videoId + ", skipping to next. reason=" + reason);
-            lastReresolveVideoId = null;
-            handleTrackEnded();
-            return true;
-        }
-
-        Log.w(TAG, "tryYouTubeFallbackForCurrentTrack: invalidating URL cache and re-resolving. reason="
+        Log.w(TAG, "tryYouTubeFallbackForCurrentTrack: skipping current track instead of re-resolving. reason="
                 + reason + " videoId=" + track.videoId);
-        lastReresolveVideoId = track.videoId;
-
-        // Drop cached URL so the next resolveStreamUrl fetches a fresh one.
-        InnertubeResolver.invalidate(track.videoId);
-
-        cancelSourcePrepareTimeout();
-        cancelPendingStreamResolver();
         stopLocalProgressTicker();
         releaseLocalExoMediaPlayer();
         usingOfflineSource = false;
-
-        // Clear any prefetched URL for this track (it may also be stale).
-        if (TextUtils.equals(track.videoId, prefetchedNextVideoId)) {
-            prefetchedNextVideoId = null;
-        }
-
-        // Retry forcing the alternative client chain (TVHTML5_SIMPLYEMBEDDED first) to
-        // bypass LOGIN_REQUIRED / age-gated responses from ANDROID_MUSIC.
-        resolveAndPlayOnlineTrack(track, activePlaybackRequestToken, true);
+        advanceToNextTrackAfterFailure();
         return true;
     }
 
@@ -2770,7 +2726,7 @@ public class SongPlayerFragment extends Fragment {
             } else {
                 releaseSingleExoMediaPlayer(mp);
             }
-            playCurrentTrack();
+            advanceToNextTrackAfterFailure();
             return true;
         });
 
@@ -4143,6 +4099,29 @@ public class SongPlayerFragment extends Fragment {
         androidx.fragment.app.FragmentTransaction transaction = fm.beginTransaction()
                 .setReorderingAllowed(true);
 
+        Fragment equalizer = findAddedByTag(fm, "module_equalizer");
+        Fragment settings = findAddedByTag(fm, "module_settings");
+        Fragment scanner = findAddedByTag(fm, "module_scanner");
+
+        if (equalizer != null) {
+            transaction.hide(equalizer);
+            if (equalizer.getLifecycle().getCurrentState().isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) {
+                transaction.setMaxLifecycle(equalizer, androidx.lifecycle.Lifecycle.State.STARTED);
+            }
+        }
+        if (settings != null) {
+            transaction.hide(settings);
+            if (settings.getLifecycle().getCurrentState().isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) {
+                transaction.setMaxLifecycle(settings, androidx.lifecycle.Lifecycle.State.STARTED);
+            }
+        }
+        if (scanner != null) {
+            transaction.hide(scanner);
+            if (scanner.getLifecycle().getCurrentState().isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) {
+                transaction.setMaxLifecycle(scanner, androidx.lifecycle.Lifecycle.State.STARTED);
+            }
+        }
+
         if (target != null && target != this && target.isAdded()) {
             transaction
                     .setCustomAnimations(
@@ -4197,11 +4176,6 @@ public class SongPlayerFragment extends Fragment {
         Fragment music = fm.findFragmentByTag(TAG_MODULE_MUSIC);
         if (music != null && music.isAdded()) {
             return music;
-        }
-
-        Fragment equalizer = findAddedByTag(fm, "module_equalizer");
-        if (equalizer != null) {
-            return equalizer;
         }
 
         Fragment apps = findAddedByTag(fm, "module_apps");

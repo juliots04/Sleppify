@@ -1,6 +1,5 @@
 package com.example.sleppify
 
-import android.util.Log
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -12,8 +11,6 @@ import java.util.concurrent.atomic.AtomicInteger
  * The proxy resolves yt-dlp once, caches the CDN URL, and proxies bytes with Range support.
  */
 object ProxyStreamResolver {
-
-    private const val TAG = "ProxyStreamResolver"
     private const val CACHE_EXPIRY_MS = 4 * 60 * 60 * 1000L // 4 hours
     private const val SERVER_PENALTY_MS = 120_000L // 2 min cooldown for failed servers
     private const val SUCCESS_STICKY_MS = 300_000L // 5 min — prefer last successful server
@@ -77,14 +74,11 @@ object ProxyStreamResolver {
             val failedAt = serverFailureTimestamps[idx] ?: 0L
             val isLastOption = attempt == order.size - 1
             if (now - failedAt < SERVER_PENALTY_MS && !isLastOption) {
-                Log.d(TAG, "Skipping server $idx (failed ${(now - failedAt) / 1000}s ago)")
                 continue
             }
             val server = STREAM_SERVERS[idx]
             val streamUrl = "$server/api/stream/$videoId"
             urlCache[videoId] = CachedUrl(streamUrl, now)
-            Log.d(TAG, "Resolved $videoId via server $idx" +
-                    if (idx == preferredIdx) " (preferred)" else "")
             return streamUrl
         }
 
@@ -106,12 +100,10 @@ object ProxyStreamResolver {
         for (i in STREAM_SERVERS.indices) {
             if (cached.url.startsWith(STREAM_SERVERS[i])) {
                 serverFailureTimestamps[i] = System.currentTimeMillis()
-                // If the failed server was the preferred one, clear preference
-                if (i == lastSuccessfulServerIndex) {
-                    lastSuccessfulServerIndex = -1
-                    lastSuccessTimestamp = 0L
-                }
-                Log.d(TAG, "Marked server $i as failed for ${SERVER_PENALTY_MS / 1000}s")
+                // Any failure should rotate away from the current sticky server.
+                lastSuccessfulServerIndex = -1
+                lastSuccessTimestamp = 0L
+                roundRobinIndex.set((i + 1) % STREAM_SERVERS.size)
                 break
             }
         }
@@ -134,7 +126,6 @@ object ProxyStreamResolver {
                 lastSuccessTimestamp = System.currentTimeMillis()
                 // Clear any failure penalty for this server since it just worked
                 serverFailureTimestamps.remove(i)
-                Log.d(TAG, "Marked server $i as SUCCESS — will prefer for next track")
                 break
             }
         }
