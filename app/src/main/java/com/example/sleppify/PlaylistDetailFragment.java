@@ -95,6 +95,7 @@ public class PlaylistDetailFragment extends Fragment
                    TrackReplacementSheet.OnReplacementConfirmedListener,
                    TrackReplacementSheet.OnReplacementUndoneListener {
 
+    private static final String TAG = "PlaylistDetailFragment";
     private static final String PREFS_STREAMING_CACHE = "streaming_cache";
     private static final long TRACKS_CACHE_TTL_MS = 24 * 60 * 60 * 1000L;
     private static final String PREF_TRACKS_UPDATED_AT_PREFIX = "playlist_tracks_updated_at_";
@@ -133,6 +134,7 @@ public class PlaylistDetailFragment extends Fragment
     private static final String TAG_OFFLINE_DOWNLOAD = "OfflinePlaylistDl";
     private static final long OFFLINE_STATE_LOOKUP_DEBOUNCE_MS = 120L;
     private static final long PLAYLIST_INITIAL_CONTENT_FADE_MS = 220L;
+    private boolean pendingEntryFade = true;
 
     /** Shared singleton — avoids allocation per bind and ensures consistent Glide cache keys. */
     private static final YouTubeCropTransformation SHARED_YT_CROP = new YouTubeCropTransformation();
@@ -480,9 +482,17 @@ public class PlaylistDetailFragment extends Fragment
         }
         // Ensure Glide is not paused if the fragment resumes after a fling was interrupted
         if (isAdded()) {
-            try { Glide.with(this).resumeRequests(); } catch (Exception ignored) {}
+            try { Glide.with(this).resumeRequests(); } catch (Exception e) {
+                Log.w(TAG, "Unexpected error", e);
+            }
         }
-        onBecameVisible(false);
+        if (!isHidden()) onBecameVisible(false);
+    }
+
+    @Override
+    public void onPause() {
+        super.onPause();
+        pendingEntryFade = true;
     }
 
     @Override
@@ -502,6 +512,7 @@ public class PlaylistDetailFragment extends Fragment
             }
         }
         if (hidden) {
+            pendingEntryFade = true;
             return;
         }
         if (rvPlaylistContent != null) {
@@ -517,8 +528,9 @@ public class PlaylistDetailFragment extends Fragment
         persistStreamingScreen(STREAM_SCREEN_PLAYLIST_DETAIL);
         syncTrackStateFromPlayer();
 
-        // Always fade-in the content when the fragment becomes visible
-        if (!awaitingInitialPlaylistRender && rvPlaylistContent != null) {
+        // Fade-in content once per visibility change
+        if (!awaitingInitialPlaylistRender && pendingEntryFade && rvPlaylistContent != null) {
+            pendingEntryFade = false;
             rvPlaylistContent.animate().cancel();
             rvPlaylistContent.setAlpha(0f);
             rvPlaylistContent.animate().alpha(1f).setDuration(PLAYLIST_INITIAL_CONTENT_FADE_MS).start();
@@ -592,7 +604,9 @@ public class PlaylistDetailFragment extends Fragment
         if (rvPlaylistContent != null) {
             try {
                 rvPlaylistContent.clearOnScrollListeners();
-            } catch (Exception ignored) {}
+            } catch (Exception e) {
+                Log.w(TAG, "Unexpected error", e);
+            }
         }
         playlistLoadingOverlay = null;
         pbPlaylistLoading = null;
@@ -2576,6 +2590,22 @@ public class PlaylistDetailFragment extends Fragment
                             ovr.getImageUrl()
                     )
             );
+
+            // Merge locally-mirrored tracks that were added via the save-to-playlist sheet
+            List<FavoritesPlaylistStore.FavoriteTrack> mirrorTracks =
+                    CustomPlaylistsStore.INSTANCE.getYtMirrorTracks(requireContext(), playlistId);
+            if (!mirrorTracks.isEmpty()) {
+                Set<String> existingIds = new java.util.HashSet<>();
+                for (PlaylistTrack t : overridden) {
+                    if (!TextUtils.isEmpty(t.videoId)) existingIds.add(t.videoId);
+                }
+                for (FavoritesPlaylistStore.FavoriteTrack mt : mirrorTracks) {
+                    if (!TextUtils.isEmpty(mt.videoId) && !existingIds.contains(mt.videoId)) {
+                        overridden.add(new PlaylistTrack(mt.videoId, mt.title, mt.artist, mt.duration, mt.imageUrl));
+                    }
+                }
+            }
+
             return overridden;
         }
         return new ArrayList<>(source);
@@ -3086,6 +3116,7 @@ public class PlaylistDetailFragment extends Fragment
         }
 
         player.externalReplaceQueue(ids, titles, artists, durations, images, startIndex, keepPlaying);
+        injectOriginalQueueOrderIfShuffled(player);
         miniPlaying = keepPlaying;
     }
 
@@ -3145,7 +3176,7 @@ public class PlaylistDetailFragment extends Fragment
     @NonNull
     private PlaybackHistoryStore.Snapshot loadPlaybackSnapshot() {
         if (!isAdded()) {
-            return new PlaybackHistoryStore.Snapshot(new ArrayList<>(), 0, 0, 1, false, 0L);
+            return new PlaybackHistoryStore.Snapshot(new ArrayList<>(), 0, 0, 1, false, 0L, null);
         }
         return PlaybackHistoryStore.load(requireContext());
     }
@@ -3382,6 +3413,7 @@ public class PlaylistDetailFragment extends Fragment
                     existingPlayer.externalPlayTrackFromStart(queueIndex);
                 } else {
                     existingPlayer.externalReplaceQueueFromStart(ids, titles, artists, durations, images, queueIndex, true);
+                    injectOriginalQueueOrderIfShuffled(existingPlayer);
                 }
 
                 currentTrackIndex = position;
@@ -3517,8 +3549,12 @@ public class PlaylistDetailFragment extends Fragment
             String gKey = CustomPlaylistsStore.getLastSavedPlaylistKey(requireContext());
             String gName = CustomPlaylistsStore.getLastSavedPlaylistName(requireContext());
             if (gKey != null && gName != null) {
-                addTrackToPlaylistByKey(gKey, selectedTrack);
-                showSavedInPlaylistBar(selectedTrack, gKey, gName);
+                if (isTrackInPlaylist(requireContext(), selectedTrack.videoId, gKey)) {
+                    showAlreadyInPlaylistBar(selectedTrack, gName);
+                } else {
+                    addTrackToPlaylistByKey(gKey, selectedTrack);
+                    showSavedInPlaylistBar(selectedTrack, gKey, gName);
+                }
             } else {
                 showSaveToPlaylistSheet(selectedTrack, null);
             }
@@ -3628,13 +3664,19 @@ public class PlaylistDetailFragment extends Fragment
 
         sheet.findViewById(R.id.btnSaveCancel).setOnClickListener(v -> saveDialog.dismiss());
         sheet.findViewById(R.id.btnSaveConfirm).setOnClickListener(v -> {
+            String addedKey = lastAddedKey[0];
+            String addedName = lastAddedName[0];
+            boolean removed = didRemove[0];
             saveDialog.dismiss();
-            if (lastAddedKey[0] != null && lastAddedName[0] != null) {
-                CustomPlaylistsStore.setLastSavedPlaylist(requireContext(), lastAddedKey[0], lastAddedName[0]);
-                showSavedInPlaylistBar(track, lastAddedKey[0], lastAddedName[0]);
-            } else if (didRemove[0]) {
+            if (addedKey != null && addedName != null) {
+                CustomPlaylistsStore.setLastSavedPlaylist(requireContext(), addedKey, addedName);
+                showSavedInPlaylistBar(track, addedKey, addedName);
+            } else if (removed) {
                 String playlistName = resolveCurrentPlaylistName();
                 showRemovedFromPlaylistBar(track, playlistName);
+                currentTracks.removeIf(t -> TextUtils.equals(t.videoId, track.videoId));
+                trackAdapter.submitTracks(currentTracks);
+                rebuildPlaybackQueue();
             }
         });
 
@@ -3643,6 +3685,20 @@ public class PlaylistDetailFragment extends Fragment
 
         float density = ctx.getResources().getDisplayMetrics().density;
         int thumbSizePx = (int) (48 * density);
+
+        // Cap scroll area so footer buttons remain visible
+        View svScroll = sheet.findViewById(R.id.svSavePlaylistScroll);
+        if (svScroll != null) {
+            int maxH = (int) (320 * density);
+            svScroll.getLayoutParams().height = android.view.ViewGroup.LayoutParams.WRAP_CONTENT;
+            svScroll.post(() -> {
+                if (svScroll.getHeight() > maxH) {
+                    android.view.ViewGroup.LayoutParams lp = svScroll.getLayoutParams();
+                    lp.height = maxH;
+                    svScroll.setLayoutParams(lp);
+                }
+            });
+        }
 
         // Build playlist entries: Favoritos first, then custom playlists
         List<FavoritesPlaylistStore.FavoriteTrack> favs = FavoritesPlaylistStore.loadFavorites(ctx);
@@ -3690,6 +3746,51 @@ public class PlaylistDetailFragment extends Fragment
                 }
                 int count = getPlaylistTrackCount(ctx, FavoritesPlaylistStore.PLAYLIST_ID);
                 tvCount.setText(count + " pistas");
+            });
+            llList.addView(row);
+        }
+
+        // "Música que te gustó" row (local mirror, insert at top)
+        {
+            String likedPid = YouTubeMusicService.SPECIAL_LIKED_VIDEOS_ID;
+            String likedMirrorKey = CustomPlaylistsStore.YT_MIRROR_PREFIX + likedPid;
+            YouTubeMusicService.TrackResult likedCached = MusicPlayerFragment.getLikedPlaylistFromCache();
+            View row = LayoutInflater.from(ctx).inflate(R.layout.item_save_playlist_row, llList, false);
+            ImageView ivThumb = row.findViewById(R.id.ivSavePlaylistThumb);
+            TextView tvName = row.findViewById(R.id.tvSavePlaylistName);
+            TextView tvCount = row.findViewById(R.id.tvSavePlaylistCount);
+            ImageView ivCheck = row.findViewById(R.id.ivSaveCheck);
+            tvName.setText("Música que te gustó");
+            tvCount.setText(likedCached != null ? likedCached.subtitle : "Playlist");
+            ivThumb.setBackgroundResource(R.drawable.bg_music_liked_gradient);
+            ivThumb.setImageResource(R.drawable.ic_thumb_up_liked);
+            ivThumb.setScaleType(ImageView.ScaleType.CENTER);
+            ivThumb.setColorFilter(android.graphics.Color.WHITE, android.graphics.PorterDuff.Mode.SRC_IN);
+            boolean isIn = CustomPlaylistsStore.INSTANCE.isTrackInYtMirror(ctx, likedPid, track.videoId);
+            if (ivCheck != null) ivCheck.setVisibility(isIn ? View.VISIBLE : View.GONE);
+            final boolean[] checked = {isIn};
+            row.setOnClickListener(v -> {
+                if (checked[0]) {
+                    CustomPlaylistsStore.INSTANCE.removeTrackFromYtMirror(ctx, likedPid, track.videoId);
+                    checked[0] = false;
+                    didRemove[0] = true;
+                    if (ivCheck != null) ivCheck.setVisibility(View.GONE);
+                    if (likedMirrorKey.equals(lastAddedKey[0])) {
+                        lastAddedKey[0] = null;
+                        lastAddedName[0] = null;
+                    }
+                } else {
+                    String tTitle = TextUtils.isEmpty(track.title) ? "Tema" : track.title;
+                    String tArtist = track.artist == null ? "" : track.artist;
+                    String tDuration = track.duration == null ? "" : track.duration;
+                    String tImage = track.imageUrl == null ? "" : track.imageUrl;
+                    CustomPlaylistsStore.INSTANCE.addTrackToYtMirror(ctx, likedPid, track.videoId,
+                            tTitle, tArtist, tDuration, tImage, true);
+                    checked[0] = true;
+                    if (ivCheck != null) ivCheck.setVisibility(View.VISIBLE);
+                    lastAddedKey[0] = likedMirrorKey;
+                    lastAddedName[0] = "Música que te gustó";
+                }
             });
             llList.addView(row);
         }
@@ -3747,8 +3848,77 @@ public class PlaylistDetailFragment extends Fragment
             llList.addView(row);
         }
 
+        // YouTube library playlists (local mirror)
+        List<YouTubeMusicService.TrackResult> ytPlaylists = MusicPlayerFragment.getYouTubeLibraryPlaylists();
+        for (YouTubeMusicService.TrackResult ytItem : ytPlaylists) {
+            String ytPlaylistId = ytItem.contentId == null ? "" : ytItem.contentId.trim();
+            if (ytPlaylistId.isEmpty()) continue;
+            String ytMirrorKey = CustomPlaylistsStore.YT_MIRROR_PREFIX + ytPlaylistId;
+            String ytFallbackThumb = ytItem.thumbnailUrl == null ? "" : ytItem.thumbnailUrl.trim();
+
+            View row = LayoutInflater.from(ctx).inflate(R.layout.item_save_playlist_row, llList, false);
+            ImageView ivThumb = row.findViewById(R.id.ivSavePlaylistThumb);
+            TextView tvName = row.findViewById(R.id.tvSavePlaylistName);
+            TextView tvCount = row.findViewById(R.id.tvSavePlaylistCount);
+            ImageView ivCheck = row.findViewById(R.id.ivSaveCheck);
+            tvName.setText(ytItem.title == null ? "" : ytItem.title);
+            tvCount.setText(ytItem.subtitle == null ? "Playlist" : ytItem.subtitle);
+            List<String> ytUrls = loadPersistedGridUrls(ctx, ytPlaylistId);
+            if (ytUrls.size() < 4) {
+                ytUrls = new ArrayList<>();
+                List<FavoritesPlaylistStore.FavoriteTrack> ytMirrorTracks =
+                        CustomPlaylistsStore.INSTANCE.getYtMirrorTracks(ctx, ytPlaylistId);
+                for (FavoritesPlaylistStore.FavoriteTrack t : ytMirrorTracks) {
+                    if (!TextUtils.isEmpty(t.imageUrl)) {
+                        if (!ytUrls.contains(t.imageUrl)) ytUrls.add(t.imageUrl);
+                        if (ytUrls.size() >= 4) break;
+                    }
+                }
+            }
+            if (ytUrls.size() >= 4) {
+                PlaylistGridArtLoader.load(ivThumb, ytUrls, thumbSizePx);
+            } else if (!ytUrls.isEmpty()) {
+                loadArtworkInto(ivThumb, ytUrls.get(0));
+            } else if (!ytFallbackThumb.isEmpty()) {
+                loadArtworkInto(ivThumb, ytFallbackThumb);
+            }
+            boolean isIn = CustomPlaylistsStore.INSTANCE.isTrackInYtMirror(ctx, ytPlaylistId, track.videoId);
+            if (ivCheck != null) ivCheck.setVisibility(isIn ? View.VISIBLE : View.GONE);
+            final boolean[] checked = {isIn};
+            final String ytPid = ytPlaylistId;
+            final String ytPName = ytItem.title == null ? "" : ytItem.title;
+            row.setOnClickListener(v -> {
+                if (checked[0]) {
+                    CustomPlaylistsStore.INSTANCE.removeTrackFromYtMirror(ctx, ytPid, track.videoId);
+                    checked[0] = false;
+                    didRemove[0] = true;
+                    if (ivCheck != null) ivCheck.setVisibility(View.GONE);
+                    if (ytMirrorKey.equals(lastAddedKey[0])) {
+                        lastAddedKey[0] = null;
+                        lastAddedName[0] = null;
+                    }
+                } else {
+                    String tTitle = TextUtils.isEmpty(track.title) ? "Tema" : track.title;
+                    String tArtist = track.artist == null ? "" : track.artist;
+                    String tDuration = track.duration == null ? "" : track.duration;
+                    String tImage = track.imageUrl == null ? "" : track.imageUrl;
+                    CustomPlaylistsStore.INSTANCE.addTrackToYtMirror(ctx, ytPid, track.videoId,
+                            tTitle, tArtist, tDuration, tImage, false);
+                    checked[0] = true;
+                    if (ivCheck != null) ivCheck.setVisibility(View.VISIBLE);
+                    lastAddedKey[0] = ytMirrorKey;
+                    lastAddedName[0] = ytPName;
+                }
+            });
+            llList.addView(row);
+        }
+
         saveDialog.getBehavior().setSkipCollapsed(true);
         saveDialog.getBehavior().setFitToContents(true);
+        try { saveDialog.getBehavior().setHideFriction(0.5f); } catch (Throwable ignored) {}
+        saveDialog.getBehavior().setState(com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_EXPANDED);
+
+        sheet.setAlpha(0f);
         saveDialog.setOnShowListener(d -> {
             View bottomSheetSave = ((com.google.android.material.bottomsheet.BottomSheetDialog) d)
                     .findViewById(com.google.android.material.R.id.design_bottom_sheet);
@@ -3757,8 +3927,27 @@ public class PlaylistDetailFragment extends Fragment
                 if (sheetParent != null) sheetParent.setBackgroundColor(Color.TRANSPARENT);
                 bottomSheetSave.setBackgroundResource(android.R.color.transparent);
             }
+            sheet.post(() -> sheet.animate().alpha(1f).setDuration(150L).start());
         });
         saveDialog.show();
+    }
+
+    @NonNull
+    private static List<String> loadPersistedGridUrls(@NonNull Context ctx, @NonNull String playlistId) {
+        try {
+            String raw = ctx.getApplicationContext()
+                    .getSharedPreferences(AppConstants.PREFS_STREAMING_CACHE, android.app.Activity.MODE_PRIVATE)
+                    .getString("playlist_grid_urls_" + playlistId, "");
+            if (TextUtils.isEmpty(raw)) return java.util.Collections.emptyList();
+            String[] parts = raw.split("\\n");
+            List<String> result = new ArrayList<>(parts.length);
+            for (String part : parts) {
+                if (!TextUtils.isEmpty(part)) result.add(part);
+            }
+            return result;
+        } catch (Exception e) {
+            return java.util.Collections.emptyList();
+        }
     }
 
     private boolean isTrackInPlaylist(@NonNull Context ctx, @NonNull String videoId, @NonNull String playlistKey) {
@@ -3772,6 +3961,9 @@ public class PlaylistDetailFragment extends Fragment
             for (FavoritesPlaylistStore.FavoriteTrack t : tracks) {
                 if (videoId.equals(t.videoId)) return true;
             }
+        } else if (playlistKey.startsWith(CustomPlaylistsStore.YT_MIRROR_PREFIX)) {
+            String pid = playlistKey.substring(CustomPlaylistsStore.YT_MIRROR_PREFIX.length());
+            return CustomPlaylistsStore.INSTANCE.isTrackInYtMirror(ctx, pid, videoId);
         }
         return false;
     }
@@ -3782,6 +3974,9 @@ public class PlaylistDetailFragment extends Fragment
         } else if (playlistKey.startsWith(CustomPlaylistsStore.CUSTOM_PLAYLIST_PREFIX)) {
             String name = playlistKey.substring(CustomPlaylistsStore.CUSTOM_PLAYLIST_PREFIX.length());
             return CustomPlaylistsStore.INSTANCE.getTracksFromPlaylist(ctx, name).size();
+        } else if (playlistKey.startsWith(CustomPlaylistsStore.YT_MIRROR_PREFIX)) {
+            String pid = playlistKey.substring(CustomPlaylistsStore.YT_MIRROR_PREFIX.length());
+            return CustomPlaylistsStore.INSTANCE.getYtMirrorTracks(ctx, pid).size();
         }
         return 0;
     }
@@ -3799,6 +3994,10 @@ public class PlaylistDetailFragment extends Fragment
             String name = playlistKey.substring(CustomPlaylistsStore.CUSTOM_PLAYLIST_PREFIX.length());
             CustomPlaylistsStore.INSTANCE.addTrackToPlaylist(requireContext(), name,
                     track.videoId, title, artist, duration, imageUrl);
+        } else if (playlistKey.startsWith(CustomPlaylistsStore.YT_MIRROR_PREFIX)) {
+            String pid = playlistKey.substring(CustomPlaylistsStore.YT_MIRROR_PREFIX.length());
+            CustomPlaylistsStore.INSTANCE.addTrackToYtMirror(requireContext(), pid,
+                    track.videoId, title, artist, duration, imageUrl, false);
         }
         maybeEnqueueOfflineDownloadForAddedTrack(playlistKey, track.videoId, title, artist, duration);
     }
@@ -3847,6 +4046,9 @@ public class PlaylistDetailFragment extends Fragment
         } else if (playlistKey.startsWith(CustomPlaylistsStore.CUSTOM_PLAYLIST_PREFIX)) {
             String name = playlistKey.substring(CustomPlaylistsStore.CUSTOM_PLAYLIST_PREFIX.length());
             CustomPlaylistsStore.INSTANCE.removeTrackFromPlaylist(requireContext(), name, videoId);
+        } else if (playlistKey.startsWith(CustomPlaylistsStore.YT_MIRROR_PREFIX)) {
+            String pid = playlistKey.substring(CustomPlaylistsStore.YT_MIRROR_PREFIX.length());
+            CustomPlaylistsStore.INSTANCE.removeTrackFromYtMirror(requireContext(), pid, videoId);
         }
     }
 
@@ -3878,14 +4080,14 @@ public class PlaylistDetailFragment extends Fragment
         bar.setGravity(android.view.Gravity.CENTER_VERTICAL);
         bar.setBackgroundColor(Color.parseColor("#FF1E1E1E"));
         int hPad = (int) (16 * density);
-        int vPad = (int) (12 * density);
+        int vPad = (int) (14 * density);
         bar.setPadding(hPad, vPad, hPad, vPad);
         bar.setElevation(8 * density);
 
         TextView tvSaved = new TextView(requireContext());
         tvSaved.setText("Se guardó en " + playlistName);
         tvSaved.setTextColor(Color.WHITE);
-        tvSaved.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 14);
+        tvSaved.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 15);
         tvSaved.setTypeface(null, android.graphics.Typeface.NORMAL);
         tvSaved.setMaxLines(1);
         tvSaved.setEllipsize(android.text.TextUtils.TruncateAt.END);
@@ -3896,13 +4098,65 @@ public class PlaylistDetailFragment extends Fragment
         TextView btnChange = new TextView(requireContext());
         btnChange.setText("Cambiar");
         btnChange.setTextColor(Color.parseColor("#8AB4F8"));
-        btnChange.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 14);
+        btnChange.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 15);
         btnChange.setTypeface(null, android.graphics.Typeface.BOLD);
         btnChange.setPadding((int) (16 * density), 0, 0, 0);
         btnChange.setOnClickListener(v -> {
             TransientBottomBarAnimator.dismiss(bar, () -> {
                 CustomPlaylistsStore.clearLastSavedPlaylist(requireContext());
                 showSaveToPlaylistSheet(track, playlistKey);
+            });
+        });
+        bar.addView(btnChange);
+
+        int barBottomMargin = computeSnackbarBottomMargin(activity, density);
+        FrameLayout.LayoutParams flp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        flp.gravity = android.view.Gravity.BOTTOM;
+        flp.bottomMargin = barBottomMargin;
+        TransientBottomBarAnimator.show(rootView, bar, flp, "saved_bar", 4000L);
+    }
+
+    private void showAlreadyInPlaylistBar(@NonNull PlaylistTrack track, @NonNull String playlistName) {
+        if (!isAdded()) return;
+        MainActivity activity = (MainActivity) requireActivity();
+        ViewGroup rootView = activity.findViewById(android.R.id.content);
+        if (rootView == null) return;
+
+        float density = getResources().getDisplayMetrics().density;
+
+        LinearLayout bar = new LinearLayout(requireContext());
+        bar.setTag("saved_bar");
+        bar.setId(View.generateViewId());
+        bar.setOrientation(LinearLayout.HORIZONTAL);
+        bar.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        bar.setBackgroundColor(Color.parseColor("#FF1E1E1E"));
+        int hPad = (int) (16 * density);
+        int vPad = (int) (14 * density);
+        bar.setPadding(hPad, vPad, hPad, vPad);
+        bar.setElevation(8 * density);
+
+        TextView tvMsg = new TextView(requireContext());
+        tvMsg.setText("Ya está en " + playlistName);
+        tvMsg.setTextColor(Color.WHITE);
+        tvMsg.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 15);
+        tvMsg.setTypeface(null, android.graphics.Typeface.NORMAL);
+        tvMsg.setMaxLines(1);
+        tvMsg.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        LinearLayout.LayoutParams tvParams = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        tvMsg.setLayoutParams(tvParams);
+        bar.addView(tvMsg);
+
+        TextView btnChange = new TextView(requireContext());
+        btnChange.setText("Cambiar");
+        btnChange.setTextColor(Color.parseColor("#8AB4F8"));
+        btnChange.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 15);
+        btnChange.setTypeface(null, android.graphics.Typeface.BOLD);
+        btnChange.setPadding((int) (16 * density), 0, 0, 0);
+        btnChange.setOnClickListener(v -> {
+            TransientBottomBarAnimator.dismiss(bar, () -> {
+                CustomPlaylistsStore.clearLastSavedPlaylist(requireContext());
+                showSaveToPlaylistSheet(track, null);
             });
         });
         bar.addView(btnChange);
@@ -3930,7 +4184,7 @@ public class PlaylistDetailFragment extends Fragment
         bar.setGravity(android.view.Gravity.CENTER_VERTICAL);
         bar.setBackgroundColor(Color.parseColor("#FF1E1E1E"));
         int hPad = (int) (16 * density);
-        int vPad = (int) (12 * density);
+        int vPad = (int) (14 * density);
         bar.setPadding(hPad, vPad, hPad, vPad);
         bar.setElevation(8 * density);
 
@@ -3938,7 +4192,7 @@ public class PlaylistDetailFragment extends Fragment
         TextView tvMsg = new TextView(requireContext());
         tvMsg.setText(title + " eliminado de " + playlistName);
         tvMsg.setTextColor(Color.WHITE);
-        tvMsg.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 14);
+        tvMsg.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 15);
         tvMsg.setTypeface(null, android.graphics.Typeface.NORMAL);
         tvMsg.setMaxLines(1);
         tvMsg.setEllipsize(android.text.TextUtils.TruncateAt.END);
@@ -3949,7 +4203,7 @@ public class PlaylistDetailFragment extends Fragment
         TextView btnUndo = new TextView(requireContext());
         btnUndo.setText("Deshacer");
         btnUndo.setTextColor(Color.parseColor("#8AB4F8"));
-        btnUndo.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 14);
+        btnUndo.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 15);
         btnUndo.setTypeface(null, android.graphics.Typeface.BOLD);
         btnUndo.setPadding((int) (16 * density), 0, 0, 0);
         btnUndo.setOnClickListener(v -> {
@@ -4125,6 +4379,12 @@ public class PlaylistDetailFragment extends Fragment
             return FavoritesPlaylistStore.PLAYLIST_TITLE;
         } else if (currentPlaylistId != null && currentPlaylistId.startsWith(CustomPlaylistsStore.CUSTOM_PLAYLIST_PREFIX)) {
             return currentPlaylistId.substring(CustomPlaylistsStore.CUSTOM_PLAYLIST_PREFIX.length());
+        } else if (currentPlaylistId != null && currentPlaylistId.startsWith(CustomPlaylistsStore.YT_MIRROR_PREFIX)) {
+            String pid = currentPlaylistId.substring(CustomPlaylistsStore.YT_MIRROR_PREFIX.length());
+            if (YouTubeMusicService.SPECIAL_LIKED_VIDEOS_ID.equals(pid)) return "Música que te gustó";
+            for (YouTubeMusicService.TrackResult item : MusicPlayerFragment.getYouTubeLibraryPlaylists()) {
+                if (item.contentId != null && pid.equals(item.contentId.trim())) return item.title;
+            }
         }
         return "playlist";
     }
@@ -4138,6 +4398,11 @@ public class PlaylistDetailFragment extends Fragment
             String name = currentPlaylistId.substring(CustomPlaylistsStore.CUSTOM_PLAYLIST_PREFIX.length());
             CustomPlaylistsStore.INSTANCE.addTrackToPlaylist(requireContext(), name, 
                 track.videoId, track.title, track.artist, track.duration, track.imageUrl);
+        } else if (currentPlaylistId != null && currentPlaylistId.startsWith(CustomPlaylistsStore.YT_MIRROR_PREFIX)) {
+            String pid = currentPlaylistId.substring(CustomPlaylistsStore.YT_MIRROR_PREFIX.length());
+            boolean insertTop = YouTubeMusicService.SPECIAL_LIKED_VIDEOS_ID.equals(pid);
+            CustomPlaylistsStore.INSTANCE.addTrackToYtMirror(requireContext(), pid,
+                track.videoId, track.title, track.artist, track.duration, track.imageUrl, insertTop);
         }
         // Refresh the track list
         currentTracks.add(track);
@@ -4531,6 +4796,7 @@ public class PlaylistDetailFragment extends Fragment
                     } else {
                         existingPlayer.externalReplaceQueue(ids, titles, artists, durations, images, queueIndex, true);
                     }
+                    injectOriginalQueueOrderIfShuffled(existingPlayer);
                 }
 
                     showSongPlayerWithEnterAnimation(existingPlayer);
@@ -4560,6 +4826,7 @@ public class PlaylistDetailFragment extends Fragment
         );
         playerFragment.externalSetReturnTargetTag(TAG_PLAYLIST_DETAIL);
         playerFragment.externalSetPlaylistContext(currentPlaylistId, currentPlaylistTitle);
+        injectOriginalQueueOrderIfShuffled(playerFragment);
         addSongPlayerWithEnterAnimation(playerFragment);
         // Don't update mini-player UI - keep it hidden while full player is visible
     }
@@ -4602,6 +4869,7 @@ public class PlaylistDetailFragment extends Fragment
                 existingPlayer.externalSetReturnTargetTag(TAG_PLAYLIST_DETAIL);
                 existingPlayer.externalSetPlaylistContext(currentPlaylistId, currentPlaylistTitle);
                 existingPlayer.externalReplaceQueue(ids, titles, artists, durations, images, snapshotIndex, startPlaying);
+                injectOriginalQueueFromSnapshot(existingPlayer, snapshot);
                 showSongPlayerWithEnterAnimation(existingPlayer);
             }
         } else {
@@ -4616,6 +4884,7 @@ public class PlaylistDetailFragment extends Fragment
             );
             playerFragment.externalSetReturnTargetTag(TAG_PLAYLIST_DETAIL);
             playerFragment.externalSetPlaylistContext(currentPlaylistId, currentPlaylistTitle);
+            injectOriginalQueueFromSnapshot(playerFragment, snapshot);
                 addSongPlayerWithEnterAnimation(playerFragment);
         }
 
@@ -4861,6 +5130,7 @@ public class PlaylistDetailFragment extends Fragment
             false
         );
         playerFragment.externalSetReturnTargetTag(TAG_PLAYLIST_DETAIL);
+        injectOriginalQueueFromSnapshot(playerFragment, snapshot);
 
         final ArrayList<String> replayIds = ids;
         final ArrayList<String> replayTitles = titles;
@@ -4884,6 +5154,7 @@ public class PlaylistDetailFragment extends Fragment
                             replaySnapshotIndex,
                             replayStartPlaying
                     );
+                    injectOriginalQueueFromSnapshot(playerFragment, snapshot);
                     syncTrackStateFromPlayer();
                 })
                 .commit();
@@ -4896,6 +5167,43 @@ public class PlaylistDetailFragment extends Fragment
         }
         syncTrackStateFromPlayer();
         return true;
+    }
+
+    private void injectOriginalQueueOrderIfShuffled(@NonNull SongPlayerFragment player) {
+        if (!shuffleModeEnabled) return;
+        List<PlaylistTrack> base = originalTracks.isEmpty() ? currentTracks : originalTracks;
+        if (base.isEmpty()) return;
+        java.util.List<SongPlayerFragment.PlayerTrack> original = new java.util.ArrayList<>(base.size());
+        for (PlaylistTrack item : base) {
+            original.add(new SongPlayerFragment.PlayerTrack(
+                    item.videoId, item.title, item.artist, item.duration, item.imageUrl
+            ));
+        }
+        player.externalSetOriginalQueueOrder(original);
+    }
+
+    private void injectOriginalQueueFromSnapshot(
+            @NonNull SongPlayerFragment player,
+            @NonNull PlaybackHistoryStore.Snapshot snapshot
+    ) {
+        if (snapshot.originalQueue == null || snapshot.originalQueue.isEmpty()) return;
+        if (snapshot.originalQueue.size() == snapshot.queue.size()) {
+            boolean same = true;
+            for (int i = 0; i < snapshot.queue.size(); i++) {
+                if (!android.text.TextUtils.equals(snapshot.queue.get(i).videoId, snapshot.originalQueue.get(i).videoId)) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same) return;
+        }
+        java.util.List<SongPlayerFragment.PlayerTrack> original = new java.util.ArrayList<>(snapshot.originalQueue.size());
+        for (PlaybackHistoryStore.QueueTrack item : snapshot.originalQueue) {
+            original.add(new SongPlayerFragment.PlayerTrack(
+                    item.videoId, item.title, item.artist, item.duration, item.imageUrl
+            ));
+        }
+        player.externalSetOriginalQueueOrder(original);
     }
 
     private boolean startHiddenIntegratedPlayerAt(int position, boolean startFromBeginning) {
@@ -4946,6 +5254,7 @@ public class PlaylistDetailFragment extends Fragment
                 true
         );
         playerFragment.externalSetReturnTargetTag(TAG_PLAYLIST_DETAIL);
+        injectOriginalQueueOrderIfShuffled(playerFragment);
 
         getParentFragmentManager()
                 .beginTransaction()

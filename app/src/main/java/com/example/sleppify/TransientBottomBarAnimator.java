@@ -6,16 +6,17 @@ import android.view.ViewGroup;
 import android.view.ViewParent;
 import android.view.animation.AccelerateInterpolator;
 import android.view.animation.DecelerateInterpolator;
+import android.view.animation.OvershootInterpolator;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
 final class TransientBottomBarAnimator {
 
-    private static final long ENTER_DURATION_MS = 240L;
-    private static final long EXIT_DURATION_MS = 180L;
-    private static final float ENTER_TRANSLATION_DP = 24f;
-    private static final float EXIT_TRANSLATION_DP = 16f;
+    private static final long ENTER_DURATION_MS = 280L;
+    private static final long EXIT_DURATION_MS = 200L;
+    private static final float ENTER_TRANSLATION_DP = 48f;
+    private static final float EXIT_TRANSLATION_DP = 32f;
 
     private static final int STATE_HIDDEN = 0;
     private static final int STATE_VISIBLE = 1;
@@ -43,15 +44,20 @@ final class TransientBottomBarAnimator {
         bar.setTranslationY(dp(bar.getContext(), ENTER_TRANSLATION_DP));
         rootView.addView(bar, layoutParams);
 
-        bar.post(() -> {
-            if (bar.getParent() == null || getState(bar) != STATE_VISIBLE) return;
-            bar.animate().cancel();
-            bar.animate()
-                    .alpha(1f)
-                    .translationY(0f)
-                    .setDuration(ENTER_DURATION_MS)
-                    .setInterpolator(new DecelerateInterpolator())
-                    .start();
+        bar.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
+            @Override
+            public void onLayoutChange(View v, int l, int t, int r, int b,
+                                       int ol, int ot, int or2, int ob) {
+                v.removeOnLayoutChangeListener(this);
+                if (v.getParent() == null || getState(v) != STATE_VISIBLE) return;
+                v.animate().cancel();
+                v.animate()
+                        .alpha(1f)
+                        .translationY(0f)
+                        .setDuration(ENTER_DURATION_MS)
+                        .setInterpolator(new OvershootInterpolator(0.6f))
+                        .start();
+            }
         });
 
         bar.postDelayed(() -> dismiss(bar, null), autoDismissMs);

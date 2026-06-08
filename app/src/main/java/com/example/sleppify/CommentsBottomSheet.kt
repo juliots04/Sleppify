@@ -15,8 +15,6 @@ import com.bumptech.glide.load.resource.bitmap.CircleCrop
 import com.bumptech.glide.request.target.DrawableImageViewTarget
 import com.google.android.material.bottomsheet.BottomSheetBehavior
 import com.google.android.material.bottomsheet.BottomSheetDialog
-import android.os.Build
-import android.text.Html
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -63,6 +61,10 @@ class CommentsBottomSheet(
     private val adapter = CommentsAdapter(comments)
 
     companion object {
+        private const val INNERTUBE_NEXT = "https://www.youtube.com/youtubei/v1/next?prettyPrint=false"
+        private const val CLIENT_NAME = "WEB"
+        private const val CLIENT_VERSION = "2.20241111.01.00"
+
         @JvmStatic
         fun newInstance(videoId: String, commentCount: String): CommentsBottomSheet {
             throw UnsupportedOperationException("Use CommentsBottomSheet(context, videoId, commentCount) directly")
@@ -123,15 +125,12 @@ class CommentsBottomSheet(
         isLoading = true
         if (pageToken != null) flPagingLoader.visibility = View.VISIBLE
 
-        val apiKey = try { (BuildConfig.YOUTUBE_DATA_API_KEY ?: "").trim() } catch (e: Exception) { "" }
-        if (apiKey.isEmpty()) { showEmpty(); isLoading = false; return }
-
         executor.execute {
             var cacheLoaded = false
             if (pageToken == null && comments.isEmpty()) {
                 val cachedBody = CommentsCacheManager.getFirstPageCache(context, videoId)
                 if (cachedBody != null) {
-                    val parsed = parseCommentsResponse(cachedBody)
+                    val parsed = parseInnertubeComments(cachedBody)
                     if (parsed.first.isNotEmpty()) {
                         bsv.post {
                             if (!dialog.isShowing) return@post
@@ -146,15 +145,30 @@ class CommentsBottomSheet(
                 }
             }
 
-            val resultAndBody = fetchComments(videoId, apiKey, pageToken)
-            val result = resultAndBody?.first
-            val body = resultAndBody?.second
+            val result: Pair<List<CommentItem>, String?>?
+            val rawBody: String?
+            if (pageToken == null) {
+                // First load: get continuation token from /next, then fetch comments
+                val contToken = fetchCommentsContinuationToken(videoId)
+                if (contToken != null) {
+                    val fetched = fetchInnertubeComments(contToken)
+                    result = fetched?.first
+                    rawBody = fetched?.second
+                } else {
+                    result = null
+                    rawBody = null
+                }
+            } else {
+                val fetched = fetchInnertubeComments(pageToken)
+                result = fetched?.first
+                rawBody = fetched?.second
+            }
 
             bsv.post {
                 if (!dialog.isShowing) return@post
                 isLoading = false
                 flPagingLoader.visibility = View.GONE
-                
+
                 if (result == null) {
                     if (comments.isEmpty()) {
                         showLoading(false)
@@ -162,11 +176,9 @@ class CommentsBottomSheet(
                     }
                 } else {
                     showLoading(false)
-                    if (pageToken == null && body != null) {
-                        CommentsCacheManager.saveFirstPageCache(context, videoId, body)
-                        if (cacheLoaded) {
-                            comments.clear()
-                        }
+                    if (pageToken == null && rawBody != null) {
+                        CommentsCacheManager.saveFirstPageCache(context, videoId, rawBody)
+                        if (cacheLoaded) comments.clear()
                     }
                     if (!cacheLoaded || pageToken == null) {
                         nextPageToken = result.second
@@ -180,108 +192,350 @@ class CommentsBottomSheet(
         }
     }
 
-    private fun fetchComments(videoId: String, apiKey: String, pageToken: String?): Pair<Pair<List<CommentItem>, String?>, String>? {
-        return try {
-            val url = StringBuilder()
-                .append("https://www.googleapis.com/youtube/v3/commentThreads")
-                .append("?part=snippet,replies")
-                .append("&videoId=").append(android.net.Uri.encode(videoId))
-                .append("&maxResults=50")
-                .append("&order=relevance")
-                .append("&key=").append(android.net.Uri.encode(apiKey))
-                .also { if (pageToken != null) it.append("&pageToken=").append(android.net.Uri.encode(pageToken)) }
-                .toString()
-            val conn = URL(url).openConnection() as HttpURLConnection
-            conn.requestMethod = "GET"
-            conn.connectTimeout = 12000
-            conn.readTimeout = 15000
-            conn.setRequestProperty("Accept", "application/json")
-            try {
-                if (conn.responseCode != HttpURLConnection.HTTP_OK) return null
-                val body = conn.inputStream.bufferedReader().readText()
-                val parsed = parseCommentsResponse(body)
-                Pair(parsed, body)
-            } finally { conn.disconnect() }
-        } catch (e: Exception) { null }
+    // ── InnerTube helpers ──────────────────────────────────────────────
+
+    private fun buildInnertubeContext(): JSONObject {
+        return JSONObject().apply {
+            put("client", JSONObject().apply {
+                put("clientName", CLIENT_NAME)
+                put("clientVersion", CLIENT_VERSION)
+                put("hl", "es")
+                put("gl", "US")
+            })
+        }
     }
 
-    private fun parseCommentsResponse(body: String): Pair<List<CommentItem>, String?> {
+    private fun postInnertube(endpoint: String, payload: JSONObject): String? {
+        val conn = URL(endpoint).openConnection() as HttpURLConnection
+        conn.requestMethod = "POST"
+        conn.connectTimeout = 12000
+        conn.readTimeout = 15000
+        conn.doOutput = true
+        conn.setRequestProperty("Content-Type", "application/json")
+        conn.setRequestProperty("Accept", "application/json")
+        conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36")
+        conn.setRequestProperty("Origin", "https://www.youtube.com")
+        conn.setRequestProperty("Referer", "https://www.youtube.com/")
+        val cookie = InnertubeResolver.getAuthCookieHeader()
+        if (cookie.isNotBlank()) {
+            conn.setRequestProperty("Cookie", cookie)
+            val sapisidHash = generateSapisidHash(cookie)
+            if (sapisidHash.isNotBlank()) {
+                conn.setRequestProperty("Authorization", sapisidHash)
+            }
+        }
+        try {
+            conn.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
+            val code = conn.responseCode
+            if (code != HttpURLConnection.HTTP_OK) {
+                val err = try { conn.errorStream?.bufferedReader()?.readText()?.take(500) ?: "" } catch (_: Exception) { "" }
+                android.util.Log.w("CommentsSheet", "InnerTube $code: $err")
+                return null
+            }
+            val body = conn.inputStream.bufferedReader().readText()
+            return body
+        } catch (e: Exception) {
+            android.util.Log.e("CommentsSheet", "postInnertube network error", e)
+            return null
+        } finally { conn.disconnect() }
+    }
+
+    private fun fetchCommentsContinuationToken(videoId: String): String? {
+        return try {
+            val payload = JSONObject().apply {
+                put("context", buildInnertubeContext())
+                put("videoId", videoId)
+            }
+            val body = postInnertube(INNERTUBE_NEXT, payload) ?: run {
+                android.util.Log.w("CommentsSheet", "fetchContinuationToken: /next returned null for $videoId")
+                return null
+            }
+            val root = JSONObject(body)
+
+            // Strategy 1: engagementPanels (standard YouTube web)
+            val panels = root.optJSONArray("engagementPanels")
+            if (panels != null) {
+                for (i in 0 until panels.length()) {
+                    val panel = panels.optJSONObject(i)
+                        ?.optJSONObject("engagementPanelSectionListRenderer") ?: continue
+                    val panelId = panel.optString("panelIdentifier", "")
+                    if (panelId != "comment-item-section") continue
+                    val token = extractContinuationFromSection(
+                        panel.optJSONObject("content")
+                            ?.optJSONObject("sectionListRenderer")
+                            ?.optJSONArray("contents")
+                    )
+                    if (token != null) {
+                        return token
+                    }
+                }
+            }
+
+            // Strategy 2: contents.twoColumnWatchNextResults.results (alternate layout)
+            val resultsContents = root.optJSONObject("contents")
+                ?.optJSONObject("twoColumnWatchNextResults")
+                ?.optJSONObject("results")
+                ?.optJSONObject("results")
+                ?.optJSONArray("contents")
+            if (resultsContents != null) {
+                for (i in 0 until resultsContents.length()) {
+                    val section = resultsContents.optJSONObject(i)
+                        ?.optJSONObject("itemSectionRenderer") ?: continue
+                    val sectionId = section.optString("sectionIdentifier", "")
+                    if (sectionId != "comment-item-section") continue
+                    val token = extractContinuationFromContents(section.optJSONArray("contents"))
+                    if (token != null) {
+                        return token
+                    }
+                }
+            }
+
+            // Strategy 3: onResponseReceivedEndpoints (sometimes returned inline)
+            val endpoints = root.optJSONArray("onResponseReceivedEndpoints")
+            if (endpoints != null) {
+                for (i in 0 until endpoints.length()) {
+                    val ep = endpoints.optJSONObject(i) ?: continue
+                    val action = ep.optJSONObject("reloadContinuationItemsAction")
+                        ?: ep.optJSONObject("reloadContinuationItemsCommand")
+                        ?: ep.optJSONObject("appendContinuationItemsAction")
+                        ?: ep.optJSONObject("appendContinuationItemsCommand") ?: continue
+                    val items = action.optJSONArray("continuationItems") ?: continue
+                    val token = extractContinuationTokenFromItems(items)
+                    if (token != null) {
+                        return token
+                    }
+                }
+            }
+
+            android.util.Log.w("CommentsSheet", "No comments continuation found. Top keys: ${root.keys().asSequence().toList()}")
+            null
+        } catch (e: Exception) {
+            android.util.Log.w("CommentsSheet", "fetchContinuationToken failed", e)
+            null
+        }
+    }
+
+    private fun extractContinuationFromSection(contents: org.json.JSONArray?): String? {
+        if (contents == null) return null
+        for (i in 0 until contents.length()) {
+            val item = contents.optJSONObject(i) ?: continue
+            // itemSectionRenderer path
+            val token = extractContinuationFromContents(
+                item.optJSONObject("itemSectionRenderer")?.optJSONArray("contents")
+            )
+            if (token != null) return token
+            // Direct continuationItemRenderer
+            val directToken = extractTokenFromContinuationItem(item)
+            if (directToken != null) return directToken
+        }
+        return null
+    }
+
+    private fun extractContinuationFromContents(contents: org.json.JSONArray?): String? {
+        if (contents == null) return null
+        for (i in 0 until contents.length()) {
+            val item = contents.optJSONObject(i) ?: continue
+            val token = extractTokenFromContinuationItem(item)
+            if (token != null) return token
+        }
+        return null
+    }
+
+    private fun extractTokenFromContinuationItem(item: JSONObject): String? {
+        val renderer = item.optJSONObject("continuationItemRenderer") ?: return null
+        // Path 1: continuationEndpoint.continuationCommand.token
+        renderer.optJSONObject("continuationEndpoint")
+            ?.optJSONObject("continuationCommand")
+            ?.optString("token", "")?.takeIf { it.isNotEmpty() }
+            ?.let { return it }
+        // Path 2: button.buttonRenderer.command.continuationCommand.token
+        renderer.optJSONObject("button")
+            ?.optJSONObject("buttonRenderer")
+            ?.optJSONObject("command")
+            ?.optJSONObject("continuationCommand")
+            ?.optString("token", "")?.takeIf { it.isNotEmpty() }
+            ?.let { return it }
+        // Path 3: continuationEndpoint directly has token
+        renderer.optJSONObject("continuationEndpoint")
+            ?.optString("token", "")?.takeIf { it.isNotEmpty() }
+            ?.let { return it }
+        return null
+    }
+
+    private fun extractContinuationTokenFromItems(items: org.json.JSONArray): String? {
+        for (i in 0 until items.length()) {
+            val item = items.optJSONObject(i) ?: continue
+            val token = extractTokenFromContinuationItem(item)
+            if (token != null) return token
+        }
+        return null
+    }
+
+    private fun fetchInnertubeComments(continuationToken: String): Pair<Pair<List<CommentItem>, String?>, String>? {
+        return try {
+            val payload = JSONObject().apply {
+                put("context", buildInnertubeContext())
+                put("continuation", continuationToken)
+            }
+            val body = postInnertube(INNERTUBE_NEXT, payload) ?: return null
+            val parsed = parseInnertubeComments(body)
+            Pair(parsed, body)
+        } catch (e: Exception) {
+            android.util.Log.w("CommentsSheet", "fetchInnertubeComments failed", e)
+            null
+        }
+    }
+
+    private fun parseInnertubeComments(body: String): Pair<List<CommentItem>, String?> {
         val result = mutableListOf<CommentItem>()
         val root = JSONObject(body)
-        val nextToken = root.optString("nextPageToken", "").takeIf { it.isNotEmpty() }
-        val arr = root.optJSONArray("items") ?: return Pair(result, nextToken)
-        for (i in 0 until arr.length()) {
-            try {
-                val thread = arr.optJSONObject(i) ?: continue
-                val topSnippet = thread.optJSONObject("snippet")
-                    ?.optJSONObject("topLevelComment")
-                    ?.optJSONObject("snippet") ?: continue
+        var nextCont: String? = null
+
+        // Build a map of commentEntityPayload from frameworkUpdates (2025+ format)
+        val entityMap = mutableMapOf<String, JSONObject>()
+        val mutations = root.optJSONObject("frameworkUpdates")
+            ?.optJSONObject("entityBatchUpdate")
+            ?.optJSONArray("mutations")
+        if (mutations != null) {
+            for (m in 0 until mutations.length()) {
+                val mutation = mutations.optJSONObject(m) ?: continue
+                val payload = mutation.optJSONObject("payload")
+                    ?.optJSONObject("commentEntityPayload") ?: continue
+                val key = mutation.optString("entityKey", "")
+                if (key.isNotEmpty()) entityMap[key] = payload
+            }
+        }
+
+        val endpoints = root.optJSONArray("onResponseReceivedEndpoints")
+        if (endpoints == null) {
+            android.util.Log.w("CommentsSheet", "parseComments: no onResponseReceivedEndpoints")
+            return Pair(result, null)
+        }
+
+        for (ep in 0 until endpoints.length()) {
+            val endpoint = endpoints.optJSONObject(ep) ?: continue
+            val action = endpoint.optJSONObject("reloadContinuationItemsAction")
+                ?: endpoint.optJSONObject("reloadContinuationItemsCommand")
+                ?: endpoint.optJSONObject("appendContinuationItemsAction")
+                ?: endpoint.optJSONObject("appendContinuationItemsCommand")
+                ?: continue
+            val items = action.optJSONArray("continuationItems") ?: continue
+
+            for (i in 0 until items.length()) {
+                val item = items.optJSONObject(i) ?: continue
+
+                // Pagination continuation token
+                val contRenderer = item.optJSONObject("continuationItemRenderer")
+                if (contRenderer != null) {
+                    nextCont = contRenderer.optJSONObject("continuationEndpoint")
+                        ?.optJSONObject("continuationCommand")
+                        ?.optString("token", "")?.takeIf { it.isNotEmpty() }
+                    continue
+                }
+
+                val threadRenderer = item.optJSONObject("commentThreadRenderer") ?: continue
+
+                // --- New format (2025+): commentViewModel + entityPayload ---
+                val vmWrapper = threadRenderer.optJSONObject("commentViewModel")
+                if (vmWrapper != null) {
+                    // commentViewModel can be nested: commentThreadRenderer.commentViewModel.commentViewModel
+                    val viewModel = vmWrapper.optJSONObject("commentViewModel") ?: vmWrapper
+                    val commentKey = viewModel.optString("commentKey", "")
+                    val commentId = viewModel.optString("commentId", "")
+                    val entityPayload = entityMap[commentKey]
+                        ?: entityMap[commentId]
+                    if (entityPayload != null) {
+                        val props = entityPayload.optJSONObject("properties")
+                        val toolbar = entityPayload.optJSONObject("toolbar")
+                        val authorObj = entityPayload.optJSONObject("author")
+                        val avatarObj = entityPayload.optJSONObject("avatar")
+
+                        val commentText = props?.optJSONObject("content")?.optString("content", "") ?: ""
+                        val author = authorObj?.optString("displayName", "")
+                            ?: props?.optString("authorButtonA11y", "") ?: ""
+                        val publishedTime = props?.optString("publishedTime", "") ?: ""
+                        val likeCount = toolbar?.optString("likeCountNotliked", "")
+                            ?: toolbar?.optString("likeCountLiked", "") ?: ""
+                        val profileUrl = avatarObj?.optJSONObject("image")
+                            ?.optJSONArray("sources")?.optJSONObject(0)?.optString("url", "")
+                            ?: avatarObj?.optString("thumbnailUrl", "") ?: ""
+
+                        // Fetch replies if available
+                        val replies = fetchRepliesForThread(threadRenderer)
+
+                        result.add(CommentItem(
+                            authorName = author,
+                            authorInitial = author.firstOrNull()?.uppercaseChar()?.toString() ?: "?",
+                            authorProfileUrl = profileUrl,
+                            text = commentText,
+                            likeCount = likeCount,
+                            publishedAt = publishedTime,
+                            replies = replies
+                        ))
+                        continue
+                    }
+                }
+
+                // --- Legacy format: comment -> commentRenderer ---
+                val commentRenderer = threadRenderer.optJSONObject("comment")
+                    ?.optJSONObject("commentRenderer") ?: continue
+
+                val author = extractText(commentRenderer.optJSONObject("authorText"))
+                val text = extractText(commentRenderer.optJSONObject("contentText"))
+                val profileUrl = commentRenderer.optJSONArray("authorThumbnail")
+                    ?.optJSONObject(0)?.optString("url", "")
+                    ?: commentRenderer.optJSONObject("authorThumbnail")
+                        ?.optJSONArray("thumbnails")?.optJSONObject(0)?.optString("url", "")
+                    ?: ""
+                val likeCountText = extractText(commentRenderer.optJSONObject("voteCount"))
+                val publishedText = extractText(commentRenderer.optJSONObject("publishedTimeText"))
+
+                // Parse replies (legacy)
                 val replies = mutableListOf<ReplyItem>()
-                val repliesArr = thread.optJSONObject("replies")?.optJSONArray("comments")
-                if (repliesArr != null) {
-                    for (j in repliesArr.length() - 1 downTo 0) {
-                        val rs = repliesArr.optJSONObject(j)?.optJSONObject("snippet") ?: continue
-                        val rAuthor = rs.optString("authorDisplayName", "")
+                val repliesRenderer = threadRenderer.optJSONObject("replies")
+                    ?.optJSONObject("commentRepliesRenderer")
+                val replyItems = repliesRenderer?.optJSONArray("contents")
+                if (replyItems != null) {
+                    for (j in 0 until replyItems.length()) {
+                        val replyRenderer = replyItems.optJSONObject(j)
+                            ?.optJSONObject("commentRenderer") ?: continue
+                        val rAuthor = extractText(replyRenderer.optJSONObject("authorText"))
                         replies.add(ReplyItem(
                             authorName = rAuthor,
                             authorInitial = rAuthor.firstOrNull()?.uppercaseChar()?.toString() ?: "?",
-                            authorProfileUrl = rs.optString("authorProfileImageUrl", ""),
-                            text = decodeHtml(rs.optString("textOriginal", "").ifEmpty { rs.optString("textDisplay", "") }),
-                            likeCount = rs.optLong("likeCount", 0).let { if (it > 0) formatCount(it) else "" },
-                            publishedAt = formatRelativeTime(rs.optString("publishedAt", ""))
+                            authorProfileUrl = replyRenderer.optJSONObject("authorThumbnail")
+                                ?.optJSONArray("thumbnails")?.optJSONObject(0)?.optString("url", "") ?: "",
+                            text = extractText(replyRenderer.optJSONObject("contentText")),
+                            likeCount = extractText(replyRenderer.optJSONObject("voteCount")),
+                            publishedAt = extractText(replyRenderer.optJSONObject("publishedTimeText"))
                         ))
                     }
                 }
-                val author = topSnippet.optString("authorDisplayName", "")
+
                 result.add(CommentItem(
                     authorName = author,
                     authorInitial = author.firstOrNull()?.uppercaseChar()?.toString() ?: "?",
-                    authorProfileUrl = topSnippet.optString("authorProfileImageUrl", ""),
-                    text = decodeHtml(topSnippet.optString("textOriginal", "").ifEmpty { topSnippet.optString("textDisplay", "") }),
-                    likeCount = topSnippet.optLong("likeCount", 0).let { if (it > 0) formatCount(it) else "" },
-                    publishedAt = formatRelativeTime(topSnippet.optString("publishedAt", "")),
+                    authorProfileUrl = profileUrl,
+                    text = text,
+                    likeCount = likeCountText,
+                    publishedAt = publishedText,
                     replies = replies
                 ))
-            } catch (e: Exception) { continue }
-        }
-        return Pair(result, nextToken)
-    }
-
-    @Suppress("DEPRECATION")
-    private fun decodeHtml(raw: String): String {
-        if (raw.isEmpty()) return raw
-        val normalized = raw
-            .replace("<br>", "\n")
-            .replace("<br/>", "\n")
-            .replace("<br />", "\n")
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            Html.fromHtml(normalized, Html.FROM_HTML_MODE_LEGACY).toString().trimEnd()
-        } else {
-            Html.fromHtml(normalized).toString().trimEnd()
-        }
-    }
-
-    private fun formatCount(n: Long): String = when {
-        n >= 1_000_000 -> "%.1fM".format(n / 1_000_000.0)
-        n >= 1_000 -> "%.1fK".format(n / 1_000.0)
-        else -> n.toString()
-    }
-
-    private fun formatRelativeTime(iso: String): String {
-        if (iso.isEmpty()) return ""
-        return try {
-            val sdf = java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", java.util.Locale.US)
-            sdf.timeZone = java.util.TimeZone.getTimeZone("UTC")
-            val then = sdf.parse(iso)?.time ?: return ""
-            val diffDays = (System.currentTimeMillis() - then) / 86_400_000L
-            when {
-                diffDays < 1 -> "hoy"
-                diffDays < 7 -> "hace ${diffDays}d"
-                diffDays < 30 -> "hace ${diffDays / 7}sem"
-                diffDays < 365 -> "hace ${diffDays / 30}mes"
-                else -> "hace ${diffDays / 365}a"
             }
-        } catch (e: Exception) { "" }
+        }
+        return Pair(result, nextCont)
+    }
+
+    private fun extractText(obj: JSONObject?): String {
+        if (obj == null) return ""
+        val simple = obj.optString("simpleText", "")
+        if (simple.isNotEmpty()) return simple
+        val runs = obj.optJSONArray("runs") ?: return ""
+        val sb = StringBuilder()
+        for (i in 0 until runs.length()) {
+            sb.append(runs.optJSONObject(i)?.optString("text", "") ?: "")
+        }
+        return sb.toString()
     }
 
     private fun showLoading(show: Boolean) {
@@ -302,6 +556,30 @@ class CommentsBottomSheet(
         rvComments.visibility = View.GONE
         tvEmpty.text = "No se pudieron cargar los comentarios"
         tvEmpty.visibility = View.VISIBLE
+    }
+
+    private fun generateSapisidHash(cookieHeader: String): String {
+        val sapisid = extractCookieValue(cookieHeader, "SAPISID")
+            ?: extractCookieValue(cookieHeader, "__Secure-3PAPISID")
+            ?: return ""
+        val timestamp = System.currentTimeMillis() / 1000
+        val origin = "https://www.youtube.com"
+        val input = "$timestamp $sapisid $origin"
+        return try {
+            val digest = java.security.MessageDigest.getInstance("SHA-1")
+            val hash = digest.digest(input.toByteArray(Charsets.UTF_8))
+                .joinToString("") { "%02x".format(it) }
+            "SAPISIDHASH ${timestamp}_${hash}"
+        } catch (_: Exception) { "" }
+    }
+
+    private fun extractCookieValue(cookieHeader: String, name: String): String? {
+        if (cookieHeader.isBlank()) return null
+        return cookieHeader.split(";")
+            .map { it.trim() }
+            .firstOrNull { it.startsWith("$name=") }
+            ?.substringAfter("=")
+            ?.trim()
     }
 
     private fun loadAvatarInto(profileUrl: String, ivAvatar: ImageView, itemView: View) {
@@ -326,7 +604,7 @@ class CommentsBottomSheet(
                 ivAvatar.visibility = View.GONE
             }
         } else {
-            try { Glide.with(context).clear(ivAvatar) } catch (e: Exception) {}
+            try { Glide.with(context).clear(ivAvatar) } catch (e: Exception) { android.util.Log.w("CommentsSheet", "Failed to clear avatar", e) }
             ivAvatar.visibility = View.GONE
         }
     }

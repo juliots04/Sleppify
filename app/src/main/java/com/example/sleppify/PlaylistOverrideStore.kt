@@ -110,7 +110,7 @@ object PlaylistOverrideStore {
 
     private fun notifyChanged(playlistId: String) {
         for (l in listeners) {
-            try { l.onOverridesChanged(playlistId) } catch (_: Exception) {}
+            try { l.onOverridesChanged(playlistId) } catch (e: Exception) { Log.w(TAG, "Override listener error", e) }
         }
     }
 
@@ -226,7 +226,9 @@ object PlaylistOverrideStore {
             try {
                 val map = parseOverridesJson(raw)
                 result.addAll(map.keys)
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to parse override keys JSON", e)
+            }
         }
         return result
     }
@@ -247,7 +249,9 @@ object PlaylistOverrideStore {
                 val map = parseOverridesJson(raw)
                 val o = map[id]
                 if (o != null) return o
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to parse override JSON for lookup", e)
+            }
         }
         return null
     }

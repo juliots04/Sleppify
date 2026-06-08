@@ -388,12 +388,14 @@ public final class CrossfadeManager {
                         (SystemClock.elapsedRealtime() - startedAtMs) / (float) crossfadeDurationMs));
                 try {
                     outgoing.setVolume(1f - progress, 1f - progress);
-                } catch (Exception ignored) {
+                } catch (Exception e) {
+                    android.util.Log.w("CrossfadeManager", "Failed to set outgoing volume", e);
                 }
                 if (incomingPlayer != null) {
                     try {
                         incomingPlayer.setVolume(progress, progress);
-                    } catch (Exception ignored) {
+                    } catch (Exception e) {
+                        android.util.Log.w("CrossfadeManager", "Failed to set incoming volume", e);
                     }
                 }
                 if (progress >= 1f) {
@@ -450,7 +452,8 @@ public final class CrossfadeManager {
         if (currentPlayer != null) {
             try {
                 currentPlayer.setVolume(1f, 1f);
-            } catch (Exception ignored) {
+            } catch (Exception e) {
+                android.util.Log.w("CrossfadeManager", "Failed to restore volume", e);
             }
         }
     }
@@ -490,11 +493,13 @@ public final class CrossfadeManager {
         if (player == null) return;
         try {
             player.stop();
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            android.util.Log.w("CrossfadeManager", "Failed to stop player", e);
         }
         try {
             player.release();
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            android.util.Log.w("CrossfadeManager", "Failed to release player", e);
         }
     }
 

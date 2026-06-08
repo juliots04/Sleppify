@@ -22,6 +22,7 @@ class YouTubeMusicService @JvmOverloads constructor(
     private val executor: ExecutorService = SHARED_EXECUTOR
 ) {
 
+    private val TAG = "YouTubeMusicService"
     private val mainHandler = Handler(Looper.getMainLooper())
 
     // ----- Public interfaces -----
@@ -683,7 +684,7 @@ class YouTubeMusicService @JvmOverloads constructor(
                                     allResults.add(r)
                                 }
                             }
-                        } catch (_: Exception) { }
+                        } catch (e: Exception) { Log.w(TAG, "Failed to parse search result item", e) }
                         if (allResults.size >= 20) break
                     }
                     if (allResults.size >= 20) break

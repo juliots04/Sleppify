@@ -1406,8 +1406,8 @@ class CloudSyncManager private constructor(context: Context) {
     companion object {
         private const val TAG = "CloudSyncManager"
 
-        @JvmField val PREFS_SETTINGS = "sleppify_settings"
-        @JvmField val PREFS_STREAMING_CACHE = "streaming_cache"
+        @JvmField val PREFS_SETTINGS = AppConstants.PREFS_SETTINGS
+        @JvmField val PREFS_STREAMING_CACHE = AppConstants.PREFS_STREAMING_CACHE
         @JvmField val KEY_AI_SHIFT_ENABLED = "ai_shift_enabled"
         @JvmField val KEY_SMART_SUGGESTIONS_ENABLED = "smart_suggestions_enabled"
         @JvmField val KEY_DEFAULT_DURATION_MINUTES = "default_duration_minutes"

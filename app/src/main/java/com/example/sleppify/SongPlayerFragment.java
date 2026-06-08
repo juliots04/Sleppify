@@ -32,6 +32,7 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.ViewGroup;
+import android.widget.HorizontalScrollView;
 import android.widget.ImageButton;
 import android.widget.ImageView;
 import android.widget.SeekBar;
@@ -102,7 +103,7 @@ public class SongPlayerFragment extends Fragment {
     public static final String ARG_IS_TEMPORARY_PLAYER = "arg_is_temporary_player";
 
     private static final long PROGRESS_TICK_MS = 200L;
-    private static final String PREFS_PLAYER_STATE = "player_state";
+    private static final String PREFS_PLAYER_STATE = AppConstants.PREFS_PLAYER_STATE;
     private static final String PREF_SOCIAL_STATS_PREFIX = "yt_social_stats_";
     private static final String PREF_LAST_PLAYLIST_ID = "stream_last_playlist_id";
     private static final String PREF_LAST_PLAYLIST_TITLE = "stream_last_playlist_title";
@@ -110,7 +111,7 @@ public class SongPlayerFragment extends Fragment {
     private static final String PREF_LAST_PLAYLIST_THUMBNAIL = "stream_last_playlist_thumbnail";
     private static final String PREF_LAST_YOUTUBE_ACCESS_TOKEN = "stream_last_youtube_access_token";
     private static final String MEDIA_NOTIFICATION_CHANNEL_ID = "sleppify_media_playback";
-    private static final int MEDIA_NOTIFICATION_ID = 11031;
+    private static final int MEDIA_NOTIFICATION_ID = AppConstants.MEDIA_NOTIFICATION_ID;
     private static final String TAG_PLAYLIST_DETAIL = "playlist_detail";
     private static final String TAG_MODULE_MUSIC = "module_music";
     private static final int MEDIA_SESSION_ARTWORK_MAX_SIZE_PX = 1400;
@@ -136,6 +137,8 @@ public class SongPlayerFragment extends Fragment {
     private static final int MAX_NEXT_UP = 50;
     private final List<PlayerTrack> nextUpTracks = new ArrayList<>();
     private final List<PlayerTrack> originalQueueOrder = new ArrayList<>();
+    @Nullable
+    private List<PlayerTrack> pendingOriginalQueueOrder;
     private static final int MAX_GLOBAL_HISTORY = 50;
     private final java.util.ArrayDeque<PlayerTrack> globalPlaybackHistory = new java.util.ArrayDeque<>();
 
@@ -437,7 +440,8 @@ public class SongPlayerFragment extends Fragment {
                     persistPlaybackSnapshot(false);
                     updateMediaSessionState();
                 }
-            } catch (Exception ignored) {
+            } catch (Exception e) {
+                Log.w(TAG, "Progress ticker error", e);
             }
 
             localProgressHandler.postDelayed(this, 200L);
@@ -651,7 +655,8 @@ public class SongPlayerFragment extends Fragment {
                                 PlaybackLoadingBus.notifyLoadingStarted(loadedVideoId);
                             }
                             localExoMediaPlayer.seekTo(currentSeconds * 1000);
-                        } catch (Exception ignored) {
+                        } catch (Exception e) {
+                            Log.w(TAG, "Seek failed", e);
                         }
                     }
                     if (isPlaying) {
@@ -717,8 +722,15 @@ public class SongPlayerFragment extends Fragment {
                 }
                 getView().setVisibility(View.VISIBLE);
             }
-            // Reparent video surface back to hero
-            videoRouter.onPlayerVisible();
+            // Reparent video surface back to hero (delay if mini-player is still animating out)
+            MainActivity ma = (getActivity() instanceof MainActivity) ? (MainActivity) getActivity() : null;
+            GlobalMiniPlayerController miniCtrl = (ma != null) ? ma.getGlobalMiniPlayer() : null;
+            if (miniCtrl != null && miniCtrl.isAnimatingOut()) {
+                View root = getView();
+                if (root != null) root.postDelayed(() -> videoRouter.onPlayerVisible(), 260);
+            } else {
+                videoRouter.onPlayerVisible();
+            }
             // ✅ Restart ticker when visible if playing
             if (isPlaying) {
                 startLocalProgressTicker();
@@ -767,7 +779,8 @@ public class SongPlayerFragment extends Fragment {
             boolean alreadyPlaying = false;
             try {
                 alreadyPlaying = localExoMediaPlayer.isPlaying();
-            } catch (Exception ignored) {
+            } catch (Exception e) {
+                Log.w(TAG, "isPlaying() check failed", e);
             }
 
             if (alreadyPlaying) {
@@ -892,7 +905,8 @@ public class SongPlayerFragment extends Fragment {
                     try {
                         localExoMediaPlayer.pause();
                         stopLocalProgressTicker();
-                    } catch (Exception ignored) {
+                    } catch (Exception e) {
+                        Log.w(TAG, "Media session pause failed", e);
                     }
                 }
                 isPlaying = false;
@@ -929,7 +943,8 @@ public class SongPlayerFragment extends Fragment {
                             PlaybackLoadingBus.notifyLoadingStarted(loadedVideoId);
                         }
                         localExoMediaPlayer.seekTo(currentSeconds * 1000);
-                    } catch (Exception ignored) {
+                    } catch (Exception e) {
+                        Log.w(TAG, "Media session seek failed", e);
                     }
                 }
                 if (isPlaying) {
@@ -1196,7 +1211,8 @@ public class SongPlayerFragment extends Fragment {
                 pauseRequestedByUser = true;
                 try {
                     localExoMediaPlayer.pause();
-                } catch (Exception ignored) {
+                } catch (Exception e) {
+                    Log.w(TAG, "Offline pause failed", e);
                 }
                 stopLocalProgressTicker();
                 isPlaying = false;
@@ -1225,7 +1241,8 @@ public class SongPlayerFragment extends Fragment {
             if (localExoMediaPlayer != null) {
                 try {
                     localExoMediaPlayer.pause();
-                } catch (Exception ignored) {
+                } catch (Exception e) {
+                    Log.w(TAG, "Online pause failed", e);
                 }
             }
             stopLocalProgressTicker();
@@ -1693,7 +1710,9 @@ public class SongPlayerFragment extends Fragment {
                             if (playlist instanceof PlaylistDetailFragment) {
                                 ((PlaylistDetailFragment) playlist).externalRefreshOfflineState();
                             }
-                        } catch (Exception ignored) {}
+                        } catch (Exception e) {
+                            Log.w(TAG, "Failed to refresh playlist offline state", e);
+                        }
                     });
                 } else {
                     OfflineAudioStore.markOfflineAudioState(normalized, false);
@@ -1955,7 +1974,8 @@ public class SongPlayerFragment extends Fragment {
         // Re-affirm EQ on the global session (session 0) — no per-player sessionId needed.
         try {
             AudioEffectsService.sendApply(playbackAppContext);
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to re-affirm EQ", e);
         }
 
         // Attach video surface
@@ -2222,11 +2242,13 @@ public class SongPlayerFragment extends Fragment {
         }
         try {
             player.stop();
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to stop player", e);
         }
         try {
             player.release();
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to release player", e);
         }
     }
 
@@ -3012,7 +3034,8 @@ public class SongPlayerFragment extends Fragment {
                             }
                         }
                     });
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to observe download work", e);
         }
     }
 
@@ -3476,7 +3499,8 @@ public class SongPlayerFragment extends Fragment {
             playerStatePrefs.edit()
                     .putString(PREF_SOCIAL_STATS_PREFIX + videoId, json.toString())
                     .apply();
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to persist social stats", e);
         }
     }
 
@@ -3661,6 +3685,9 @@ public class SongPlayerFragment extends Fragment {
             return;
         }
 
+        HorizontalScrollView hsActions = root.findViewById(R.id.hsSocialActions);
+        if (hsActions != null) hsActions.scrollTo(0, 0);
+
         playerEnterAnimationRunning = true;
 
         // Use cached height or resources fallback for first frame
@@ -3737,7 +3764,8 @@ public class SongPlayerFragment extends Fragment {
         if (isHidden() && localExoMediaPlayer != null) {
             try {
                 return Math.max(0, localExoMediaPlayer.getCurrentPosition() / 1000);
-            } catch (Exception ignored) {
+            } catch (Exception e) {
+                Log.w(TAG, "getCurrentPosition failed", e);
             }
         }
         return Math.max(0, currentSeconds);
@@ -3748,7 +3776,8 @@ public class SongPlayerFragment extends Fragment {
             try {
                 int durationMs = localExoMediaPlayer.getDuration();
                 if (durationMs > 0) return Math.max(1, durationMs / 1000);
-            } catch (Exception ignored) {
+            } catch (Exception e) {
+                Log.w(TAG, "getDuration failed", e);
             }
         }
         return Math.max(1, totalSeconds);
@@ -4324,7 +4353,9 @@ public class SongPlayerFragment extends Fragment {
                                    .putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, iconBitmap)
                                    .putBitmap(MediaMetadataCompat.METADATA_KEY_DISPLAY_ICON, iconBitmap);
                 }
-            } catch (Exception ignored) {}
+            } catch (Exception e) {
+                Log.w(TAG, "Failed to load fallback icon for media session", e);
+            }
         }
 
         if (!TextUtils.isEmpty(track.imageUrl)) {
@@ -4468,7 +4499,13 @@ public class SongPlayerFragment extends Fragment {
             currentIndex = 0;
         }
 
-        cacheOriginalQueueOrder();
+        if (pendingOriginalQueueOrder != null && !pendingOriginalQueueOrder.isEmpty()) {
+            originalQueueOrder.clear();
+            originalQueueOrder.addAll(pendingOriginalQueueOrder);
+            pendingOriginalQueueOrder = null;
+        } else {
+            cacheOriginalQueueOrder();
+        }
         if (shuffleEnabled) {
             currentIndex = Math.max(0, Math.min(currentIndex, tracks.size() - 1));
             randomizeQueueFromCurrentTrack();
@@ -4478,6 +4515,17 @@ public class SongPlayerFragment extends Fragment {
     private void cacheOriginalQueueOrder() {
         originalQueueOrder.clear();
         originalQueueOrder.addAll(tracks);
+    }
+
+    public void externalSetOriginalQueueOrder(@NonNull List<PlayerTrack> original) {
+        if (original.isEmpty()) return;
+        // If tracks are already loaded, apply directly; otherwise store for hydrateTracksFromArgs
+        if (!tracks.isEmpty()) {
+            originalQueueOrder.clear();
+            originalQueueOrder.addAll(original);
+        } else {
+            pendingOriginalQueueOrder = new ArrayList<>(original);
+        }
     }
 
     private void randomizeQueueFromCurrentTrack() {
@@ -4588,6 +4636,8 @@ public class SongPlayerFragment extends Fragment {
         }
 
         final List<PlayerTrack> tracksCopy = new ArrayList<>(tracks);
+        final List<PlayerTrack> originalCopy = shuffleEnabled && !originalQueueOrder.isEmpty()
+                ? new ArrayList<>(originalQueueOrder) : null;
         final int index = currentIndex;
         final int current = externalGetCurrentSeconds();
         final int total = externalGetTotalSeconds();
@@ -4607,6 +4657,20 @@ public class SongPlayerFragment extends Fragment {
                     ));
                 }
 
+                List<PlaybackHistoryStore.QueueTrack> origQueue = null;
+                if (originalCopy != null) {
+                    origQueue = new ArrayList<>(originalCopy.size());
+                    for (PlayerTrack track : originalCopy) {
+                        origQueue.add(new PlaybackHistoryStore.QueueTrack(
+                                track.videoId,
+                                track.title,
+                                track.artist,
+                                track.duration,
+                                track.imageUrl
+                        ));
+                    }
+                }
+
                 int safeIndex = Math.max(0, Math.min(index, Math.max(0, tracksCopy.size() - 1)));
                 PlaybackHistoryStore.save(
                         context,
@@ -4615,7 +4679,8 @@ public class SongPlayerFragment extends Fragment {
                         Math.max(0, current),
                         Math.max(1, total),
                         effectivelyPlaying,
-                        synchronous
+                        synchronous,
+                        origQueue
                 );
 
                 // Also persist fallback prefs so the mini-player can restore
@@ -4624,7 +4689,7 @@ public class SongPlayerFragment extends Fragment {
                 PlayerTrack currentTrack = (safeIndex >= 0 && safeIndex < tracksCopy.size())
                         ? tracksCopy.get(safeIndex) : null;
                 if (currentTrack != null && !TextUtils.isEmpty(currentTrack.videoId)) {
-                    context.getSharedPreferences("player_state", Activity.MODE_PRIVATE)
+                    context.getSharedPreferences(AppConstants.PREFS_PLAYER_STATE, Activity.MODE_PRIVATE)
                             .edit()
                             .putString("stream_last_video_id", currentTrack.videoId)
                             .putString("stream_last_track_title", currentTrack.title != null ? currentTrack.title : "")
@@ -4637,9 +4702,11 @@ public class SongPlayerFragment extends Fragment {
                 // Notify listeners that the playback snapshot was persisted
                 try {
                     PlaybackEventBus.notifyPlaybackSnapshotUpdated();
-                } catch (Exception ignored) {
+                } catch (Exception e) {
+                    Log.w(TAG, "Event bus notification failed", e);
                 }
-            } catch (Exception ignored) {
+            } catch (Exception e) {
+                Log.w(TAG, "persistPlaybackSnapshot task failed", e);
             }
         };
 
@@ -4943,10 +5010,18 @@ public class SongPlayerFragment extends Fragment {
                 root,
                 android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
                 android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
-                true);
-        popup.setElevation(16 * density);
+                false);
+        popup.setFocusable(false);
         popup.setOutsideTouchable(true);
         popup.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(android.graphics.Color.TRANSPARENT));
+        popup.setElevation(16 * density);
+        popup.setTouchInterceptor((v, event) -> {
+            if (event.getActionMasked() == MotionEvent.ACTION_OUTSIDE) {
+                popup.dismiss();
+                return true;
+            }
+            return false;
+        });
 
         for (int i = 0; i < labels.length; i++) {
             android.widget.LinearLayout row = new android.widget.LinearLayout(requireContext());
@@ -5022,8 +5097,15 @@ public class SongPlayerFragment extends Fragment {
         String gKey = CustomPlaylistsStore.getLastSavedPlaylistKey(requireContext());
         String gName = CustomPlaylistsStore.getLastSavedPlaylistName(requireContext());
         if (gKey != null && gName != null) {
-            addTrackToPlaylistByKey(gKey, current);
-            showSavedInPlaylistBarPlayer(current, gKey, gName);
+            if (isTrackInPlaylist(requireContext(), current.videoId, gKey)) {
+                showPlayerActionBar("Ya está en " + gName, "Cambiar", v -> {
+                    CustomPlaylistsStore.clearLastSavedPlaylist(requireContext());
+                    showSaveToPlaylistSheet(current, null);
+                });
+            } else {
+                addTrackToPlaylistByKey(gKey, current);
+                showSavedInPlaylistBarPlayer(current, gKey, gName);
+            }
             return;
         }
         showSaveToPlaylistSheet(current, null);
@@ -5046,11 +5128,14 @@ public class SongPlayerFragment extends Fragment {
 
         sheet.findViewById(R.id.btnSaveCancel).setOnClickListener(v -> saveDialog.dismiss());
         sheet.findViewById(R.id.btnSaveConfirm).setOnClickListener(v -> {
+            String addedKey = lastAddedKey[0];
+            String addedName = lastAddedName[0];
+            boolean removed = didRemove[0];
             saveDialog.dismiss();
-            if (lastAddedKey[0] != null && lastAddedName[0] != null) {
-                CustomPlaylistsStore.setLastSavedPlaylist(requireContext(), lastAddedKey[0], lastAddedName[0]);
-                showSavedInPlaylistBarPlayer(track, lastAddedKey[0], lastAddedName[0]);
-            } else if (didRemove[0]) {
+            if (addedKey != null && addedName != null) {
+                CustomPlaylistsStore.setLastSavedPlaylist(requireContext(), addedKey, addedName);
+                showSavedInPlaylistBarPlayer(track, addedKey, addedName);
+            } else if (removed) {
                 showRemovedFromPlaylistBarPlayer();
             }
         });
@@ -5060,6 +5145,20 @@ public class SongPlayerFragment extends Fragment {
 
         float density = ctx.getResources().getDisplayMetrics().density;
         int thumbSizePx = (int) (48 * density);
+
+        // Cap scroll area so footer buttons remain visible
+        View svScroll = sheet.findViewById(R.id.svSavePlaylistScroll);
+        if (svScroll != null) {
+            int maxH = (int) (320 * density);
+            svScroll.getLayoutParams().height = android.view.ViewGroup.LayoutParams.WRAP_CONTENT;
+            svScroll.post(() -> {
+                if (svScroll.getHeight() > maxH) {
+                    android.view.ViewGroup.LayoutParams lp = svScroll.getLayoutParams();
+                    lp.height = maxH;
+                    svScroll.setLayoutParams(lp);
+                }
+            });
+        }
 
         // Favoritos
         java.util.List<FavoritesPlaylistStore.FavoriteTrack> favs = FavoritesPlaylistStore.loadFavorites(ctx);
@@ -5106,6 +5205,51 @@ public class SongPlayerFragment extends Fragment {
                 }
                 int count = getPlaylistTrackCount(ctx, FavoritesPlaylistStore.PLAYLIST_ID);
                 tvCount.setText(count + " pistas");
+            });
+            llList.addView(row);
+        }
+
+        // "Música que te gustó" row (local mirror, insert at top)
+        {
+            String likedPid = YouTubeMusicService.SPECIAL_LIKED_VIDEOS_ID;
+            String likedMirrorKey = CustomPlaylistsStore.YT_MIRROR_PREFIX + likedPid;
+            YouTubeMusicService.TrackResult likedCached = MusicPlayerFragment.getLikedPlaylistFromCache();
+            View row = LayoutInflater.from(ctx).inflate(R.layout.item_save_playlist_row, llList, false);
+            ImageView ivThumb = row.findViewById(R.id.ivSavePlaylistThumb);
+            android.widget.TextView tvName = row.findViewById(R.id.tvSavePlaylistName);
+            android.widget.TextView tvCount = row.findViewById(R.id.tvSavePlaylistCount);
+            ImageView ivCheck = row.findViewById(R.id.ivSaveCheck);
+            tvName.setText("Música que te gustó");
+            tvCount.setText(likedCached != null ? likedCached.subtitle : "Playlist");
+            ivThumb.setBackgroundResource(R.drawable.bg_music_liked_gradient);
+            ivThumb.setImageResource(R.drawable.ic_thumb_up_liked);
+            ivThumb.setScaleType(ImageView.ScaleType.CENTER);
+            ivThumb.setColorFilter(android.graphics.Color.WHITE, android.graphics.PorterDuff.Mode.SRC_IN);
+            boolean isIn = CustomPlaylistsStore.INSTANCE.isTrackInYtMirror(ctx, likedPid, track.videoId);
+            if (ivCheck != null) ivCheck.setVisibility(isIn ? View.VISIBLE : View.GONE);
+            final boolean[] checked = {isIn};
+            row.setOnClickListener(v -> {
+                if (checked[0]) {
+                    CustomPlaylistsStore.INSTANCE.removeTrackFromYtMirror(ctx, likedPid, track.videoId);
+                    checked[0] = false;
+                    didRemove[0] = true;
+                    if (ivCheck != null) ivCheck.setVisibility(View.GONE);
+                    if (likedMirrorKey.equals(lastAddedKey[0])) {
+                        lastAddedKey[0] = null;
+                        lastAddedName[0] = null;
+                    }
+                } else {
+                    String tTitle = TextUtils.isEmpty(track.title) ? "Tema" : track.title;
+                    String tArtist = track.artist == null ? "" : track.artist;
+                    String tDuration = track.duration == null ? "" : track.duration;
+                    String tImage = track.imageUrl == null ? "" : track.imageUrl;
+                    CustomPlaylistsStore.INSTANCE.addTrackToYtMirror(ctx, likedPid, track.videoId,
+                            tTitle, tArtist, tDuration, tImage, true);
+                    checked[0] = true;
+                    if (ivCheck != null) ivCheck.setVisibility(View.VISIBLE);
+                    lastAddedKey[0] = likedMirrorKey;
+                    lastAddedName[0] = "Música que te gustó";
+                }
             });
             llList.addView(row);
         }
@@ -5163,8 +5307,77 @@ public class SongPlayerFragment extends Fragment {
             llList.addView(row);
         }
 
+        // YouTube library playlists (local mirror)
+        java.util.List<YouTubeMusicService.TrackResult> ytPlaylists = MusicPlayerFragment.getYouTubeLibraryPlaylists();
+        for (YouTubeMusicService.TrackResult ytItem : ytPlaylists) {
+            String ytPlaylistId = ytItem.contentId == null ? "" : ytItem.contentId.trim();
+            if (ytPlaylistId.isEmpty()) continue;
+            String ytMirrorKey = CustomPlaylistsStore.YT_MIRROR_PREFIX + ytPlaylistId;
+            String ytFallbackThumb = ytItem.thumbnailUrl == null ? "" : ytItem.thumbnailUrl.trim();
+
+            View row = LayoutInflater.from(ctx).inflate(R.layout.item_save_playlist_row, llList, false);
+            ImageView ivThumb = row.findViewById(R.id.ivSavePlaylistThumb);
+            android.widget.TextView tvName = row.findViewById(R.id.tvSavePlaylistName);
+            android.widget.TextView tvCount = row.findViewById(R.id.tvSavePlaylistCount);
+            ImageView ivCheck = row.findViewById(R.id.ivSaveCheck);
+            tvName.setText(ytItem.title == null ? "" : ytItem.title);
+            tvCount.setText(ytItem.subtitle == null ? "Playlist" : ytItem.subtitle);
+            java.util.List<String> ytUrls = loadPersistedGridUrls(ctx, ytPlaylistId);
+            if (ytUrls.size() < 4) {
+                ytUrls = new ArrayList<>();
+                java.util.List<FavoritesPlaylistStore.FavoriteTrack> ytMirrorTracks =
+                        CustomPlaylistsStore.INSTANCE.getYtMirrorTracks(ctx, ytPlaylistId);
+                for (FavoritesPlaylistStore.FavoriteTrack t : ytMirrorTracks) {
+                    if (!TextUtils.isEmpty(t.imageUrl)) {
+                        if (!ytUrls.contains(t.imageUrl)) ytUrls.add(t.imageUrl);
+                        if (ytUrls.size() >= 4) break;
+                    }
+                }
+            }
+            if (ytUrls.size() >= 4) {
+                PlaylistGridArtLoader.load(ivThumb, ytUrls, thumbSizePx);
+            } else if (!ytUrls.isEmpty()) {
+                Glide.with(this).load(ytUrls.get(0)).centerCrop().into(ivThumb);
+            } else if (!ytFallbackThumb.isEmpty()) {
+                Glide.with(this).load(ytFallbackThumb).centerCrop().into(ivThumb);
+            }
+            boolean isIn = CustomPlaylistsStore.INSTANCE.isTrackInYtMirror(ctx, ytPlaylistId, track.videoId);
+            if (ivCheck != null) ivCheck.setVisibility(isIn ? View.VISIBLE : View.GONE);
+            final boolean[] checked = {isIn};
+            final String ytPid = ytPlaylistId;
+            final String ytPName = ytItem.title == null ? "" : ytItem.title;
+            row.setOnClickListener(v -> {
+                if (checked[0]) {
+                    CustomPlaylistsStore.INSTANCE.removeTrackFromYtMirror(ctx, ytPid, track.videoId);
+                    checked[0] = false;
+                    didRemove[0] = true;
+                    if (ivCheck != null) ivCheck.setVisibility(View.GONE);
+                    if (ytMirrorKey.equals(lastAddedKey[0])) {
+                        lastAddedKey[0] = null;
+                        lastAddedName[0] = null;
+                    }
+                } else {
+                    String tTitle = TextUtils.isEmpty(track.title) ? "Tema" : track.title;
+                    String tArtist = track.artist == null ? "" : track.artist;
+                    String tDuration = track.duration == null ? "" : track.duration;
+                    String tImage = track.imageUrl == null ? "" : track.imageUrl;
+                    CustomPlaylistsStore.INSTANCE.addTrackToYtMirror(ctx, ytPid, track.videoId,
+                            tTitle, tArtist, tDuration, tImage, false);
+                    checked[0] = true;
+                    if (ivCheck != null) ivCheck.setVisibility(View.VISIBLE);
+                    lastAddedKey[0] = ytMirrorKey;
+                    lastAddedName[0] = ytPName;
+                }
+            });
+            llList.addView(row);
+        }
+
         saveDialog.getBehavior().setSkipCollapsed(true);
         saveDialog.getBehavior().setFitToContents(true);
+        try { saveDialog.getBehavior().setHideFriction(0.5f); } catch (Throwable ignored) {}
+        saveDialog.getBehavior().setState(BottomSheetBehavior.STATE_EXPANDED);
+
+        sheet.setAlpha(0f);
         saveDialog.setOnShowListener(d -> {
             View bottomSheet = ((BottomSheetDialog) d)
                     .findViewById(com.google.android.material.R.id.design_bottom_sheet);
@@ -5173,8 +5386,27 @@ public class SongPlayerFragment extends Fragment {
                 if (sheetParent != null) sheetParent.setBackgroundColor(android.graphics.Color.TRANSPARENT);
                 bottomSheet.setBackgroundResource(android.R.color.transparent);
             }
+            sheet.post(() -> sheet.animate().alpha(1f).setDuration(150L).start());
         });
         saveDialog.show();
+    }
+
+    @NonNull
+    private static java.util.List<String> loadPersistedGridUrls(@NonNull Context ctx, @NonNull String playlistId) {
+        try {
+            String raw = ctx.getApplicationContext()
+                    .getSharedPreferences(AppConstants.PREFS_STREAMING_CACHE, android.app.Activity.MODE_PRIVATE)
+                    .getString("playlist_grid_urls_" + playlistId, "");
+            if (TextUtils.isEmpty(raw)) return java.util.Collections.emptyList();
+            String[] parts = raw.split("\\n");
+            java.util.List<String> result = new ArrayList<>(parts.length);
+            for (String part : parts) {
+                if (!TextUtils.isEmpty(part)) result.add(part);
+            }
+            return result;
+        } catch (Exception e) {
+            return java.util.Collections.emptyList();
+        }
     }
 
     private boolean isTrackInPlaylist(@NonNull Context ctx, @NonNull String videoId, @NonNull String playlistKey) {
@@ -5188,6 +5420,9 @@ public class SongPlayerFragment extends Fragment {
             for (FavoritesPlaylistStore.FavoriteTrack t : tracks) {
                 if (videoId.equals(t.videoId)) return true;
             }
+        } else if (playlistKey.startsWith(CustomPlaylistsStore.YT_MIRROR_PREFIX)) {
+            String pid = playlistKey.substring(CustomPlaylistsStore.YT_MIRROR_PREFIX.length());
+            return CustomPlaylistsStore.INSTANCE.isTrackInYtMirror(ctx, pid, videoId);
         }
         return false;
     }
@@ -5198,6 +5433,9 @@ public class SongPlayerFragment extends Fragment {
         } else if (playlistKey.startsWith(CustomPlaylistsStore.CUSTOM_PLAYLIST_PREFIX)) {
             String name = playlistKey.substring(CustomPlaylistsStore.CUSTOM_PLAYLIST_PREFIX.length());
             return CustomPlaylistsStore.INSTANCE.getTracksFromPlaylist(ctx, name).size();
+        } else if (playlistKey.startsWith(CustomPlaylistsStore.YT_MIRROR_PREFIX)) {
+            String pid = playlistKey.substring(CustomPlaylistsStore.YT_MIRROR_PREFIX.length());
+            return CustomPlaylistsStore.INSTANCE.getYtMirrorTracks(ctx, pid).size();
         }
         return 0;
     }
@@ -5215,6 +5453,10 @@ public class SongPlayerFragment extends Fragment {
             String name = playlistKey.substring(CustomPlaylistsStore.CUSTOM_PLAYLIST_PREFIX.length());
             CustomPlaylistsStore.INSTANCE.addTrackToPlaylist(requireContext(), name,
                     track.videoId, title, artist, duration, imageUrl);
+        } else if (playlistKey.startsWith(CustomPlaylistsStore.YT_MIRROR_PREFIX)) {
+            String pid = playlistKey.substring(CustomPlaylistsStore.YT_MIRROR_PREFIX.length());
+            CustomPlaylistsStore.INSTANCE.addTrackToYtMirror(requireContext(), pid,
+                    track.videoId, title, artist, duration, imageUrl, false);
         }
         maybeEnqueueOfflineDownloadForTrack(playlistKey, track.videoId, title, artist, duration);
     }
@@ -5224,7 +5466,7 @@ public class SongPlayerFragment extends Fragment {
         if (!isAdded() || TextUtils.isEmpty(videoId)) return;
         // Resolve actual playlistId (for custom playlists the key IS the id used in prefs)
         String playlistId = playlistKey;
-        android.content.SharedPreferences cachePrefs = requireContext().getSharedPreferences("streaming_cache", android.app.Activity.MODE_PRIVATE);
+        android.content.SharedPreferences cachePrefs = requireContext().getSharedPreferences(AppConstants.PREFS_STREAMING_CACHE, android.app.Activity.MODE_PRIVATE);
         boolean offlineAuto = cachePrefs.getBoolean("playlist_offline_auto_" + playlistId, false);
         if (!offlineAuto) return;
         if (OfflineAudioStore.hasOfflineAudio(requireContext(), videoId)) return;
@@ -5252,7 +5494,9 @@ public class SongPlayerFragment extends Fragment {
                     .addTag("offline_add_track_" + videoId)
                     .build();
             androidx.work.WorkManager.getInstance(requireContext()).enqueue(request);
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to enqueue offline download", e);
+        }
     }
 
     private void removeTrackFromPlaylistByKey(@NonNull String playlistKey, @NonNull String videoId) {
@@ -5262,6 +5506,9 @@ public class SongPlayerFragment extends Fragment {
         } else if (playlistKey.startsWith(CustomPlaylistsStore.CUSTOM_PLAYLIST_PREFIX)) {
             String name = playlistKey.substring(CustomPlaylistsStore.CUSTOM_PLAYLIST_PREFIX.length());
             CustomPlaylistsStore.INSTANCE.removeTrackFromPlaylist(requireContext(), name, videoId);
+        } else if (playlistKey.startsWith(CustomPlaylistsStore.YT_MIRROR_PREFIX)) {
+            String pid = playlistKey.substring(CustomPlaylistsStore.YT_MIRROR_PREFIX.length());
+            CustomPlaylistsStore.INSTANCE.removeTrackFromYtMirror(requireContext(), pid, videoId);
         }
     }
 
@@ -5292,14 +5539,14 @@ public class SongPlayerFragment extends Fragment {
         bar.setGravity(android.view.Gravity.CENTER_VERTICAL);
         bar.setBackgroundColor(android.graphics.Color.parseColor("#FF1E1E1E"));
         int hPad = (int) (16 * density);
-        int vPad = (int) (12 * density);
+        int vPad = (int) (14 * density);
         bar.setPadding(hPad, vPad, hPad, vPad);
         bar.setElevation(8 * density);
 
         TextView tvMsg = new TextView(requireContext());
         tvMsg.setText(message);
         tvMsg.setTextColor(android.graphics.Color.WHITE);
-        tvMsg.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 14);
+        tvMsg.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 15);
         tvMsg.setTypeface(null, android.graphics.Typeface.NORMAL);
         tvMsg.setMaxLines(1);
         tvMsg.setEllipsize(android.text.TextUtils.TruncateAt.END);
@@ -5311,7 +5558,7 @@ public class SongPlayerFragment extends Fragment {
         TextView btnAction = new TextView(requireContext());
         btnAction.setText(actionLabel);
         btnAction.setTextColor(android.graphics.Color.parseColor("#8AB4F8"));
-        btnAction.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 14);
+        btnAction.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 15);
         btnAction.setTypeface(null, android.graphics.Typeface.BOLD);
         btnAction.setPadding((int) (16 * density), 0, 0, 0);
         btnAction.setOnClickListener(v -> {
@@ -5342,6 +5589,8 @@ public class SongPlayerFragment extends Fragment {
 
     private void showQueueBottomSheet() {
         if (!isAdded()) return;
+
+        nextUpTracks.clear();
 
         BottomSheetDialog bottomSheetDialog = new BottomSheetDialog(requireContext());
         View bsv = getLayoutInflater().inflate(R.layout.bottom_sheet_player_queue, null);
@@ -5389,6 +5638,9 @@ public class SongPlayerFragment extends Fragment {
         
         rvQueue.setAdapter(nextUpAdapter);
 
+        // Pre-hide the sheet content to prevent ghost flash on second open
+        bsv.setAlpha(0f);
+
         bottomSheetDialog.setOnShowListener(dialog -> {
             BottomSheetDialog d = (BottomSheetDialog) dialog;
             View bottomSheet = d.findViewById(com.google.android.material.R.id.design_bottom_sheet);
@@ -5396,20 +5648,13 @@ public class SongPlayerFragment extends Fragment {
                 bottomSheet.setBackgroundResource(android.R.color.transparent);
                 BottomSheetBehavior<View> behavior = BottomSheetBehavior.from(bottomSheet);
                 behavior.setSkipCollapsed(true);
-                // Aumentar la fricción para que requiera deslizar más abajo para cerrarlo (ej. 50%)
                 try {
                     behavior.setHideFriction(0.5f);
                 } catch (Throwable ignored) {
-                    // Ignorar si la versión de Material Design no soporta setHideFriction
                 }
-                bottomSheet.setAlpha(0f);
-                bottomSheet.setVisibility(View.INVISIBLE);
+                behavior.setState(BottomSheetBehavior.STATE_EXPANDED);
                 bottomSheet.post(() -> {
-                    behavior.setState(BottomSheetBehavior.STATE_EXPANDED);
-                    bottomSheet.post(() -> {
-                        bottomSheet.setVisibility(View.VISIBLE);
-                        bottomSheet.animate().alpha(1f).setDuration(120L).start();
-                    });
+                    bsv.animate().alpha(1f).setDuration(150L).start();
                 });
             }
         });
@@ -5446,7 +5691,12 @@ public class SongPlayerFragment extends Fragment {
 
         nextUpItemTouchHelper = new ItemTouchHelper(dragCallback);
         nextUpItemTouchHelper.attachToRecyclerView(rvQueue);
-        
+
+        bottomSheetDialog.setOnDismissListener(dialog -> {
+            nextUpAdapter = null;
+            nextUpItemTouchHelper = null;
+        });
+
         bottomSheetDialog.show();
 
         // Queue computation is O(n) on an in-memory ArrayList — no need for a background thread
@@ -5607,7 +5857,8 @@ public class SongPlayerFragment extends Fragment {
         videoRouter.onPlayerReleased();
         try {
             localExoMediaPlayer.release();
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to release local player", e);
         }
         localExoMediaPlayer = null;
         usingOfflineSource = false;

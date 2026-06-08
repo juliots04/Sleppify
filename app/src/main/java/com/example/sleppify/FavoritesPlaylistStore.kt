@@ -3,6 +3,7 @@ package com.example.sleppify
 import android.app.Activity
 import android.content.Context
 import android.content.SharedPreferences
+import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Locale
@@ -11,7 +12,7 @@ object FavoritesPlaylistStore {
     const val PLAYLIST_ID = "sleppify_favorites"
     const val PLAYLIST_TITLE = "Favoritos"
 
-    private const val PREFS_STREAMING_CACHE = "streaming_cache"
+    private val PREFS_STREAMING_CACHE = AppConstants.PREFS_STREAMING_CACHE
     private const val PREF_TRACKS_UPDATED_AT_PREFIX = "playlist_tracks_updated_at_"
     private const val PREF_TRACKS_DATA_PREFIX = "playlist_tracks_data_"
     private const val PREF_TRACKS_FULL_CACHE_PREFIX = "playlist_tracks_cache_full_"
@@ -58,7 +59,9 @@ object FavoritesPlaylistStore {
                     val vid = safe(array.optJSONObject(i)?.optString("videoId", ""))
                     if (vid.isNotEmpty()) idSet.add(vid)
                 }
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                Log.w("FavPlaylistStore", "Failed to parse liked music IDs", e)
+            }
         }
         synchronized(CACHE_LOCK) { likedMusicIdSet = idSet }
         return idSet.contains(target)
@@ -235,7 +238,8 @@ object FavoritesPlaylistStore {
                 .putBoolean(PREF_PLAYLIST_OFFLINE_COMPLETE_PREFIX + PLAYLIST_ID, false)
                 .putString(PREF_TRACKS_DATA_PREFIX + PLAYLIST_ID, array.toString())
                 .apply()
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            Log.w("FavPlaylistStore", "Failed to persist liked music tracks", e)
         }
     }
 

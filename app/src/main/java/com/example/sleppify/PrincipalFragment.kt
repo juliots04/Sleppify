@@ -10,6 +10,7 @@ import android.os.Looper
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.util.Log
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -38,6 +39,7 @@ import org.json.JSONObject
 class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
     companion object {
+        private const val TAG = "PrincipalFragment"
         private const val TAG_SONG_PLAYER = "song_player"
         private const val PREFS_PLAYER_STATE = "player_state"
         private const val PREF_LAST_YOUTUBE_WEB_COOKIE = "stream_last_youtube_web_cookie"
@@ -223,7 +225,9 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             try {
                 val brandFont: Typeface? = ResourcesCompat.getFont(requireContext(), R.font.manrope_variable)
                 if (brandFont != null) tv.typeface = brandFont
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                Log.w(TAG, "Unexpected error", e)
+            }
             val density = resources.displayMetrics.density
             val iconSize = (26 * density).toInt()
             val icon = ContextCompat.getDrawable(requireContext(), R.mipmap.ic_launcher)
@@ -262,7 +266,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
     fun refreshFragHeaderProfilePhoto() {
         if (!isAdded || btnFragProfilePhoto == null || btnFragSignIn == null) return
-        val prefs = requireContext().getSharedPreferences("streaming_cache", Activity.MODE_PRIVATE)
+        val prefs = requireContext().getSharedPreferences(AppConstants.PREFS_STREAMING_CACHE, Activity.MODE_PRIVATE)
         val cachedUrl = prefs.getString("cached_google_profile_photo_url", "") ?: ""
         var photoUri: Uri? = FirebaseAuth.getInstance().currentUser?.photoUrl
         if (photoUri == null && cachedUrl.isNotEmpty()) {
@@ -365,7 +369,9 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 existingIds.add(fav.videoId)
                 existing.add(PlayCountStore.PlayCountEntry(fav.videoId, fav.title, fav.artist, fav.imageUrl, FavoritesPlaylistStore.PLAYLIST_ID, "Favoritos", 0, 0L))
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w(TAG, "Unexpected error", e)
+        }
     }
 
     // ========== Mixes ==========
@@ -420,7 +426,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         if (!isAdded || ivShortcutProfilePhoto == null) return
         var photoUri: Uri? = FirebaseAuth.getInstance().currentUser?.photoUrl
         if (photoUri == null) {
-            val cached = requireContext().getSharedPreferences("streaming_cache", Context.MODE_PRIVATE)
+            val cached = requireContext().getSharedPreferences(AppConstants.PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
                 .getString("cached_google_profile_photo_url", "") ?: ""
             if (cached.isNotEmpty()) photoUri = Uri.parse(cached)
         }
@@ -472,9 +478,13 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                         val title = arr.optJSONObject(i)?.optString("title", "")?.trim() ?: ""
                         if (title.isNotEmpty() && title !in topSet) extraTitles.add(title)
                     }
-                } catch (_: Exception) {}
+                } catch (e: Exception) {
+                    Log.w(TAG, "Unexpected error", e)
+                }
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w(TAG, "Unexpected error", e)
+        }
 
         val selected = mutableListOf<String>()
         topTitles.shuffle()
@@ -701,7 +711,9 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                     if (imgUrl.isNotEmpty() && seen.add(imgUrl)) urls.add(imgUrl)
                 }
                 if (urls.size >= 4) { playlistGridUrlsCache[playlistId] = urls; return urls }
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                Log.w(TAG, "Unexpected error", e)
+            }
         }
 
         val dbUrls = PlayCountStore.getPlaylistTrackImages(requireContext(), playlistId, 4)
@@ -759,7 +771,9 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 .putString(CACHE_KEY_HOME_MIXES, arr.toString())
                 .putString("home_personal_mixes_data", arrPers.toString())
                 .apply()
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w(TAG, "Unexpected error", e)
+        }
     }
 
     private fun loadCachedMixes() {
@@ -803,7 +817,9 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 tvPersonalMixesLabel?.visibility = if (personalEmpty) View.GONE else View.VISIBLE
                 rvPersonalMixes?.visibility = if (personalEmpty) View.GONE else View.VISIBLE
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w(TAG, "Unexpected error", e)
+        }
     }
 
     // ========== Cache Covers ==========
@@ -824,7 +840,9 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 .edit()
                 .putString("home_covers_data", arr.toString())
                 .apply()
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w(TAG, "Unexpected error", e)
+        }
     }
 
     private fun loadCachedCovers() {
@@ -850,7 +868,9 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 ))
             }
             if (coversResults.isNotEmpty()) updateCoversUi()
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w(TAG, "Unexpected error", e)
+        }
     }
 
     // ========== Adapters ==========

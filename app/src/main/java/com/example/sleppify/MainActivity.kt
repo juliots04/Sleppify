@@ -895,7 +895,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun loadProfilePhoto() {
-        val prefs = getSharedPreferences("streaming_cache", MODE_PRIVATE)
+        val prefs = getSharedPreferences(AppConstants.PREFS_STREAMING_CACHE, MODE_PRIVATE)
         val cachedUrl = prefs.getString("cached_google_profile_photo_url", "") ?: ""
         val photoUri = com.google.firebase.auth.FirebaseAuth.getInstance().currentUser?.photoUrl
             ?: if (cachedUrl.isNotEmpty()) android.net.Uri.parse(cachedUrl) else null
@@ -1593,6 +1593,7 @@ class MainActivity : AppCompatActivity() {
 
         if (player.externalTryEnterMiniMode()) return true
 
+        transferPlayerSavedBarToActivity(player)
         snapshotStreamingScreenBeforeNavigation()
         hideEqualizerImmediately()
         val fallback = resolveSongPlayerReturnTarget(player.externalGetReturnTargetTag())
@@ -1617,7 +1618,7 @@ class MainActivity : AppCompatActivity() {
         val player = supportFragmentManager.findFragmentByTag(TAG_SONG_PLAYER) as? SongPlayerFragment ?: return
         if (!player.isAdded || player.isHidden) return
 
-
+        transferPlayerSavedBarToActivity(player)
 
         hideEqualizerImmediately()
         val fallback = resolveSongPlayerReturnTarget(player.externalGetReturnTargetTag())
@@ -1635,6 +1636,47 @@ class MainActivity : AppCompatActivity() {
         topAppBar.visibility = if (isFragOwnedHeader) View.GONE else View.VISIBLE
         bottomNav.visibility = View.VISIBLE
         PlaybackEventBus.notifyPlaybackSnapshotUpdated()
+    }
+
+    private fun transferPlayerSavedBarToActivity(player: SongPlayerFragment) {
+        val playerRoot = player.view as? android.view.ViewGroup ?: return
+        val bar = playerRoot.findViewWithTag<View>("saved_bar") ?: return
+        bar.handler?.removeCallbacksAndMessages(null)
+        bar.animate().cancel()
+        (bar.parent as? android.view.ViewGroup)?.removeView(bar)
+
+        val activityRoot = findViewById<android.view.ViewGroup>(android.R.id.content) ?: return
+        val density = resources.displayMetrics.density
+        var margin = (80 * density).toInt()
+        val bottomNav = findViewById<View>(R.id.bottomNavigation)
+        if (bottomNav != null && bottomNav.visibility == View.VISIBLE) margin += bottomNav.height
+        val miniPlayer = findViewById<View>(R.id.llGlobalMiniPlayer)
+        if (miniPlayer != null && miniPlayer.visibility == View.VISIBLE) margin += miniPlayer.height
+
+        // Prepare for slide-up entry animation
+        val enterTranslation = 48 * density
+        bar.alpha = 0f
+        bar.translationY = enterTranslation
+        val flp = android.widget.FrameLayout.LayoutParams(
+            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+            android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        flp.gravity = android.view.Gravity.BOTTOM
+        flp.bottomMargin = margin
+
+        val existing = activityRoot.findViewWithTag<View>("saved_bar")
+        if (existing != null) activityRoot.removeView(existing)
+
+        activityRoot.addView(bar, flp)
+        bar.post {
+            bar.animate()
+                .alpha(1f)
+                .translationY(0f)
+                .setDuration(280L)
+                .setInterpolator(android.view.animation.OvershootInterpolator(0.6f))
+                .start()
+        }
+        bar.postDelayed({ TransientBottomBarAnimator.dismiss(bar) }, 3000L)
     }
 
     private fun resolveSongPlayerReturnTarget(preferredTag: String?): Fragment? {

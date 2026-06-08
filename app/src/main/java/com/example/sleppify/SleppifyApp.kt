@@ -49,7 +49,9 @@ class SleppifyApp : Application() {
         // Pre-warm Glide (fast, recommended on main thread)
         try {
             com.bumptech.glide.Glide.get(this)
-        } catch (e: Exception) {}
+        } catch (e: Exception) {
+            android.util.Log.w("SleppifyApp", "Glide pre-warm failed", e)
+        }
 
         // ExoPlayer is now lazy-initialized on first use via ExoPlayerManager.getSharedExoPlayer()
         // — no need to block the main thread here.
@@ -65,7 +67,7 @@ class SleppifyApp : Application() {
     }
 
     private fun hasExistingSession(): Boolean {
-        val prefs = getSharedPreferences("player_state", MODE_PRIVATE)
+        val prefs = getSharedPreferences(AppConstants.PREFS_PLAYER_STATE, MODE_PRIVATE)
         val cookie = prefs.getString("stream_last_youtube_web_cookie", "") ?: ""
         return cookie.trim().isNotEmpty()
     }

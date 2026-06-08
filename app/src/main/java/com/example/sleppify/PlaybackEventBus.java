@@ -24,7 +24,8 @@ public class PlaybackEventBus {
         for (Listener l : listeners) {
             try {
                 l.onPlaybackSnapshotUpdated();
-            } catch (Exception ignored) {
+            } catch (Exception e) {
+                android.util.Log.w("PlaybackEventBus", "Listener error", e);
             }
         }
     }

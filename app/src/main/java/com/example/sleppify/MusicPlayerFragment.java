@@ -82,10 +82,11 @@ import java.text.Normalizer;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Listener {
+    private static final String TAG = "MusicPlayerFragment";
     private static final long LIBRARY_CACHE_TTL_MS = 20 * 60 * 1000L;
     private static final long LIBRARY_REFRESH_MIN_INTERVAL_MS = 90 * 1000L;
     private static final long TOKEN_CACHE_TTL_MS = 45 * 60 * 1000L;
-    private static final String PREFS_PLAYER_STATE = "player_state";
+    private static final String PREFS_PLAYER_STATE = AppConstants.PREFS_PLAYER_STATE;
     private static final String PREF_LAST_PLAYLIST_ID = "stream_last_playlist_id";
     private static final String PREF_LAST_PLAYLIST_TITLE = "stream_last_playlist_title";
     private static final String PREF_LAST_PLAYLIST_SUBTITLE = "stream_last_playlist_subtitle";
@@ -103,7 +104,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     private static final long LIBRARY_INLINE_SEARCH_DEBOUNCE_MS = 320L;
     private static final String TAG_MODULE_MUSIC = "module_music";
     private static final String TAG_STREAMING = "SleppifyStreaming";
-    private static final String PREFS_STREAMING_CACHE = "streaming_cache";
+    private static final String PREFS_STREAMING_CACHE = AppConstants.PREFS_STREAMING_CACHE;
     private static final String PREF_LIBRARY_UPDATED_AT_PREFIX = "library_updated_at_";
     private static final String PREF_LIBRARY_DATA_PREFIX = "library_data_";
     private static final String PREF_TRACKS_UPDATED_AT_PREFIX = "playlist_tracks_updated_at_";
@@ -228,7 +229,8 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                                     .putString(PREF_LIBRARY_DATA_PREFIX + accountKey, array.toString())
                                     .putString(PREF_LAST_STREAMING_ACCOUNT_KEY, accountKey)
                                     .apply();
-                        } catch (Exception ignored) {
+                        } catch (Exception e) {
+                            Log.w(TAG, "Unexpected error", e);
                         }
                         finishStreamingWarmup();
                     }
@@ -257,6 +259,43 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         }
         return value.trim().toLowerCase(Locale.US);
     }
+    /**
+     * Returns a snapshot of YouTube playlists from the library cache,
+     * excluding Liked and Favoritos (those are handled separately).
+     */
+    @NonNull
+    public static List<YouTubeMusicService.TrackResult> getYouTubeLibraryPlaylists() {
+        List<YouTubeMusicService.TrackResult> result = new ArrayList<>();
+        synchronized (LIBRARY_CACHE) {
+            for (YouTubeMusicService.TrackResult item : LIBRARY_CACHE) {
+                if (item == null) continue;
+                String cid = item.contentId == null ? "" : item.contentId.trim();
+                if (cid.isEmpty()) continue;
+                // Skip liked collection and favoritos — they have dedicated rows
+                if (isLikedPlaylistStyle(item)) continue;
+                if (FavoritesPlaylistStore.PLAYLIST_ID.equals(cid)) continue;
+                if (cid.startsWith(CustomPlaylistsStore.CUSTOM_PLAYLIST_PREFIX)) continue;
+                result.add(item);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Returns the cached TrackResult for the liked playlist ("Música que te gustó") from LIBRARY_CACHE,
+     * or null if not available.
+     */
+    @Nullable
+    public static YouTubeMusicService.TrackResult getLikedPlaylistFromCache() {
+        synchronized (LIBRARY_CACHE) {
+            for (YouTubeMusicService.TrackResult item : LIBRARY_CACHE) {
+                if (item == null) continue;
+                if (isLikedPlaylistStyle(item)) return item;
+            }
+        }
+        return null;
+    }
+
     @NonNull
     private static List<YouTubeMusicService.TrackResult> mapPlaylistsToLibraryTracks(
             @NonNull List<YouTubeMusicService.PlaylistResult> playlists
@@ -860,7 +899,9 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             try {
                 Typeface brandFont = androidx.core.content.res.ResourcesCompat.getFont(requireContext(), R.font.manrope_variable);
                 if (brandFont != null) tvFragBrandTitle.setTypeface(brandFont);
-            } catch (Exception ignored) {}
+            } catch (Exception e) {
+                Log.w(TAG, "Unexpected error", e);
+            }
             float density = getResources().getDisplayMetrics().density;
             int iconSize = (int) (26 * density);
             android.graphics.drawable.Drawable icon = androidx.core.content.ContextCompat.getDrawable(requireContext(), R.mipmap.ic_launcher);
@@ -913,7 +954,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
 
     void refreshFragHeaderProfilePhoto() {
         if (!isAdded() || btnFragProfilePhoto == null || btnFragSignIn == null) return;
-        android.content.SharedPreferences prefs = requireContext().getSharedPreferences("streaming_cache", android.app.Activity.MODE_PRIVATE);
+        android.content.SharedPreferences prefs = requireContext().getSharedPreferences(AppConstants.PREFS_STREAMING_CACHE, android.app.Activity.MODE_PRIVATE);
         String cachedUrl = prefs.getString("cached_google_profile_photo_url", "");
         android.net.Uri photoUri = null;
         com.google.firebase.auth.FirebaseUser user = com.google.firebase.auth.FirebaseAuth.getInstance().getCurrentUser();
@@ -1192,7 +1233,9 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                     try {
                         List<LocalFilesStore.LocalTrack> fresh = LocalFilesStore.scanLocalFiles(requireContext());
                         LocalFilesStore.cacheFiles(requireContext(), fresh);
-                    } catch (Exception ignored) {}
+                    } catch (Exception e) {
+                        Log.w(TAG, "Unexpected error", e);
+                    }
                     if (isAdded()) {
                         requireActivity().runOnUiThread(() -> {
                             displayLibraryDirty = true;
@@ -1237,7 +1280,9 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             if (resId != 0) {
                 serverClientId = getString(resId);
             }
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            Log.w(TAG, "Unexpected error", e);
+        }
         GoogleSignInOptions.Builder optionsBuilder = new GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
                 .requestEmail()
                 .requestScopes(ytScope);
@@ -1401,7 +1446,8 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                             clearPendingRecoverableAuthState();
                             try {
                                 startActivity(recoverIntent);
-                            } catch (Exception ignored) {
+                            } catch (Exception e) {
+                                Log.w(TAG, "Unexpected error", e);
                             }
                         }
                     }
@@ -2478,7 +2524,8 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                     .putLong(PREF_LIBRARY_UPDATED_AT_PREFIX + accountKey, updatedAt)
                     .putString(PREF_LIBRARY_DATA_PREFIX + accountKey, array.toString())
                     .apply();
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            Log.w(TAG, "Unexpected error", e);
         }
     }
     private long getPersistedLibraryUpdatedAt(@NonNull String accountKey) {
@@ -2524,7 +2571,8 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                         thumbnailUrl
                 ));
             }
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            Log.w(TAG, "Unexpected error", e);
             return new ArrayList<>();
         }
         return result;
@@ -2670,7 +2718,8 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             if (YouTubeMusicService.SPECIAL_LIKED_VIDEOS_ID.equals(playlistId)) {
                 FavoritesPlaylistStore.invalidateLikedMusicCache();
             }
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            Log.w(TAG, "Unexpected error", e);
         }
     }
     private void markOfflinePrefetchFinished(@NonNull String playlistId) {
@@ -3076,7 +3125,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     @NonNull
     private PlaybackHistoryStore.Snapshot loadPlaybackSnapshot() {
         if (!isAdded()) {
-            return new PlaybackHistoryStore.Snapshot(new ArrayList<>(), 0, 0, 1, false, 0L);
+            return new PlaybackHistoryStore.Snapshot(new ArrayList<>(), 0, 0, 1, false, 0L, null);
         }
         return PlaybackHistoryStore.load(requireContext());
     }
@@ -3110,6 +3159,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             if (existingPlayer.isAdded()) {
                 existingPlayer.externalSetReturnTargetTag(TAG_MODULE_MUSIC);
                 existingPlayer.externalReplaceQueue(ids, titles, artists, durations, images, snapshotIndex, startPlaying);
+                injectOriginalQueueFromSnapshot(existingPlayer, snapshot);
             }
             return true;
         }
@@ -3126,6 +3176,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 startPlaying
         );
         playerFragment.externalSetReturnTargetTag(TAG_MODULE_MUSIC);
+        injectOriginalQueueFromSnapshot(playerFragment, snapshot);
         getParentFragmentManager()
                 .beginTransaction()
                 .setReorderingAllowed(true)
@@ -3133,6 +3184,30 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 .hide(playerFragment)
                 .commit();
         return true;
+    }
+
+    private void injectOriginalQueueFromSnapshot(
+            @NonNull SongPlayerFragment player,
+            @NonNull PlaybackHistoryStore.Snapshot snapshot
+    ) {
+        if (snapshot.originalQueue == null || snapshot.originalQueue.isEmpty()) return;
+        if (snapshot.originalQueue.size() == snapshot.queue.size()) {
+            boolean same = true;
+            for (int i = 0; i < snapshot.queue.size(); i++) {
+                if (!android.text.TextUtils.equals(snapshot.queue.get(i).videoId, snapshot.originalQueue.get(i).videoId)) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same) return;
+        }
+        java.util.List<SongPlayerFragment.PlayerTrack> original = new java.util.ArrayList<>(snapshot.originalQueue.size());
+        for (PlaybackHistoryStore.QueueTrack item : snapshot.originalQueue) {
+            original.add(new SongPlayerFragment.PlayerTrack(
+                    item.videoId, item.title, item.artist, item.duration, item.imageUrl
+            ));
+        }
+        player.externalSetOriginalQueueOrder(original);
     }
     private boolean openLastPlaylistDetailFromPrefs() {
         if (!isAdded()) {
@@ -3143,7 +3218,8 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                     "playlist_detail",
                     androidx.fragment.app.FragmentManager.POP_BACK_STACK_INCLUSIVE
             );
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            Log.w(TAG, "Unexpected error", e);
         }
         SharedPreferences prefs = requireContext().getSharedPreferences(PREFS_PLAYER_STATE, Activity.MODE_PRIVATE);
         String playlistId = prefs.getString(PREF_LAST_PLAYLIST_ID, "");
@@ -4749,7 +4825,8 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 }
                 result.add(new CachedPlaylistTrack(videoId, title, artist, duration, imageUrl));
             }
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            Log.w(TAG, "Unexpected error", e);
             return new ArrayList<>();
         }
 
@@ -4835,7 +4912,9 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             getCachePrefs().edit()
                     .putString(PREF_PLAYLIST_GRID_URLS_PREFIX + playlistId, sb.toString())
                     .apply();
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            Log.w(TAG, "Unexpected error", e);
+        }
     }
     @NonNull
     private List<String> loadPersistedGridUrls(@NonNull String playlistId) {
@@ -4901,7 +4980,8 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                     queueTracks.add(qTrack);
                 }
             }
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            Log.w(TAG, "Unexpected error", e);
         }
 
         // For playlist types, open normally
@@ -5035,7 +5115,8 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         try {
             Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(track.getWatchUrl()));
             startActivity(intent);
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            Log.w(TAG, "Unexpected error", e);
         }
     }
     private boolean shouldUseRadioQueueForTrack(@NonNull YouTubeMusicService.TrackResult selectedTrack) {

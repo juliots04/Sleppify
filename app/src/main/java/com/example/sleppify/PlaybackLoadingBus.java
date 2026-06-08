@@ -69,7 +69,8 @@ public final class PlaybackLoadingBus {
             for (Listener l : listeners) {
                 try {
                     l.onPlaybackLoadingStateChanged(videoId, loading);
-                } catch (Exception ignored) {
+                } catch (Exception e) {
+                    android.util.Log.w("PlaybackLoadingBus", "Listener error", e);
                 }
             }
         } else {
@@ -77,7 +78,8 @@ public final class PlaybackLoadingBus {
                 for (Listener l : listeners) {
                     try {
                         l.onPlaybackLoadingStateChanged(videoId, loading);
-                    } catch (Exception ignored) {
+                    } catch (Exception e) {
+                        android.util.Log.w("PlaybackLoadingBus", "Listener error", e);
                     }
                 }
             });

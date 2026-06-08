@@ -2,6 +2,7 @@ package com.example.sleppify
 
 import android.content.Context
 import android.text.TextUtils
+import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.ArrayList
@@ -18,16 +19,22 @@ class PlaybackHistoryStore private constructor() {
         @JvmField val imageUrl: String
     )
 
-    class Snapshot(
+    class Snapshot @JvmOverloads constructor(
         queue: List<QueueTrack>,
         @JvmField val currentIndex: Int,
         @JvmField val currentSeconds: Int,
         @JvmField val totalSeconds: Int,
         @JvmField val isPlaying: Boolean,
-        @JvmField val updatedAtMs: Long
+        @JvmField val updatedAtMs: Long,
+        originalQueue: List<QueueTrack>? = null
     ) {
         @JvmField
         val queue: List<QueueTrack> = Collections.unmodifiableList(ArrayList(queue))
+
+        @JvmField
+        val originalQueue: List<QueueTrack> = Collections.unmodifiableList(
+            ArrayList(originalQueue?.takeIf { it.isNotEmpty() } ?: queue)
+        )
 
         fun isValid(): Boolean {
             return queue.isNotEmpty() && currentIndex >= 0 && currentIndex < queue.size
@@ -99,7 +106,7 @@ class PlaybackHistoryStore private constructor() {
             totalSeconds: Int,
             isPlaying: Boolean
         ) {
-            save(context, queue, currentIndex, currentSeconds, totalSeconds, isPlaying, false)
+            save(context, queue, currentIndex, currentSeconds, totalSeconds, isPlaying, false, null)
         }
 
         @JvmStatic
@@ -111,6 +118,20 @@ class PlaybackHistoryStore private constructor() {
             totalSeconds: Int,
             isPlaying: Boolean,
             synchronous: Boolean
+        ) {
+            save(context, queue, currentIndex, currentSeconds, totalSeconds, isPlaying, synchronous, null)
+        }
+
+        @JvmStatic
+        fun save(
+            context: Context,
+            queue: List<QueueTrack>,
+            currentIndex: Int,
+            currentSeconds: Int,
+            totalSeconds: Int,
+            isPlaying: Boolean,
+            synchronous: Boolean,
+            originalQueue: List<QueueTrack>?
         ) {
             if (queue.isEmpty()) {
                 return
@@ -125,13 +146,15 @@ class PlaybackHistoryStore private constructor() {
             val task = Runnable {
                 try {
                     val queueCopy = copyQueue(queue)
+                    val origCopy = if (originalQueue != null) copyQueue(originalQueue) else null
                     val snapshot = Snapshot(
                         queueCopy,
                         safeIndex,
                         safeCurrentSeconds,
                         safeTotalSeconds,
                         isPlaying,
-                        updatedAtMs
+                        updatedAtMs,
+                        origCopy
                     )
 
                     val raw = serializeSnapshot(snapshot)
@@ -159,7 +182,8 @@ class PlaybackHistoryStore private constructor() {
                         cachedRawSnapshot = raw
                         cachedSnapshot = snapshot
                     }
-                } catch (_: Exception) {
+                } catch (e: Exception) {
+                    Log.w("PlaybackHistStore", "Failed to parse playback snapshot", e)
                 }
             }
 
@@ -196,6 +220,23 @@ class PlaybackHistoryStore private constructor() {
                     }
                 }
 
+                val originalQueueArray = root.optJSONArray("originalQueue")
+                val originalQueue = ArrayList<QueueTrack>()
+                if (originalQueueArray != null) {
+                    for (i in 0 until originalQueueArray.length()) {
+                        val item = originalQueueArray.optJSONObject(i) ?: continue
+                        val vid = safe(item.optString("videoId", ""))
+                        if (vid.isEmpty()) continue
+                        originalQueue.add(QueueTrack(
+                            vid,
+                            safe(item.optString("title", "")),
+                            safe(item.optString("artist", "")),
+                            safe(item.optString("duration", "")),
+                            safe(item.optString("imageUrl", ""))
+                        ))
+                    }
+                }
+
                 val currentIndex = root.optInt("currentIndex", 0)
                 val currentSeconds = root.optInt("currentSeconds", 0).coerceAtLeast(0)
                 val totalSeconds = root.optInt("totalSeconds", 1).coerceAtLeast(1)
@@ -206,7 +247,8 @@ class PlaybackHistoryStore private constructor() {
                     emptySnapshot()
                 } else {
                     val safeIndex = currentIndex.coerceIn(0, queue.size - 1)
-                    Snapshot(queue, safeIndex, currentSeconds, totalSeconds, isPlaying, updatedAtMs)
+                    Snapshot(queue, safeIndex, currentSeconds, totalSeconds, isPlaying, updatedAtMs,
+                        originalQueue.takeIf { it.isNotEmpty() })
                 }
             } catch (_: Exception) {
                 emptySnapshot()
@@ -228,6 +270,21 @@ class PlaybackHistoryStore private constructor() {
 
                 val root = JSONObject()
                 root.put("queue", queueArray)
+
+                if (snapshot.originalQueue.isNotEmpty() && snapshot.originalQueue != snapshot.queue) {
+                    val origArray = JSONArray()
+                    for (track in snapshot.originalQueue) {
+                        val item = JSONObject()
+                        item.put("videoId", safe(track.videoId))
+                        item.put("title", safe(track.title))
+                        item.put("artist", safe(track.artist))
+                        item.put("duration", safe(track.duration))
+                        item.put("imageUrl", safe(track.imageUrl))
+                        origArray.put(item)
+                    }
+                    root.put("originalQueue", origArray)
+                }
+
                 root.put("currentIndex", snapshot.currentIndex)
                 root.put("currentSeconds", snapshot.currentSeconds)
                 root.put("totalSeconds", snapshot.totalSeconds)

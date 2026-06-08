@@ -108,7 +108,9 @@ class TrackReplacementSheet : BottomSheetDialogFragment() {
                     .load(finalImageUrl)
                     .centerCrop()
                     .into(iv)
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                android.util.Log.w("TrackReplaceSheet", "Failed to load thumbnail", e)
+            }
         }
 
         rvCandidates?.layoutManager = LinearLayoutManager(requireContext())
@@ -232,7 +234,9 @@ class TrackReplacementSheet : BottomSheetDialogFragment() {
                     .load(item.thumbnailUrl)
                     .centerCrop()
                     .into(holder.ivThumbnail)
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                android.util.Log.w("TrackReplaceSheet", "Failed to load candidate thumbnail", e)
+            }
 
             holder.btnReplace.setOnClickListener { onReplace(item) }
             holder.itemView.setOnClickListener { onReplace(item) }

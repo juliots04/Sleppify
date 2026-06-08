@@ -8,6 +8,8 @@ import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.locks.ReentrantLock
 
 /**
  * Downloads video via three parallel Sleppify proxy servers.
@@ -35,6 +37,11 @@ object SleppifyDownloaderResolver {
     private const val VIDEO_READ_TIMEOUT_MS = 120000
     private const val MIN_VALID_VIDEO_BYTES = 24L * 1024L // 24KB to match worker limit
 
+    private val downloadLocks = ConcurrentHashMap<String, ReentrantLock>()
+
+    private fun lockFor(videoId: String): ReentrantLock =
+        downloadLocks.computeIfAbsent(videoId) { ReentrantLock() }
+
     /**
      * Downloads 720p mp4 video (fallback 360p) for [videoId] via server [serverIndex] into [targetFile].
      * Supports resumable downloads via HTTP Range header.
@@ -49,7 +56,9 @@ object SleppifyDownloaderResolver {
     ): Boolean {
         if (videoId.isBlank()) return false
 
-        synchronized(videoId.intern()) {
+        val lock = lockFor(videoId)
+        lock.lock()
+        try {
             // Re-check if another concurrent thread just finished downloading this exact file
             if (targetFile.exists() && targetFile.length() >= MIN_VALID_VIDEO_BYTES) {
                 Log.d(TAG, "video_proxy_ok id=$videoId reason=already_downloaded_concurrently")
@@ -209,7 +218,10 @@ object SleppifyDownloaderResolver {
 
         Log.d(TAG, "video_proxy_ok id=$videoId $serverLabel bytes=$totalBytes elapsed=${elapsed}ms")
         return true
-        } // end synchronized block
+        } finally {
+            lock.unlock()
+            downloadLocks.remove(videoId)
+        }
     }
 
 }

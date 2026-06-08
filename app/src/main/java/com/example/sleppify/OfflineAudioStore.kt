@@ -310,7 +310,8 @@ object OfflineAudioStore {
         } finally {
             try {
                 retriever.release()
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                android.util.Log.w("OfflineAudioStore", "Failed to release MediaMetadataRetriever", e)
             }
         }
     }

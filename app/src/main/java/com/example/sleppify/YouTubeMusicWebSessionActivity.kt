@@ -198,7 +198,7 @@ class YouTubeMusicWebSessionActivity : AppCompatActivity() {
         // killed by the system while this activity is in the foreground, the
         // recreated MusicPlayerFragment will find the session in SharedPreferences
         // and won't launch the WebView again.
-        getSharedPreferences("player_state", MODE_PRIVATE)
+        getSharedPreferences(AppConstants.PREFS_PLAYER_STATE, MODE_PRIVATE)
             .edit()
             .putString("stream_last_youtube_web_cookie", lastCookieHeader)
             .commit()

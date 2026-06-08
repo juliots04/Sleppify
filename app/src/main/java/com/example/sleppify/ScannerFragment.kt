@@ -37,7 +37,7 @@ import com.example.sleppify.CloudSyncManager
 import com.google.android.material.bottomsheet.BottomSheetDialog
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
-import com.google.android.material.snackbar.Snackbar
+
 import com.google.mlkit.vision.barcode.BarcodeScanner
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
@@ -726,8 +726,45 @@ class ScannerFragment : Fragment() {
         if (!isAdded) return
         val cb = requireContext().getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return
         cb.setPrimaryClip(ClipData.newPlainText("escaneo", v))
-        val root = scannerRoot ?: return
-        Snackbar.make(root, getString(R.string.scan_result_copied), Snackbar.LENGTH_SHORT).show()
+
+        val rootView = requireActivity().findViewById<android.view.ViewGroup>(android.R.id.content) ?: return
+        val density = resources.displayMetrics.density
+        val bar = android.widget.LinearLayout(requireContext()).apply {
+            tag = "saved_bar"
+            id = View.generateViewId()
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            setBackgroundColor(android.graphics.Color.parseColor("#FF1E1E1E"))
+            val hPad = (16 * density).toInt()
+            val vPad = (14 * density).toInt()
+            setPadding(hPad, vPad, hPad, vPad)
+            elevation = 8 * density
+        }
+        val tvMsg = android.widget.TextView(requireContext()).apply {
+            text = getString(R.string.scan_result_copied)
+            setTextColor(android.graphics.Color.WHITE)
+            textSize = 15f
+            setTypeface(null, android.graphics.Typeface.NORMAL)
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            layoutParams = android.widget.LinearLayout.LayoutParams(0, android.view.ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        bar.addView(tvMsg)
+
+        var bottomMargin = (8 * density).toInt()
+        val bottomNav = requireActivity().findViewById<View>(R.id.bottomNavigation)
+        if (bottomNav != null && bottomNav.visibility == View.VISIBLE) bottomMargin += bottomNav.height
+        val miniPlayer = requireActivity().findViewById<View>(R.id.llGlobalMiniPlayer)
+        if (miniPlayer != null && miniPlayer.visibility == View.VISIBLE) bottomMargin += miniPlayer.height
+
+        val flp = android.widget.FrameLayout.LayoutParams(
+            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+            android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply {
+            gravity = android.view.Gravity.BOTTOM
+            this.bottomMargin = bottomMargin
+        }
+        TransientBottomBarAnimator.show(rootView, bar, flp, "saved_bar", 2500L)
     }
 
     private fun describeBarcodeType(b: Barcode) = when (b.format) {

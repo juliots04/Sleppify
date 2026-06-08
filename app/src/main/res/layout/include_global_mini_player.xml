@@ -11,7 +11,7 @@
     android:paddingEnd="0dp"
     android:paddingBottom="0dp"
     android:visibility="gone"
-    android:elevation="33dp"
+    android:elevation="8dp"
     app:layout_constraintBottom_toTopOf="@id/bottomNavigation"
     app:layout_constraintEnd_toEndOf="parent"
     app:layout_constraintStart_toStartOf="parent">

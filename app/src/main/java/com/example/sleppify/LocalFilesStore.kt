@@ -5,8 +5,8 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.os.Build
 import android.provider.MediaStore
+import android.util.Log
 import org.json.JSONArray
-import org.json.JSONException
 import org.json.JSONObject
 
 object LocalFilesStore {
@@ -94,15 +94,25 @@ object LocalFilesStore {
                     tracks.add(LocalTrack(videoId, title, artist, durationLabel, albumArtUri, contentUri))
                 }
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w("LocalFilesStore", "Failed to scan local audio files", e)
+        }
 
         return tracks
     }
 
     @JvmStatic
     fun getCachedFiles(context: Context): List<LocalTrack> {
-        val json = getPrefs(context).getString(KEY_CACHED_TRACKS, "[]") ?: "[]"
-        return parseTracks(json)
+        return getPrefs(context).mapJsonArray(KEY_CACHED_TRACKS) { obj ->
+            LocalTrack(
+                obj.optString("videoId", ""),
+                obj.optString("title", ""),
+                obj.optString("artist", ""),
+                obj.optString("duration", ""),
+                obj.optString("albumArtUri", ""),
+                obj.optString("contentUri", "")
+            )
+        }
     }
 
     @JvmStatic
@@ -133,24 +143,7 @@ object LocalFilesStore {
         return videoId != null && videoId.startsWith(LOCAL_VIDEO_ID_PREFIX)
     }
 
-    private fun parseTracks(json: String): List<LocalTrack> {
-        val list = mutableListOf<LocalTrack>()
-        try {
-            val arr = JSONArray(json)
-            for (i in 0 until arr.length()) {
-                val obj = arr.getJSONObject(i)
-                list.add(LocalTrack(
-                    obj.optString("videoId", ""),
-                    obj.optString("title", ""),
-                    obj.optString("artist", ""),
-                    obj.optString("duration", ""),
-                    obj.optString("albumArtUri", ""),
-                    obj.optString("contentUri", "")
-                ))
-            }
-        } catch (_: JSONException) {}
-        return list
-    }
+
 
     private fun formatDuration(ms: Long): String {
         val totalSec = ms / 1000

@@ -59,6 +59,7 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
     @NonNull private String lastArtVideoId = "";
     @NonNull private String lastArtUrl = "";
     private int lastProgressValue = -1;
+    private boolean animatingOut = false;
 
     public GlobalMiniPlayerController(@NonNull MainActivity activity) {
         this.activity = activity;
@@ -118,6 +119,9 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
         if (activity.isFinishing() || activity.isDestroyed()) return;
         if (llMiniPlayer == null) return;
 
+        // Don't update while exit animation is playing (prevents artwork flash)
+        if (animatingOut) return;
+
         // Hide when full player is visible
         if (activity.isSongPlayerVisible()) {
             llMiniPlayer.setVisibility(View.GONE);
@@ -171,6 +175,7 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
             llMiniPlayer.setTranslationY(distance);
             llMiniPlayer.setVisibility(View.VISIBLE);
             llMiniPlayer.animate().cancel();
+            ensureNavAboveMiniPlayer();
             llMiniPlayer.animate()
                     .translationY(0f)
                     .setDuration(250)
@@ -270,14 +275,39 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
      */
     public void animateOut() {
         if (llMiniPlayer == null) return;
+        animatingOut = true;
         llMiniPlayer.animate().cancel();
+        ensureNavAboveMiniPlayer();
         float distance = llMiniPlayer.getHeight() > 0 ? llMiniPlayer.getHeight() : 300f;
         llMiniPlayer.animate()
                 .translationY(distance)
                 .setDuration(250)
                 .setInterpolator(MATERIAL_EASE)
-                .withEndAction(() -> llMiniPlayer.setVisibility(View.GONE))
+                .withEndAction(() -> {
+                    llMiniPlayer.setVisibility(View.GONE);
+                    animatingOut = false;
+                })
                 .start();
+    }
+
+    public boolean isAnimatingOut() {
+        return animatingOut;
+    }
+
+    /**
+     * Ensures the bottom navigation bar draws above the mini-player
+     * during translationY animations (some GPUs ignore static elevation
+     * for views being animated).
+     */
+    private void ensureNavAboveMiniPlayer() {
+        View nav = activity.findViewById(R.id.bottomNavigation);
+        if (nav != null) {
+            nav.bringToFront();
+            nav.setTranslationZ(50f);
+            if (nav.getParent() instanceof View) {
+                ((View) nav.getParent()).requestLayout();
+            }
+        }
     }
 
     // ── Progress ticker ───────────────────────────────────────────
@@ -345,6 +375,8 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
                 snapshotIndex, startPlaying
         );
 
+        injectOriginalQueueFromSnapshot(playerFragment, snapshot);
+
         activity.getSupportFragmentManager()
                 .beginTransaction()
                 .setReorderingAllowed(true)
@@ -379,6 +411,7 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
         SongPlayerFragment existingPlayer = activity.findSongPlayerFragment();
         if (existingPlayer != null && existingPlayer.isAdded()) {
             existingPlayer.externalReplaceQueue(ids, titles, artists, durations, images, snapshotIndex, startPlaying);
+            injectOriginalQueueFromSnapshot(existingPlayer, snapshot);
             activity.openSongPlayer();
             return;
         }
@@ -390,12 +423,39 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
                 snapshotIndex, startPlaying
         );
 
+        injectOriginalQueueFromSnapshot(playerFragment, snapshot);
+
         activity.getSupportFragmentManager()
                 .beginTransaction()
                 .setReorderingAllowed(true)
                 .add(R.id.playerContainer, playerFragment, "song_player")
                 .runOnCommit(playerFragment::externalAnimateEnterSlide)
                 .commit();
+    }
+
+    private void injectOriginalQueueFromSnapshot(
+            @NonNull SongPlayerFragment player,
+            @NonNull PlaybackHistoryStore.Snapshot snapshot
+    ) {
+        if (snapshot.originalQueue == null || snapshot.originalQueue.isEmpty()) return;
+        // Only inject if originalQueue differs from queue (shuffle was active when persisted)
+        if (snapshot.originalQueue.size() == snapshot.queue.size()) {
+            boolean same = true;
+            for (int i = 0; i < snapshot.queue.size(); i++) {
+                if (!android.text.TextUtils.equals(snapshot.queue.get(i).videoId, snapshot.originalQueue.get(i).videoId)) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same) return;
+        }
+        java.util.List<SongPlayerFragment.PlayerTrack> original = new java.util.ArrayList<>(snapshot.originalQueue.size());
+        for (PlaybackHistoryStore.QueueTrack item : snapshot.originalQueue) {
+            original.add(new SongPlayerFragment.PlayerTrack(
+                    item.videoId, item.title, item.artist, item.duration, item.imageUrl
+            ));
+        }
+        player.externalSetOriginalQueueOrder(original);
     }
 
     // ── PlaybackLoadingBus.Listener ─────────────────────────────────────
@@ -467,7 +527,8 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
                     .override(320, 320)
                     .transition(DrawableTransitionOptions.withCrossFade())
                     .into(ivArt);
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            android.util.Log.w("MiniPlayer", "Failed to load artwork", e);
         }
     }
 

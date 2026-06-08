@@ -65,7 +65,7 @@ object InnertubeResolver {
     @JvmStatic
     fun loadAuthCookiesFromPrefs(context: Context) {
         try {
-            val prefs = context.getSharedPreferences("player_state", Context.MODE_PRIVATE)
+            val prefs = context.getSharedPreferences(AppConstants.PREFS_PLAYER_STATE, Context.MODE_PRIVATE)
             val cookie = prefs.getString("stream_last_youtube_web_cookie", "") ?: ""
             if (cookie.isNotBlank()) {
                 authCookieHeader = cookie.trim()

@@ -2,8 +2,8 @@ package com.example.sleppify
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.util.Log
 import org.json.JSONArray
-import org.json.JSONException
 import org.json.JSONObject
 
 object RadioHistoryStore {
@@ -157,38 +157,20 @@ object RadioHistoryStore {
     // --- Internal helpers ---
 
     private fun loadRadiosInternal(prefs: SharedPreferences): List<JSONObject> {
-        val json = prefs.getString(KEY_RADIOS, "[]") ?: "[]"
-        val result = mutableListOf<JSONObject>()
-        try {
-            val arr = JSONArray(json)
-            for (i in 0 until arr.length()) {
-                result.add(arr.getJSONObject(i))
-            }
-        } catch (_: JSONException) {}
-        return result
+        return prefs.mapJsonArray(KEY_RADIOS) { it }
     }
 
     private fun loadPinnedIds(prefs: SharedPreferences): Set<String> {
-        val json = prefs.getString(KEY_PINNED, "[]") ?: "[]"
+        val arr = prefs.getJsonArray(KEY_PINNED)
         val set = mutableSetOf<String>()
-        try {
-            val arr = JSONArray(json)
-            for (i in 0 until arr.length()) {
-                set.add(arr.getString(i))
-            }
-        } catch (_: JSONException) {}
+        for (i in 0 until arr.length()) set.add(arr.getString(i))
         return set
     }
 
     private fun loadPinnedPlaylistIds(prefs: SharedPreferences): List<String> {
-        val json = prefs.getString(KEY_PINNED_PLAYLISTS, "[]") ?: "[]"
+        val arr = prefs.getJsonArray(KEY_PINNED_PLAYLISTS)
         val list = mutableListOf<String>()
-        try {
-            val arr = JSONArray(json)
-            for (i in 0 until arr.length()) {
-                list.add(arr.getString(i))
-            }
-        } catch (_: JSONException) {}
+        for (i in 0 until arr.length()) list.add(arr.getString(i))
         return list
     }
 

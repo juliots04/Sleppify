@@ -3,6 +3,7 @@ package com.example.sleppify
 import android.content.Context
 import android.content.SharedPreferences
 import android.text.TextUtils
+import android.util.Log
 import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
@@ -10,6 +11,7 @@ import org.json.JSONObject
 object CustomPlaylistsStore {
     private const val PREFS_NAME = "sleppify_custom_playlists"
     const val CUSTOM_PLAYLIST_PREFIX = "custom_playlist_"
+    const val YT_MIRROR_PREFIX = "yt_mirror_"
     private const val KEY_PLAYLIST_NAMES = "all_playlist_names"
 
     private fun getPrefs(context: Context): SharedPreferences {
@@ -17,18 +19,11 @@ object CustomPlaylistsStore {
     }
 
     fun getAllPlaylistNames(context: Context): List<String> {
-        val prefs = getPrefs(context)
-        val namesJson = prefs.getString(KEY_PLAYLIST_NAMES, "[]")
+        val arr = getPrefs(context).getJsonArray(KEY_PLAYLIST_NAMES)
         val names = mutableListOf<String>()
-        try {
-            val arr = JSONArray(namesJson)
-            for (i in 0 until arr.length()) {
-                val name = arr.getString(i)
-                if (!TextUtils.isEmpty(name)) {
-                    names.add(name)
-                }
-            }
-        } catch (e: JSONException) {
+        for (i in 0 until arr.length()) {
+            val name = arr.optString(i, "")
+            if (name.isNotEmpty()) names.add(name)
         }
         return names.sorted()
     }
@@ -112,26 +107,104 @@ object CustomPlaylistsStore {
         }
     }
 
-    fun getTracksFromPlaylist(context: Context, playlistName: String): List<FavoritesPlaylistStore.FavoriteTrack> {
+    // --- YT mirror playlist methods ---
+
+    fun addTrackToYtMirror(context: Context, playlistId: String, videoId: String, title: String, subtitle: String, duration: String, thumbnailUrl: String, insertAtTop: Boolean = false) {
+        if (videoId.isBlank() || playlistId.isBlank()) return
         val prefs = getPrefs(context)
-        val key = CUSTOM_PLAYLIST_PREFIX + playlistName
+        val key = YT_MIRROR_PREFIX + playlistId
         val existingJson = prefs.getString(key, "[]")
-        val tracks = mutableListOf<FavoritesPlaylistStore.FavoriteTrack>()
-        try {
-            val arr = JSONArray(existingJson)
-            for (i in 0 until arr.length()) {
-                val obj = arr.getJSONObject(i)
-                tracks.add(FavoritesPlaylistStore.FavoriteTrack(
-                    obj.getString("videoId"),
-                    obj.getString("title"),
-                    obj.getString("subtitle"),
-                    obj.getString("duration"),
-                    obj.getString("thumbnailUrl")
-                ))
+        val arr = try { JSONArray(existingJson) } catch (e: JSONException) { JSONArray() }
+
+        val newArr = JSONArray()
+        var exists = false
+        for (i in 0 until arr.length()) {
+            val obj = arr.getJSONObject(i)
+            if (obj.getString("videoId") == videoId) {
+                obj.put("title", title)
+                obj.put("subtitle", subtitle)
+                obj.put("duration", duration)
+                obj.put("thumbnailUrl", thumbnailUrl)
+                exists = true
             }
-        } catch (e: JSONException) {
+            newArr.put(obj)
         }
-        return tracks
+
+        if (!exists) {
+            val trackObj = JSONObject()
+            trackObj.put("videoId", videoId)
+            trackObj.put("title", title)
+            trackObj.put("subtitle", subtitle)
+            trackObj.put("duration", duration)
+            trackObj.put("thumbnailUrl", thumbnailUrl)
+            if (insertAtTop) {
+                val shifted = JSONArray()
+                shifted.put(trackObj)
+                for (i in 0 until newArr.length()) shifted.put(newArr.get(i))
+                prefs.edit().putString(key, shifted.toString()).apply()
+            } else {
+                newArr.put(trackObj)
+                prefs.edit().putString(key, newArr.toString()).apply()
+            }
+        } else {
+            prefs.edit().putString(key, newArr.toString()).apply()
+        }
+
+        if (AuthManager.getInstance(context).isSignedIn()) {
+            val updatedTracks = getYtMirrorTracks(context, playlistId)
+            CloudSyncManager.getInstance(context).syncPlaylistToCloud(YT_MIRROR_PREFIX + playlistId, updatedTracks)
+        }
+    }
+
+    fun removeTrackFromYtMirror(context: Context, playlistId: String, videoId: String) {
+        if (videoId.isBlank() || playlistId.isBlank()) return
+        val prefs = getPrefs(context)
+        val key = YT_MIRROR_PREFIX + playlistId
+        val existingJson = prefs.getString(key, "[]")
+        val arr = try { JSONArray(existingJson) } catch (e: JSONException) { JSONArray() }
+        val newArr = JSONArray()
+        for (i in 0 until arr.length()) {
+            val obj = arr.getJSONObject(i)
+            if (obj.getString("videoId") != videoId) newArr.put(obj)
+        }
+        prefs.edit().putString(key, newArr.toString()).apply()
+
+        if (AuthManager.getInstance(context).isSignedIn()) {
+            val updatedTracks = getYtMirrorTracks(context, playlistId)
+            CloudSyncManager.getInstance(context).syncPlaylistToCloud(YT_MIRROR_PREFIX + playlistId, updatedTracks)
+        }
+    }
+
+    fun getYtMirrorTracks(context: Context, playlistId: String): List<FavoritesPlaylistStore.FavoriteTrack> {
+        val key = YT_MIRROR_PREFIX + playlistId
+        return getPrefs(context).mapJsonArray(key) { obj ->
+            FavoritesPlaylistStore.FavoriteTrack(
+                obj.getString("videoId"),
+                obj.getString("title"),
+                obj.getString("subtitle"),
+                obj.getString("duration"),
+                obj.getString("thumbnailUrl")
+            )
+        }
+    }
+
+    fun isTrackInYtMirror(context: Context, playlistId: String, videoId: String): Boolean {
+        return getYtMirrorTracks(context, playlistId).any { it.videoId == videoId }
+    }
+
+    // --- Custom playlist methods ---
+
+    fun getTracksFromPlaylist(context: Context, playlistName: String): List<FavoritesPlaylistStore.FavoriteTrack> {
+        val key = CUSTOM_PLAYLIST_PREFIX + playlistName
+        return getPrefs(context).mapJsonArray(key) { obj ->
+            FavoritesPlaylistStore.FavoriteTrack(
+                obj.getString("videoId"),
+                obj.getString("title"),
+                obj.getString("subtitle"),
+                obj.getString("duration"),
+                obj.getString("thumbnailUrl")
+            )
+        }
     }
 
     fun savePlaylist(context: Context, playlistName: String, tracks: List<FavoritesPlaylistStore.FavoriteTrack>) {

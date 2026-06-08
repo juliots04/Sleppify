@@ -285,7 +285,8 @@ class AudioEffectsService : Service() {
         // Set input gain to 0 dB (no pre-attenuation)
         try {
             dp.setInputGainAllChannelsTo(0f)
-        } catch (ignored: Exception) {
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to set input gain", e)
         }
 
 
@@ -353,7 +354,8 @@ class AudioEffectsService : Service() {
                         val band = dp.getPreEqBandByChannelIndex(ch, bandIndex)
                         band.gain = totalGain
                         dp.setPreEqBandByChannelIndex(ch, bandIndex, band)
-                    } catch (ignored: Exception) {
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to set EQ band gain ch=$ch band=$bandIndex", e)
                     }
                 }
             }
@@ -362,7 +364,8 @@ class AudioEffectsService : Service() {
         // Ensure NO input gain reduction — keep at 0 dB
         try {
             dp.setInputGainAllChannelsTo(0f)
-        } catch (ignored: Exception) {
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to set input gain after apply", e)
         }
 
 

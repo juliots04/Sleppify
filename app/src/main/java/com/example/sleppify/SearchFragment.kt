@@ -69,7 +69,7 @@ class SearchFragment : Fragment() {
         const val EXTRA_RESULT_THUMBNAIL = "search_result_thumbnail"
         const val EXTRA_RESULT_TRACKS_JSON = "search_result_tracks_json"
 
-        private const val PREFS_STREAMING_CACHE = "streaming_cache"
+        private val PREFS_STREAMING_CACHE = AppConstants.PREFS_STREAMING_CACHE
         private const val PREF_RECENT_SEARCH_QUERIES = "stream_recent_search_queries"
         private const val PREF_RECENT_SEARCH_DATA = "stream_recent_search_data"
         private const val SEARCH_PAGE_SIZE = 30
@@ -375,11 +375,13 @@ class SearchFragment : Fragment() {
                 for (name in CustomPlaylistsStore.getAllPlaylistNames(ctx)) {
                     CustomPlaylistsStore.getTracksFromPlaylist(ctx, name).forEach { tryAdd(it.videoId, it.title, it.artist, it.duration, it.imageUrl) }
                 }
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                Log.w(TAG, "Unexpected error", e)
+            }
 
             // 3. All cached YT Music playlists (playlist_tracks_data_*)
             try {
-                val cache = ctx.getSharedPreferences("streaming_cache", Context.MODE_PRIVATE)
+                val cache = ctx.getSharedPreferences(AppConstants.PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
                 for ((key, value) in cache.all) {
                     if (key.startsWith("playlist_tracks_data_") && value is String) {
                         val arr = org.json.JSONArray(value)
@@ -389,19 +391,25 @@ class SearchFragment : Fragment() {
                         }
                     }
                 }
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                Log.w(TAG, "Unexpected error", e)
+            }
 
             // 4. Playback history
             try {
                 PlaybackHistoryStore.load(ctx).queue.forEach { tryAdd(it.videoId, it.title, it.artist, it.duration, it.imageUrl) }
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                Log.w(TAG, "Unexpected error", e)
+            }
 
             // 5. Radio history tracks
             try {
                 RadioHistoryStore.getRadios(ctx).forEach { radio ->
                     radio.tracks.forEach { t -> tryAdd(t.videoId, t.title, t.artist, "", t.thumbnailUrl) }
                 }
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                Log.w(TAG, "Unexpected error", e)
+            }
 
             launch(Dispatchers.Main) {
                 if (!isAdded) return@launch
@@ -714,7 +722,7 @@ class SearchFragment : Fragment() {
     private fun buildStreamingCacheIndex(): List<IndexedTrack> {
         val result = mutableListOf<IndexedTrack>()
         try {
-            val prefs = requireContext().getSharedPreferences("streaming_cache", Context.MODE_PRIVATE)
+            val prefs = requireContext().getSharedPreferences(AppConstants.PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
             for ((key, value) in prefs.all) {
                 if (key.startsWith("playlist_tracks_data_") && value is String) {
                     val arr = org.json.JSONArray(value)
@@ -978,6 +986,28 @@ class SearchFragment : Fragment() {
         }
     }
 
+    /** Extract duration string (e.g. "1:58") from a YTM subtitle like "Artist • ny2mia • 1:58" */
+    private fun extractDurationFromSubtitle(subtitle: String?): String {
+        if (subtitle.isNullOrEmpty()) return ""
+        val parts = subtitle.split(" \u2022 ").map { it.trim() }
+        for (part in parts.asReversed()) {
+            if (part.matches(Regex("\\d{1,2}:\\d{2}(:\\d{2})?")))
+                return part
+        }
+        return ""
+    }
+
+    /** Build a clean subtitle for search display: artist + duration only (no repeated song name) */
+    private fun buildCleanSearchSubtitle(track: YouTubeMusicService.TrackResult): String {
+        val artist = extractArtistFromSubtitle(track.subtitle)
+        val duration = extractDurationFromSubtitle(track.subtitle)
+        return when {
+            artist.isNotEmpty() && duration.isNotEmpty() -> "$artist \u2022 $duration"
+            artist.isNotEmpty() -> artist
+            else -> track.subtitle ?: ""
+        }
+    }
+
     /** Extract play count as a numeric value from subtitle for popularity tiebreaking */
     private fun extractPlayCount(subtitle: String?): Long {
         if (subtitle.isNullOrEmpty()) return 0L
@@ -1174,9 +1204,10 @@ class SearchFragment : Fragment() {
         tvFeaturedTitle.text = track.title
         val typeLabel = searchTypeLabel(track)
         if (typeLabel.isEmpty()) {
-            tvFeaturedSubtitle.text = track.subtitle
+            tvFeaturedSubtitle.text = buildCleanSearchSubtitle(track)
         } else {
-            tvFeaturedSubtitle.text = if (track.subtitle.isEmpty()) typeLabel else "$typeLabel • ${track.subtitle}"
+            val clean = buildCleanSearchSubtitle(track)
+            tvFeaturedSubtitle.text = if (clean.isEmpty()) typeLabel else "$typeLabel • $clean"
         }
         
         val isDownloaded = track.videoId.isNotEmpty() && OfflineAudioStore.hasOfflineAudio(requireContext(), track.videoId)
@@ -1204,7 +1235,7 @@ class SearchFragment : Fragment() {
                 putExtra(EXTRA_RESULT_TYPE, track.resultType ?: "")
                 putExtra(EXTRA_RESULT_CONTENT_ID, track.contentId ?: "")
                 putExtra(EXTRA_RESULT_TITLE, track.title ?: "")
-                putExtra(EXTRA_RESULT_SUBTITLE, track.subtitle ?: "")
+                putExtra(EXTRA_RESULT_SUBTITLE, extractArtistFromSubtitle(track.subtitle))
                 putExtra(EXTRA_RESULT_THUMBNAIL, track.thumbnailUrl ?: "")
             }
             if (requireActivity() is MainActivity) {
@@ -1244,7 +1275,7 @@ class SearchFragment : Fragment() {
             putExtra(EXTRA_RESULT_VIDEO_ID, track.videoId ?: "")
             putExtra(EXTRA_RESULT_CONTENT_ID, track.contentId ?: "")
             putExtra(EXTRA_RESULT_TITLE, track.title ?: "")
-            putExtra(EXTRA_RESULT_SUBTITLE, track.subtitle ?: "")
+            putExtra(EXTRA_RESULT_SUBTITLE, extractArtistFromSubtitle(track.subtitle))
             putExtra(EXTRA_RESULT_THUMBNAIL, track.thumbnailUrl ?: "")
             putExtra(EXTRA_RESULT_TRACKS_JSON, tracksArray.toString())
         }
@@ -1270,18 +1301,19 @@ class SearchFragment : Fragment() {
             obj.put("videoId", track.videoId)
             obj.put("contentId", track.contentId)
             obj.put("title", track.title)
-            obj.put("subtitle", track.subtitle)
+            obj.put("subtitle", extractArtistFromSubtitle(track.subtitle))
             obj.put("thumbnailUrl", track.thumbnailUrl)
             tracksArray.put(obj)
         }
 
+        val cleanArtist = extractArtistFromSubtitle(track.subtitle)
         val playbackIntent = Intent(requireContext(), MainActivity::class.java).apply {
             action = MainActivity.ACTION_PLAY_FROM_SEARCH
             putExtra(EXTRA_RESULT_TYPE, track.resultType ?: "")
             putExtra(EXTRA_RESULT_VIDEO_ID, track.videoId ?: "")
             putExtra(EXTRA_RESULT_CONTENT_ID, track.contentId ?: "")
             putExtra(EXTRA_RESULT_TITLE, track.title ?: "")
-            putExtra(EXTRA_RESULT_SUBTITLE, track.subtitle ?: "")
+            putExtra(EXTRA_RESULT_SUBTITLE, cleanArtist)
             putExtra(EXTRA_RESULT_THUMBNAIL, track.thumbnailUrl ?: "")
             putExtra(EXTRA_RESULT_TRACKS_JSON, tracksArray.toString())
         }
@@ -1307,7 +1339,9 @@ class SearchFragment : Fragment() {
             if (favs.any { it.videoId == videoId }) {
                 return buildQueueFromFavoriteTracks(favs, videoId)
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w(TAG, "Unexpected error", e)
+        }
 
         // 2. Check custom playlists
         try {
@@ -1317,11 +1351,13 @@ class SearchFragment : Fragment() {
                     return buildQueueFromFavoriteTracks(playlistTracks, videoId)
                 }
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w(TAG, "Unexpected error", e)
+        }
 
         // 3. Check cached YouTube playlists
         try {
-            val cache = ctx.getSharedPreferences("streaming_cache", Context.MODE_PRIVATE)
+            val cache = ctx.getSharedPreferences(AppConstants.PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
             for ((key, value) in cache.all) {
                 if (key.startsWith("playlist_tracks_data_") && value is String) {
                     val arr = org.json.JSONArray(value)
@@ -1337,7 +1373,9 @@ class SearchFragment : Fragment() {
                     }
                 }
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w(TAG, "Unexpected error", e)
+        }
 
         // 4. Check playback history queue
         try {
@@ -1345,7 +1383,9 @@ class SearchFragment : Fragment() {
             if (snapshot.queue.any { it.videoId == videoId }) {
                 return buildQueueFromHistoryTracks(snapshot.queue, videoId)
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w(TAG, "Unexpected error", e)
+        }
 
         return JSONArray()
     }
@@ -1442,8 +1482,9 @@ class SearchFragment : Fragment() {
 
         tvTitle.text = if (track.title.isNullOrEmpty()) "Tema" else track.title
         val typeLabel = searchTypeLabel(track)
-        tvSubtitle.text = if (typeLabel.isEmpty()) track.subtitle
-            else if (track.subtitle.isEmpty()) typeLabel else "$typeLabel • ${track.subtitle}"
+        val cleanSub = buildCleanSearchSubtitle(track)
+        tvSubtitle.text = if (typeLabel.isEmpty()) cleanSub
+            else if (cleanSub.isEmpty()) typeLabel else "$typeLabel • $cleanSub"
         loadArtworkInto(ivArt, track.thumbnailUrl, videoId)
         ivBsOffline?.visibility = if (hasOfflineAudio) View.VISIBLE else View.GONE
 
@@ -1518,10 +1559,17 @@ class SearchFragment : Fragment() {
             val lspk = CustomPlaylistsStore.getLastSavedPlaylistKey(requireContext())
             val lspn = CustomPlaylistsStore.getLastSavedPlaylistName(requireContext())
             if (lspk != null && lspn != null) {
-                addTrackToPlaylistByKey(lspk, track)
-                showStatusBarSearch("Se guardó en $lspn") {
-                    CustomPlaylistsStore.clearLastSavedPlaylist(requireContext())
-                    showSaveToPlaylistSheet(track)
+                if (isTrackInPlaylist(requireContext(), track.videoId ?: "", lspk)) {
+                    showStatusBarSearch("Ya está en $lspn") {
+                        CustomPlaylistsStore.clearLastSavedPlaylist(requireContext())
+                        showSaveToPlaylistSheet(track)
+                    }
+                } else {
+                    addTrackToPlaylistByKey(lspk, track)
+                    showStatusBarSearch("Se guardó en $lspn") {
+                        CustomPlaylistsStore.clearLastSavedPlaylist(requireContext())
+                        showSaveToPlaylistSheet(track)
+                    }
                 }
             } else {
                 showSaveToPlaylistSheet(track)
@@ -1542,7 +1590,7 @@ class SearchFragment : Fragment() {
 
         // Row: Ir a artista
         val btnGoToArtist = view.findViewById<View>(R.id.btnBsGoToArtist)
-        val artistName = track.subtitle ?: ""
+        val artistName = extractArtistFromSubtitle(track.subtitle)
         if (artistName.isNotEmpty()) {
             btnGoToArtist.visibility = View.VISIBLE
             btnGoToArtist.setOnClickListener {
@@ -1613,7 +1661,7 @@ class SearchFragment : Fragment() {
         if (videoId.isEmpty()) return
         val ctx = requireContext()
         val title = track.title ?: "Tema"
-        val artist = track.subtitle ?: ""
+        val artist = extractArtistFromSubtitle(track.subtitle)
         val input = Data.Builder()
             .putString(OfflinePlaylistDownloadWorker.INPUT_PLAYLIST_ID, "search")
             .putString(OfflinePlaylistDownloadWorker.INPUT_PLAYLIST_TITLE, "Búsqueda")
@@ -1653,14 +1701,17 @@ class SearchFragment : Fragment() {
         sheet.findViewById<ImageView>(R.id.ivSaveClose).setOnClickListener { saveDialog.dismiss() }
         sheet.findViewById<View>(R.id.btnSaveCancel).setOnClickListener { saveDialog.dismiss() }
         sheet.findViewById<View>(R.id.btnSaveConfirm).setOnClickListener {
+            val addedKey = lastAddedKey
+            val addedName = lastAddedName
+            val removed = didRemove
             saveDialog.dismiss()
-            if (lastAddedKey != null && lastAddedName != null) {
-                CustomPlaylistsStore.setLastSavedPlaylist(requireContext(), lastAddedKey, lastAddedName)
-                showStatusBarSearch("Se guardó en $lastAddedName") {
+            if (addedKey != null && addedName != null) {
+                CustomPlaylistsStore.setLastSavedPlaylist(requireContext(), addedKey, addedName)
+                showStatusBarSearch("Se guardó en $addedName") {
                     CustomPlaylistsStore.clearLastSavedPlaylist(requireContext())
                     showSaveToPlaylistSheet(track)
                 }
-            } else if (didRemove) {
+            } else if (removed) {
                 showStatusBarSearch("Se eliminó correctamente") { showSaveToPlaylistSheet(track) }
             }
         }
@@ -1670,6 +1721,20 @@ class SearchFragment : Fragment() {
 
         val density = ctx.resources.displayMetrics.density
         val thumbSizePx = (48 * density).toInt()
+
+        // Cap scroll area so footer buttons remain visible
+        val svScroll = sheet.findViewById<View>(R.id.svSavePlaylistScroll)
+        if (svScroll != null) {
+            val maxH = (320 * density).toInt()
+            svScroll.layoutParams.height = android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+            svScroll.post {
+                if (svScroll.height > maxH) {
+                    val lp = svScroll.layoutParams
+                    lp.height = maxH
+                    svScroll.layoutParams = lp
+                }
+            }
+        }
 
         val favs = FavoritesPlaylistStore.loadFavorites(ctx)
         val favUrls = mutableListOf<String>()
@@ -1716,6 +1781,50 @@ class SearchFragment : Fragment() {
                 }
                 val newCount = getPlaylistTrackCount(ctx, FavoritesPlaylistStore.PLAYLIST_ID)
                 tvCount.text = "$newCount pistas"
+            }
+            llList.addView(row)
+        }
+
+        // "Música que te gustó" row (local mirror, insert at top)
+        run {
+            val likedPid = YouTubeMusicService.SPECIAL_LIKED_VIDEOS_ID
+            val likedMirrorKey = CustomPlaylistsStore.YT_MIRROR_PREFIX + likedPid
+            val likedCached = MusicPlayerFragment.getLikedPlaylistFromCache()
+            val row = layoutInflater.inflate(R.layout.item_save_playlist_row, llList, false)
+            val ivThumb = row.findViewById<ImageView>(R.id.ivSavePlaylistThumb)
+            val tvName = row.findViewById<TextView>(R.id.tvSavePlaylistName)
+            val tvCount = row.findViewById<TextView>(R.id.tvSavePlaylistCount)
+            val ivCheck = row.findViewById<ImageView>(R.id.ivSaveCheck)
+            tvName.text = "Música que te gustó"
+            tvCount.text = likedCached?.subtitle ?: "Playlist"
+            ivThumb.setBackgroundResource(R.drawable.bg_music_liked_gradient)
+            ivThumb.setImageResource(R.drawable.ic_thumb_up_liked)
+            ivThumb.scaleType = ImageView.ScaleType.CENTER
+            ivThumb.setColorFilter(android.graphics.Color.WHITE, android.graphics.PorterDuff.Mode.SRC_IN)
+            val isIn = CustomPlaylistsStore.isTrackInYtMirror(ctx, likedPid, track.videoId ?: "")
+            ivCheck?.visibility = if (isIn) View.VISIBLE else View.GONE
+            var checked = isIn
+            row.setOnClickListener {
+                if (checked) {
+                    CustomPlaylistsStore.removeTrackFromYtMirror(ctx, likedPid, track.videoId ?: "")
+                    checked = false
+                    didRemove = true
+                    ivCheck?.visibility = View.GONE
+                    if (lastAddedKey == likedMirrorKey) {
+                        lastAddedKey = null
+                        lastAddedName = null
+                    }
+                } else {
+                    val tTitle = track.title?.takeIf { it.isNotEmpty() } ?: "Tema"
+                    val tArtist = extractArtistFromSubtitle(track.subtitle)
+                    val tImage = track.thumbnailUrl ?: ""
+                    CustomPlaylistsStore.addTrackToYtMirror(ctx, likedPid, track.videoId ?: "",
+                        tTitle, tArtist, "--:--", tImage, true)
+                    checked = true
+                    ivCheck?.visibility = View.VISIBLE
+                    lastAddedKey = likedMirrorKey
+                    lastAddedName = "Música que te gustó"
+                }
             }
             llList.addView(row)
         }
@@ -1771,14 +1880,81 @@ class SearchFragment : Fragment() {
             llList.addView(row)
         }
 
+        // YouTube library playlists (local mirror)
+        val ytPlaylists = MusicPlayerFragment.getYouTubeLibraryPlaylists()
+        for (ytItem in ytPlaylists) {
+            val ytPlaylistId = ytItem.contentId?.trim().orEmpty()
+            if (ytPlaylistId.isEmpty()) continue
+            val ytMirrorKey = CustomPlaylistsStore.YT_MIRROR_PREFIX + ytPlaylistId
+            val ytFallbackThumb = ytItem.thumbnailUrl?.trim().orEmpty()
+
+            val row = layoutInflater.inflate(R.layout.item_save_playlist_row, llList, false)
+            val ivThumb = row.findViewById<ImageView>(R.id.ivSavePlaylistThumb)
+            val tvName = row.findViewById<TextView>(R.id.tvSavePlaylistName)
+            val tvCount = row.findViewById<TextView>(R.id.tvSavePlaylistCount)
+            val ivCheck = row.findViewById<ImageView>(R.id.ivSaveCheck)
+            tvName.text = ytItem.title ?: ""
+            tvCount.text = ytItem.subtitle ?: "Playlist"
+            var ytUrls = loadPersistedGridUrls(ctx, ytPlaylistId)
+            if (ytUrls.size < 4) {
+                ytUrls = mutableListOf()
+                val ytMirrorTracks = CustomPlaylistsStore.getYtMirrorTracks(ctx, ytPlaylistId)
+                for (t in ytMirrorTracks) {
+                    if (!t.imageUrl.isNullOrEmpty() && t.imageUrl !in ytUrls) {
+                        ytUrls.add(t.imageUrl)
+                        if (ytUrls.size >= 4) break
+                    }
+                }
+            }
+            if (ytUrls.size >= 4) {
+                PlaylistGridArtLoader.load(ivThumb, ytUrls, thumbSizePx)
+            } else if (ytUrls.isNotEmpty()) {
+                loadArtworkInto(ivThumb, ytUrls[0])
+            } else if (ytFallbackThumb.isNotEmpty()) {
+                loadArtworkInto(ivThumb, ytFallbackThumb)
+            }
+            val isIn = CustomPlaylistsStore.isTrackInYtMirror(ctx, ytPlaylistId, track.videoId ?: "")
+            ivCheck?.visibility = if (isIn) View.VISIBLE else View.GONE
+            var checked = isIn
+            val ytPName = ytItem.title ?: ""
+            row.setOnClickListener {
+                if (checked) {
+                    CustomPlaylistsStore.removeTrackFromYtMirror(ctx, ytPlaylistId, track.videoId ?: "")
+                    checked = false
+                    didRemove = true
+                    ivCheck?.visibility = View.GONE
+                    if (lastAddedKey == ytMirrorKey) {
+                        lastAddedKey = null
+                        lastAddedName = null
+                    }
+                } else {
+                    val tTitle = track.title?.takeIf { it.isNotEmpty() } ?: "Tema"
+                    val tArtist = extractArtistFromSubtitle(track.subtitle)
+                    val tImage = track.thumbnailUrl ?: ""
+                    CustomPlaylistsStore.addTrackToYtMirror(ctx, ytPlaylistId, track.videoId ?: "",
+                        tTitle, tArtist, "--:--", tImage, false)
+                    checked = true
+                    ivCheck?.visibility = View.VISIBLE
+                    lastAddedKey = ytMirrorKey
+                    lastAddedName = ytPName
+                }
+            }
+            llList.addView(row)
+        }
+
         saveDialog.behavior.skipCollapsed = true
         saveDialog.behavior.isFitToContents = true
+        try { saveDialog.behavior.setHideFriction(0.5f) } catch (_: Throwable) {}
+        saveDialog.behavior.state = com.google.android.material.bottomsheet.BottomSheetBehavior.STATE_EXPANDED
+
+        sheet.alpha = 0f
         saveDialog.setOnShowListener { d ->
             val bottomSheet = (d as com.google.android.material.bottomsheet.BottomSheetDialog)
                 .findViewById<View>(com.google.android.material.R.id.design_bottom_sheet) ?: return@setOnShowListener
             val sheetParent = sheet.parent as? View
             sheetParent?.setBackgroundColor(android.graphics.Color.TRANSPARENT)
             bottomSheet.setBackgroundResource(android.R.color.transparent)
+            sheet.post { sheet.animate().alpha(1f).setDuration(150L).start() }
         }
         saveDialog.show()
     }
@@ -1797,7 +1973,7 @@ class SearchFragment : Fragment() {
             gravity = android.view.Gravity.CENTER_VERTICAL
             setBackgroundColor(android.graphics.Color.parseColor("#FF1E1E1E"))
             val hPad = (16 * density).toInt()
-            val vPad = (12 * density).toInt()
+            val vPad = (14 * density).toInt()
             setPadding(hPad, vPad, hPad, vPad)
             elevation = 8 * density
         }
@@ -1805,7 +1981,7 @@ class SearchFragment : Fragment() {
         val tvMsg = TextView(requireContext()).apply {
             text = message
             setTextColor(android.graphics.Color.WHITE)
-            textSize = 14f
+            textSize = 15f
             setTypeface(null, android.graphics.Typeface.NORMAL)
             maxLines = 1
             ellipsize = android.text.TextUtils.TruncateAt.END
@@ -1818,7 +1994,7 @@ class SearchFragment : Fragment() {
             val btnChange = TextView(requireContext()).apply {
                 text = "Cambiar"
                 setTextColor(android.graphics.Color.parseColor("#8AB4F8"))
-                textSize = 14f
+                textSize = 15f
                 setTypeface(null, android.graphics.Typeface.BOLD)
                 setPadding((16 * density).toInt(), 0, 0, 0)
                 setOnClickListener {
@@ -1859,6 +2035,10 @@ class SearchFragment : Fragment() {
             FavoritesPlaylistStore.PLAYLIST_TITLE
         } else if (playlistKey.startsWith(CustomPlaylistsStore.CUSTOM_PLAYLIST_PREFIX)) {
             playlistKey.removePrefix(CustomPlaylistsStore.CUSTOM_PLAYLIST_PREFIX)
+        } else if (playlistKey.startsWith(CustomPlaylistsStore.YT_MIRROR_PREFIX)) {
+            val pid = playlistKey.removePrefix(CustomPlaylistsStore.YT_MIRROR_PREFIX)
+            if (pid == YouTubeMusicService.SPECIAL_LIKED_VIDEOS_ID) "Música que te gustó"
+            else MusicPlayerFragment.getYouTubeLibraryPlaylists().firstOrNull { it.contentId?.trim() == pid }?.title ?: "playlist"
         } else {
             "playlist"
         }
@@ -1878,7 +2058,7 @@ class SearchFragment : Fragment() {
             gravity = android.view.Gravity.CENTER_VERTICAL
             setBackgroundColor(android.graphics.Color.parseColor("#FF1E1E1E"))
             val hPad = (16 * density).toInt()
-            val vPad = (12 * density).toInt()
+            val vPad = (14 * density).toInt()
             setPadding(hPad, vPad, hPad, vPad)
             elevation = 8 * density
         }
@@ -1886,7 +2066,7 @@ class SearchFragment : Fragment() {
         val tvMsg = TextView(requireContext()).apply {
             text = message
             setTextColor(android.graphics.Color.WHITE)
-            textSize = 14f
+            textSize = 15f
             setTypeface(null, android.graphics.Typeface.NORMAL)
             maxLines = 1
             ellipsize = android.text.TextUtils.TruncateAt.END
@@ -1897,7 +2077,7 @@ class SearchFragment : Fragment() {
         val btnUndo = TextView(requireContext()).apply {
             text = "Deshacer"
             setTextColor(android.graphics.Color.parseColor("#8AB4F8"))
-            textSize = 14f
+            textSize = 15f
             setTypeface(null, android.graphics.Typeface.BOLD)
             setPadding((16 * density).toInt(), 0, 0, 0)
             setOnClickListener {
@@ -1927,6 +2107,9 @@ class SearchFragment : Fragment() {
         } else if (playlistKey.startsWith(CustomPlaylistsStore.CUSTOM_PLAYLIST_PREFIX)) {
             val name = playlistKey.removePrefix(CustomPlaylistsStore.CUSTOM_PLAYLIST_PREFIX)
             return CustomPlaylistsStore.getTracksFromPlaylist(ctx, name).any { it.videoId == videoId }
+        } else if (playlistKey.startsWith(CustomPlaylistsStore.YT_MIRROR_PREFIX)) {
+            val pid = playlistKey.removePrefix(CustomPlaylistsStore.YT_MIRROR_PREFIX)
+            return CustomPlaylistsStore.isTrackInYtMirror(ctx, pid, videoId)
         }
         return false
     }
@@ -1937,6 +2120,9 @@ class SearchFragment : Fragment() {
         } else if (playlistKey.startsWith(CustomPlaylistsStore.CUSTOM_PLAYLIST_PREFIX)) {
             val name = playlistKey.removePrefix(CustomPlaylistsStore.CUSTOM_PLAYLIST_PREFIX)
             return CustomPlaylistsStore.getTracksFromPlaylist(ctx, name).size
+        } else if (playlistKey.startsWith(CustomPlaylistsStore.YT_MIRROR_PREFIX)) {
+            val pid = playlistKey.removePrefix(CustomPlaylistsStore.YT_MIRROR_PREFIX)
+            return CustomPlaylistsStore.getYtMirrorTracks(ctx, pid).size
         }
         return 0
     }
@@ -1949,6 +2135,9 @@ class SearchFragment : Fragment() {
         } else if (playlistKey.startsWith(CustomPlaylistsStore.CUSTOM_PLAYLIST_PREFIX)) {
             val name = playlistKey.removePrefix(CustomPlaylistsStore.CUSTOM_PLAYLIST_PREFIX)
             CustomPlaylistsStore.removeTrackFromPlaylist(ctx, name, videoId)
+        } else if (playlistKey.startsWith(CustomPlaylistsStore.YT_MIRROR_PREFIX)) {
+            val pid = playlistKey.removePrefix(CustomPlaylistsStore.YT_MIRROR_PREFIX)
+            CustomPlaylistsStore.removeTrackFromYtMirror(ctx, pid, videoId)
         }
     }
 
@@ -1956,13 +2145,17 @@ class SearchFragment : Fragment() {
         if (track.videoId.isNullOrEmpty()) return
         val ctx = requireContext()
         val title = track.title?.takeIf { it.isNotEmpty() } ?: "Tema"
-        val artist = track.subtitle ?: ""
+        val artist = extractArtistFromSubtitle(track.subtitle)
+        val duration = extractDurationFromSubtitle(track.subtitle).ifEmpty { "--:--" }
         val imageUrl = track.thumbnailUrl ?: ""
         if (playlistKey == FavoritesPlaylistStore.PLAYLIST_ID) {
-            FavoritesPlaylistStore.upsertFavorite(ctx, track.videoId, title, artist, "--:--", imageUrl)
+            FavoritesPlaylistStore.upsertFavorite(ctx, track.videoId, title, artist, duration, imageUrl)
         } else if (playlistKey.startsWith(CustomPlaylistsStore.CUSTOM_PLAYLIST_PREFIX)) {
             val name = playlistKey.removePrefix(CustomPlaylistsStore.CUSTOM_PLAYLIST_PREFIX)
-            CustomPlaylistsStore.addTrackToPlaylist(ctx, name, track.videoId, title, artist, "--:--", imageUrl)
+            CustomPlaylistsStore.addTrackToPlaylist(ctx, name, track.videoId, title, artist, duration, imageUrl)
+        } else if (playlistKey.startsWith(CustomPlaylistsStore.YT_MIRROR_PREFIX)) {
+            val pid = playlistKey.removePrefix(CustomPlaylistsStore.YT_MIRROR_PREFIX)
+            CustomPlaylistsStore.addTrackToYtMirror(ctx, pid, track.videoId, title, artist, duration, imageUrl, false)
         }
         maybeEnqueueOfflineDownloadForTrack(playlistKey, track.videoId, title, artist)
     }
@@ -1970,7 +2163,7 @@ class SearchFragment : Fragment() {
     private fun maybeEnqueueOfflineDownloadForTrack(playlistKey: String, videoId: String, title: String, artist: String) {
         if (!isAdded || videoId.isEmpty()) return
         val ctx = requireContext()
-        val cachePrefs = ctx.getSharedPreferences("streaming_cache", android.app.Activity.MODE_PRIVATE)
+        val cachePrefs = ctx.getSharedPreferences(AppConstants.PREFS_STREAMING_CACHE, android.app.Activity.MODE_PRIVATE)
         val offlineAuto = cachePrefs.getBoolean("playlist_offline_auto_$playlistKey", false)
         if (!offlineAuto) return
         if (OfflineAudioStore.hasOfflineAudio(ctx, videoId)) return
@@ -1998,7 +2191,9 @@ class SearchFragment : Fragment() {
                 .addTag("offline_add_track_$videoId")
                 .build()
             androidx.work.WorkManager.getInstance(ctx).enqueue(request)
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w(TAG, "Unexpected error", e)
+        }
     }
 
     private fun addToQueue(track: YouTubeMusicService.TrackResult, playNext: Boolean) {
@@ -2007,7 +2202,7 @@ class SearchFragment : Fragment() {
             putExtra(EXTRA_RESULT_TYPE, track.resultType ?: "")
             putExtra(EXTRA_RESULT_VIDEO_ID, track.videoId ?: "")
             putExtra(EXTRA_RESULT_TITLE, track.title ?: "")
-            putExtra(EXTRA_RESULT_SUBTITLE, track.subtitle ?: "")
+            putExtra(EXTRA_RESULT_SUBTITLE, extractArtistFromSubtitle(track.subtitle))
             putExtra(EXTRA_RESULT_THUMBNAIL, track.thumbnailUrl ?: "")
         }
         if (requireActivity() is MainActivity) {
@@ -2033,7 +2228,7 @@ class SearchFragment : Fragment() {
             putExtra(EXTRA_RESULT_TYPE, "playlist")
             putExtra(EXTRA_RESULT_CONTENT_ID, radioPlaylistId)
             putExtra(EXTRA_RESULT_TITLE, radioTitle)
-            putExtra(EXTRA_RESULT_SUBTITLE, track.subtitle ?: "")
+            putExtra(EXTRA_RESULT_SUBTITLE, extractArtistFromSubtitle(track.subtitle))
             putExtra(EXTRA_RESULT_THUMBNAIL, track.thumbnailUrl ?: "")
         }
         if (requireActivity() is MainActivity) {
@@ -2375,13 +2570,17 @@ class SearchFragment : Fragment() {
             history.queue.firstOrNull { it.videoId == videoId }?.let {
                 if (it.artist.isNotEmpty()) return it.artist
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w(TAG, "Unexpected error", e)
+        }
         // 2. Favorites
         try {
             FavoritesPlaylistStore.loadFavorites(ctx).firstOrNull { it.videoId == videoId }?.let {
                 if (it.artist.isNotEmpty()) return it.artist
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w(TAG, "Unexpected error", e)
+        }
         // 3. Custom playlists
         try {
             for (name in CustomPlaylistsStore.getAllPlaylistNames(ctx)) {
@@ -2389,10 +2588,12 @@ class SearchFragment : Fragment() {
                     if (it.artist.isNotEmpty()) return it.artist
                 }
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w(TAG, "Unexpected error", e)
+        }
         // 4. Cached online playlists
         try {
-            val cache = ctx.getSharedPreferences("streaming_cache", Context.MODE_PRIVATE)
+            val cache = ctx.getSharedPreferences(AppConstants.PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
             for ((key, value) in cache.all) {
                 if (key.startsWith("playlist_tracks_data_") && value is String) {
                     val arr = org.json.JSONArray(value)
@@ -2405,8 +2606,22 @@ class SearchFragment : Fragment() {
                     }
                 }
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w(TAG, "Unexpected error", e)
+        }
         return ""
+    }
+
+    private fun loadPersistedGridUrls(ctx: android.content.Context, playlistId: String): List<String> {
+        return try {
+            val raw = ctx.applicationContext
+                .getSharedPreferences(AppConstants.PREFS_STREAMING_CACHE, android.app.Activity.MODE_PRIVATE)
+                .getString("playlist_grid_urls_$playlistId", "") ?: ""
+            if (raw.isEmpty()) emptyList()
+            else raw.split("\n").filter { it.isNotEmpty() }
+        } catch (_: Exception) {
+            emptyList()
+        }
     }
 
     private fun loadArtworkInto(target: ImageView, url: String?, videoId: String? = null) {
@@ -2468,7 +2683,7 @@ class SearchFragment : Fragment() {
 
     private fun getCookieHeader(): String {
         if (!isAdded) return ""
-        val prefs = requireContext().getSharedPreferences("player_state", android.app.Activity.MODE_PRIVATE)
+        val prefs = requireContext().getSharedPreferences(AppConstants.PREFS_PLAYER_STATE, android.app.Activity.MODE_PRIVATE)
         return (prefs.getString("stream_last_youtube_web_cookie", "") ?: "").trim()
     }
 
@@ -2554,9 +2769,10 @@ class SearchFragment : Fragment() {
             holder.title.text = item.title ?: "Resultado"
             val typeLabel = searchTypeLabel(item)
             if (typeLabel.isEmpty()) {
-                holder.subtitle.text = item.subtitle
+                holder.subtitle.text = buildCleanSearchSubtitle(item)
             } else {
-                holder.subtitle.text = if (item.subtitle.isEmpty()) typeLabel else "$typeLabel • ${item.subtitle}"
+                val clean = buildCleanSearchSubtitle(item)
+                holder.subtitle.text = if (clean.isEmpty()) typeLabel else "$typeLabel • $clean"
             }
             loadArtworkInto(holder.thumb, item.thumbnailUrl, item.videoId)
 

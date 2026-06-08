@@ -116,7 +116,7 @@ class SettingsFragment : Fragment() {
             if (data != null) {
                 val cookieHeader = data.getStringExtra(YouTubeMusicWebSessionActivity.EXTRA_SESSION_COOKIE_HEADER)
                 if (!TextUtils.isEmpty(cookieHeader)) {
-                    requireContext().getSharedPreferences("player_state", Context.MODE_PRIVATE)
+                    requireContext().getSharedPreferences(AppConstants.PREFS_PLAYER_STATE, Context.MODE_PRIVATE)
                         .edit()
                         .putString("stream_last_youtube_web_cookie", cookieHeader)
                         .apply()
@@ -312,7 +312,9 @@ class SettingsFragment : Fragment() {
             try { 
                 Glide.get(context).clearDiskCache()
                 withContext(Dispatchers.Main) { Glide.get(context).clearMemory() }
-            } catch (e: Exception) {}
+            } catch (e: Exception) {
+                android.util.Log.w("SettingsFragment", "Failed to clear Glide cache", e)
+            }
             deleted.coerceAtLeast(0L)
         } catch (e: Exception) { -1L }
     }
@@ -640,7 +642,7 @@ class SettingsFragment : Fragment() {
         tvProfileName.text = name?.takeIf { it.isNotBlank() } ?: "Usuario"
         tvProfileBadge.text = email?.takeIf { it.isNotBlank() } ?: "Cuenta conectada · toca para cerrar sesion"
         
-        val hasYtSession = requireContext().getSharedPreferences("player_state", Context.MODE_PRIVATE)
+        val hasYtSession = requireContext().getSharedPreferences(AppConstants.PREFS_PLAYER_STATE, Context.MODE_PRIVATE)
             .getString("stream_last_youtube_web_cookie", "")?.trim()?.isNotEmpty() == true
         if (hasYtSession) {
             ivYoutubeMusicStatus.visibility = View.VISIBLE
@@ -670,7 +672,7 @@ class SettingsFragment : Fragment() {
         tvSleppifyName.text = authManager.getDisplayName()
         tvSleppifyEmail.text = authManager.getEmail()
 
-        val cookie = requireContext().getSharedPreferences("player_state", Context.MODE_PRIVATE)
+        val cookie = requireContext().getSharedPreferences(AppConstants.PREFS_PLAYER_STATE, Context.MODE_PRIVATE)
             .getString("stream_last_youtube_web_cookie", "")?.trim() ?: ""
         if (cookie.isNotEmpty()) {
             tvYtStatus.text = "Conectado"
