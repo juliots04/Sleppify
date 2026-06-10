@@ -15,16 +15,11 @@
         android:layout_marginEnd="10dp"
         android:layout_marginTop="2dp">
 
-        <TextView
-            android:id="@+id/tvReplyAvatar"
+        <View
+            android:id="@+id/vReplyAvatarBg"
             android:layout_width="28dp"
             android:layout_height="28dp"
-            android:background="@drawable/bg_comment_avatar"
-            android:gravity="center"
-            android:textColor="@color/surface_dark"
-            android:textSize="11sp"
-            android:textStyle="bold"
-            android:fontFamily="@font/inter_variable" />
+            android:background="@drawable/bg_comment_avatar" />
 
         <ImageView
             android:id="@+id/ivReplyAvatar"

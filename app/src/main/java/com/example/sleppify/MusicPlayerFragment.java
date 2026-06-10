@@ -138,6 +138,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     // Cached display library result to avoid redundant disk I/O on every navigation
     private List<YouTubeMusicService.TrackResult> cachedDisplayLibrary = null;
     private boolean displayLibraryDirty = true;
+    private boolean viewCreatedInitDone = false;
     // Cached network state to avoid repeated ConnectivityManager queries
     private boolean cachedNetworkAvailable;
     private long cachedNetworkAvailableAtMs;
@@ -518,6 +519,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                     }
                     for (Map.Entry<String, List<FavoritesPlaylistStore.FavoriteTrack>> entry : cloudMap.entrySet()) {
                         String name = entry.getKey();
+                        if (name.startsWith(CustomPlaylistsStore.YT_MIRROR_PREFIX)) continue;
                         String contentId = CustomPlaylistsStore.CUSTOM_PLAYLIST_PREFIX + name;
                         if (existingIds.contains(contentId)) continue;
                         // Skip if already a local custom playlist
@@ -789,7 +791,6 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         restoreCachedStreamingSessionState();
         refreshCurrentPlayingPlaylistState();
         setupLibraryPullToRefresh();
-        startObservingOfflineQueue();
         llFeaturedResult.setVisibility(View.GONE);
         btnYoutubeLogin.setVisibility(View.GONE);
         btnYoutubeLogin.setOnClickListener(v -> onYoutubeLoginClicked());
@@ -805,24 +806,29 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             shareTrackResult(featuredTrack);
         });
         updateYoutubeButtonLabel();
+
+        // Restore mini-player BEFORE first render so it's immediately usable
+        maybeRestoreHiddenMiniPlayerFromPausedSnapshot();
+
         switchScreen(ScreenMode.LIBRARY);
         if (!isPlaylistDetailStatePending()) {
             persistStreamingScreen(STREAM_SCREEN_LIBRARY);
         }
+
+        // Defer non-critical work
         view.postDelayed(() -> {
             if (!isAdded() || isRemoving() || isDetached()) return;
+            startObservingOfflineQueue();
             maybeAutoLaunchWebSessionIfNeeded();
         }, 800L);
-        view.post(() -> {
-            if (!isAdded() || isRemoving() || isDetached()) return;
-            maybeRestoreHiddenMiniPlayerFromPausedSnapshot();
-        });
+
         // Always start from the top — post so it runs AFTER RecyclerView restores saved scroll state
         if (rvMusicResults != null) {
             rvMusicResults.post(() -> {
                 scrollToTop();
             });
         }
+        viewCreatedInitDone = true;
     }
     @Override
     public void onResume() {
@@ -830,14 +836,18 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         offlineQueueHadActiveWork = false;
         offlineManualQueueHadActiveWork = false;
         if (isHidden()) return;
+
+        // Skip heavy work on first onResume — onViewCreated already did it
+        if (viewCreatedInitDone) {
+            viewCreatedInitDone = false;
+            return;
+        }
+
         refreshFragHeaderProfilePhoto();
-        startObservingOfflineQueue();
-        maybeResumeStarledOfflineDownloads();
         refreshCurrentPlayingPlaylistState();
         if (adapter != null) {
             adapter.invalidatePlaylistOfflineState(null);
         }
-        maybeEnqueueNextOfflineAutoPlaylist();
         maybeRestoreHiddenMiniPlayerFromPausedSnapshot();
         maybeSyncLibraryIfAuthorized();
         if (isAdded()) {
@@ -848,6 +858,13 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 renderLibraryResults();
             }
         }
+        // Defer expensive offline work
+        mainHandler.postDelayed(() -> {
+            if (!isAdded() || isHidden()) return;
+            startObservingOfflineQueue();
+            maybeResumeStarledOfflineDownloads();
+            maybeEnqueueNextOfflineAutoPlaylist();
+        }, 600L);
     }
     public void scrollToTop() {
         pendingScrollToTop = true;
@@ -865,14 +882,18 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         }
         refreshFragHeaderProfilePhoto();
         scrollToTop();
-        startObservingOfflineQueue();
         refreshCurrentPlayingPlaylistState();
         if (adapter != null) {
             adapter.invalidatePlaylistOfflineState(null);
         }
-        maybeEnqueueNextOfflineAutoPlaylist();
         maybeRestoreHiddenMiniPlayerFromPausedSnapshot();
         maybeSyncLibraryIfAuthorized();
+        // Defer expensive offline work
+        mainHandler.postDelayed(() -> {
+            if (!isAdded() || isHidden()) return;
+            startObservingOfflineQueue();
+            maybeEnqueueNextOfflineAutoPlaylist();
+        }, 400L);
     }
 
     private void setupFragBrandHeader(@NonNull View root) {

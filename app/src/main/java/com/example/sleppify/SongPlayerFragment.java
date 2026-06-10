@@ -645,6 +645,7 @@ public class SongPlayerFragment extends Fragment {
                 @Override
                 public void onStopTrackingTouch(SeekBar seekBar) {
                     userSeeking = false;
+                    cancelOfflineCrossfade();
                     if (localExoMediaPlayer != null) {
                         try {
                             // Show loading spinners until playback resumes after seek
@@ -934,6 +935,7 @@ public class SongPlayerFragment extends Fragment {
             @Override
             public void onSeekTo(long pos) {
                 currentSeconds = Math.max(0, (int) (pos / 1000L));
+                cancelOfflineCrossfade();
                 if (localExoMediaPlayer != null) {
                     try {
                         if (!usingOfflineSource && pbVideoLoading != null) {
@@ -1173,8 +1175,22 @@ public class SongPlayerFragment extends Fragment {
 
 
     private void schedulePlaybackRetry(@NonNull String videoId) {
-        // Disabled: never auto-retry the same track after a playback error.
         cancelPlaybackErrorRetry();
+        if (TextUtils.isEmpty(videoId) || !isAdded()) return;
+
+        // Exponential backoff: 3s, 6s, 12s, 24s, capped at 30s
+        long delayMs = Math.min(3000L * (1L << Math.min(consecutiveStreamFailures, 4)), 30000L);
+        Log.d(TAG, "[PLAYBACK_RETRY] scheduling retry for videoId=" + videoId + " delay=" + delayMs + "ms attempt=" + consecutiveStreamFailures);
+
+        playbackErrorRetryVideoId = videoId;
+        playbackErrorRetryRunnable = () -> {
+            if (!isAdded()) return;
+            if (!TextUtils.equals(loadedVideoId, videoId)) return;
+            Log.d(TAG, "[PLAYBACK_RETRY] retrying videoId=" + videoId);
+            InnertubeResolver.invalidate(videoId);
+            playCurrentTrack();
+        };
+        localProgressHandler.postDelayed(playbackErrorRetryRunnable, delayMs);
     }
 
     private void cancelPlaybackErrorRetry() {
@@ -2292,11 +2308,6 @@ public class SongPlayerFragment extends Fragment {
         }
         
         consecutiveStreamFailures++;
-        if (consecutiveStreamFailures >= 6 && !forceAttempt) {
-            Log.e(TAG, "Too many consecutive failures (" + consecutiveStreamFailures + "). Pausing playback to avoid API bans.");
-            markPlaybackUnavailable("Múltiples fallos consecutivos. Reproducción pausada para evitar bloqueos del servidor.");
-            return true;
-        }
 
         if (tracks.isEmpty() || currentIndex < 0 || currentIndex >= tracks.size()) {
             return false;
@@ -2307,12 +2318,12 @@ public class SongPlayerFragment extends Fragment {
             return false;
         }
 
-        Log.w(TAG, "tryYouTubeFallbackForCurrentTrack: skipping current track instead of re-resolving. reason="
-                + reason + " videoId=" + track.videoId);
+        Log.w(TAG, "[PLAYBACK_RETRY] resolution failed, scheduling retry. reason="
+                + reason + " videoId=" + track.videoId + " attempt=" + consecutiveStreamFailures);
         stopLocalProgressTicker();
         releaseLocalExoMediaPlayer();
         usingOfflineSource = false;
-        advanceToNextTrackAfterFailure();
+        schedulePlaybackRetry(track.videoId);
         return true;
     }
 
@@ -2540,18 +2551,18 @@ public class SongPlayerFragment extends Fragment {
         stopLocalProgressTicker();
         releaseLocalExoMediaPlayer();
         usingOfflineSource = false;
-        pauseRequestedByUser = true;
-        isPlaying = false;
-        updatePlayerSurfaceForSource();
 
+        updatePlayerSurfaceForSource();
         updatePlayPauseIcon();
         updateMediaSessionMetadata();
         updateMediaSessionState();
         syncMiniStateWithPlaylist();
         persistPlaybackSnapshot(false);
 
-        // No further fallbacks — skip forward.
-        handleTrackEnded();
+        // Stay on current track and keep retrying
+        if (!TextUtils.isEmpty(loadedVideoId)) {
+            schedulePlaybackRetry(loadedVideoId);
+        }
     }
 
     @NonNull

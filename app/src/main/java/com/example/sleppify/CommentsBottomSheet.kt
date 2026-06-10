@@ -12,7 +12,6 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.bumptech.glide.Glide
 import com.bumptech.glide.load.resource.bitmap.CircleCrop
-import com.bumptech.glide.request.target.DrawableImageViewTarget
 import com.google.android.material.bottomsheet.BottomSheetBehavior
 import com.google.android.material.bottomsheet.BottomSheetDialog
 import org.json.JSONObject
@@ -42,14 +41,17 @@ class CommentsBottomSheet(
         val text: String,
         val likeCount: String,
         val publishedAt: String,
-        val replies: List<ReplyItem>,
-        var repliesExpanded: Boolean = false
+        var replies: List<ReplyItem> = emptyList(),
+        var repliesExpanded: Boolean = false,
+        val replyCount: Int = 0,
+        val replyContinuationToken: String? = null
     )
 
     private val executor = Executors.newSingleThreadExecutor()
     private val comments = mutableListOf<CommentItem>()
     private var nextPageToken: String? = null
     private var isLoading = false
+    @Volatile private var commentsDisabledMessage: String? = null
 
     private val dialog = BottomSheetDialog(context)
     private val bsv: View = LayoutInflater.from(context).inflate(R.layout.bottom_sheet_comments, null)
@@ -83,10 +85,10 @@ class CommentsBottomSheet(
         if (sheet != null) {
             sheet.setBackgroundResource(android.R.color.transparent)
             val behavior = BottomSheetBehavior.from(sheet)
-            
+
             val screenHeight = context.resources.displayMetrics.heightPixels
             sheet.layoutParams.height = screenHeight
-            
+
             behavior.isFitToContents = false
             behavior.halfExpandedRatio = 0.55f
             behavior.skipCollapsed = true
@@ -172,7 +174,12 @@ class CommentsBottomSheet(
                 if (result == null) {
                     if (comments.isEmpty()) {
                         showLoading(false)
-                        showError()
+                        val disabledMsg = commentsDisabledMessage
+                        if (disabledMsg != null && disabledMsg.isNotBlank()) {
+                            showMessage(disabledMsg)
+                        } else {
+                            showError()
+                        }
                     }
                 } else {
                     showLoading(false)
@@ -183,6 +190,7 @@ class CommentsBottomSheet(
                     if (!cacheLoaded || pageToken == null) {
                         nextPageToken = result.second
                         comments.addAll(result.first)
+                        preloadAvatars(result.first)
                         adapter.rebuildRows()
                         adapter.notifyDataSetChanged()
                     }
@@ -260,11 +268,10 @@ class CommentsBottomSheet(
                         ?.optJSONObject("engagementPanelSectionListRenderer") ?: continue
                     val panelId = panel.optString("panelIdentifier", "")
                     if (panelId != "comment-item-section") continue
-                    val token = extractContinuationFromSection(
-                        panel.optJSONObject("content")
-                            ?.optJSONObject("sectionListRenderer")
-                            ?.optJSONArray("contents")
-                    )
+                    val sectionContents = panel.optJSONObject("content")
+                        ?.optJSONObject("sectionListRenderer")
+                        ?.optJSONArray("contents")
+                    val token = extractContinuationFromSection(sectionContents)
                     if (token != null) {
                         return token
                     }
@@ -283,9 +290,21 @@ class CommentsBottomSheet(
                         ?.optJSONObject("itemSectionRenderer") ?: continue
                     val sectionId = section.optString("sectionIdentifier", "")
                     if (sectionId != "comment-item-section") continue
-                    val token = extractContinuationFromContents(section.optJSONArray("contents"))
+                    val sectionContent = section.optJSONArray("contents")
+                    val token = extractContinuationFromContents(sectionContent)
                     if (token != null) {
                         return token
+                    }
+                    // Check if comments are disabled (messageRenderer present)
+                    if (sectionContent != null) {
+                        for (j in 0 until sectionContent.length()) {
+                            val msg = sectionContent.optJSONObject(j)
+                                ?.optJSONObject("messageRenderer")
+                            if (msg != null) {
+                                commentsDisabledMessage = extractText(msg.optJSONObject("text"))
+                                return null
+                            }
+                        }
                     }
                 }
             }
@@ -307,7 +326,7 @@ class CommentsBottomSheet(
                 }
             }
 
-            android.util.Log.w("CommentsSheet", "No comments continuation found. Top keys: ${root.keys().asSequence().toList()}")
+            android.util.Log.w("CommentsSheet", "No comments continuation found for videoId=$videoId")
             null
         } catch (e: Exception) {
             android.util.Log.w("CommentsSheet", "fetchContinuationToken failed", e)
@@ -460,8 +479,29 @@ class CommentsBottomSheet(
                             ?.optJSONArray("sources")?.optJSONObject(0)?.optString("url", "")
                             ?: avatarObj?.optString("thumbnailUrl", "") ?: ""
 
-                        // Fetch replies if available
-                        val replies = fetchRepliesForThread(threadRenderer)
+                        // Extract reply continuation token for lazy loading
+                        var replyCont: String? = null
+                        var replyCount = 0
+                        val repliesRenderer = threadRenderer.optJSONObject("replies")
+                            ?.optJSONObject("commentRepliesRenderer")
+                        if (repliesRenderer != null) {
+                            val rcContents = repliesRenderer.optJSONArray("contents")
+                            if (rcContents != null) {
+                                for (rc in 0 until rcContents.length()) {
+                                    replyCont = rcContents.optJSONObject(rc)
+                                        ?.optJSONObject("continuationItemRenderer")
+                                        ?.optJSONObject("continuationEndpoint")
+                                        ?.optJSONObject("continuationCommand")
+                                        ?.optString("token", "")?.takeIf { it.isNotEmpty() }
+                                    if (replyCont != null) break
+                                }
+                            }
+                            val viewRepliesObj = repliesRenderer.optJSONObject("viewReplies")
+                                ?.optJSONObject("buttonRenderer")
+                                ?.optJSONObject("text")
+                            replyCount = extractText(viewRepliesObj)
+                                .replace(Regex("[^0-9]"), "").toIntOrNull() ?: 1
+                        }
 
                         result.add(CommentItem(
                             authorName = author,
@@ -470,7 +510,8 @@ class CommentsBottomSheet(
                             text = commentText,
                             likeCount = likeCount,
                             publishedAt = publishedTime,
-                            replies = replies
+                            replyCount = replyCount,
+                            replyContinuationToken = replyCont
                         ))
                         continue
                     }
@@ -490,26 +531,29 @@ class CommentsBottomSheet(
                 val likeCountText = extractText(commentRenderer.optJSONObject("voteCount"))
                 val publishedText = extractText(commentRenderer.optJSONObject("publishedTimeText"))
 
-                // Parse replies (legacy)
-                val replies = mutableListOf<ReplyItem>()
-                val repliesRenderer = threadRenderer.optJSONObject("replies")
+                // Extract reply continuation token for lazy loading (legacy)
+                var legacyReplyCont: String? = null
+                var legacyReplyCount = 0
+                val legacyRepliesRenderer = threadRenderer.optJSONObject("replies")
                     ?.optJSONObject("commentRepliesRenderer")
-                val replyItems = repliesRenderer?.optJSONArray("contents")
-                if (replyItems != null) {
-                    for (j in 0 until replyItems.length()) {
-                        val replyRenderer = replyItems.optJSONObject(j)
-                            ?.optJSONObject("commentRenderer") ?: continue
-                        val rAuthor = extractText(replyRenderer.optJSONObject("authorText"))
-                        replies.add(ReplyItem(
-                            authorName = rAuthor,
-                            authorInitial = rAuthor.firstOrNull()?.uppercaseChar()?.toString() ?: "?",
-                            authorProfileUrl = replyRenderer.optJSONObject("authorThumbnail")
-                                ?.optJSONArray("thumbnails")?.optJSONObject(0)?.optString("url", "") ?: "",
-                            text = extractText(replyRenderer.optJSONObject("contentText")),
-                            likeCount = extractText(replyRenderer.optJSONObject("voteCount")),
-                            publishedAt = extractText(replyRenderer.optJSONObject("publishedTimeText"))
-                        ))
+                if (legacyRepliesRenderer != null) {
+                    val rcItems = legacyRepliesRenderer.optJSONArray("contents")
+                    if (rcItems != null) {
+                        for (rc in 0 until rcItems.length()) {
+                            legacyReplyCont = rcItems.optJSONObject(rc)
+                                ?.optJSONObject("continuationItemRenderer")
+                                ?.optJSONObject("continuationEndpoint")
+                                ?.optJSONObject("continuationCommand")
+                                ?.optString("token", "")?.takeIf { it.isNotEmpty() }
+                            if (legacyReplyCont != null) break
+                        }
                     }
+                    val replyCountText = extractText(
+                        legacyRepliesRenderer.optJSONObject("viewReplies")
+                            ?.optJSONObject("buttonRenderer")
+                            ?.optJSONObject("text")
+                    )
+                    legacyReplyCount = replyCountText.replace(Regex("[^0-9]"), "").toIntOrNull() ?: 1
                 }
 
                 result.add(CommentItem(
@@ -519,11 +563,95 @@ class CommentsBottomSheet(
                     text = text,
                     likeCount = likeCountText,
                     publishedAt = publishedText,
-                    replies = replies
+                    replyCount = legacyReplyCount,
+                    replyContinuationToken = legacyReplyCont
                 ))
             }
         }
         return Pair(result, nextCont)
+    }
+
+    private fun fetchRepliesForThread(replyCont: String): List<ReplyItem> {
+        val result = mutableListOf<ReplyItem>()
+        try {
+            val payload = JSONObject().apply {
+                put("context", buildInnertubeContext())
+                put("continuation", replyCont)
+            }
+            val body = postInnertube(INNERTUBE_NEXT, payload) ?: return result
+            val root = JSONObject(body)
+
+            // Build entity map for replies from mutations
+            val replyEntityMap = mutableMapOf<String, JSONObject>()
+            val mutations = root.optJSONObject("frameworkUpdates")
+                ?.optJSONObject("entityBatchUpdate")
+                ?.optJSONArray("mutations")
+            if (mutations != null) {
+                for (m in 0 until mutations.length()) {
+                    val mutation = mutations.optJSONObject(m) ?: continue
+                    val ep = mutation.optJSONObject("payload")
+                        ?.optJSONObject("commentEntityPayload") ?: continue
+                    val key = mutation.optString("entityKey", "")
+                    if (key.isNotEmpty()) replyEntityMap[key] = ep
+                }
+            }
+
+            // Parse reply items from onResponseReceivedEndpoints
+            val endpoints = root.optJSONArray("onResponseReceivedEndpoints")
+            if (endpoints != null) {
+                for (ep in 0 until endpoints.length()) {
+                    val endpoint = endpoints.optJSONObject(ep) ?: continue
+                    val action = endpoint.optJSONObject("reloadContinuationItemsAction")
+                        ?: endpoint.optJSONObject("reloadContinuationItemsCommand")
+                        ?: endpoint.optJSONObject("appendContinuationItemsAction")
+                        ?: endpoint.optJSONObject("appendContinuationItemsCommand")
+                        ?: continue
+                    val items = action.optJSONArray("continuationItems") ?: continue
+                    for (i in 0 until items.length()) {
+                        val replyItem = items.optJSONObject(i) ?: continue
+                        // New format: commentViewModel wrapper
+                        val vmWrapper = replyItem.optJSONObject("commentViewModel")
+                        if (vmWrapper != null) {
+                            val vm = vmWrapper.optJSONObject("commentViewModel") ?: vmWrapper
+                            val replyKey = vm.optString("commentKey", "")
+                            val replyId = vm.optString("commentId", "")
+                            val payload2 = replyEntityMap[replyKey] ?: replyEntityMap[replyId] ?: continue
+                            val props = payload2.optJSONObject("properties")
+                            val authorObj = payload2.optJSONObject("author")
+                            val rToolbar = payload2.optJSONObject("toolbar")
+                            val rAuthor = authorObj?.optString("displayName", "")
+                                ?: props?.optString("authorButtonA11y", "") ?: ""
+                            result.add(ReplyItem(
+                                authorName = rAuthor,
+                                authorInitial = rAuthor.firstOrNull()?.uppercaseChar()?.toString() ?: "?",
+                                authorProfileUrl = payload2.optJSONObject("avatar")
+                                    ?.optJSONObject("image")?.optJSONArray("sources")
+                                    ?.optJSONObject(0)?.optString("url", "") ?: "",
+                                text = props?.optJSONObject("content")?.optString("content", "") ?: "",
+                                likeCount = rToolbar?.optString("likeCountNotliked", "") ?: "",
+                                publishedAt = props?.optString("publishedTime", "") ?: ""
+                            ))
+                            continue
+                        }
+                        // Legacy format: commentRenderer
+                        val cr = replyItem.optJSONObject("commentRenderer") ?: continue
+                        val rAuthor = extractText(cr.optJSONObject("authorText"))
+                        result.add(ReplyItem(
+                            authorName = rAuthor,
+                            authorInitial = rAuthor.firstOrNull()?.uppercaseChar()?.toString() ?: "?",
+                            authorProfileUrl = cr.optJSONObject("authorThumbnail")
+                                ?.optJSONArray("thumbnails")?.optJSONObject(0)?.optString("url", "") ?: "",
+                            text = extractText(cr.optJSONObject("contentText")),
+                            likeCount = extractText(cr.optJSONObject("voteCount")),
+                            publishedAt = extractText(cr.optJSONObject("publishedTimeText"))
+                        ))
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            android.util.Log.w("CommentsSheet", "fetchRepliesForThread failed", e)
+        }
+        return result
     }
 
     private fun extractText(obj: JSONObject?): String {
@@ -548,6 +676,13 @@ class CommentsBottomSheet(
         pbLoading.visibility = View.GONE
         rvComments.visibility = View.GONE
         tvEmpty.text = "No hay comentarios"
+        tvEmpty.visibility = View.VISIBLE
+    }
+
+    private fun showMessage(msg: String) {
+        pbLoading.visibility = View.GONE
+        rvComments.visibility = View.GONE
+        tvEmpty.text = msg
         tvEmpty.visibility = View.VISIBLE
     }
 
@@ -582,29 +717,32 @@ class CommentsBottomSheet(
             ?.trim()
     }
 
-    private fun loadAvatarInto(profileUrl: String, ivAvatar: ImageView, itemView: View) {
+    private fun preloadAvatars(items: List<CommentItem>) {
+        for (item in items) {
+            if (item.authorProfileUrl.isNotEmpty()) {
+                try { Glide.with(context).load(item.authorProfileUrl).transform(CircleCrop()).preload() } catch (_: Exception) {}
+            }
+            for (reply in item.replies) {
+                if (reply.authorProfileUrl.isNotEmpty()) {
+                    try { Glide.with(context).load(reply.authorProfileUrl).transform(CircleCrop()).preload() } catch (_: Exception) {}
+                }
+            }
+        }
+    }
+
+    private fun loadAvatarInto(profileUrl: String, ivAvatar: ImageView) {
         if (profileUrl.isNotEmpty()) {
+            ivAvatar.visibility = View.VISIBLE
             try {
                 Glide.with(context)
                     .load(profileUrl)
                     .transform(CircleCrop())
-                    .into(object : DrawableImageViewTarget(ivAvatar) {
-                        override fun onResourceReady(
-                            resource: android.graphics.drawable.Drawable,
-                            transition: com.bumptech.glide.request.transition.Transition<in android.graphics.drawable.Drawable>?
-                        ) {
-                            super.onResourceReady(resource, transition)
-                            ivAvatar.visibility = View.VISIBLE
-                        }
-                        override fun onLoadFailed(errorDrawable: android.graphics.drawable.Drawable?) {
-                            ivAvatar.visibility = View.GONE
-                        }
-                    })
-            } catch (e: Exception) {
+                    .into(ivAvatar)
+            } catch (_: Exception) {
                 ivAvatar.visibility = View.GONE
             }
         } else {
-            try { Glide.with(context).clear(ivAvatar) } catch (e: Exception) { android.util.Log.w("CommentsSheet", "Failed to clear avatar", e) }
+            try { Glide.with(context).clear(ivAvatar) } catch (_: Exception) {}
             ivAvatar.visibility = View.GONE
         }
     }
@@ -628,8 +766,9 @@ class CommentsBottomSheet(
             for (ci in data.indices) {
                 val c = data[ci]
                 rows.add(AdapterRow(TYPE_COMMENT, ci))
-                if (c.replies.isNotEmpty()) {
-                    if (c.repliesExpanded) {
+                val hasReplies = c.replies.isNotEmpty() || c.replyCount > 0 || c.replyContinuationToken != null
+                if (hasReplies) {
+                    if (c.repliesExpanded && c.replies.isNotEmpty()) {
                         for (ri in c.replies.indices) rows.add(AdapterRow(TYPE_REPLY, ci, ri))
                     }
                     rows.add(AdapterRow(TYPE_TOGGLE, ci))
@@ -659,38 +798,34 @@ class CommentsBottomSheet(
         }
 
         inner class CommentVH(view: View) : RecyclerView.ViewHolder(view) {
-            private val tvAvatar: TextView = view.findViewById(R.id.tvCommentAvatar)
             private val ivAvatar: ImageView = view.findViewById(R.id.ivCommentAvatar)
             private val tvAuthor: TextView = view.findViewById(R.id.tvCommentAuthor)
             private val tvTime: TextView = view.findViewById(R.id.tvCommentTime)
             private val tvText: TextView = view.findViewById(R.id.tvCommentText)
             private val tvLikes: TextView = view.findViewById(R.id.tvCommentLikes)
             fun bind(item: CommentItem) {
-                tvAvatar.text = item.authorInitial
                 tvAuthor.text = item.authorName
                 tvTime.text = item.publishedAt
                 tvText.text = item.text
                 tvLikes.text = item.likeCount
                 tvLikes.visibility = if (item.likeCount.isEmpty()) View.GONE else View.VISIBLE
-                loadAvatarInto(item.authorProfileUrl, ivAvatar, itemView)
+                loadAvatarInto(item.authorProfileUrl, ivAvatar)
             }
         }
 
         inner class ReplyVH(view: View) : RecyclerView.ViewHolder(view) {
-            private val tvAvatar: TextView = view.findViewById(R.id.tvReplyAvatar)
             private val ivAvatar: ImageView = view.findViewById(R.id.ivReplyAvatar)
             private val tvAuthor: TextView = view.findViewById(R.id.tvReplyAuthor)
             private val tvTime: TextView = view.findViewById(R.id.tvReplyTime)
             private val tvText: TextView = view.findViewById(R.id.tvReplyText)
             private val tvLikes: TextView = view.findViewById(R.id.tvReplyLikes)
             fun bind(item: ReplyItem) {
-                tvAvatar.text = item.authorInitial
                 tvAuthor.text = item.authorName
                 tvTime.text = item.publishedAt
                 tvText.text = item.text
                 tvLikes.text = item.likeCount
                 tvLikes.visibility = if (item.likeCount.isEmpty()) View.GONE else View.VISIBLE
-                loadAvatarInto(item.authorProfileUrl, ivAvatar, itemView)
+                loadAvatarInto(item.authorProfileUrl, ivAvatar)
             }
         }
 
@@ -698,16 +833,33 @@ class CommentsBottomSheet(
             private val tvToggle: TextView = view.findViewById(R.id.tvRepliesToggle)
             private val ivChevron: android.widget.ImageView = view.findViewById(R.id.ivRepliesChevron)
             fun bind(item: CommentItem, commentIdx: Int) {
-                val count = item.replies.size
-                tvToggle.text = if (item.repliesExpanded)
-                    "Ocultar respuestas"
-                else
-                    "$count ${if (count == 1) "respuesta" else "respuestas"}"
+                val count = if (item.replies.isNotEmpty()) item.replies.size else item.replyCount
+                if (item.repliesExpanded) {
+                    tvToggle.text = "Ocultar respuestas"
+                } else {
+                    tvToggle.text = if (count > 0)
+                        "$count ${if (count == 1) "respuesta" else "respuestas"}"
+                    else "Ver respuestas"
+                }
                 ivChevron.rotation = if (item.repliesExpanded) 180f else 0f
                 itemView.setOnClickListener {
-                    item.repliesExpanded = !item.repliesExpanded
-                    rebuildRows()
-                    notifyDataSetChanged()
+                    if (!item.repliesExpanded && item.replies.isEmpty() && item.replyContinuationToken != null) {
+                        tvToggle.text = "Cargando…"
+                        executor.execute {
+                            val fetched = fetchRepliesForThread(item.replyContinuationToken)
+                            bsv.post {
+                                if (!dialog.isShowing) return@post
+                                item.replies = fetched
+                                item.repliesExpanded = true
+                                rebuildRows()
+                                notifyDataSetChanged()
+                            }
+                        }
+                    } else {
+                        item.repliesExpanded = !item.repliesExpanded
+                        rebuildRows()
+                        notifyDataSetChanged()
+                    }
                 }
             }
         }

@@ -229,6 +229,10 @@ class MainActivity : AppCompatActivity() {
         localPrefs = getSharedPreferences("sleppify_local_config", Context.MODE_PRIVATE)
         updateNavigationForScreenSize()
 
+        // Pre-warm caches before fragments are created so first render has no I/O
+        PlaybackHistoryStore.load(this)
+        FavoritesPlaylistStore.loadFavorites(this)
+
         // Always open directly on Biblioteca — no login gate.
         suppressNavListener = true
         bottomNav.selectedItemId = R.id.nav_music
@@ -247,6 +251,9 @@ class MainActivity : AppCompatActivity() {
             if (authManagerLazy.isSignedIn()) {
                 authManagerLazy.getCurrentUser()?.let { handleSignedInUser(it, null) }
             }
+            // Check for app updates after UI is fully ready
+            delay(1400)
+            AppUpdateManager.checkForUpdate(this@MainActivity)
         }
 
         if (intent?.getBooleanExtra("SHOW_SETTINGS", false) == true) {

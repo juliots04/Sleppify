@@ -16,6 +16,8 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "1.0"
+        buildConfigField("int", "VERSION_CODE", "${versionCode!!}")
+        buildConfigField("String", "VERSION_NAME", "\"${versionName!!}\"")
         buildConfigField("String", "YOUTUBE_DATA_API_KEY", "\"$youtubeDataApiKey\"")
         buildConfigField("String", "SLEPPIFY_DOWNLOAD_SERVICE_URL", "\"$sleppifyDownloadServiceUrl\"")
 
@@ -62,6 +64,7 @@ dependencies {
     implementation(platform(libs.firebase.bom))
     implementation(libs.firebase.auth)
     implementation(libs.firebase.firestore)
+    implementation(libs.firebase.storage)
     implementation(libs.androidx.credentials)
     implementation(libs.androidx.credentials.play.services.auth)
     implementation(libs.googleid)
@@ -81,6 +84,10 @@ dependencies {
     implementation("androidx.media3:media3-database:$media3Version")
     implementation("androidx.media3:media3-ui:$media3Version")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("com.github.TeamNewPipe:NewPipeExtractor:v0.26.1") {
+        exclude(group = "com.google.protobuf", module = "protobuf-javalite")
+    }
+    implementation("com.github.spotbugs:spotbugs-annotations:4.8.3")
     implementation("androidx.camera:camera-core:$cameraXVersion")
     implementation("androidx.camera:camera-camera2:$cameraXVersion")
     implementation("androidx.camera:camera-lifecycle:$cameraXVersion")

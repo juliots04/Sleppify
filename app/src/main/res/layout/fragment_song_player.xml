@@ -244,22 +244,6 @@
             </LinearLayout>
 
             <LinearLayout
-                android:id="@+id/actionRadio"
-                android:layout_width="wrap_content"
-                android:layout_height="37dp"
-                android:layout_marginStart="8dp"
-                android:background="@drawable/bg_player_social_chip"
-                android:clickable="true"
-                android:focusable="true"
-                android:foreground="?attr/selectableItemBackground"
-                android:gravity="center_vertical"
-                android:orientation="horizontal"
-                android:paddingHorizontal="14dp">
-                <ImageView android:layout_width="19dp" android:layout_height="19dp" android:src="@drawable/ic_bs_radio" app:tint="@color/text_primary" />
-                <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginStart="6dp" android:fontFamily="@font/inter_variable" android:text="Iniciar radio" android:textColor="@color/text_primary" android:textSize="14sp" android:textStyle="bold" />
-            </LinearLayout>
-
-            <LinearLayout
                 android:id="@+id/actionGoToArtist"
                 android:layout_width="wrap_content"
                 android:layout_height="37dp"
@@ -277,7 +261,7 @@
             </LinearLayout>
 
             <LinearLayout
-                android:id="@+id/actionShare"
+                android:id="@+id/actionRadio"
                 android:layout_width="wrap_content"
                 android:layout_height="37dp"
                 android:layout_marginStart="8dp"
@@ -288,8 +272,8 @@
                 android:gravity="center_vertical"
                 android:orientation="horizontal"
                 android:paddingHorizontal="14dp">
-                <ImageView android:layout_width="19dp" android:layout_height="19dp" android:src="@drawable/ic_playlist_share" app:tint="@color/text_primary" />
-                <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginStart="6dp" android:fontFamily="@font/inter_variable" android:text="Compartir" android:textColor="@color/text_primary" android:textSize="14sp" android:textStyle="bold" />
+                <ImageView android:layout_width="19dp" android:layout_height="19dp" android:src="@drawable/ic_bs_radio" app:tint="@color/text_primary" />
+                <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginStart="6dp" android:fontFamily="@font/inter_variable" android:text="Iniciar radio" android:textColor="@color/text_primary" android:textSize="14sp" android:textStyle="bold" />
             </LinearLayout>
 
             <LinearLayout
@@ -323,6 +307,22 @@
                 android:visibility="gone">
                 <ImageView android:layout_width="19dp" android:layout_height="19dp" android:src="@drawable/ic_search" app:tint="@color/text_primary" />
                 <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginStart="6dp" android:fontFamily="@font/inter_variable" android:text="Buscar" android:textColor="@color/text_primary" android:textSize="14sp" android:textStyle="bold" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:id="@+id/actionShare"
+                android:layout_width="wrap_content"
+                android:layout_height="37dp"
+                android:layout_marginStart="8dp"
+                android:background="@drawable/bg_player_social_chip"
+                android:clickable="true"
+                android:focusable="true"
+                android:foreground="?attr/selectableItemBackground"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingHorizontal="14dp">
+                <ImageView android:layout_width="19dp" android:layout_height="19dp" android:src="@drawable/ic_playlist_share" app:tint="@color/text_primary" />
+                <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginStart="6dp" android:fontFamily="@font/inter_variable" android:text="Compartir" android:textColor="@color/text_primary" android:textSize="14sp" android:textStyle="bold" />
             </LinearLayout>
 
         </LinearLayout>

@@ -382,6 +382,53 @@ class YouTubeMusicService @JvmOverloads constructor(
         }
 
         var results = parseInnertubeSearchResults(rootJson, maxResults).toMutableList()
+        var continuationToken = extractSearchContinuationToken(rootJson) ?: ""
+
+        // Always also fetch unfiltered "Top" results to maximize result count
+        try {
+            val topBody = JSONObject().apply {
+                put("context", JSONObject().apply { put("client", clientContext) })
+                put("query", query)
+            }.toString().toByteArray(StandardCharsets.UTF_8)
+
+            val topConn = URL(endpoint).openConnection() as HttpURLConnection
+            topConn.requestMethod = "POST"
+            topConn.connectTimeout = 12000
+            topConn.readTimeout = 15000
+            topConn.doOutput = true
+            topConn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            topConn.setRequestProperty("Accept", "application/json")
+            topConn.setRequestProperty("User-Agent", "Mozilla/5.0")
+            topConn.setRequestProperty("Origin", "https://music.youtube.com")
+            topConn.setRequestProperty("Referer", "https://music.youtube.com/")
+            if (isAuthenticated) {
+                topConn.setRequestProperty("Cookie", cookieHeader)
+            }
+            try {
+                topConn.outputStream.use { it.write(topBody) }
+                val topStatus = topConn.responseCode
+                if (topStatus == HttpURLConnection.HTTP_OK) {
+                    val topResponse = readResponse(topConn, false)
+                    val topJson = JSONObject(topResponse)
+                    val topResults = parseInnertubeSearchResults(topJson, maxResults)
+                    val existingIds = results.map { it.videoId }.toHashSet()
+                    for (track in topResults) {
+                        if (track.videoId !in existingIds) {
+                            results.add(track)
+                            existingIds.add(track.videoId)
+                        }
+                    }
+                    if (continuationToken.isEmpty()) {
+                        continuationToken = extractSearchContinuationToken(topJson) ?: ""
+                    }
+                }
+            } finally {
+                topConn.disconnect()
+            }
+        } catch (e: Exception) {
+            Log.w("YouTubeMusicService", "[INNERTUBE] Top search merge failed: ${e.message}")
+        }
+
         if (results.isEmpty()) {
             val topKeys = rootJson.keys().asSequence().toList()
             val contentsKeys = rootJson.optJSONObject("contents")?.keys()?.asSequence()?.toList()
@@ -390,7 +437,6 @@ class YouTubeMusicService @JvmOverloads constructor(
         }
 
         // Return first page immediately — further pages loaded via continueInnertubeSearch + scroll
-        val continuationToken = extractSearchContinuationToken(rootJson) ?: ""
         return SearchPageResult(results, continuationToken)
     }
 

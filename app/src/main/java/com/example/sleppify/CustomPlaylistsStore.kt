@@ -23,7 +23,7 @@ object CustomPlaylistsStore {
         val names = mutableListOf<String>()
         for (i in 0 until arr.length()) {
             val name = arr.optString(i, "")
-            if (name.isNotEmpty()) names.add(name)
+            if (name.isNotEmpty() && !name.startsWith(YT_MIRROR_PREFIX)) names.add(name)
         }
         return names.sorted()
     }
