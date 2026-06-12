@@ -120,7 +120,7 @@ class SettingsFragment : Fragment() {
                         .edit()
                         .putString("stream_last_youtube_web_cookie", cookieHeader)
                         .apply()
-                    InnertubeResolver.setAuthCookies(cookieHeader)
+                    StreamResolver.setAuthCookies(cookieHeader)
                     Toast.makeText(requireContext(), "Cuenta de YouTube Music actualizada", Toast.LENGTH_SHORT).show()
                     renderProfileState()
                 }

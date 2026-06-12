@@ -83,7 +83,7 @@ object SleppifyDownloaderResolver {
         var serverLabel = "unknown"
 
         while (retryCount <= MAX_RETRIES && !success) {
-            val urlString = InnertubeResolver.resolveStreamUrl(context, videoId)
+            val urlString = StreamResolver.resolveStreamUrl(context, videoId)
             if (urlString == null) {
                 Log.w(TAG, "No stream url resolved for $videoId")
                 return false
@@ -101,7 +101,7 @@ object SleppifyDownloaderResolver {
                     readTimeout = 30000
                     doOutput = false
                     setRequestProperty("Accept", "video/mp4, */*")
-                    InnertubeResolver.getHeadersFor(videoId).forEach { (k, v) -> setRequestProperty(k, v) }
+                    StreamResolver.getHeadersFor(videoId).forEach { (k, v) -> setRequestProperty(k, v) }
                     if (isAppend) {
                         setRequestProperty("Range", "bytes=$totalBytes-")
                     }
@@ -120,7 +120,7 @@ object SleppifyDownloaderResolver {
                 if (!resumingNow && !freshStart) {
                     val errBody = try { connection.errorStream?.bufferedReader()?.readText()?.take(300) } catch (_: Exception) { null }
                     Log.w(TAG, "video_proxy_fail id=$videoId $serverLabel http=$code elapsed=${System.currentTimeMillis() - startMs}ms err=$errBody")
-                    InnertubeResolver.invalidate(videoId)
+                    StreamResolver.invalidate(videoId)
                     if (code == 403 || code == 404) {
                         retryCount++
                         continue // Retry with newly resolved URL (maybe proxy)
@@ -163,7 +163,7 @@ object SleppifyDownloaderResolver {
                 lastException = e
                 retryCount++
                 Log.w(TAG, "video_proxy_exception id=$videoId $serverLabel attempt=$retryCount reason=${e.javaClass.simpleName} msg=${e.message}")
-                InnertubeResolver.invalidate(videoId)
+                StreamResolver.invalidate(videoId)
                 if (retryCount <= MAX_RETRIES) {
                     try { Thread.sleep(2000) } catch (ie: InterruptedException) { Thread.currentThread().interrupt(); break }
                 }

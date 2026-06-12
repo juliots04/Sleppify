@@ -84,7 +84,7 @@ dependencies {
     implementation("androidx.media3:media3-database:$media3Version")
     implementation("androidx.media3:media3-ui:$media3Version")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    implementation("com.github.TeamNewPipe:NewPipeExtractor:v0.26.1") {
+    implementation("com.github.TeamNewPipe:NewPipeExtractor:v0.26.3") {
         exclude(group = "com.google.protobuf", module = "protobuf-javalite")
     }
     implementation("com.github.spotbugs:spotbugs-annotations:4.8.3")

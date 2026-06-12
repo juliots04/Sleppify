@@ -1382,9 +1382,9 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         if (isAdded()) {
             ((SleppifyApp) requireContext().getApplicationContext()).performDeferredInit();
         }
-        // Activar inmediatamente la cookie en InnertubeResolver para que las
+        // Activar inmediatamente la cookie en StreamResolver para que las
         // siguientes peticiones de resolución y playback estén autenticadas.
-        InnertubeResolver.setAuthCookies(cookieHeader);
+        StreamResolver.setAuthCookies(cookieHeader);
         streamingOauthCompleted = true;
         updateYoutubeButtonLabel();
         // Keep user-agent available for future web-session API extensions.
@@ -2278,9 +2278,9 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         hydrateCachedSessionState();
         String webCookie = playerPrefs.getString(PREF_LAST_YOUTUBE_WEB_COOKIE, "");
         boolean hasWebSession = !TextUtils.isEmpty(webCookie == null ? "" : webCookie.trim());
-        // Pasar la cookie a InnertubeResolver para autenticar peticiones de
+        // Pasar la cookie a StreamResolver para autenticar peticiones de
         // resolución y playback (evita LOGIN_REQUIRED y CDN 403 sin PO Token).
-        InnertubeResolver.setAuthCookies(webCookie);
+        StreamResolver.setAuthCookies(webCookie);
         boolean hasCachedLibrary = !libraryTracks.isEmpty();
         streamingOauthCompleted = hasWebSession || hasCachedLibrary || !TextUtils.isEmpty(youtubeAccessToken);
         Log.i(

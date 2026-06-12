@@ -233,6 +233,13 @@ public class PlaylistDetailFragment extends Fragment
     private boolean restoringHiddenPlayerFromSnapshot;
     private boolean awaitingInitialPlaylistRender = true;
     private boolean isScrolling = false;
+    /** True only during a momentum fling (SCROLL_STATE_SETTLING). During a fling we defer
+     *  image decode + disk state lookups to avoid main-thread jank; the SCROLL_STATE_IDLE
+     *  handler loads only the visible range once the fling settles (YT Music behavior). */
+    private boolean isFlinging = false;
+    /** Cached artwork decode size in px (50dp). Resolved once to avoid a DisplayMetrics
+     *  lookup on every list bind. */
+    private int cachedTrackArtPx = 0;
     private boolean pendingOfflineToggle = false;
     private final Map<String, Long> lastOfflineStateLookupTimeByTrack = new LinkedHashMap<String, Long>(
             PLAYLIST_TRACKS_FETCH_MAX_LIMIT / 4 + 1, 0.75f, true) {
@@ -395,7 +402,7 @@ public class PlaylistDetailFragment extends Fragment
         rvPlaylistContent.setLayoutManager(layoutManager);
         rvPlaylistContent.setHasFixedSize(true);
         rvPlaylistContent.setItemAnimator(null);
-        rvPlaylistContent.setItemViewCacheSize(5);
+        rvPlaylistContent.setItemViewCacheSize(8);
 
         // Single unified scroll listener — reduces per-frame dispatch overhead vs. 3 separate listeners
         rvPlaylistContent.addOnScrollListener(new RecyclerView.OnScrollListener() {
@@ -403,6 +410,7 @@ public class PlaylistDetailFragment extends Fragment
             public void onScrollStateChanged(@NonNull RecyclerView recyclerView, int newState) {
                 if (!isAdded()) return;
                 isScrolling = newState != RecyclerView.SCROLL_STATE_IDLE;
+                isFlinging = newState == RecyclerView.SCROLL_STATE_SETTLING;
 
                 if (newState == RecyclerView.SCROLL_STATE_IDLE) {
                     if (trackAdapter != null) {
@@ -1100,8 +1108,11 @@ public class PlaylistDetailFragment extends Fragment
         // white flash before the new image loads. Glide's crossFade transition
         // handles the swap smoothly from old→new image.
         boolean offlineOnly = !cachedHasValidatedInternet(ctx);
-        float density = ctx.getResources().getDisplayMetrics().density;
-        int px = Math.max(100, Math.round(50 * density));
+        if (cachedTrackArtPx == 0) {
+            float density = ctx.getResources().getDisplayMetrics().density;
+            cachedTrackArtPx = Math.max(100, Math.round(50 * density));
+        }
+        int px = cachedTrackArtPx;
         Glide.with(target)
                 .load(imageUrl.trim())
                 .transform(SHARED_YT_CROP)
@@ -1134,8 +1145,8 @@ public class PlaylistDetailFragment extends Fragment
                     if (OfflineAudioStore.hasValidatedOfflineAudio(appContext, videoId, duration)) {
                         return;
                     }
-                    // This will cache the URL in InnertubeResolver
-                    InnertubeResolver.resolveStreamUrl(appContext, videoId);
+                    // This will cache the URL in StreamResolver
+                    StreamResolver.resolveStreamUrl(appContext, videoId);
                 } catch (Exception e) {
                     Log.w(TAG_OFFLINE_DOWNLOAD, "prefetchStreamUrl failed for " + videoId, e);
                 }
@@ -6586,15 +6597,24 @@ public class PlaylistDetailFragment extends Fragment
                     holder.ivTrackArt.setBackgroundColor(ContextCompat.getColor(context, R.color.surface_high));
                     holder.ivTrackArt.setImageResource(R.drawable.ic_music);
                 }
+            } else if (isFlinging) {
+                // During a momentum fling, defer the decode. Clear any stale image left on
+                // the recycled holder and show the grey placeholder; reloadImagesForRange()
+                // (fired on SCROLL_STATE_IDLE) loads only the visible rows once the fling stops.
+                holder.ivTrackArt.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                Glide.with(context).clear(holder.ivTrackArt);
+                holder.ivTrackArt.setImageDrawable(null);
+                holder.ivTrackArt.setBackgroundColor(ContextCompat.getColor(context, R.color.surface_high));
             } else {
                 holder.ivTrackArt.setScaleType(ImageView.ScaleType.CENTER_CROP);
                 holder.ivTrackArt.setBackgroundColor(android.graphics.Color.TRANSPARENT);
                 loadTrackArt(holder.ivTrackArt, track.imageUrl, com.bumptech.glide.Priority.HIGH);
             }
 
-            // Eagerly trigger state lookup on full bind so first-visible items
-            // don't have to wait for the scroll listener / layout listener.
-            if (!TextUtils.isEmpty(track.videoId)) {
+            // Trigger the disk-based offline state lookup on bind, but never during a fling —
+            // flooding the executor with MediaMetadataRetriever reads while binding dozens of
+            // rows is a primary jank source. loadStateForVisibleRange() covers it on idle.
+            if (!isFlinging && !TextUtils.isEmpty(track.videoId)) {
                 triggerOfflineStateLookup(position, track);
             }
 

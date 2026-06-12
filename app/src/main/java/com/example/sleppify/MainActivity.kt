@@ -219,7 +219,7 @@ class MainActivity : AppCompatActivity() {
         // Cargar cookies de la sesión web YouTube Music (si existen) lo más
         // temprano posible para que las primeras peticiones InnerTube ya estén
         // autenticadas y eviten LOGIN_REQUIRED / 403 en el CDN.
-        InnertubeResolver.loadAuthCookiesFromPrefs(this)
+        StreamResolver.loadAuthCookiesFromPrefs(this)
         setupListeners()
         configureHeaderActionForMainModules()
         configureAudioAuthorizationFlow()

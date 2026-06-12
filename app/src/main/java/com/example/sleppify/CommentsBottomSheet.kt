@@ -224,7 +224,7 @@ class CommentsBottomSheet(
         conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36")
         conn.setRequestProperty("Origin", "https://www.youtube.com")
         conn.setRequestProperty("Referer", "https://www.youtube.com/")
-        val cookie = InnertubeResolver.getAuthCookieHeader()
+        val cookie = StreamResolver.getAuthCookieHeader()
         if (cookie.isNotBlank()) {
             conn.setRequestProperty("Cookie", cookie)
             val sapisidHash = generateSapisidHash(cookie)

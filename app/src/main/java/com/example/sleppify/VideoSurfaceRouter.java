@@ -73,7 +73,8 @@ public final class VideoSurfaceRouter {
      */
     public void onTrackStarted(
             @NonNull ExoMediaPlayer player,
-            @NonNull String videoId
+            @NonNull String videoId,
+            boolean isVideo
     ) {
         // If the new player wraps the same underlying ExoPlayer that is already
         // attached to the PlayerView, skip detach+reattach.  Re-assigning the
@@ -87,8 +88,12 @@ public final class VideoSurfaceRouter {
         if (sameUnderlying) {
             activePlayer = player;
             activeVideoId = videoId;
-            videoActive = true;
-            if (callback != null) callback.onVideoConfirmed();
+            videoActive = isVideo;
+            if (!videoActive) {
+                detachAndHide();
+            } else {
+                if (callback != null) callback.onVideoConfirmed();
+            }
             return;
         }
 
@@ -96,9 +101,11 @@ public final class VideoSurfaceRouter {
 
         activePlayer = player;
         activeVideoId = videoId;
-        videoActive = true;
-        attachToCurrentContainer(player);
-        if (callback != null) callback.onVideoConfirmed();
+        videoActive = isVideo;
+        if (videoActive) {
+            attachToCurrentContainer(player);
+            if (callback != null) callback.onVideoConfirmed();
+        }
     }
 
     /**

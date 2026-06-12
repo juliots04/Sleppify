@@ -545,7 +545,7 @@ class SearchFragment : Fragment() {
                     setSearchLoadingState(false, "")
                     allTracks.firstOrNull()?.videoId?.let { id ->
                         lifecycleScope.launch(Dispatchers.IO) {
-                            InnertubeResolver.resolveStreamUrl(requireContext(), id)
+                            StreamResolver.resolveStreamUrl(requireContext(), id)
                         }
                     }
                     revealModuleContent()

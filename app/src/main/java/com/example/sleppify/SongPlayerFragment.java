@@ -20,6 +20,8 @@ import android.net.NetworkCapabilities;
 import androidx.media3.exoplayer.ExoPlayer;
 import com.google.android.material.bottomsheet.BottomSheetDialog;
 import com.google.android.material.bottomsheet.BottomSheetBehavior;
+import android.graphics.drawable.GradientDrawable;
+import androidx.palette.graphics.Palette;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -272,6 +274,7 @@ public class SongPlayerFragment extends Fragment {
     private final YouTubeMusicService radioMusicService = new YouTubeMusicService();
     private final ExecutorService streamResolverExecutor = Executors.newFixedThreadPool(3);
     private final ExecutorService backgroundExecutor = Executors.newSingleThreadExecutor();
+    private final ExecutorService backgroundDownloadExecutor = Executors.newSingleThreadExecutor();
     private final android.util.LruCache<String, SocialStats> socialStatsCache = new android.util.LruCache<>(50);
 
     // Direct streaming & pre-fetching
@@ -289,6 +292,10 @@ public class SongPlayerFragment extends Fragment {
     @NonNull
     private String gaplessPreBufferedVideoId = "";
     private boolean gaplessPreBufferTriggered = false;
+    @NonNull
+    private String gaplessPreBufferingVideoId = "";
+    @Nullable
+    private ExoMediaPlayer gaplessPreBufferingPlayer = null;
 
     @Nullable
     private Future<?> pendingStreamResolverFuture;
@@ -648,8 +655,7 @@ public class SongPlayerFragment extends Fragment {
                     cancelOfflineCrossfade();
                     if (localExoMediaPlayer != null) {
                         try {
-                            // Show loading spinners until playback resumes after seek
-                            if (pbVideoLoading != null && !usingOfflineSource) {
+                            if (pbVideoLoading != null && !usingOfflineSource && isVideoTrackId(loadedVideoId)) {
                                 pbVideoLoading.setVisibility(View.VISIBLE);
                             }
                             if (!usingOfflineSource && !loadedVideoId.isEmpty()) {
@@ -678,7 +684,7 @@ public class SongPlayerFragment extends Fragment {
                     requireContext().getApplicationContext(),
                     settingsPrefs,
                     crossfadeCallback,
-                    (ctx, videoId) -> InnertubeResolver.resolveStreamUrl(ctx, videoId),
+                    (ctx, videoId) -> StreamResolver.resolveStreamUrl(ctx, videoId),
                     streamResolverExecutor
             );
             crossfadeManager.invalidateDurationCache();
@@ -868,6 +874,7 @@ public class SongPlayerFragment extends Fragment {
         flPlayerHero = null;
         streamResolverExecutor.shutdownNow();
         backgroundExecutor.shutdownNow();
+        backgroundDownloadExecutor.shutdownNow();
         super.onDestroyView();
     }
 
@@ -938,7 +945,7 @@ public class SongPlayerFragment extends Fragment {
                 cancelOfflineCrossfade();
                 if (localExoMediaPlayer != null) {
                     try {
-                        if (!usingOfflineSource && pbVideoLoading != null) {
+                        if (!usingOfflineSource && pbVideoLoading != null && isVideoTrackId(loadedVideoId)) {
                             pbVideoLoading.setVisibility(View.VISIBLE);
                         }
                         if (!usingOfflineSource && !loadedVideoId.isEmpty()) {
@@ -1177,6 +1184,8 @@ public class SongPlayerFragment extends Fragment {
     private void schedulePlaybackRetry(@NonNull String videoId) {
         cancelPlaybackErrorRetry();
         if (TextUtils.isEmpty(videoId) || !isAdded()) return;
+        // Without network, retrying the same track will always fail — skip instead.
+        if (!isNetworkAvailable()) return;
 
         // Exponential backoff: 3s, 6s, 12s, 24s, capped at 30s
         long delayMs = Math.min(3000L * (1L << Math.min(consecutiveStreamFailures, 4)), 30000L);
@@ -1187,7 +1196,7 @@ public class SongPlayerFragment extends Fragment {
             if (!isAdded()) return;
             if (!TextUtils.equals(loadedVideoId, videoId)) return;
             Log.d(TAG, "[PLAYBACK_RETRY] retrying videoId=" + videoId);
-            InnertubeResolver.invalidate(videoId);
+            StreamResolver.invalidate(videoId);
             playCurrentTrack();
         };
         localProgressHandler.postDelayed(playbackErrorRetryRunnable, delayMs);
@@ -1596,6 +1605,11 @@ public class SongPlayerFragment extends Fragment {
         totalSeconds = durationMs > 0 ? Math.max(1, durationMs / 1000) : Math.max(1, parseDurationSeconds(track.duration));
 
         isPlaying = true;
+
+        // Attach video surface and update UI for the adopted gapless track
+        videoRouter.onTrackStarted(preBuffered, track.videoId, isVideoTrack(track));
+        updatePlayerSurfaceForSource();
+
         updatePlayPauseIcon();
         startLocalProgressTicker();
         updateMediaSessionMetadata();
@@ -1632,15 +1646,17 @@ public class SongPlayerFragment extends Fragment {
 
     private void resolveAndPlayOnlineTrack(@NonNull PlayerTrack track, long requestToken, boolean forceAlternativeClient) {
         if (!isNetworkAvailable()) {
-            markPlaybackUnavailable("Sin conexión a internet.");
+            // No network and no offline audio for this track: skip to the next available offline track.
+            Log.w(TAG, "resolveAndPlayOnlineTrack: offline, no download for videoId=" + track.videoId + " — skipping.");
+            moveTrack(1, false);
             return;
         }
 
         PlaybackLoadingBus.notifyLoadingStarted(track.videoId);
         pendingStreamResolverFuture = streamResolverExecutor.submit(() -> {
             String resolvedUrl = forceAlternativeClient
-                    ? InnertubeResolver.resolveStreamUrl(requireContext(), track.videoId, true)
-                    : InnertubeResolver.resolveStreamUrl(requireContext(), track.videoId);
+                    ? StreamResolver.resolveStreamUrl(requireContext(), track.videoId, true)
+                    : StreamResolver.resolveStreamUrl(requireContext(), track.videoId);
 
             localProgressHandler.post(() -> {
                 if (requestToken != activePlaybackRequestToken || !isAdded()) return;
@@ -1648,7 +1664,7 @@ public class SongPlayerFragment extends Fragment {
 
                 if (!TextUtils.isEmpty(resolvedUrl)) {
                     startMediaPlaybackFromSource(track, resolvedUrl, requestToken, () -> {
-                        InnertubeResolver.invalidate(track.videoId);
+                        StreamResolver.invalidate(track.videoId);
                         tryReresolveOrSkipCurrentTrack("Fallo de reproducción directa: re-resolviendo.", false);
                     });
                 } else {
@@ -1677,7 +1693,7 @@ public class SongPlayerFragment extends Fragment {
 
             final String videoId = track.videoId;
             streamResolverExecutor.submit(() -> {
-                String url = InnertubeResolver.resolveStreamUrl(requireContext(), videoId);
+                String url = StreamResolver.resolveStreamUrl(requireContext(), videoId);
                 if (!TextUtils.isEmpty(url) && isImmediate) {
                     prefetchedNextVideoId = videoId;
                     prefetchedNextUrl = url;
@@ -1702,7 +1718,7 @@ public class SongPlayerFragment extends Fragment {
         if (OfflineAudioStore.hasOfflineAudio(appContext, normalized)) return;
 
         streamDownloadingVideoId = normalized;
-        streamResolverExecutor.execute(() -> {
+        backgroundDownloadExecutor.execute(() -> {
             try {
                 // Re-check on background thread
                 if (OfflineAudioStore.hasOfflineAudio(appContext, normalized)) {
@@ -1755,7 +1771,6 @@ public class SongPlayerFragment extends Fragment {
                 || localExoMediaPlayer == null
                 || localSourcePreparing
                 || crossfadeManager.isInProgress()
-                || gaplessPreBufferTriggered
                 || !isPlaying) {
             return;
         }
@@ -1776,32 +1791,53 @@ public class SongPlayerFragment extends Fragment {
             return;
         }
 
-        // Skip if local device file or already offline (offline playback is already instant)
-        if (LocalFilesStore.isLocalVideoId(nextTrack.videoId)) return;
-        if (OfflineAudioStore.hasOfflineAudio(requireContext(), nextTrack.videoId)) {
+        // Skip if already preloaded/preloading the exact same track
+        if (TextUtils.equals(gaplessPreBufferingVideoId, nextTrack.videoId)) {
             return;
         }
 
-        // Skip if already pre-buffered for this track
-        if (gaplessPreBufferedPlayer != null && TextUtils.equals(gaplessPreBufferedVideoId, nextTrack.videoId)) {
-            return;
+        // If we are currently pre-buffering/pre-buffered for a different track, cancel it first
+        if (!TextUtils.isEmpty(gaplessPreBufferingVideoId)) {
+            cancelGaplessPreBuffer();
         }
 
+        gaplessPreBufferingVideoId = nextTrack.videoId;
         gaplessPreBufferTriggered = true;
 
-        // Find a URL: use prefetched if available, otherwise resolve in background
         String url = null;
-        if (TextUtils.equals(nextTrack.videoId, prefetchedNextVideoId) && !TextUtils.isEmpty(prefetchedNextUrl)) {
-            url = prefetchedNextUrl;
+        boolean isLocalOrOffline = false;
+
+        if (LocalFilesStore.isLocalVideoId(nextTrack.videoId)) {
+            url = LocalFilesStore.getContentUriForVideoId(requireContext(), nextTrack.videoId);
+            isLocalOrOffline = true;
+        } else if (OfflineAudioStore.hasOfflineAudio(requireContext(), nextTrack.videoId)) {
+            java.io.File offlineFile = OfflineAudioStore.getExistingOfflineAudioFile(requireContext(), nextTrack.videoId);
+            if (offlineFile != null && offlineFile.isFile() && offlineFile.length() > 0L) {
+                url = offlineFile.getAbsolutePath();
+                isLocalOrOffline = true;
+            }
+        }
+
+        if (!isLocalOrOffline) {
+            // Find a URL: use prefetched if available, otherwise resolve in background
+            if (TextUtils.equals(nextTrack.videoId, prefetchedNextVideoId) && !TextUtils.isEmpty(prefetchedNextUrl)) {
+                url = prefetchedNextUrl;
+            }
         }
 
         if (!TextUtils.isEmpty(url)) {
             prepareGaplessPlayer(nextTrack, url);
         } else {
             streamResolverExecutor.submit(() -> {
-                String resolved = InnertubeResolver.resolveStreamUrl(requireContext(), nextTrack.videoId);
+                String resolved = StreamResolver.resolveStreamUrl(requireContext(), nextTrack.videoId);
                 localProgressHandler.post(() -> {
-                    if (!isAdded() || TextUtils.isEmpty(resolved)) return;
+                    if (!isAdded()) return;
+                    if (TextUtils.isEmpty(resolved)) {
+                        if (TextUtils.equals(gaplessPreBufferingVideoId, nextTrack.videoId)) {
+                            gaplessPreBufferingVideoId = "";
+                        }
+                        return;
+                    }
                     prepareGaplessPlayer(nextTrack, resolved);
                 });
             });
@@ -1817,9 +1853,14 @@ public class SongPlayerFragment extends Fragment {
             gaplessPreBufferedPlayer = null;
             gaplessPreBufferedVideoId = "";
         }
+        if (gaplessPreBufferingPlayer != null) {
+            releaseSingleExoMediaPlayer(gaplessPreBufferingPlayer);
+            gaplessPreBufferingPlayer = null;
+        }
 
         Context appCtx = requireContext().getApplicationContext();
         ExoMediaPlayer player = new ExoMediaPlayer(appCtx, false, true); // backgroundBuffer: progressive download
+        gaplessPreBufferingPlayer = player;
         player.isCrossfadeComponent = true; // Mark so it doesn't interfere with media session
 
         try {
@@ -1828,26 +1869,39 @@ public class SongPlayerFragment extends Fragment {
                     .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                     .build());
 
-            Map<String, String> headers = new HashMap<>();
-            headers.put("User-Agent", STREAM_HTTP_USER_AGENT);
-            headers.put("Accept", "*/*");
-            // Inject InnerTube-specific headers for direct googlevideo.com URLs
-            Map<String, String> innertubeHeaders = InnertubeResolver.getHeadersFor(nextTrack.videoId);
-            headers.putAll(innertubeHeaders);
-            player.setDataSource(appCtx, Uri.parse(url), headers);
+            if (url.startsWith("http://") || url.startsWith("https://")) {
+                Map<String, String> headers = new HashMap<>();
+                headers.put("User-Agent", STREAM_HTTP_USER_AGENT);
+                headers.put("Accept", "*/*");
+                // Inject InnerTube-specific headers for direct googlevideo.com URLs
+                Map<String, String> innertubeHeaders = StreamResolver.getHeadersFor(nextTrack.videoId);
+                headers.putAll(innertubeHeaders);
+                player.setDataSource(appCtx, Uri.parse(url), headers);
+            } else if (url.startsWith("content://")) {
+                player.setDataSource(appCtx, Uri.parse(url), null);
+            } else {
+                player.setDataSource(url);
+            }
             player.setVolume(0f, 0f);
 
             player.setOnPreparedListener(mp -> {
-                // Prepared and buffering — keep silent, ready to use
+                if (gaplessPreBufferingPlayer == mp) {
+                    gaplessPreBufferingPlayer = null;
+                }
                 gaplessPreBufferedPlayer = mp;
                 gaplessPreBufferedVideoId = nextTrack.videoId;
             });
 
             player.setOnErrorListener((mp, what, extra) -> {
-                // Pre-buffer failed — silent cleanup, normal flow will handle it
+                if (gaplessPreBufferingPlayer == mp) {
+                    gaplessPreBufferingPlayer = null;
+                }
                 if (gaplessPreBufferedPlayer == mp) {
                     gaplessPreBufferedPlayer = null;
                     gaplessPreBufferedVideoId = "";
+                }
+                if (TextUtils.equals(gaplessPreBufferingVideoId, nextTrack.videoId)) {
+                    gaplessPreBufferingVideoId = "";
                 }
                 releaseSingleExoMediaPlayer(mp);
                 return true;
@@ -1855,12 +1909,23 @@ public class SongPlayerFragment extends Fragment {
 
             player.prepareAsync();
         } catch (Exception e) {
+            if (gaplessPreBufferingPlayer == player) {
+                gaplessPreBufferingPlayer = null;
+            }
+            if (TextUtils.equals(gaplessPreBufferingVideoId, nextTrack.videoId)) {
+                gaplessPreBufferingVideoId = "";
+            }
             releaseSingleExoMediaPlayer(player);
         }
     }
 
     private void cancelGaplessPreBuffer() {
         gaplessPreBufferTriggered = false;
+        gaplessPreBufferingVideoId = "";
+        if (gaplessPreBufferingPlayer != null) {
+            releaseSingleExoMediaPlayer(gaplessPreBufferingPlayer);
+            gaplessPreBufferingPlayer = null;
+        }
         if (gaplessPreBufferedPlayer != null) {
             releaseSingleExoMediaPlayer(gaplessPreBufferedPlayer);
             gaplessPreBufferedPlayer = null;
@@ -1951,9 +2016,13 @@ public class SongPlayerFragment extends Fragment {
         localSourcePreparing = true;
         updatePlayerSurfaceForSource();
 
-        // Show player loading spinner immediately for network sources
-        if (networkSource && pbVideoLoading != null) {
-            pbVideoLoading.setVisibility(View.VISIBLE);
+        // Show player loading spinner only for local video tracks
+        if (pbVideoLoading != null) {
+            if (isVideoTrack(track)) {
+                pbVideoLoading.setVisibility(View.VISIBLE);
+            } else {
+                pbVideoLoading.setVisibility(View.GONE);
+            }
         }
 
         Context playbackAppContext = getPlaybackAppContext();
@@ -1995,13 +2064,13 @@ public class SongPlayerFragment extends Fragment {
         }
 
         // Attach video surface
-        videoRouter.onTrackStarted(player, track.videoId);
+        videoRouter.onTrackStarted(player, track.videoId, isVideoTrack(track));
 
         // Show/hide loading spinner based on buffering state, but only hide when
         // audio is actually playing (not just when prepare finishes with isPlaying=false).
         player.setOnBufferingListener((mp, isBuffering) -> {
             if (mp == localExoMediaPlayer && pbVideoLoading != null) {
-                if (isBuffering) {
+                if (isBuffering && isVideoTrack(track)) {
                     pbVideoLoading.setVisibility(View.VISIBLE);
                 }
             }
@@ -2062,7 +2131,13 @@ public class SongPlayerFragment extends Fragment {
                     mp.setVolume(1f, 1f);
                     mp.start();
                     Log.d(TAG, "[PLAYBACK_FLOW] mp.start() called, AUDIO PLAYING for videoId=" + track.videoId);
-                    if (networkSource) ProxyStreamResolver.markSuccess(track.videoId);
+                    if (!LocalFilesStore.isLocalVideoId(track.videoId)) {
+                        PlaybackLoadingBus.notifyAudioConfirmed(track.videoId);
+                        if (pbVideoLoading != null) {
+                            pbVideoLoading.setVisibility(View.GONE);
+                        }
+                    }
+                    if (networkSource) StreamResolver.markSuccess(track.videoId);
                     consecutiveStreamFailures = 0; // Reset counter on successful playback
                     audioTrackReinitToken = -1;
                     startLocalProgressTicker();
@@ -2142,7 +2217,7 @@ public class SongPlayerFragment extends Fragment {
 
             // Only mark the proxy server as failed for network/source errors, not codec crashes
             if (networkSource && !isCodecError) {
-                ProxyStreamResolver.markFailed(track.videoId);
+                StreamResolver.markFailed(track.videoId);
             }
 
             if (localExoMediaPlayer == mp) {
@@ -2191,7 +2266,7 @@ public class SongPlayerFragment extends Fragment {
                 headers.put("User-Agent", STREAM_HTTP_USER_AGENT);
                 headers.put("Accept", "*/*");
                 // Inject InnerTube-specific headers for direct googlevideo.com URLs
-                Map<String, String> innertubeHeaders = InnertubeResolver.getHeadersFor(track.videoId);
+                Map<String, String> innertubeHeaders = StreamResolver.getHeadersFor(track.videoId);
                 headers.putAll(innertubeHeaders);
                 player.setDataSource(playbackAppContext, Uri.parse(source), headers);
             } else if (source.startsWith("content://") && isAdded()) {
@@ -2303,20 +2378,30 @@ public class SongPlayerFragment extends Fragment {
     }
 
     private boolean tryReresolveOrSkipCurrentTrack(@NonNull String reason, boolean forceAttempt) {
-        if (!isAdded() || !isNetworkAvailable()) {
+        if (!isAdded()) {
             return false;
         }
-        
-        consecutiveStreamFailures++;
 
         if (tracks.isEmpty() || currentIndex < 0 || currentIndex >= tracks.size()) {
             return false;
         }
 
         PlayerTrack track = tracks.get(currentIndex);
-        if (TextUtils.isEmpty(track.videoId)) {
+        if (track == null || TextUtils.isEmpty(track.videoId)) {
             return false;
         }
+
+        if (LocalFilesStore.isLocalVideoId(track.videoId)) {
+            Log.w(TAG, "Local file playback failed: videoId=" + track.videoId + " — skipping to next.");
+            moveTrack(1, false);
+            return true;
+        }
+
+        if (!isNetworkAvailable()) {
+            return false;
+        }
+        
+        consecutiveStreamFailures++;
 
         Log.w(TAG, "[PLAYBACK_RETRY] resolution failed, scheduling retry. reason="
                 + reason + " videoId=" + track.videoId + " attempt=" + consecutiveStreamFailures);
@@ -2559,7 +2644,28 @@ public class SongPlayerFragment extends Fragment {
         syncMiniStateWithPlaylist();
         persistPlaybackSnapshot(false);
 
-        // Stay on current track and keep retrying
+        if (!isNetworkAvailable()) {
+            // Offline and this track has no usable source. Skip forward to the nearest
+            // downloaded track rather than scheduling a retry that can never succeed.
+            boolean hasAnyOffline = false;
+            if (isAdded()) {
+                for (PlayerTrack t : tracks) {
+                    if (t != null && !TextUtils.isEmpty(t.videoId)
+                            && (LocalFilesStore.isLocalVideoId(t.videoId)
+                                || OfflineAudioStore.hasOfflineAudio(requireContext(), t.videoId))) {
+                        hasAnyOffline = true;
+                        break;
+                    }
+                }
+            }
+            if (hasAnyOffline) {
+                moveTrack(1, false);
+            }
+            // else: nothing to play offline — stay stopped, no retry.
+            return;
+        }
+
+        // Stay on current track and keep retrying (network available)
         if (!TextUtils.isEmpty(loadedVideoId)) {
             schedulePlaybackRetry(loadedVideoId);
         }
@@ -2726,6 +2832,7 @@ public class SongPlayerFragment extends Fragment {
         usingOfflineSource = !wasNetwork;
         accumulatedListenMs = 0;
         gaplessPreBufferTriggered = false;
+        gaplessPreBufferingVideoId = "";
         currentIndex = nextIndex;
         pauseRequestedByUser = false;
         isPlaying = true;
@@ -2776,7 +2883,7 @@ public class SongPlayerFragment extends Fragment {
 
         // Attach video surface for crossfaded track
         if (localExoMediaPlayer != null) {
-            videoRouter.onTrackStarted(localExoMediaPlayer, track.videoId);
+            videoRouter.onTrackStarted(localExoMediaPlayer, track.videoId, isVideoTrack(track));
         }
 
         prefetchedNextVideoId = null;
@@ -2865,7 +2972,29 @@ public class SongPlayerFragment extends Fragment {
         cancelPendingStreamResolver();
         streamResolverExecutor.shutdownNow();
         backgroundExecutor.shutdownNow();
+        backgroundDownloadExecutor.shutdownNow();
         super.onDestroy();
+    }
+
+    private void animateBackgroundTransition(android.graphics.drawable.Drawable newDrawable) {
+        if (playerBackgroundContainer == null) return;
+        android.graphics.drawable.Drawable oldDrawable = playerBackgroundContainer.getBackground();
+        if (oldDrawable == null) {
+            oldDrawable = new android.graphics.drawable.ColorDrawable(Color.BLACK);
+        } else if (oldDrawable instanceof android.graphics.drawable.TransitionDrawable) {
+            android.graphics.drawable.TransitionDrawable td = (android.graphics.drawable.TransitionDrawable) oldDrawable;
+            if (td.getNumberOfLayers() > 1) {
+                oldDrawable = td.getDrawable(1);
+            } else if (td.getNumberOfLayers() > 0) {
+                oldDrawable = td.getDrawable(0);
+            }
+        }
+        
+        android.graphics.drawable.Drawable[] layers = new android.graphics.drawable.Drawable[]{oldDrawable, newDrawable};
+        android.graphics.drawable.TransitionDrawable transition = new android.graphics.drawable.TransitionDrawable(layers);
+        transition.setCrossFadeEnabled(true);
+        playerBackgroundContainer.setBackground(transition);
+        transition.startTransition(400); // 400ms fade transition
     }
 
     private void bindCurrentTrack(boolean allowResume) {
@@ -2913,13 +3042,105 @@ public class SongPlayerFragment extends Fragment {
         boolean bootstrapArtwork = playerArtworkBootstrapPending;
         if (bootstrapArtwork) {
             playerArtworkBootstrapPending = false;
-            // Black background — video surface will show on top
-            if (playerBackgroundContainer != null) {
-                playerBackgroundContainer.setBackgroundColor(Color.BLACK);
+        }
+
+        boolean isLocalVideo = isVideoTrack(track);
+
+        if (ivPlayerCover != null) {
+            if (isLocalVideo) {
+                if (ivPlayerCover.getVisibility() == View.VISIBLE) {
+                    ivPlayerCover.animate().cancel();
+                    ivPlayerCover.animate().alpha(0f).setDuration(250).withEndAction(() -> {
+                        ivPlayerCover.setVisibility(View.GONE);
+                    }).start();
+                } else {
+                    ivPlayerCover.setVisibility(View.GONE);
+                }
+                if (playerBackgroundContainer != null) {
+                    animateBackgroundTransition(new android.graphics.drawable.ColorDrawable(Color.BLACK));
+                }
+            } else {
+                ivPlayerCover.setVisibility(View.VISIBLE);
+                ivPlayerCover.setAlpha(1f);
+
+                // Convert low-res image URL to HD
+                String hdUrl = getHdImageUrl(track.imageUrl, track.videoId);
+
+                Glide.with(this)
+                    .asBitmap()
+                    .load(hdUrl)
+                    .transform(SHARED_YT_CROP)
+                    .diskCacheStrategy(DiskCacheStrategy.ALL)
+                    .error(
+                        Glide.with(this)
+                            .asBitmap()
+                            .load(track.imageUrl)
+                            .transform(SHARED_YT_CROP)
+                            .diskCacheStrategy(DiskCacheStrategy.ALL)
+                    )
+                    .into(new CustomTarget<Bitmap>() {
+                        @Override
+                        public void onResourceReady(@NonNull Bitmap resource, @Nullable Transition<? super Bitmap> transition) {
+                            if (!isAdded()) return;
+
+                            // Adjust flPlayerHero aspect ratio and margins based on loaded cover artwork
+                            float aspect = (float) resource.getWidth() / resource.getHeight();
+                            if (flPlayerHero != null && getContext() != null) {
+                                androidx.constraintlayout.widget.ConstraintLayout.LayoutParams p =
+                                        (androidx.constraintlayout.widget.ConstraintLayout.LayoutParams) flPlayerHero.getLayoutParams();
+                                if (p != null) {
+                                    float density = getResources().getDisplayMetrics().density;
+                                    if (aspect > 1.2f) {
+                                        p.leftMargin = 0;
+                                        p.rightMargin = 0;
+                                        p.dimensionRatio = "H," + resource.getWidth() + ":" + resource.getHeight();
+                                        flPlayerHero.setBackground(androidx.core.content.ContextCompat.getDrawable(getContext(), R.drawable.bg_player_cover_flat));
+                                    } else {
+                                        p.leftMargin = (int) (20 * density);
+                                        p.rightMargin = (int) (20 * density);
+                                        p.dimensionRatio = "H,1:1";
+                                        flPlayerHero.setBackground(androidx.core.content.ContextCompat.getDrawable(getContext(), R.drawable.bg_player_cover_rounded));
+                                    }
+                                    flPlayerHero.setLayoutParams(p);
+                                }
+                            }
+                            
+                            // Crossfade new cover image smoothly
+                            ivPlayerCover.animate().cancel();
+                            ivPlayerCover.animate().alpha(0f).setDuration(150).withEndAction(() -> {
+                                ivPlayerCover.setImageBitmap(resource);
+                                ivPlayerCover.animate().alpha(1f).setDuration(250).start();
+                                if (pbVideoLoading != null && !isVideoTrack(track)) {
+                                    pbVideoLoading.setVisibility(View.GONE);
+                                }
+                            }).start();
+
+                            // Extract dominant color and set vertical gradient
+                            Palette.from(resource).generate(palette -> {
+                                if (palette == null || !isAdded()) return;
+                                int dominantColor = palette.getDominantColor(0xFF121212);
+
+                                if (playerBackgroundContainer != null) {
+                                    int r = Color.red(dominantColor);
+                                    int g = Color.green(dominantColor);
+                                    int b = Color.blue(dominantColor);
+                                    // Soft dark end color for vertical gradient
+                                    int colorEnd = Color.rgb((int)(r * 0.22f), (int)(g * 0.22f), (int)(b * 0.22f));
+
+                                    GradientDrawable gd = new GradientDrawable(
+                                        GradientDrawable.Orientation.TOP_BOTTOM,
+                                        new int[] { dominantColor, colorEnd }
+                                    );
+                                    animateBackgroundTransition(gd);
+                                }
+                            });
+                        }
+
+                        @Override
+                        public void onLoadCleared(@Nullable Drawable placeholder) {}
+                    });
             }
         }
-        // Hide cover art — all playback is video now
-        if (ivPlayerCover != null) ivPlayerCover.setVisibility(View.GONE);
 
         // Load notification/MediaSession artwork only
         loadNotificationArtworkOnly(track);
@@ -2940,6 +3161,33 @@ public class SongPlayerFragment extends Fragment {
         }
         syncMiniStateWithPlaylist();
         persistPlaybackSnapshot(false);
+    }
+
+    private String getHdImageUrl(String url, String videoId) {
+        if (TextUtils.isEmpty(url)) {
+            if (!TextUtils.isEmpty(videoId)) {
+                return "https://i.ytimg.com/vi/" + videoId + "/hq720.jpg";
+            }
+            return "";
+        }
+        // If it is a Google user content URL (YouTube Music thumbnail)
+        if (url.contains("googleusercontent.com") || url.contains("ggpht.com")) {
+            String hdUrl = url.replaceAll("=[ws]\\d+(-[ws]\\d+)*.*", "=w720-h720-l90-rj");
+            if (!hdUrl.contains("=w720")) {
+                hdUrl = url + "=w720-h720-l90-rj";
+            }
+            return hdUrl;
+        }
+        // If it is a standard YouTube thumbnail URL
+        if (url.contains("i.ytimg.com") || url.contains("img.youtube.com")) {
+            if (!TextUtils.isEmpty(videoId)) {
+                return "https://i.ytimg.com/vi/" + videoId + "/hq720.jpg";
+            }
+            return url.replace("default.jpg", "hq720.jpg")
+                      .replace("mqdefault.jpg", "hq720.jpg")
+                      .replace("hqdefault.jpg", "hq720.jpg");
+        }
+        return url;
     }
 
     private void setupSocialActions() {
@@ -4094,24 +4342,80 @@ public class SongPlayerFragment extends Fragment {
         backPressedCallback.setEnabled(!hidden && isResumed());
     }
 
+    private boolean isVideoTrackId(String videoId) {
+        if (TextUtils.isEmpty(videoId)) return false;
+        if (LocalFilesStore.isLocalVideoId(videoId)) {
+            return true;
+        }
+        Context context = getContext();
+        if (context != null && OfflineAudioStore.hasOfflineVideo(context, videoId)) {
+            return true;
+        }
+        return false;
+    }
+
+    private boolean isVideoTrack(PlayerTrack track) {
+        if (track == null) return false;
+        return isVideoTrackId(track.videoId);
+    }
 
     private void updatePlayerSurfaceForSource() {
-        // All playback is video — hide cover, full-width hero, black background
-        if (ivPlayerCover != null) ivPlayerCover.setVisibility(View.GONE);
+        // Keep cover visible if we are playing normal audio (network track or offline audio).
+        // Only hide cover if we are playing a local device video file (which contains video content to show).
+        boolean isLocalVideo = false;
+        if (currentIndex >= 0 && currentIndex < tracks.size()) {
+            PlayerTrack current = tracks.get(currentIndex);
+            if (current != null && isVideoTrack(current)) {
+                isLocalVideo = true;
+            }
+        }
+
+        if (ivPlayerCover != null) {
+            if (isLocalVideo) {
+                if (ivPlayerCover.getVisibility() == View.VISIBLE) {
+                    ivPlayerCover.animate().cancel();
+                    ivPlayerCover.animate().alpha(0f).setDuration(250).withEndAction(() -> {
+                        ivPlayerCover.setVisibility(View.GONE);
+                    }).start();
+                } else {
+                    ivPlayerCover.setVisibility(View.GONE);
+                }
+            } else {
+                ivPlayerCover.setVisibility(View.VISIBLE);
+                ivPlayerCover.setAlpha(1f);
+            }
+        }
+
         if (flPlayerHero != null && getContext() != null) {
             androidx.constraintlayout.widget.ConstraintLayout.LayoutParams p =
                     (androidx.constraintlayout.widget.ConstraintLayout.LayoutParams) flPlayerHero.getLayoutParams();
             if (p != null) {
-                p.leftMargin = 0;
-                p.rightMargin = 0;
-                p.height = 0; // MATCH_CONSTRAINT
+                if (isLocalVideo) {
+                    p.leftMargin = 0;
+                    p.rightMargin = 0;
+                    p.height = 0; // MATCH_CONSTRAINT
+                    p.dimensionRatio = "H,16:9";
+                    flPlayerHero.setBackground(androidx.core.content.ContextCompat.getDrawable(getContext(), R.drawable.bg_player_cover_flat));
+                } else {
+                    float density = getResources().getDisplayMetrics().density;
+                    p.leftMargin = (int) (20 * density);
+                    p.rightMargin = (int) (20 * density);
+                    p.height = 0; // MATCH_CONSTRAINT
+                    p.dimensionRatio = "H,1:1";
+                    flPlayerHero.setBackground(androidx.core.content.ContextCompat.getDrawable(getContext(), R.drawable.bg_player_cover_rounded));
+                }
                 flPlayerHero.setLayoutParams(p);
             }
-            flPlayerHero.setBackground(androidx.core.content.ContextCompat.getDrawable(getContext(), R.drawable.bg_player_cover_flat));
         }
-        if (playerBackgroundContainer != null) {
-            playerBackgroundContainer.animate().cancel();
-            playerBackgroundContainer.setBackgroundColor(0xFF000000);
+
+        // Hide spinner for audio tracks; only show for local video
+        if (pbVideoLoading != null && !isLocalVideo) {
+            pbVideoLoading.setVisibility(View.GONE);
+        }
+
+        // If it's a local video, force black background. If not, the Palette extraction will set it dynamically.
+        if (isLocalVideo && playerBackgroundContainer != null) {
+            animateBackgroundTransition(new android.graphics.drawable.ColorDrawable(Color.BLACK));
         }
     }
 

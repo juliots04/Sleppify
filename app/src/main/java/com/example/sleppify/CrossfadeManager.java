@@ -234,7 +234,7 @@ public final class CrossfadeManager {
         if (appContext != null && LocalFilesStore.isLocalVideoId(nextTrack.videoId)) {
             String contentUri = LocalFilesStore.getContentUriForVideoId(appContext, nextTrack.videoId);
             if (contentUri != null && !contentUri.isEmpty()) {
-                crossfadeWithSource(outgoing, nextIndex, contentUri, false, crossfadeDurationMs);
+                crossfadeWithSource(outgoing, nextIndex, nextTrack.videoId, contentUri, false, crossfadeDurationMs);
                 return;
             }
         }
@@ -243,14 +243,14 @@ public final class CrossfadeManager {
         if (appContext != null && OfflineAudioStore.hasValidatedOfflineAudio(appContext, nextTrack.videoId, nextTrack.duration)) {
             File nextFile = OfflineAudioStore.getExistingOfflineAudioFile(appContext, nextTrack.videoId);
             if (nextFile != null && nextFile.isFile() && nextFile.length() > 0L) {
-                crossfadeWithSource(outgoing, nextIndex, nextFile.getAbsolutePath(), false, crossfadeDurationMs);
+                crossfadeWithSource(outgoing, nextIndex, nextTrack.videoId, nextFile.getAbsolutePath(), false, crossfadeDurationMs);
                 return;
             }
         }
 
         // 4. Prefetched URL
         if (TextUtils.equals(nextTrack.videoId, prefetchedNextVideoId) && !TextUtils.isEmpty(prefetchedNextUrl)) {
-            crossfadeWithSource(outgoing, nextIndex, prefetchedNextUrl, true, crossfadeDurationMs);
+            crossfadeWithSource(outgoing, nextIndex, nextTrack.videoId, prefetchedNextUrl, true, crossfadeDurationMs);
             return;
         }
 
@@ -265,7 +265,7 @@ public final class CrossfadeManager {
                 handler.post(() -> {
                     if (inProgress) return;
                     if (!TextUtils.isEmpty(resolved)) {
-                        crossfadeWithSource(fadeOutgoing, fadeNextIndex, resolved, true, fadeDuration);
+                        crossfadeWithSource(fadeOutgoing, fadeNextIndex, videoId, resolved, true, fadeDuration);
                     } else {
                         fadeOutOnly(fadeOutgoing, fadeDuration);
                     }
@@ -300,6 +300,7 @@ public final class CrossfadeManager {
     private void crossfadeWithSource(
             @NonNull ExoMediaPlayer outgoing,
             int nextIndex,
+            @NonNull String videoId,
             @NonNull String source,
             boolean isNetworkSource,
             int crossfadeDurationMs
@@ -320,10 +321,10 @@ public final class CrossfadeManager {
                 Map<String, String> headers = new HashMap<>();
                 headers.put("User-Agent", STREAM_HTTP_USER_AGENT);
                 headers.put("Accept", "*/*");
-                // Inject InnerTube-specific headers for direct googlevideo.com URLs
-                if (source.contains("googlevideo.com")) {
-                    headers.put("Origin", "https://music.youtube.com");
-                    headers.put("Referer", "https://music.youtube.com/");
+                // Inject exact headers resolved by StreamResolver for this videoId
+                Map<String, String> streamHeaders = StreamResolver.getHeadersFor(videoId);
+                if (streamHeaders != null) {
+                    headers.putAll(streamHeaders);
                 }
                 incoming.setDataSource(appContext, Uri.parse(source), headers);
             } else if (source.startsWith("content://")) {
