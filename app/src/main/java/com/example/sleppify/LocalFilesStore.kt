@@ -143,8 +143,6 @@ object LocalFilesStore {
         return videoId != null && videoId.startsWith(LOCAL_VIDEO_ID_PREFIX)
     }
 
-
-
     private fun formatDuration(ms: Long): String {
         val totalSec = ms / 1000
         val min = totalSec / 60

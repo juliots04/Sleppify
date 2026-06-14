@@ -341,7 +341,7 @@
         android:clickable="true"
         android:focusable="true"
         android:visibility="gone"
-        app:layout_constraintTop_toBottomOf="@id/llFeaturedResult"
+        app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent">
@@ -350,7 +350,6 @@
             android:layout_width="62dp"
             android:layout_height="62dp"
             android:layout_gravity="center"
-            android:alpha="0.76"
             android:indeterminate="true"
             android:indeterminateTint="@android:color/white" />
     </FrameLayout>

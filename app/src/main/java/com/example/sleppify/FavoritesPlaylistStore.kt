@@ -47,24 +47,27 @@ object FavoritesPlaylistStore {
         synchronized(CACHE_LOCK) {
             val cached = likedMusicIdSet
             if (cached != null) return cached.contains(target)
-        }
-        val appContext = context.applicationContext
-        val raw = appContext.getSharedPreferences(PREFS_STREAMING_CACHE, Activity.MODE_PRIVATE)
-            .getString("playlist_tracks_data_$LIKED_PLAYLIST_ID", "").orEmpty()
-        val idSet = HashSet<String>()
-        if (raw.isNotBlank()) {
-            try {
-                val array = org.json.JSONArray(raw)
-                for (i in 0 until array.length()) {
-                    val vid = safe(array.optJSONObject(i)?.optString("videoId", ""))
-                    if (vid.isNotEmpty()) idSet.add(vid)
+
+            // Load + cache atomically inside the lock so a concurrent invalidateLikedMusicCache()
+            // can't slot in between the disk read and the cache write and leave a stale set.
+            val appContext = context.applicationContext
+            val raw = appContext.getSharedPreferences(PREFS_STREAMING_CACHE, Activity.MODE_PRIVATE)
+                .getString("playlist_tracks_data_$LIKED_PLAYLIST_ID", "").orEmpty()
+            val idSet = HashSet<String>()
+            if (raw.isNotBlank()) {
+                try {
+                    val array = org.json.JSONArray(raw)
+                    for (i in 0 until array.length()) {
+                        val vid = safe(array.optJSONObject(i)?.optString("videoId", ""))
+                        if (vid.isNotEmpty()) idSet.add(vid)
+                    }
+                } catch (e: Exception) {
+                    Log.w("FavPlaylistStore", "Failed to parse liked music IDs", e)
                 }
-            } catch (e: Exception) {
-                Log.w("FavPlaylistStore", "Failed to parse liked music IDs", e)
             }
+            likedMusicIdSet = idSet
+            return idSet.contains(target)
         }
-        synchronized(CACHE_LOCK) { likedMusicIdSet = idSet }
-        return idSet.contains(target)
     }
 
     @JvmStatic
@@ -169,47 +172,47 @@ object FavoritesPlaylistStore {
     fun loadFavorites(context: Context): List<FavoriteTrack> {
         synchronized(CACHE_LOCK) {
             favoritesCache?.let { return it }
-        }
 
-        val appContext = context.applicationContext
-        val prefs = getPrefs(appContext)
-        val raw = prefs.getString(PREF_TRACKS_DATA_PREFIX + PLAYLIST_ID, "").orEmpty()
-        if (raw.isBlank()) {
-            val empty = emptyList<FavoriteTrack>()
-            synchronized(CACHE_LOCK) {
+            // Load + cache atomically inside the lock: holding it across the disk read avoids a
+            // concurrent invalidateCache() racing between the read and the cache write (which
+            // could return data inconsistent with the cached state). Only the cold (uncached)
+            // call does I/O here; warm calls return from cache above without touching disk.
+            val appContext = context.applicationContext
+            val prefs = getPrefs(appContext)
+            val raw = prefs.getString(PREF_TRACKS_DATA_PREFIX + PLAYLIST_ID, "").orEmpty()
+            if (raw.isBlank()) {
+                val empty = emptyList<FavoriteTrack>()
                 updateCache(empty)
+                return empty
             }
-            return empty
-        }
 
-        val parsed = try {
-            val array = JSONArray(raw)
-            val dedup = LinkedHashMap<String, FavoriteTrack>()
-            for (i in 0 until array.length()) {
-                val obj = array.optJSONObject(i) ?: continue
-                val videoId = safe(obj.optString("videoId", ""))
-                if (videoId.isEmpty()) {
-                    continue
+            val parsed = try {
+                val array = JSONArray(raw)
+                val dedup = LinkedHashMap<String, FavoriteTrack>()
+                for (i in 0 until array.length()) {
+                    val obj = array.optJSONObject(i) ?: continue
+                    val videoId = safe(obj.optString("videoId", ""))
+                    if (videoId.isEmpty()) {
+                        continue
+                    }
+
+                    val track = FavoriteTrack(
+                        videoId,
+                        fallback(obj.optString("title", ""), "Tema"),
+                        safe(obj.optString("artist", "")),
+                        sanitizeDuration(obj.optString("duration", "")),
+                        safe(obj.optString("imageUrl", ""))
+                    )
+                    dedup[videoId] = track
                 }
-
-                val track = FavoriteTrack(
-                    videoId,
-                    fallback(obj.optString("title", ""), "Tema"),
-                    safe(obj.optString("artist", "")),
-                    sanitizeDuration(obj.optString("duration", "")),
-                    safe(obj.optString("imageUrl", ""))
-                )
-                dedup[videoId] = track
+                ArrayList(dedup.values)
+            } catch (_: Exception) {
+                emptyList<FavoriteTrack>()
             }
-            ArrayList(dedup.values)
-        } catch (_: Exception) {
-            emptyList<FavoriteTrack>()
-        }
 
-        synchronized(CACHE_LOCK) {
             updateCache(parsed)
+            return parsed
         }
-        return parsed
     }
 
     private fun updateCache(tracks: List<FavoriteTrack>) {

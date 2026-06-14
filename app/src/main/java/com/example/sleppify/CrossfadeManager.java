@@ -74,8 +74,26 @@ public final class CrossfadeManager {
     private final Handler handler = new Handler(Looper.getMainLooper());
 
     private boolean inProgress = false;
+    /** True while the incoming source is being resolved/prepared, BEFORE the fade starts.
+     *  Blocks onProgressTick from re-arming a transition every ~250ms (which used to spam
+     *  the resolver executor with duplicate NewPipe resolutions of the same video). */
+    private boolean armed = false;
+    /** True after a transition was aborted (resolution/prepare failed, or no playable next
+     *  source). Blocks re-arming until {@link #cancel()} — which fires on every track change,
+     *  pause and seek — so the outgoing track simply finishes at full volume and the
+     *  fragment's natural-completion path advances the queue (including offline skipping). */
+    private boolean suppressed = false;
+    /** Bumped on every cancel/reset. Async resolution/prepare callbacks capture the value at
+     *  submit time and abort if it changed — otherwise a resolution finishing after the user
+     *  paused or skipped would start a crossfade on a player that is no longer active. */
+    private long generation = 0L;
     @Nullable
     private ExoMediaPlayer incomingPlayer;
+    /** Incoming player while it is buffering, before the fade begins. */
+    @Nullable
+    private ExoMediaPlayer preparingPlayer;
+    @Nullable
+    private Runnable prepareTimeoutRunnable;
     private int targetIndex = -1;
     private boolean isNetwork = false;
     private long startedAtMs = 0L;
@@ -108,6 +126,11 @@ public final class CrossfadeManager {
 
     public boolean isInProgress() {
         return inProgress;
+    }
+
+    /** True if the running crossfade is consuming the given player as its incoming side. */
+    public boolean isUsingPlayer(@Nullable ExoMediaPlayer player) {
+        return player != null && inProgress && incomingPlayer == player;
     }
 
     public int getCrossfadeDurationMs() {
@@ -164,6 +187,8 @@ public final class CrossfadeManager {
         if (currentPlayer == null
                 || localSourcePreparing
                 || inProgress
+                || armed
+                || suppressed
                 || userSeeking
                 || !isPlaying
                 || durationMs <= 0
@@ -213,13 +238,17 @@ public final class CrossfadeManager {
 
         int nextIndex = resolveNextIndex(tracks, currentIndex, repeatMode);
         if (nextIndex < 0 || nextIndex >= tracks.size()) {
+            // Genuine end of playback (repeat-one park or end of queue): fade out gracefully.
             fadeOutOnly(outgoing, crossfadeDurationMs);
             return;
         }
 
         SongPlayerFragment.PlayerTrack nextTrack = tracks.get(nextIndex);
         if (nextTrack == null || TextUtils.isEmpty(nextTrack.videoId)) {
-            fadeOutOnly(outgoing, crossfadeDurationMs);
+            // Unplayable queue entry: do NOT fade out (that used to release the player and
+            // leave the UI stuck on "playing"). Let the track end naturally so the
+            // fragment's completion path advances and skips it.
+            abortTransitionUntilCancel();
             return;
         }
 
@@ -254,27 +283,53 @@ public final class CrossfadeManager {
             return;
         }
 
-        // 5. Resolve online URL on background thread
+        // 5. Resolve online URL on background thread. `armed` blocks the ~250ms ticker from
+        // re-submitting this resolution while it is in flight (it used to queue dozens of
+        // duplicate NewPipe extractions, starving the shared executor that prebuffer uses).
         if (networkAvailable && sourceResolver != null && resolverExecutor != null && appContext != null) {
             final ExoMediaPlayer fadeOutgoing = outgoing;
             final int fadeNextIndex = nextIndex;
             final int fadeDuration = crossfadeDurationMs;
             final String videoId = nextTrack.videoId;
+            final long gen = generation;
+            armed = true;
             resolverExecutor.submit(() -> {
                 String resolved = sourceResolver.resolveStreamUrl(appContext, videoId);
                 handler.post(() -> {
-                    if (inProgress) return;
+                    // The transition was cancelled (track change / pause / seek) while
+                    // resolving — do not start a crossfade on a player that moved on.
+                    if (gen != generation || inProgress) return;
                     if (!TextUtils.isEmpty(resolved)) {
                         crossfadeWithSource(fadeOutgoing, fadeNextIndex, videoId, resolved, true, fadeDuration);
                     } else {
-                        fadeOutOnly(fadeOutgoing, fadeDuration);
+                        // Resolution failed: keep playing at full volume; natural completion
+                        // will advance the queue without crossfade.
+                        abortTransitionUntilCancel();
                     }
                 });
             });
             return;
         }
 
-        fadeOutOnly(outgoing, crossfadeDurationMs);
+        // No network and the next track has no local/offline source: let the track finish
+        // naturally — the fragment's completion path skips to the next offline-available
+        // track. Fading out here used to kill playback entirely in offline mode.
+        abortTransitionUntilCancel();
+    }
+
+    /** Aborts the pending transition without fading. The outgoing track keeps playing at
+     *  full volume to its natural end; re-arming stays blocked until {@link #cancel()}. */
+    private void abortTransitionUntilCancel() {
+        armed = false;
+        suppressed = true;
+        if (prepareTimeoutRunnable != null) {
+            handler.removeCallbacks(prepareTimeoutRunnable);
+            prepareTimeoutRunnable = null;
+        }
+        if (preparingPlayer != null) {
+            releaseSingle(preparingPlayer);
+            preparingPlayer = null;
+        }
     }
 
     private void crossfadeWithPlayer(
@@ -284,13 +339,41 @@ public final class CrossfadeManager {
             int crossfadeDurationMs
     ) {
         preBuffered.isCrossfadeComponent = true;
+
+        // Replace the listeners the fragment's prebuffer phase installed: its error listener
+        // released the player unconditionally, which mid-fade would have destroyed the
+        // manager's incoming side without the manager noticing — completeCrossfade would
+        // then hand a RELEASED player to the fragment (silence, UI stuck on "playing").
+        final long gen = generation;
+        preBuffered.setOnPreparedListener(null);
+        preBuffered.setOnErrorListener((mp, what, extra) -> {
+            if (gen != generation) {
+                releaseSingle(mp);
+                return true;
+            }
+            Log.w(TAG, "crossfadeWithPlayer: incoming player error what=" + what);
+            if (inProgress && incomingPlayer == mp) {
+                // Error mid-fade: cancel the fade and restore the outgoing track so the
+                // music does not die at reduced volume.
+                cancelAndRestoreVolume(outgoing);
+                suppressed = true;
+            } else {
+                abortTransitionUntilCancel();
+            }
+            if (callback != null) {
+                callback.onCrossfadeFailed(nextIndex);
+            }
+            return true;
+        });
+
         try {
             preBuffered.setVolume(0f, 0f);
             preBuffered.start();
         } catch (Exception e) {
             Log.e(TAG, "crossfadeWithPlayer: start failed", e);
             releaseSingle(preBuffered);
-            fadeOutOnly(outgoing, crossfadeDurationMs);
+            // Keep playing at full volume; natural completion advances the queue.
+            abortTransitionUntilCancel();
             return;
         }
 
@@ -306,12 +389,13 @@ public final class CrossfadeManager {
             int crossfadeDurationMs
     ) {
         if (appContext == null) {
-            fadeOutOnly(outgoing, crossfadeDurationMs);
+            abortTransitionUntilCancel();
             return;
         }
 
-        ExoMediaPlayer incoming = new ExoMediaPlayer(appContext);
+        final ExoMediaPlayer incoming = new ExoMediaPlayer(appContext);
         incoming.isCrossfadeComponent = true;
+        final long gen = generation;
         try {
             incoming.setAudioAttributes(new AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -332,19 +416,71 @@ public final class CrossfadeManager {
             } else {
                 incoming.setDataSource(source);
             }
+
+            // Do NOT begin the fade yet: prepare() is asynchronous, and ramping the outgoing
+            // volume down while the incoming player is still buffering produced an audible
+            // fade-to-silence with the next track popping in late ("crossfade missing").
+            // The fade starts in onPrepared, when the incoming player can actually play.
+            armed = true;
+            preparingPlayer = incoming;
+
+            incoming.setOnPreparedListener(mp -> {
+                if (gen != generation || preparingPlayer != mp) {
+                    // Cancelled while buffering (track change / pause / seek).
+                    releaseSingle(mp);
+                    return;
+                }
+                if (prepareTimeoutRunnable != null) {
+                    handler.removeCallbacks(prepareTimeoutRunnable);
+                    prepareTimeoutRunnable = null;
+                }
+                preparingPlayer = null;
+                armed = false;
+                beginFade(outgoing, mp, nextIndex, isNetworkSource, crossfadeDurationMs);
+            });
+
+            incoming.setOnErrorListener((mp, what, extra) -> {
+                if (gen != generation) {
+                    releaseSingle(mp);
+                    return true;
+                }
+                Log.w(TAG, "crossfadeWithSource: incoming player error what=" + what);
+                if (inProgress && incomingPlayer == mp) {
+                    // Error mid-fade: cancel the fade and restore the outgoing track so the
+                    // music does not die at reduced volume.
+                    cancelAndRestoreVolume(outgoing);
+                    suppressed = true;
+                } else {
+                    abortTransitionUntilCancel();
+                }
+                if (callback != null) {
+                    callback.onCrossfadeFailed(nextIndex);
+                }
+                return true;
+            });
+
             incoming.prepare();
             incoming.setVolume(0f, 0f);
             incoming.start();
+
+            // Buffering watchdog: if the incoming source is not ready in time, give up on
+            // the crossfade (natural completion advances the queue without one).
+            prepareTimeoutRunnable = () -> {
+                prepareTimeoutRunnable = null;
+                if (gen != generation || preparingPlayer != incoming) return;
+                Log.w(TAG, "crossfadeWithSource: incoming player not ready in time — aborting fade");
+                abortTransitionUntilCancel();
+            };
+            handler.postDelayed(prepareTimeoutRunnable, Math.min(crossfadeDurationMs, 5_000));
         } catch (Exception e) {
             Log.e(TAG, "crossfadeWithSource: failed to prepare incoming player", e);
+            preparingPlayer = null;
             releaseSingle(incoming);
+            abortTransitionUntilCancel();
             if (callback != null) {
                 callback.onCrossfadeFailed(nextIndex);
             }
-            return;
         }
-
-        beginFade(outgoing, incoming, nextIndex, isNetworkSource, crossfadeDurationMs);
     }
 
     private void beginFade(
@@ -360,7 +496,10 @@ public final class CrossfadeManager {
         this.targetIndex = nextIndex;
         this.startedAtMs = SystemClock.elapsedRealtime();
 
-        outgoing.setOnCompletionListener(null);
+        // Keep the outgoing player's completion listener attached: the fragment's completion
+        // handler already ignores completions while isInProgress(). Nulling it here meant
+        // that after a cancelled crossfade (seek back, pause) the track could reach its end
+        // and never advance because nobody restored the listener.
         this.ticker = buildTicker(outgoing, crossfadeDurationMs);
         handler.post(this.ticker);
     }
@@ -432,14 +571,18 @@ public final class CrossfadeManager {
     // --- Cancel ---
 
     public void cancel() {
-        boolean wasInProgress = inProgress;
-
         if (ticker != null) {
             handler.removeCallbacks(ticker);
+        }
+        if (prepareTimeoutRunnable != null) {
+            handler.removeCallbacks(prepareTimeoutRunnable);
         }
 
         if (incomingPlayer != null) {
             releaseSingle(incomingPlayer);
+        }
+        if (preparingPlayer != null) {
+            releaseSingle(preparingPlayer);
         }
 
         resetState();
@@ -462,12 +605,17 @@ public final class CrossfadeManager {
     // --- Helpers ---
 
     private void resetState() {
+        generation++;
         inProgress = false;
+        armed = false;
+        suppressed = false;
         isNetwork = false;
         startedAtMs = 0L;
         targetIndex = -1;
         ticker = null;
         incomingPlayer = null;
+        preparingPlayer = null;
+        prepareTimeoutRunnable = null;
     }
 
     private int resolveNextIndex(

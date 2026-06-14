@@ -56,8 +56,8 @@ object CustomPlaylistsStore {
         val newArr = JSONArray()
         var added = false
         for (i in 0 until arr.length()) {
-            val obj = arr.getJSONObject(i)
-            if (obj.getString("videoId") == videoId) {
+            val obj = arr.optJSONObject(i) ?: continue
+            if (obj.optString("videoId", "") == videoId) {
                 // Update existing
                 obj.put("title", title)
                 obj.put("subtitle", subtitle)
@@ -94,8 +94,8 @@ object CustomPlaylistsStore {
         val arr = try { JSONArray(existingJson) } catch (e: JSONException) { JSONArray() }
         val newArr = JSONArray()
         for (i in 0 until arr.length()) {
-            val obj = arr.getJSONObject(i)
-            if (obj.getString("videoId") != videoId) {
+            val obj = arr.optJSONObject(i) ?: continue
+            if (obj.optString("videoId", "") != videoId) {
                 newArr.put(obj)
             }
         }
@@ -119,8 +119,8 @@ object CustomPlaylistsStore {
         val newArr = JSONArray()
         var exists = false
         for (i in 0 until arr.length()) {
-            val obj = arr.getJSONObject(i)
-            if (obj.getString("videoId") == videoId) {
+            val obj = arr.optJSONObject(i) ?: continue
+            if (obj.optString("videoId", "") == videoId) {
                 obj.put("title", title)
                 obj.put("subtitle", subtitle)
                 obj.put("duration", duration)
@@ -164,8 +164,8 @@ object CustomPlaylistsStore {
         val arr = try { JSONArray(existingJson) } catch (e: JSONException) { JSONArray() }
         val newArr = JSONArray()
         for (i in 0 until arr.length()) {
-            val obj = arr.getJSONObject(i)
-            if (obj.getString("videoId") != videoId) newArr.put(obj)
+            val obj = arr.optJSONObject(i) ?: continue
+            if (obj.optString("videoId", "") != videoId) newArr.put(obj)
         }
         prefs.edit().putString(key, newArr.toString()).apply()
 
@@ -179,11 +179,11 @@ object CustomPlaylistsStore {
         val key = YT_MIRROR_PREFIX + playlistId
         return getPrefs(context).mapJsonArray(key) { obj ->
             FavoritesPlaylistStore.FavoriteTrack(
-                obj.getString("videoId"),
-                obj.getString("title"),
-                obj.getString("subtitle"),
-                obj.getString("duration"),
-                obj.getString("thumbnailUrl")
+                obj.optString("videoId", ""),
+                obj.optString("title", ""),
+                obj.optString("subtitle", ""),
+                obj.optString("duration", ""),
+                obj.optString("thumbnailUrl", "")
             )
         }
     }
@@ -198,11 +198,11 @@ object CustomPlaylistsStore {
         val key = CUSTOM_PLAYLIST_PREFIX + playlistName
         return getPrefs(context).mapJsonArray(key) { obj ->
             FavoritesPlaylistStore.FavoriteTrack(
-                obj.getString("videoId"),
-                obj.getString("title"),
-                obj.getString("subtitle"),
-                obj.getString("duration"),
-                obj.getString("thumbnailUrl")
+                obj.optString("videoId", ""),
+                obj.optString("title", ""),
+                obj.optString("subtitle", ""),
+                obj.optString("duration", ""),
+                obj.optString("thumbnailUrl", "")
             )
         }
     }

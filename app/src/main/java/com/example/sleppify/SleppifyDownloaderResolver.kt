@@ -43,184 +43,178 @@ object SleppifyDownloaderResolver {
         downloadLocks.computeIfAbsent(videoId) { ReentrantLock() }
 
     /**
-     * Downloads 720p mp4 video (fallback 360p) for [videoId] via server [serverIndex] into [targetFile].
-     * Supports resumable downloads via HTTP Range header.
-     * Returns true on success, false on any failure.
+     * Downloads [videoId] for offline use into [targetFile] by asking the Sleppify proxy servers to
+     * fetch it server-side (yt-dlp) and stream it back. The track's assigned server is [serverIndex]
+     * (round-robin across a playlist so the 3 servers share the load); if it fails we fall back to
+     * the other two before giving up, so one slow/busy/down proxy never fails a track.
+     *
+     * Downloads VIDEO mp4 (the server falls back to audio-only for tracks that have no real video,
+     * e.g. plain songs, so those stay light). The player decides per file whether to present it as
+     * video (offline file with a video track → black, full-bleed) or as music (cover + backdrop).
+     * Returns true on success, false if all servers failed.
      */
     fun downloadVideoViaProxy(
         context: Context,
         videoId: String,
         targetFile: File,
         serverIndex: Int = 0,
-        onProgress: ((Long) -> Unit)? = null
+        onProgress: ((Float) -> Unit)? = null
     ): Boolean {
         if (videoId.isBlank()) return false
 
         val lock = lockFor(videoId)
         lock.lock()
         try {
-            // Re-check if another concurrent thread just finished downloading this exact file
+            // Another concurrent task may have just finished this exact file.
             if (targetFile.exists() && targetFile.length() >= MIN_VALID_VIDEO_BYTES) {
-                Log.d(TAG, "video_proxy_ok id=$videoId reason=already_downloaded_concurrently")
+                Log.d(TAG, "video_proxy_ok id=$videoId reason=already_downloaded")
                 return true
             }
 
             val tempFile = File(targetFile.absolutePath + ".tmp")
-            val existingBytes = if (tempFile.isFile) tempFile.length() else 0L
-            val isResume = existingBytes >= MIN_VALID_VIDEO_BYTES / 2
+            if (tempFile.isFile) tempFile.delete()
+
+            val cookie = StreamResolver.getAuthCookieHeader()
+            val payload = JSONObject()
+                .put("url", "https://www.youtube.com/watch?v=$videoId")
+                .put("format", "video")
+                .toString()
+                .toByteArray(StandardCharsets.UTF_8)
 
             val startMs = System.currentTimeMillis()
+            // Preferred server first, then the other two as fallbacks (wrap-around round robin).
+            for (attempt in 0 until SERVER_COUNT) {
+                val server = ((serverIndex % SERVER_COUNT) + SERVER_COUNT + attempt) % SERVER_COUNT
+                val downloaded = downloadFromServer(
+                    VIDEO_ENDPOINTS[server], server, videoId, payload, cookie, tempFile, onProgress
+                )
+                if (downloaded && finalizeDownload(tempFile, targetFile, videoId, server, startMs)) {
+                    return true
+                }
+                if (tempFile.isFile) tempFile.delete()
+            }
 
-        var totalBytes = if (isResume) existingBytes else 0L
-        if (!isResume && tempFile.isFile) {
-            tempFile.delete()
+            Log.w(TAG, "video_proxy_fail id=$videoId all_servers_failed elapsed=${System.currentTimeMillis() - startMs}ms")
+            return false
+        } finally {
+            // Keep the lock instance in the map (do NOT remove): computeIfAbsent + remove cannot
+            // provide per-id mutual exclusion. The bounded per-process leak is negligible.
+            lock.unlock()
         }
+    }
 
-        var retryCount = 0
-        val MAX_RETRIES = 5
-        var success = false
-        var lastException: Exception? = null
-        var serverLabel = "unknown"
+    /** POSTs to a single proxy's /api/video and streams the result into [tempFile]. Returns true if
+     *  a complete, large-enough file was written; false on any HTTP/IO error (caller tries next server). */
+    private fun downloadFromServer(
+        endpoint: String,
+        server: Int,
+        videoId: String,
+        payload: ByteArray,
+        cookie: String,
+        tempFile: File,
+        onProgress: ((Float) -> Unit)?
+    ): Boolean {
+        var connection: HttpURLConnection? = null
+        return try {
+            connection = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                connectTimeout = CONNECT_TIMEOUT_MS
+                // The server downloads the whole track BEFORE sending the first byte, so this must
+                // cover the full server-side fetch time.
+                readTimeout = VIDEO_READ_TIMEOUT_MS
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json")
+                setRequestProperty("Accept", "audio/mp4, video/mp4, */*")
+                setRequestProperty("User-Agent", "Sleppify-Android/1.0")
+                if (cookie.isNotBlank()) setRequestProperty("X-Youtube-Cookie", cookie)
+            }
+            connection.outputStream.use { it.write(payload) }
 
-        while (retryCount <= MAX_RETRIES && !success) {
-            val urlString = StreamResolver.resolveStreamUrl(context, videoId)
-            if (urlString == null) {
-                Log.w(TAG, "No stream url resolved for $videoId")
+            val code = connection.responseCode
+            if (code != HttpURLConnection.HTTP_OK) {
+                val err = try { connection.errorStream?.bufferedReader()?.readText()?.take(200) } catch (_: Exception) { null }
+                Log.w(TAG, "video_proxy_fail id=$videoId server=$server http=$code err=$err")
                 return false
             }
-            val isDirectGooglevideo = urlString.contains("googlevideo.com")
-            serverLabel = if (isDirectGooglevideo) "innertube" else "proxy_fallback"
 
-            var connection: HttpURLConnection? = null
-            try {
-                val isAppend = totalBytes > 0
-                connection = (URL(urlString).openConnection() as HttpURLConnection).apply {
-                    requestMethod = "GET"
-                    connectTimeout = CONNECT_TIMEOUT_MS
-                    // Use a shorter read timeout since we will retry on timeout
-                    readTimeout = 30000
-                    doOutput = false
-                    setRequestProperty("Accept", "video/mp4, */*")
-                    StreamResolver.getHeadersFor(videoId).forEach { (k, v) -> setRequestProperty(k, v) }
-                    if (isAppend) {
-                        setRequestProperty("Range", "bytes=$totalBytes-")
-                    }
-                }
+            val expected = connection.getHeaderField("Content-Length")?.toLongOrNull() ?: -1L
+            tempFile.parentFile?.let { if (!it.exists()) it.mkdirs() }
 
-                val code = connection.responseCode
-                if (code == 416) {
-                    // Range Not Satisfiable -> we already downloaded the whole file!
-                    success = true
-                    break
-                }
-                
-                val resumingNow = isAppend && code == HttpURLConnection.HTTP_PARTIAL
-                val freshStart = code == HttpURLConnection.HTTP_OK
-
-                if (!resumingNow && !freshStart) {
-                    val errBody = try { connection.errorStream?.bufferedReader()?.readText()?.take(300) } catch (_: Exception) { null }
-                    Log.w(TAG, "video_proxy_fail id=$videoId $serverLabel http=$code elapsed=${System.currentTimeMillis() - startMs}ms err=$errBody")
-                    StreamResolver.invalidate(videoId)
-                    if (code == 403 || code == 404) {
-                        retryCount++
-                        continue // Retry with newly resolved URL (maybe proxy)
-                    }
-                    return false
-                }
-
-                // If we tried to resume but the server sent the full file (200 OK), we MUST overwrite, not append.
-                var actualAppend = isAppend
-                if (isAppend && freshStart) {
-                    actualAppend = false
-                    totalBytes = 0
-                    if (tempFile.isFile) tempFile.delete()
-                }
-
-                tempFile.parentFile?.let { if (!it.exists()) it.mkdirs() }
-
-                var bytesReadThisSession = 0L
-                connection.inputStream.use { input ->
-                    FileOutputStream(tempFile, actualAppend).use { output ->
-                        val buf = ByteArray(16384)
-                        var n: Int
-                        while (input.read(buf).also { n = it } != -1) {
-                            output.write(buf, 0, n)
-                            totalBytes += n
-                            bytesReadThisSession += n
-                            onProgress?.invoke(totalBytes)
+            var total = 0L
+            connection.inputStream.use { input ->
+                FileOutputStream(tempFile, false).use { output ->
+                    val buf = ByteArray(16384)
+                    var n: Int
+                    while (input.read(buf).also { n = it } != -1) {
+                        output.write(buf, 0, n)
+                        total += n
+                        if (onProgress != null) {
+                            val fraction = if (expected > 0L) {
+                                (total.toDouble() / expected).coerceIn(0.02, 0.99).toFloat()
+                            } else {
+                                (1.0 - kotlin.math.exp(-total / 4_000_000.0)).coerceIn(0.02, 0.95).toFloat()
+                            }
+                            onProgress.invoke(fraction)
                         }
                     }
                 }
-                
-                val expectedContentLength = connection.getHeaderField("Content-Length")?.toLongOrNull() ?: -1L
-                if (expectedContentLength > 0L && bytesReadThisSession < expectedContentLength) {
-                    throw java.io.IOException("Truncated stream: expected $expectedContentLength bytes but got $bytesReadThisSession")
-                }
-
-                // If it reached here without exception, stream finished successfully.
-                success = true
-            } catch (e: Exception) {
-                lastException = e
-                retryCount++
-                Log.w(TAG, "video_proxy_exception id=$videoId $serverLabel attempt=$retryCount reason=${e.javaClass.simpleName} msg=${e.message}")
-                StreamResolver.invalidate(videoId)
-                if (retryCount <= MAX_RETRIES) {
-                    try { Thread.sleep(2000) } catch (ie: InterruptedException) { Thread.currentThread().interrupt(); break }
-                }
-            } finally {
-                connection?.disconnect()
             }
-        }
 
-        val elapsed = System.currentTimeMillis() - startMs
-        if (!success) {
-            Log.w(TAG, "video_proxy_fail id=$videoId $serverLabel failed_after_retries last_err=${lastException?.javaClass?.simpleName} bytes=$totalBytes elapsed=${elapsed}ms")
-            return false
-        }
-
-        if (totalBytes < MIN_VALID_VIDEO_BYTES) {
-            Log.w(TAG, "video_proxy_fail id=$videoId $serverLabel reason=too_small bytes=$totalBytes elapsed=${elapsed}ms")
-            tempFile.delete()
-            return false
-        }
-
-        var isPlayable = false
-        try {
-            val extractor = android.media.MediaExtractor()
-            extractor.setDataSource(tempFile.absolutePath)
-            for (i in 0 until extractor.trackCount) {
-                val format = extractor.getTrackFormat(i)
-                val mime = format.getString(android.media.MediaFormat.KEY_MIME)
-                if (mime != null && (mime.startsWith("audio/") || mime.startsWith("video/"))) {
-                    isPlayable = true
-                    break
-                }
+            if (expected > 0L && total < expected) {
+                Log.w(TAG, "video_proxy_fail id=$videoId server=$server truncated got=$total expected=$expected")
+                return false
             }
-            extractor.release()
+            if (total < MIN_VALID_VIDEO_BYTES) {
+                Log.w(TAG, "video_proxy_fail id=$videoId server=$server too_small bytes=$total")
+                return false
+            }
+            true
         } catch (e: Exception) {
-            // Not playable or corrupt
+            Log.w(TAG, "video_proxy_exception id=$videoId server=$server reason=${e.javaClass.simpleName} msg=${e.message}")
+            false
+        } finally {
+            connection?.disconnect()
         }
+    }
 
-        if (!isPlayable) {
-            Log.w(TAG, "video_proxy_fail id=$videoId reason=corrupt_or_not_playable")
-            tempFile.delete()
+    /** Validates the freshly-downloaded temp file is playable, then atomically renames to target. */
+    private fun finalizeDownload(
+        tempFile: File,
+        targetFile: File,
+        videoId: String,
+        server: Int,
+        startMs: Long
+    ): Boolean {
+        if (!isPlayable(tempFile)) {
+            Log.w(TAG, "video_proxy_fail id=$videoId server=$server corrupt_or_not_playable")
             return false
         }
-
-        if (targetFile.exists()) {
-            targetFile.delete()
-        }
-        val renamed = tempFile.renameTo(targetFile)
-        if (!renamed) {
+        if (targetFile.exists()) targetFile.delete()
+        if (!tempFile.renameTo(targetFile)) {
             Log.w(TAG, "video_proxy_fail id=$videoId reason=rename_failed")
             return false
         }
-
-        Log.d(TAG, "video_proxy_ok id=$videoId $serverLabel bytes=$totalBytes elapsed=${elapsed}ms")
+        Log.d(TAG, "video_proxy_ok id=$videoId server=$server bytes=${targetFile.length()} elapsed=${System.currentTimeMillis() - startMs}ms")
         return true
-        } finally {
-            lock.unlock()
-            downloadLocks.remove(videoId)
+    }
+
+    private fun isPlayable(file: File): Boolean {
+        return try {
+            val extractor = android.media.MediaExtractor()
+            try {
+                extractor.setDataSource(file.absolutePath)
+                for (i in 0 until extractor.trackCount) {
+                    val mime = extractor.getTrackFormat(i).getString(android.media.MediaFormat.KEY_MIME)
+                    if (mime != null && (mime.startsWith("audio/") || mime.startsWith("video/"))) {
+                        return true
+                    }
+                }
+                false
+            } finally {
+                extractor.release()
+            }
+        } catch (e: Exception) {
+            false
         }
     }
 

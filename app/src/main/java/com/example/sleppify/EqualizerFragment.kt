@@ -182,6 +182,15 @@ class EqualizerFragment : Fragment() {
         super.onStop()
     }
 
+    override fun onDestroyView() {
+        // onStop is not guaranteed before view teardown in every lifecycle path — clear pending
+        // handler callbacks here too so they never fire against a destroyed view.
+        mainHandler.removeCallbacksAndMessages(null)
+        dismissActivePopupWindow()
+        unregisterOutputDeviceCallback()
+        super.onDestroyView()
+    }
+
     private fun dismissActivePopupWindow() {
         val popup = activePopupWindow ?: return
         runCatching { popup.dismiss() }

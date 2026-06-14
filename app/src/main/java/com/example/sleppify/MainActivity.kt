@@ -190,6 +190,10 @@ class MainActivity : AppCompatActivity() {
                 return
             }
 
+            // Safety net: a full-screen EQ overlay whose tracking flags were lost would otherwise
+            // fall through to moveTaskToBack and feel "stuck". Recover before that.
+            if (recoverFromStuckEqualizerOverlay()) return
+
             if (handleSongPlayerBackPressed()) return
             if (handlePlaylistDetailBackPressed()) return
 
@@ -534,6 +538,7 @@ class MainActivity : AppCompatActivity() {
         }
         cloudSyncManager.setSyncStateListener(null)
         unregisterNetworkCallback()
+        mainHandler.removeCallbacksAndMessages(null)
         super.onDestroy()
     }
 
@@ -592,14 +597,14 @@ class MainActivity : AppCompatActivity() {
         if (isFinishing || isDestroyed) return
         settingsPrefs.edit().putBoolean(CloudSyncManager.KEY_OFFLINE_MODE_ENABLED, true).apply()
         showNetworkStatusBar("Modo offline activado", android.graphics.Color.parseColor("#FF1E1E1E"))
-        mainHandler.postDelayed({ notifyOfflineModeChanged() }, 1500L)
+        mainHandler.postDelayed({ if (!isFinishing && !isDestroyed) notifyOfflineModeChanged() }, 1500L)
     }
 
     private fun onNetworkRestored() {
         if (isFinishing || isDestroyed) return
         settingsPrefs.edit().putBoolean(CloudSyncManager.KEY_OFFLINE_MODE_ENABLED, false).apply()
         showNetworkStatusBar("Vuelves a tener conexión", android.graphics.Color.parseColor("#FF00C853"))
-        mainHandler.postDelayed({ notifyOfflineModeChanged() }, 1500L)
+        mainHandler.postDelayed({ if (!isFinishing && !isDestroyed) notifyOfflineModeChanged() }, 1500L)
     }
 
     private fun showNetworkStatusBar(message: String, bgColor: Int) {
@@ -661,6 +666,7 @@ class MainActivity : AppCompatActivity() {
 
         // Auto-dismiss after 4 seconds
         mainHandler.postDelayed({
+            if (isFinishing || isDestroyed) return@postDelayed
             if (bar.parent != null) {
                 bar.animate()
                     .translationY(100 * density)
@@ -1053,8 +1059,50 @@ class MainActivity : AppCompatActivity() {
     }
 
     fun returnFromEqualizer() {
-        if (inEqualizerFromSettings) exitEqualizerToSettings()
-        else if (inEqualizerFromPlayer) exitEqualizerToMusic()
+        when {
+            inEqualizerFromSettings -> exitEqualizerToSettings()
+            inEqualizerFromPlayer -> exitEqualizerToMusic()
+            // Flags got lost (e.g. after process recreation) but the EQ is still on screen — the
+            // close button must still get the user out. Recover instead of doing nothing.
+            else -> recoverFromStuckEqualizerOverlay()
+        }
+    }
+
+    /**
+     * Safety net for a stuck full-screen equalizer overlay: the EQ is opened from the player or
+     * settings with bottomNav hidden, but inEqualizerFromPlayer/Settings were reset (process
+     * recreation, a racing transaction, etc.). In that state neither the system back nor the EQ's
+     * own close button can dismiss it. This detects that situation and routes out to the most
+     * sensible origin. Returns true if it handled a stuck overlay; false otherwise (so callers can
+     * fall through to normal handling). It deliberately ignores the EQ when it is the normal
+     * bottom-nav module (bottom nav visible), which is a valid flags-false state.
+     */
+    private fun recoverFromStuckEqualizerOverlay(): Boolean {
+        if (inEqualizerFromPlayer || inEqualizerFromSettings) return false
+        val eq = supportFragmentManager.findFragmentByTag(TAG_MODULE_EQUALIZER) ?: return false
+        if (!eq.isAdded || eq.isHidden) return false
+        // EQ shown as the regular bottom-nav module — not stuck; let normal navigation handle it.
+        if (currentMainNavItemId == R.id.nav_equalizer && bottomNav.visibility == View.VISIBLE) return false
+
+        Log.w("MainActivity", "recoverFromStuckEqualizerOverlay: dismissing EQ with no flag set")
+        val player = supportFragmentManager.findFragmentByTag(TAG_SONG_PLAYER)
+        val settings = supportFragmentManager.findFragmentByTag(TAG_MODULE_SETTINGS)
+        when {
+            player != null && player.isAdded -> {
+                inEqualizerFromPlayer = true
+                exitEqualizerToMusic()
+            }
+            settings != null && settings.isAdded -> {
+                inEqualizerFromSettings = true
+                exitEqualizerToSettings()
+            }
+            else -> {
+                hideEqualizerImmediately()
+                val fallbackNav = if (currentMainNavItemId == R.id.nav_equalizer) R.id.nav_music else currentMainNavItemId
+                switchToMainModule(fallbackNav)
+            }
+        }
+        return true
     }
 
     private fun exitEqualizerToMusic() {
@@ -1549,16 +1597,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setOverlayFullscreen(fullscreen: Boolean) {
+        // Always position the loading overlay full-screen so the navigation spinner lands in a
+        // FIXED, screen-centered spot on every transition. The old 'above-nav' variant raised the
+        // spinner on some screens, which made it appear to jump between navigations. The param is
+        // kept for call-site compatibility.
         val lp = moduleLoadingOverlay.layoutParams as? androidx.constraintlayout.widget.ConstraintLayout.LayoutParams ?: return
-        if (fullscreen) {
-            lp.bottomToTop = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.UNSET
-            lp.bottomToBottom = R.id.main
-            lp.bottomMargin = 0
-        } else {
-            lp.bottomToBottom = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.UNSET
-            lp.bottomToTop = R.id.bottomNavigation
-            lp.bottomMargin = (72 * resources.displayMetrics.density).toInt()
-        }
+        lp.bottomToTop = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.UNSET
+        lp.bottomToBottom = R.id.main
+        lp.bottomMargin = 0
         moduleLoadingOverlay.layoutParams = lp
     }
 
@@ -1723,13 +1769,15 @@ class MainActivity : AppCompatActivity() {
             // Pop only the topmost one so we return to the previous playlist.
             supportFragmentManager.popBackStackImmediate()
         } else {
-            // Single detail — pop all the way back to library
-            markStreamingEntryAsLibrary()
+            // Single detail — pop it and return to the module the playlist was opened FROM
+            // (the bottom-nav selection is unchanged while a detail is on top), instead of always
+            // forcing Music. So a playlist opened from Principal returns to Principal.
+            val returnNav = bottomNav.selectedItemId
+            if (returnNav == R.id.nav_music) markStreamingEntryAsLibrary()
             supportFragmentManager.popBackStackImmediate(TAG_PLAYLIST_DETAIL, androidx.fragment.app.FragmentManager.POP_BACK_STACK_INCLUSIVE)
-            
-            // Switch to the music module cleanly to hide any other main modules (like PrincipalFragment)
-            // and show MusicPlayerFragment.
-            switchToMainModule(R.id.nav_music)
+
+            // Show the origin module cleanly (hides the detail and any other resident module).
+            if (!switchToMainModule(returnNav)) switchToMainModule(R.id.nav_music)
         }
         return true
     }

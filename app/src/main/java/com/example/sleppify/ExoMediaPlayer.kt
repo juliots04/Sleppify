@@ -201,54 +201,51 @@ class ExoMediaPlayer {
         activeInstances.add(WeakReference(this))
     }
 
+    // IMPORTANT: the posted dispatches below re-read the listener FIELD at execution time
+    // instead of capturing the listener at event time. Capturing meant that replacing or
+    // nulling a listener could not stop an already-queued post — e.g. a stale error post
+    // installed by a finished crossfade could release the player AFTER it had been promoted
+    // to the active player, silently killing playback.
     private val playerListener = object : Player.Listener {
         override fun onPlaybackStateChanged(playbackState: Int) {
             if (playbackState == Player.STATE_READY && !prepared) {
                 prepared = true
-                preparedListener?.let { listener ->
-                    mainHandler.post {
-                        if (!released) {
-                            listener.onPrepared(this@ExoMediaPlayer)
-                        }
+                mainHandler.post {
+                    if (!released) {
+                        preparedListener?.onPrepared(this@ExoMediaPlayer)
                     }
                 }
             } else if (playbackState == Player.STATE_ENDED) {
-                completionListener?.let { listener ->
-                    mainHandler.post {
-                        if (!released) {
-                            listener.onCompletion(this@ExoMediaPlayer)
-                        }
+                mainHandler.post {
+                    if (!released) {
+                        completionListener?.onCompletion(this@ExoMediaPlayer)
                     }
                 }
             }
             // Notify buffering state changes for seek feedback
-            bufferingListener?.let { listener ->
+            if (bufferingListener != null) {
                 val isBuffering = playbackState == Player.STATE_BUFFERING
                 mainHandler.post {
                     if (!released) {
-                        listener.onBufferingChanged(this@ExoMediaPlayer, isBuffering)
+                        bufferingListener?.onBufferingChanged(this@ExoMediaPlayer, isBuffering)
                     }
                 }
             }
         }
 
         override fun onRenderedFirstFrame() {
-            renderedFirstFrameListener?.let { listener ->
-                mainHandler.post {
-                    if (!released) {
-                        listener.onRenderedFirstFrame(this@ExoMediaPlayer)
-                    }
+            mainHandler.post {
+                if (!released) {
+                    renderedFirstFrameListener?.onRenderedFirstFrame(this@ExoMediaPlayer)
                 }
             }
         }
 
         override fun onPlayerError(error: PlaybackException) {
             Log.w(TAG, "onPlayerError: code=${error.errorCode} message=${error.message}")
-            errorListener?.let { listener ->
-                mainHandler.post {
-                    if (!released) {
-                        listener.onError(this@ExoMediaPlayer, error.errorCode, 0)
-                    }
+            mainHandler.post {
+                if (!released) {
+                    errorListener?.onError(this@ExoMediaPlayer, error.errorCode, 0)
                 }
             }
         }
@@ -459,6 +456,11 @@ class ExoMediaPlayer {
         preparedListener = null
         completionListener = null
         errorListener = null
+        bufferingListener = null
+        renderedFirstFrameListener = null
+        // Drop this instance from the active registry so released players don't accumulate as
+        // dead WeakReferences (stopOthers only prunes lazily while iterating).
+        activeInstances.removeIf { it.get() === this }
         exoPlayer?.let { player ->
             try {
                 player.removeListener(playerListener)

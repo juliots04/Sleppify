@@ -125,7 +125,23 @@ object OfflineAudioStore {
         }
 
         val actualDurationSeconds = readAudioDurationSeconds(existing)
-        if (!isPlausibleOfflineAudioFile(existing, actualDurationSeconds)) {
+
+        // Genuinely-tiny files are junk — safe to remove.
+        if (existing.length() < MIN_VALID_AUDIO_FILE_BYTES) {
+            deleteOfflineAudio(context, normalized)
+            return false
+        }
+
+        // Duration could not be read (transient MediaMetadataRetriever failure) on an
+        // otherwise size-valid file: do NOT delete. This method is called from read-only UI
+        // status scans, and deleting here would destroy a good download and make the progress
+        // circle regress on a mere refresh. Report not-validated-now without poisoning the cache.
+        if (actualDurationSeconds < 0) {
+            return false
+        }
+
+        // Positively too short -> corrupt/partial download, remove it.
+        if (actualDurationSeconds < MIN_VALID_AUDIO_DURATION_SECONDS) {
             deleteOfflineAudio(context, normalized)
             return false
         }
@@ -145,7 +161,10 @@ object OfflineAudioStore {
         val matchesExpectedDuration = actualDurationSeconds >= minimumAllowedDurationSeconds
         if (!matchesExpectedDuration) {
             android.util.Log.w("OfflineAudioStore", "validation:fail id=$normalized actual=$actualDurationSeconds expected=$expectedDurationLabel (min=$minimumAllowedDurationSeconds)")
-            deleteOfflineAudio(context, normalized)
+            // Shorter than expected. Don't delete on a read-only scan; just report not-validated
+            // so a re-download can replace it. The worker's own post-download
+            // validateDownloadedTrackFile still prunes genuinely-bad downloads at fetch time.
+            putCachedOfflineState(normalized, false)
             return false
         }
 
@@ -281,13 +300,6 @@ object OfflineAudioStore {
         }
 
         return false
-    }
-
-    private fun isPlausibleOfflineAudioFile(file: File, durationSeconds: Int): Boolean {
-        if (!file.isFile || file.length() < MIN_VALID_AUDIO_FILE_BYTES) {
-            return false
-        }
-        return durationSeconds >= MIN_VALID_AUDIO_DURATION_SECONDS
     }
 
     private fun readAudioDurationSeconds(file: File): Int {

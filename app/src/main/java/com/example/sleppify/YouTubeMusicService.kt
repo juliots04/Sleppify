@@ -1478,9 +1478,11 @@ class YouTubeMusicService @JvmOverloads constructor(
 
     private fun readResponse(connection: HttpURLConnection, fromErrorStream: Boolean): String {
         return try {
-            if (fromErrorStream && connection.errorStream == null) return ""
-
-            val stream = if (fromErrorStream) connection.errorStream else connection.inputStream
+            val stream = if (fromErrorStream) {
+                connection.errorStream ?: return ""
+            } else {
+                connection.inputStream ?: return ""
+            }
             BufferedReader(InputStreamReader(stream, StandardCharsets.UTF_8)).use { reader ->
                 val builder = StringBuilder()
                 var line = reader.readLine()
@@ -1503,28 +1505,32 @@ class YouTubeMusicService @JvmOverloads constructor(
     ): Boolean {
         val url = URL("$API_BASE_URL/playlistItems?part=snippet")
         val conn = url.openConnection() as HttpURLConnection
-        conn.requestMethod = "POST"
-        conn.setRequestProperty("Authorization", "Bearer $token")
-        conn.setRequestProperty("Content-Type", "application/json")
-        conn.doOutput = true
+        try {
+            conn.requestMethod = "POST"
+            conn.setRequestProperty("Authorization", "Bearer $token")
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.doOutput = true
 
-        val snippet = JSONObject()
-        snippet.put("playlistId", playlistId)
-        val resourceId = JSONObject()
-        resourceId.put("kind", "youtube#video")
-        resourceId.put("videoId", videoId)
-        snippet.put("resourceId", resourceId)
+            val snippet = JSONObject()
+            snippet.put("playlistId", playlistId)
+            val resourceId = JSONObject()
+            resourceId.put("kind", "youtube#video")
+            resourceId.put("videoId", videoId)
+            snippet.put("resourceId", resourceId)
 
-        val root = JSONObject()
-        root.put("snippet", snippet)
+            val root = JSONObject()
+            root.put("snippet", snippet)
 
-        conn.outputStream.use { os ->
-            val input = root.toString().toByteArray(StandardCharsets.UTF_8)
-            os.write(input, 0, input.size)
+            conn.outputStream.use { os ->
+                val input = root.toString().toByteArray(StandardCharsets.UTF_8)
+                os.write(input, 0, input.size)
+            }
+
+            val code = conn.responseCode
+            return code in 200..299
+        } finally {
+            conn.disconnect()
         }
-
-        val code = conn.responseCode
-        return code in 200..299
     }
 
     @Throws(Exception::class)

@@ -111,6 +111,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     private static final String PREF_TRACKS_DATA_PREFIX = "playlist_tracks_data_";
     private static final String PREF_TRACKS_FULL_CACHE_PREFIX = "playlist_tracks_cache_full_";
     private static final String PREF_PLAYLIST_OFFLINE_COMPLETE_PREFIX = "playlist_offline_complete_";
+    private static final String PREF_PLAYLIST_OFFLINE_FRACTION_PREFIX = "playlist_offline_fraction_";
     private static final String PREF_PLAYLIST_OFFLINE_AUTO_PREFIX = "playlist_offline_auto_";
     private static final String PREF_PLAYLIST_GRID_URLS_PREFIX = "playlist_grid_urls_";
     private static final String PREF_LAST_STREAMING_ACCOUNT_KEY = "stream_last_library_account_key";
@@ -815,10 +816,14 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             persistStreamingScreen(STREAM_SCREEN_LIBRARY);
         }
 
+        // Attach the WorkManager progress observers immediately (idempotent, lifecycle-scoped)
+        // so a download already RUNNING on cold start is reflected in the tiles right away
+        // instead of after the 800ms defer.
+        startObservingOfflineQueue();
+
         // Defer non-critical work
         view.postDelayed(() -> {
             if (!isAdded() || isRemoving() || isDetached()) return;
-            startObservingOfflineQueue();
             maybeAutoLaunchWebSessionIfNeeded();
         }, 800L);
 
@@ -4287,6 +4292,11 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             return;
         }
 
+        // Snapshot which playlists were downloading BEFORE recomputing, so we can force a
+        // per-playlist offline-state recompute for any that just finished. The per-pid path is
+        // NOT subject to the 5s full-invalidate throttle, so the check icon flips immediately.
+        Set<String> previouslyDownloadingAuto = new HashSet<>(autoQueueDownloading);
+
         // Extract per-playlist download progress for circular indicator
         Map<String, Float> progressByPlaylist = new HashMap<>();
         Set<String> downloading = new HashSet<>();
@@ -4306,8 +4316,11 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                     int downloaded = progress.getInt(OfflinePlaylistDownloadWorker.PROGRESS_DOWNLOADED, 0);
                     int total = progress.getInt(OfflinePlaylistDownloadWorker.PROGRESS_TOTAL, 0);
                     if (total > 0) {
+                        // Byte-aware: add the in-flight tracks' partial byte fractions to the
+                        // count of completed tracks so the arc advances smoothly instead of in
+                        // N discrete jumps (one per finished track).
                         float fraction = Math.max(0f, Math.min(1f,
-                                downloaded / (float) total));
+                                (downloaded + sumActiveFractions(progress)) / (float) total));
                         progressByPlaylist.put(playlistId, fraction);
                     } else {
                         // Worker hasn't emitted first progress yet — retain previous fraction
@@ -4315,6 +4328,13 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                         if (previous != null) {
                             progressByPlaylist.put(playlistId, previous);
                         }
+                    }
+                } else {
+                    // ENQUEUED: carry forward the last-known fraction so a queued (waiting)
+                    // playlist does not visibly drop to 0% between RUNNING ticks.
+                    Float previous = autoQueueProgressByPlaylist.get(playlistId);
+                    if (previous != null) {
+                        progressByPlaylist.put(playlistId, previous);
                     }
                 }
             }
@@ -4324,6 +4344,16 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         autoQueueDownloading.clear();
         autoQueueDownloading.addAll(downloading);
         dispatchMergedDownloadProgress();
+
+        // Any playlist that just left the active set finished (or was cancelled) — force an
+        // immediate, un-throttled disk recompute so its tile flips to the check icon now.
+        if (adapter != null) {
+            for (String pid : previouslyDownloadingAuto) {
+                if (!downloading.contains(pid)) {
+                    adapter.invalidatePlaylistOfflineState(pid, true);
+                }
+            }
+        }
 
         if (hasActiveWork) {
             offlineQueueHadActiveWork = true;
@@ -4360,6 +4390,9 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         if (!isAdded()) {
             return;
         }
+        // Snapshot which playlists were downloading BEFORE recomputing (see auto-queue handler).
+        Set<String> previouslyDownloadingManual = new HashSet<>(manualQueueDownloading);
+
         // Extract progress from manual queue too
         Map<String, Float> progressByPlaylist = new HashMap<>();
         Set<String> downloading = new HashSet<>();
@@ -4377,7 +4410,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                     int total = progress.getInt(OfflinePlaylistDownloadWorker.PROGRESS_TOTAL, 0);
                     if (total > 0) {
                         float fraction = Math.max(0f, Math.min(1f,
-                                downloaded / (float) total));
+                                (downloaded + sumActiveFractions(progress)) / (float) total));
                         progressByPlaylist.put(playlistId, fraction);
                     } else {
                         // Worker hasn't emitted first progress yet — retain previous fraction
@@ -4385,6 +4418,12 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                         if (previous != null) {
                             progressByPlaylist.put(playlistId, previous);
                         }
+                    }
+                } else {
+                    // ENQUEUED: carry forward the last-known fraction (avoid 0% flicker).
+                    Float previous = manualQueueProgressByPlaylist.get(playlistId);
+                    if (previous != null) {
+                        progressByPlaylist.put(playlistId, previous);
                     }
                 }
             }
@@ -4395,6 +4434,14 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         manualQueueDownloading.addAll(downloading);
         dispatchMergedDownloadProgress();
 
+        if (adapter != null) {
+            for (String pid : previouslyDownloadingManual) {
+                if (!downloading.contains(pid)) {
+                    adapter.invalidatePlaylistOfflineState(pid, true);
+                }
+            }
+        }
+
         boolean hasActiveWork = hasActiveOfflineWork(workInfos);
         if (hasActiveWork) {
             offlineManualQueueHadActiveWork = true;
@@ -4404,6 +4451,19 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             adapter.invalidatePlaylistOfflineState(null);
         }
         offlineManualQueueHadActiveWork = false;
+    }
+
+    /** Sum of the in-flight tracks' partial byte fractions reported by the worker (0 if none). */
+    private static float sumActiveFractions(@NonNull Data progress) {
+        float[] activeFractions = progress.getFloatArray(OfflinePlaylistDownloadWorker.PROGRESS_ACTIVE_FRACTIONS);
+        if (activeFractions == null) {
+            return 0f;
+        }
+        float sum = 0f;
+        for (float f : activeFractions) {
+            sum += Math.max(0f, Math.min(1f, f));
+        }
+        return sum;
     }
     private void dispatchMergedDownloadProgress() {
         if (adapter == null) return;
@@ -4775,6 +4835,32 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             return false;
         }
         return getCachePrefs(context).getBoolean(PREF_PLAYLIST_OFFLINE_COMPLETE_PREFIX + playlistId, false);
+    }
+    private void persistPlaylistOfflineFraction(
+            @NonNull Context context,
+            @NonNull String playlistId,
+            float fraction
+    ) {
+        if (TextUtils.isEmpty(playlistId)) {
+            return;
+        }
+        getCachePrefs(context).edit()
+                .putFloat(PREF_PLAYLIST_OFFLINE_FRACTION_PREFIX + playlistId,
+                        Math.max(0f, Math.min(1f, fraction)))
+                .apply();
+    }
+    private float getPersistedPlaylistOfflineFraction(@NonNull Context context, @NonNull String playlistId) {
+        if (TextUtils.isEmpty(playlistId)) {
+            return 0f;
+        }
+        return getCachePrefs(context).getFloat(PREF_PLAYLIST_OFFLINE_FRACTION_PREFIX + playlistId, 0f);
+    }
+    private float getPersistedPlaylistOfflineFraction(@NonNull String playlistId) {
+        Context context = getContext();
+        if (context == null || TextUtils.isEmpty(playlistId)) {
+            return 0f;
+        }
+        return getPersistedPlaylistOfflineFraction(context.getApplicationContext(), playlistId);
     }
     private void persistPlaylistOfflineAutoEnabled(@NonNull String playlistId, boolean enabled) {
         Context context = getContext();
@@ -5477,8 +5563,24 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             getActivity().runOnUiThread(() -> {
                 refreshCurrentPlayingPlaylistState();
                 syncPlaybackStateToAdapter();
+                // The offline download worker fires this per finished track and once on batch
+                // completion; recompute the tiles' offline state so the check icon flips live.
+                scheduleOfflineStateRecalc();
             });
         }
+    }
+    private final Runnable offlineStateRecalcRunnable = () -> {
+        if (isAdded() && adapter != null) {
+            // Forced (un-throttled) per the 5s full-invalidate gate, since this is a real state
+            // change (a track just finished), not spammy rebinding.
+            adapter.invalidatePlaylistOfflineState(null, true);
+        }
+    };
+    private void scheduleOfflineStateRecalc() {
+        // Coalesce a burst of per-track events into a single forced recompute shortly after the
+        // burst settles, so we don't re-scan every playlist on every track.
+        mainHandler.removeCallbacks(offlineStateRecalcRunnable);
+        mainHandler.postDelayed(offlineStateRecalcRunnable, 450L);
     }
     private void syncPlaybackStateToAdapter() {
         if (!isAdded()) return;
@@ -6069,6 +6171,18 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             holder.itemView.setOnClickListener(v -> onTrackClick.onTrackClick(item));
         }
 
+        /** Real (disk-computed) offline fraction for a playlist, falling back to the persisted
+         *  value on a cache miss (cold start) so the ring opens near the true value instead of 0.
+         *  Reads a SharedPreferences float only on miss; does NOT populate the in-memory cache
+         *  (so the async disk scan's corrective notify is never deduped away). */
+        private float realFractionFor(@NonNull String playlistId) {
+            Float cached = playlistRealFractionCache.get(playlistId);
+            if (cached != null) {
+                return cached;
+            }
+            return getPersistedPlaylistOfflineFraction(playlistId);
+        }
+
         private void bindOfflineState(@NonNull TrackViewHolder holder, @NonNull YouTubeMusicService.TrackResult item) {
             String playlistId = item.contentId == null ? "" : item.contentId.trim();
             if (playlistId.isEmpty()) return;
@@ -6091,10 +6205,9 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             boolean isDownloading = playlistsCurrentlyDownloading.contains(playlistId);
             float downloadFraction = 0f;
             if (isDownloading) {
-                float workerFraction = playlistDownloadProgressCache.containsKey(playlistId) 
+                float workerFraction = playlistDownloadProgressCache.containsKey(playlistId)
                         ? playlistDownloadProgressCache.get(playlistId) : 0f;
-                float realFraction = playlistRealFractionCache.containsKey(playlistId) 
-                        ? playlistRealFractionCache.get(playlistId) : 0f;
+                float realFraction = realFractionFor(playlistId);
                 // Use max, because worker fraction may be 0 if it's just ENQUEUED.
                 downloadFraction = Math.max(workerFraction, realFraction);
             }
@@ -6109,8 +6222,12 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 holder.ivPlaylistOfflineAll.setBackground(null);
                 holder.ivPlaylistOfflineAll.setColorFilter(ContextCompat.getColor(ctx, R.color.stitch_blue));
                 holder.ivPlaylistOfflineAll.setAlpha(1f);
-            } else if (completeOffline && offlineAutoEnabled) {
-                // State: fully downloaded — filled circle + check
+            } else if (completeOffline) {
+                // State: fully downloaded — filled circle + check.
+                // Show the check whenever the playlist is fully on disk, regardless of the
+                // auto-offline toggle (e.g. completed via per-track taps, or shared tracks
+                // already downloaded by another playlist). Disk-completeness is the source of
+                // truth; the auto flag only gates the "queued/in-progress" ring below.
                 holder.flPlaylistOfflineContainer.setVisibility(View.VISIBLE);
                 holder.circularProgress.setVisibility(View.GONE);
                 holder.circularProgress.setProgressImmediate(0f);
@@ -6121,8 +6238,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             } else if (offlineAutoEnabled) {
                 // State: queued (auto-offline enabled, waiting for worker)
                 // Show empty circular track + download icon (like downloading at 0%)
-                float realFraction = playlistRealFractionCache.containsKey(playlistId) 
-                        ? playlistRealFractionCache.get(playlistId) : 0f;
+                float realFraction = realFractionFor(playlistId);
                 holder.flPlaylistOfflineContainer.setVisibility(View.VISIBLE);
                 holder.circularProgress.setVisibility(View.VISIBLE);
                 holder.circularProgress.setProgressImmediate(realFraction);
@@ -6262,10 +6378,14 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                     float[] results = computePlaylistOfflineProgressFromFiles(requireContext().getApplicationContext(), playlistId);
                     computed = results[0] > 0.5f;
                     fraction = results[1];
-                } else {
+                } else if (isAdded()) {
                     computed = isPlaylistFullyOffline(playlistId);
                     float[] results = computePlaylistOfflineProgressFromFiles(requireContext().getApplicationContext(), playlistId);
                     fraction = results[1];
+                } else {
+                    // Fragment detached between execute() and run() — requireContext() below
+                    // would throw. Bail out instead of crashing.
+                    return;
                 }
                 final float finalFraction = fraction;
                 mainHandler.post(() -> {
@@ -6298,11 +6418,14 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             }
             ArrayList<CachedPlaylistTrack> cachedTracks = loadCachedPlaylistTracksForOffline(appContext, playlistId);
             if (cachedTracks.isEmpty()) {
-                // Track list was wiped (e.g. by pull-to-refresh) and prefetch hasn't finished yet.
-                // Do NOT write false to SharedPreferences â€” that would corrupt a correct persisted
-                // true value. Return the persisted state as-is and wait for the prefetch to repopulate.
+                // Track list not available yet (e.g. pull-to-refresh marked caches stale and the
+                // prefetch hasn't repopulated). Do NOT write false to SharedPreferences — that
+                // would corrupt a correct persisted true value. Return the persisted complete
+                // flag and the last-known fraction so the ring keeps its real value until tracks
+                // reload, instead of collapsing to 0%.
                 boolean persisted = isPersistedPlaylistOfflineComplete(appContext, playlistId);
-                return new float[]{persisted ? 1f : 0f, persisted ? 1f : 0f};
+                float persistedFraction = persisted ? 1f : getPersistedPlaylistOfflineFraction(appContext, playlistId);
+                return new float[]{persisted ? 1f : 0f, persistedFraction};
             }
             HashSet<String> seen = new HashSet<>();
             int eligibleCount = 0;
@@ -6326,6 +6449,9 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             // Update persisted state with the computed truth
             persistPlaylistOfflineComplete(appContext, playlistId, complete);
             float fraction = eligibleCount > 0 ? (float) offlineCount / eligibleCount : 0f;
+            // Persist the fraction too so cold start can seed the ring at the real value before
+            // the async disk scan finishes (instead of briefly showing 0%).
+            persistPlaylistOfflineFraction(appContext, playlistId, fraction);
             return new float[]{complete ? 1f : 0f, fraction};
         }
         private int findPlaylistPositionById(@NonNull String playlistId) {

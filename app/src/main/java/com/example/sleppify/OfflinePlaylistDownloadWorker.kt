@@ -42,6 +42,7 @@ class OfflinePlaylistDownloadWorker(
             )
         }
 
+        val playlistId = inputData.getString(INPUT_PLAYLIST_ID)?.trim().orEmpty()
         val playlistTitle = normalizePlaylistTitle(
             inputData.getString(INPUT_PLAYLIST_TITLE),
             inputData.getString(INPUT_PLAYLIST_ID)
@@ -161,6 +162,21 @@ class OfflinePlaylistDownloadWorker(
             Log.w(TAG, "doWork:network_unavailable retrying")
             return Result.retry()
         }
+
+        // Persist playlist-level offline state so the home/library ring + check icon are correct
+        // on cold start WITHOUT having to open the playlist first. Only do this for full-playlist
+        // downloads (manualQueue == false); single-track manual enqueues carry total=1 and would
+        // otherwise wrongly mark the whole playlist complete. The async disk scan in
+        // MusicPlayerFragment later overwrites these with the same disk truth.
+        if (!manualQueue && playlistId.isNotEmpty() && total > 0) {
+            val fraction = maxOf(0f, minOf(1f, downloaded.toFloat() / total.toFloat()))
+            persistPlaylistOfflineState(appContext, playlistId, downloaded >= total, fraction)
+        }
+
+        // Notify the UI once on batch completion so the library tile / playlist header can
+        // recompute offline-complete state from disk — covers batches that were entirely
+        // already-offline (which never fire the per-track notify above).
+        PlaybackEventBus.notifyPlaybackSnapshotUpdated()
 
         return Result.success(
             Data.Builder()
@@ -285,13 +301,15 @@ class OfflinePlaylistDownloadWorker(
         activeTrackProgressFractions: MutableMap<String, Float>
     ): ActiveProgressSnapshot {
         synchronized(activeTrackIds) {
-            val ids = activeTrackIds.toTypedArray()
-            val fractions = FloatArray(ids.size)
-            for (i in ids.indices) {
-                val value = activeTrackProgressFractions[ids[i]]
-                fractions[i] = if (value == null) 0f else maxOf(0f, minOf(1f, value))
+            synchronized(activeTrackProgressFractions) {
+                val ids = activeTrackIds.toTypedArray()
+                val fractions = FloatArray(ids.size)
+                for (i in ids.indices) {
+                    val value = activeTrackProgressFractions[ids[i]]
+                    fractions[i] = if (value == null) 0f else maxOf(0f, minOf(1f, value))
+                }
+                return ActiveProgressSnapshot(ids, fractions)
             }
-            return ActiveProgressSnapshot(ids, fractions)
         }
     }
 
@@ -301,6 +319,27 @@ class OfflinePlaylistDownloadWorker(
         val resolvedId = playlistId?.trim().orEmpty()
         if (resolvedId.isNotEmpty()) return resolvedId
         return "Playlist"
+    }
+
+    /**
+     * Mirror of MusicPlayerFragment's persistPlaylistOfflineComplete/Fraction: writes the
+     * playlist-level offline-complete flag and download fraction into the streaming-cache prefs
+     * using the exact same keys MusicPlayerFragment reads at cold start. Keeping the keys/prefs
+     * file identical is what lets the home ring + check icon be correct before the async disk
+     * scan runs.
+     */
+    private fun persistPlaylistOfflineState(
+        context: Context,
+        playlistId: String,
+        complete: Boolean,
+        fraction: Float
+    ) {
+        if (playlistId.isEmpty()) return
+        context.getSharedPreferences(AppConstants.PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(PREF_PLAYLIST_OFFLINE_COMPLETE_PREFIX + playlistId, complete)
+            .putFloat(PREF_PLAYLIST_OFFLINE_FRACTION_PREFIX + playlistId, maxOf(0f, minOf(1f, fraction)))
+            .apply()
     }
 
     private fun isDownloadAllowedByCurrentNetworkPolicy(
@@ -349,8 +388,9 @@ class OfflinePlaylistDownloadWorker(
         val videoTarget = OfflineAudioStore.getOfflineVideoFile(context, videoId)
 
         val ok = try {
-            SleppifyDownloaderResolver.downloadVideoViaProxy(context, videoId, videoTarget, primaryServer, onProgress = { bytesReceived ->
-                val fraction = (bytesReceived.toFloat() / 12_000_000L).coerceIn(0.05f, 0.90f)
+            // The resolver now reports a real 0..1 fraction (computed from Content-Length),
+            // so just forward it instead of dividing raw bytes by a fixed 12MB denominator.
+            SleppifyDownloaderResolver.downloadVideoViaProxy(context, videoId, videoTarget, primaryServer, onProgress = { fraction ->
                 progressReporter?.onProgress(fraction)
             })
         } catch (e: Exception) {
@@ -554,6 +594,12 @@ class OfflinePlaylistDownloadWorker(
 
     companion object {
         private const val TAG = "OfflineDlWorker"
+
+        // Must stay identical to MusicPlayerFragment's PREF_PLAYLIST_OFFLINE_COMPLETE_PREFIX /
+        // PREF_PLAYLIST_OFFLINE_FRACTION_PREFIX (same streaming-cache prefs file) so the values
+        // persisted here are read back as the cold-start fallback for the library ring/check.
+        private const val PREF_PLAYLIST_OFFLINE_COMPLETE_PREFIX = "playlist_offline_complete_"
+        private const val PREF_PLAYLIST_OFFLINE_FRACTION_PREFIX = "playlist_offline_fraction_"
 
         @JvmField val INPUT_PLAYLIST_ID = "input_playlist_id"
         @JvmField val INPUT_VIDEO_IDS = "input_video_ids"

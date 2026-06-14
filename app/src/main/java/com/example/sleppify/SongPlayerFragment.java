@@ -258,6 +258,17 @@ public class SongPlayerFragment extends Fragment {
     private final Random random = new Random();
     @NonNull
     private String loadedVideoId = "";
+    /** Whether the actively loaded track was classified as VIDEO when its playback started.
+     *  Presentation must use this pinned value for the loaded track: the stream-as-download
+     *  worker can drop an .mp4 on disk mid-song, and re-evaluating disk state on a later
+     *  rebind would flip the UI to video mode while the playing source has no video frames. */
+    private boolean loadedTrackIsVideo = false;
+    /** Cache of "does the offline file for this videoId contain a real video track" so the
+     *  per-bind classification probe (MediaExtractor) runs at most once per id. Only positive/
+     *  negative results for files that EXIST are cached; absent files are never cached so a later
+     *  download is picked up. */
+    @NonNull
+    private final java.util.Map<String, Boolean> offlineVideoProbeCache = new java.util.concurrent.ConcurrentHashMap<>();
 
     @NonNull
     public String getLoadedVideoId() {
@@ -287,6 +298,8 @@ public class SongPlayerFragment extends Fragment {
     // Gapless pre-buffer: an ExoMediaPlayer prepared silently for the next track
     private static final long GAPLESS_PRE_BUFFER_LISTEN_THRESHOLD_MS = 2_000L;
     private long accumulatedListenMs = 0;
+    /** Last whole second at which the periodic snapshot persist ran (see ticker). */
+    private int lastSnapshotPersistSecond = -1;
     @Nullable
     private ExoMediaPlayer gaplessPreBufferedPlayer = null;
     @NonNull
@@ -299,6 +312,11 @@ public class SongPlayerFragment extends Fragment {
 
     @Nullable
     private Future<?> pendingStreamResolverFuture;
+    // videoId the in-flight online stream resolution (pendingStreamResolverFuture) is for, or "".
+    // Used so a rapid skip to a DIFFERENT track does not get falsely short-circuited by the
+    // pending-resolution guard in playCurrentTrack().
+    @NonNull
+    private String pendingResolutionVideoId = "";
     @Nullable
     private Runnable sourcePrepareTimeoutRunnable;
     private boolean localSourcePreparing = false;
@@ -319,11 +337,42 @@ public class SongPlayerFragment extends Fragment {
         }
         @Override
         public void onFadeOutFinished() {
-            // Fade-out-only finished with no next track — track ended
+            // The manager already released the outgoing player — which was our
+            // localExoMediaPlayer. Drop the stale reference and run the normal
+            // end-of-track path so the UI leaves the "playing" state (it used to stay
+            // stuck on a released player with the pause icon showing).
+            stopLocalProgressTicker();
+            releaseLocalExoMediaPlayer();
+            handleTrackEnded();
         }
         @Override
         public void onCrossfadeFailed(int nextIndex) {
-            playCurrentTrack();
+            // The failed crossfade did not commit any state: the current track keeps
+            // playing at full volume and natural completion advances the queue (the old
+            // behavior restarted the current song from zero near its end). If the track
+            // already ended while the failed fade ran (its completion event was swallowed
+            // by the isInProgress guard), advance now.
+            Log.w(TAG, "Crossfade failed for nextIndex=" + nextIndex + " — continuing without crossfade");
+            ExoMediaPlayer p = localExoMediaPlayer;
+            boolean ended = p == null;
+            if (p != null) {
+                try {
+                    int dur = p.getDuration();
+                    ended = !p.isPlaying() && dur > 0 && p.getCurrentPosition() >= dur - 250;
+                } catch (Exception ignored) { }
+            }
+            if (ended) {
+                // Consume this player's end before advancing: ExoMediaPlayer re-reads the
+                // listener field at dispatch time, so nulling it here also kills the
+                // pending ENDED post for the same end event — otherwise it would land
+                // after playCurrentTrack switched tracks and advance a second time,
+                // skipping the just-loaded track.
+                if (p != null) {
+                    p.setOnCompletionListener(null);
+                }
+                stopLocalProgressTicker();
+                handleTrackEnded();
+            }
         }
     };
     private long lastPlaybackStartRequestAtMs = 0L;
@@ -350,6 +399,17 @@ public class SongPlayerFragment extends Fragment {
     private Runnable pendingSocialStatsFetchRunnable;
 
     private View playerBackgroundContainer;
+    /** Bumped on every cover bind. Async artwork deliveries (Glide CustomTarget, Palette)
+     *  capture the value at submit time and no-op if it changed — without this, a late
+     *  result from a previous track repainted the cover OVER a playing video, applied the
+     *  wrong hero aspect ratio, or recolored the backdrop with another song's palette. */
+    private int playerArtworkGeneration = 0;
+    /** Generation whose artwork-derived hero ratio is currently applied (see
+     *  updatePlayerSurfaceForSource — it must not stomp the artwork ratio). */
+    private int heroRatioAppliedGeneration = -1;
+    /** In-flight cover target so a new bind can cancel the previous load. */
+    @Nullable
+    private com.bumptech.glide.request.target.CustomTarget<Bitmap> playerCoverTarget;
     @Nullable
     private Runnable nextUpRevealRunnable;
     private int nextUpRevealCursor = 0;
@@ -396,8 +456,14 @@ public class SongPlayerFragment extends Fragment {
                         prefetchedNextVideoId,
                         prefetchedNextUrl
                 );
-                // If crossfade consumed the gapless player, clear our reference
+                // If a crossfade started, resolve the fate of the pre-buffered player.
                 if (crossfadeManager.isInProgress() && gaplessPreBufferedPlayer != null) {
+                    if (!crossfadeManager.isUsingPlayer(gaplessPreBufferedPlayer)) {
+                        // The crossfade went with a different source — release the stale
+                        // pre-buffered player. Just dropping the reference (old behavior)
+                        // leaked a live, buffering ExoPlayer instance.
+                        releaseSingleExoMediaPlayer(gaplessPreBufferedPlayer);
+                    }
                     gaplessPreBufferedPlayer = null;
                     gaplessPreBufferedVideoId = "";
                     gaplessPreBufferTriggered = false;
@@ -443,7 +509,11 @@ public class SongPlayerFragment extends Fragment {
                         );
                     }
                 }
-                if (currentSeconds % 5 == 0) {
+                // The ticker fires 5x per second, so "% 5 == 0" alone re-persisted the whole
+                // queue snapshot and rebuilt the media session state five times in a burst
+                // during every fifth second. Track the last persisted second to fire once.
+                if (currentSeconds % 5 == 0 && currentSeconds != lastSnapshotPersistSecond) {
+                    lastSnapshotPersistSecond = currentSeconds;
                     persistPlaybackSnapshot(false);
                     updateMediaSessionState();
                 }
@@ -652,6 +722,7 @@ public class SongPlayerFragment extends Fragment {
                 @Override
                 public void onStopTrackingTouch(SeekBar seekBar) {
                     userSeeking = false;
+                    lastSnapshotPersistSecond = -1;
                     cancelOfflineCrossfade();
                     if (localExoMediaPlayer != null) {
                         try {
@@ -858,8 +929,14 @@ public class SongPlayerFragment extends Fragment {
         // Mantenerlo en su estado actual para que la reproducción continúe
         if (!isTemporaryPlayer) {
             releaseLocalExoMediaPlayer();
+        } else {
+            // Temporary players keep localExoMediaPlayer alive (handed off to keep playback
+            // going), so releaseLocalExoMediaPlayer() — and thus cancelOfflineCrossfade() ->
+            // cancelGaplessPreBuffer() — is skipped here, leaking any fragment-scoped gapless
+            // pre-buffer player. Release it explicitly; it never touches the visible player.
+            cancelGaplessPreBuffer();
         }
-        
+
         if (getActivity() instanceof MainActivity) {
             ((MainActivity) getActivity()).setContainerOverlayMode(false);
         }
@@ -909,6 +986,10 @@ public class SongPlayerFragment extends Fragment {
             @Override
             public void onPause() {
                 pauseRequestedByUser = true;
+                // Cancel any armed/in-flight crossfade: without this, a transition resolving
+                // in the background would begin (or finish) the fade against the paused
+                // player and force playback back on.
+                cancelOfflineCrossfade();
                 if (localExoMediaPlayer != null) {
                     try {
                         localExoMediaPlayer.pause();
@@ -936,12 +1017,17 @@ public class SongPlayerFragment extends Fragment {
 
             @Override
             public void onSetShuffleMode(int shuffleMode) {
-                toggleShuffleMode();
+                // SET to the requested state (idempotent) — do NOT toggle. System controllers
+                // (Bluetooth/AVRCP, Android Auto, the media notification, media-resumption) call
+                // this to SYNC shuffle state; toggling here flipped shuffle "by itself" on every
+                // such sync. setShuffleEnabled already no-ops when the state is unchanged.
+                setShuffleEnabled(shuffleMode != PlaybackStateCompat.SHUFFLE_MODE_NONE);
             }
 
             @Override
             public void onSeekTo(long pos) {
                 currentSeconds = Math.max(0, (int) (pos / 1000L));
+                lastSnapshotPersistSecond = -1;
                 cancelOfflineCrossfade();
                 if (localExoMediaPlayer != null) {
                     try {
@@ -965,6 +1051,8 @@ public class SongPlayerFragment extends Fragment {
                 updateMediaSessionState();
             }
         });
+        // Advertise the loaded shuffle state so controllers start in sync.
+        publishShuffleModeToSession(shuffleEnabled);
         ensureMediaNotificationChannel();
     }
 
@@ -1263,6 +1351,10 @@ public class SongPlayerFragment extends Fragment {
             Log.d(TAG, "[PLAYBACK_DBG] togglePlayback: PAUSING (isPlaying was true)");
             pauseRequestedByUser = true;
             isPlaying = false;
+            // Cancel any armed/in-flight crossfade (mirrors the offline pause branch):
+            // otherwise a transition resolving in the background would begin the fade
+            // against the paused player and force playback back on.
+            cancelOfflineCrossfade();
             if (localExoMediaPlayer != null) {
                 try {
                     localExoMediaPlayer.pause();
@@ -1353,6 +1445,17 @@ public class SongPlayerFragment extends Fragment {
         setShuffleEnabled(!shuffleEnabled);
     }
 
+    private void publishShuffleModeToSession(boolean enabled) {
+        if (mediaSession == null) return;
+        try {
+            mediaSession.setShuffleMode(enabled
+                    ? PlaybackStateCompat.SHUFFLE_MODE_ALL
+                    : PlaybackStateCompat.SHUFFLE_MODE_NONE);
+        } catch (Exception e) {
+            Log.w(TAG, "setShuffleMode failed", e);
+        }
+    }
+
     private void cycleRepeatMode() {
         if (repeatMode == REPEAT_MODE_OFF) {
             repeatMode = REPEAT_MODE_ALL;
@@ -1368,6 +1471,10 @@ public class SongPlayerFragment extends Fragment {
     }
 
     private void setShuffleEnabled(boolean enabled) {
+        // Keep the MediaSession's advertised shuffle mode in sync so remote controllers
+        // (Bluetooth/Android Auto/notification) display the real state and don't push back a
+        // contradicting value on connect.
+        publishShuffleModeToSession(enabled);
         if (shuffleEnabled == enabled) {
             updatePlaybackModeButtons();
             return;
@@ -1475,6 +1582,18 @@ public class SongPlayerFragment extends Fragment {
         final PlayerTrack track = tracks.get(currentIndex);
         Log.d(TAG, "[PLAYBACK_DBG] playCurrentTrack videoId=" + track.videoId + " idx=" + currentIndex, new Throwable("caller"));
 
+        // Detach the pre-buffered player for THIS track before cancelOfflineCrossfade —
+        // its cancelGaplessPreBuffer() releases gaplessPreBufferedPlayer, which made the
+        // gapless fast-path below dead code: every non-crossfade advance threw away the
+        // fully buffered next track and re-resolved it from scratch.
+        ExoMediaPlayer adoptablePreBuffered = null;
+        if (gaplessPreBufferedPlayer != null && TextUtils.equals(gaplessPreBufferedVideoId, track.videoId)) {
+            adoptablePreBuffered = gaplessPreBufferedPlayer;
+            gaplessPreBufferedPlayer = null;
+            gaplessPreBufferedVideoId = "";
+            gaplessPreBufferTriggered = false;
+        }
+
         // Safety: ensure no crossfade is active and no duplicate players exist
         cancelOfflineCrossfade();
         // Also ensure any lingering incoming player from a failed crossfade is released
@@ -1483,9 +1602,11 @@ public class SongPlayerFragment extends Fragment {
             localCrossfadeIncomingPlayer = null;
         }
         loadedVideoId = track.videoId;
+        loadedTrackIsVideo = isVideoTrackId(track.videoId);
         playCountRecordedForCurrentTrack = false;
         currentSeconds = 0;
         lastSeekTargetSeconds = -1;
+        lastSnapshotPersistSecond = -1;
         isRestoringPosition = false;
 
         long requestToken = ++activePlaybackRequestToken;
@@ -1499,6 +1620,10 @@ public class SongPlayerFragment extends Fragment {
                 && snapshot.currentTrack().videoId.equals(track.videoId);
 
         if (isSharedPlayerActive && localExoMediaPlayer == null) {
+            if (adoptablePreBuffered != null) {
+                releaseSingleExoMediaPlayer(adoptablePreBuffered);
+                adoptablePreBuffered = null;
+            }
             PlaybackLoadingBus.clearLoading();
             bindCurrentTrackInternal(true, false); // Keep current time and UI intact
             usingOfflineSource = true;
@@ -1528,7 +1653,10 @@ public class SongPlayerFragment extends Fragment {
         lastPlaybackStartRequestAtMs = SystemClock.elapsedRealtime();
 
         cancelPlaybackErrorRetry();
-        if (hasPendingStreamResolution() && TextUtils.equals(loadedVideoId, track.videoId)) {
+        if (hasPendingStreamResolution() && TextUtils.equals(pendingResolutionVideoId, track.videoId)) {
+            if (adoptablePreBuffered != null) {
+                releaseSingleExoMediaPlayer(adoptablePreBuffered);
+            }
             return;
         }
         cancelPendingStreamResolver();
@@ -1541,6 +1669,12 @@ public class SongPlayerFragment extends Fragment {
         boolean hasOfflineLocal = LocalFilesStore.isLocalVideoId(track.videoId)
                 || OfflineAudioStore.hasOfflineAudio(requireContext(), track.videoId);
         if (hasOfflineLocal) {
+            // Offline/local sources start instantly anyway; the pre-buffered network player
+            // (if any) is not needed. adoptGaplessPlayer assumes a network source, so do
+            // not adopt it for offline tracks.
+            if (adoptablePreBuffered != null) {
+                releaseSingleExoMediaPlayer(adoptablePreBuffered);
+            }
             PlaybackLoadingBus.clearLoading();
             List<String> directSources = buildDirectSourceCandidates(track);
             attemptPlaybackFromSources(track, directSources, 0, requestToken, 0);
@@ -1548,15 +1682,10 @@ public class SongPlayerFragment extends Fragment {
         }
 
         // GAPLESS: if pre-buffered player is ready for this track, use it instantly
-        if (gaplessPreBufferedPlayer != null && TextUtils.equals(gaplessPreBufferedVideoId, track.videoId)) {
-            ExoMediaPlayer preBuffered = gaplessPreBufferedPlayer;
-            gaplessPreBufferedPlayer = null;
-            gaplessPreBufferedVideoId = "";
-            gaplessPreBufferTriggered = false;
-            adoptGaplessPlayer(track, preBuffered, requestToken);
+        if (adoptablePreBuffered != null) {
+            adoptGaplessPlayer(track, adoptablePreBuffered, requestToken);
             return;
         }
-        cancelGaplessPreBuffer();
 
         // Not offline — check prefetch (main-thread fields), then resolve online via executor.
         if (TextUtils.equals(track.videoId, prefetchedNextVideoId) && !TextUtils.isEmpty(prefetchedNextUrl)) {
@@ -1653,10 +1782,26 @@ public class SongPlayerFragment extends Fragment {
         }
 
         PlaybackLoadingBus.notifyLoadingStarted(track.videoId);
+        // Stop the previous track's audio/ticker immediately so a rapid skip does not keep the
+        // OLD song playing (and the seekbar tracking it) during the async resolution window.
+        // Pause rather than release: re-resolve/failure callers may still reference the player,
+        // and startMediaPlaybackFromSource will release+replace it once the new source is ready.
+        stopLocalProgressTicker();
+        if (localExoMediaPlayer != null) {
+            try {
+                localExoMediaPlayer.pause();
+            } catch (Exception ignored) {
+            }
+        }
+        // Record which track this in-flight resolution is for so playCurrentTrack's
+        // pending-resolution guard can tell a re-entrant call for the SAME track from a skip
+        // to a DIFFERENT track.
+        pendingResolutionVideoId = track.videoId;
+        // Capture the app context now: requireContext() inside the executor lambda throws
+        // if the fragment detaches mid-flight, silently aborting the resolution.
+        final Context resolveCtx = requireContext().getApplicationContext();
         pendingStreamResolverFuture = streamResolverExecutor.submit(() -> {
-            String resolvedUrl = forceAlternativeClient
-                    ? StreamResolver.resolveStreamUrl(requireContext(), track.videoId, true)
-                    : StreamResolver.resolveStreamUrl(requireContext(), track.videoId);
+            String resolvedUrl = StreamResolver.resolveStreamUrl(resolveCtx, track.videoId, forceAlternativeClient);
 
             localProgressHandler.post(() -> {
                 if (requestToken != activePlaybackRequestToken || !isAdded()) return;
@@ -1668,14 +1813,23 @@ public class SongPlayerFragment extends Fragment {
                         tryReresolveOrSkipCurrentTrack("Fallo de reproducción directa: re-resolviendo.", false);
                     });
                 } else {
-                    tryReresolveOrSkipCurrentTrack("No se pudo resolver el stream directo. Reintentando.", false);
+                    if (!tryReresolveOrSkipCurrentTrack("No se pudo resolver el stream directo. Reintentando.", false)
+                            && !isNetworkAvailable()) {
+                        // Offline dead-end: tryReresolveOrSkipCurrentTrack returns false without
+                        // advancing or clearing the spinner. Clear it so loading does not hang.
+                        PlaybackLoadingBus.clearLoading();
+                    }
                 }
             });
         });
     }
 
     private void prefetchNextTrackStream() {
-        if (tracks.size() <= 1) return;
+        if (tracks.size() <= 1 || !isAdded()) return;
+
+        // Capture the app context now: requireContext() inside the executor lambda throws
+        // if the fragment detaches mid-flight, silently killing the prefetch.
+        final Context appCtx = requireContext().getApplicationContext();
 
         // Prefetch next 2 tracks in parallel for instant transitions
         for (int offset = 1; offset <= Math.min(2, tracks.size() - 1); offset++) {
@@ -1685,7 +1839,7 @@ public class SongPlayerFragment extends Fragment {
 
             // Skip local files and offline tracks
             if (LocalFilesStore.isLocalVideoId(track.videoId)) continue;
-            if (isAdded() && OfflineAudioStore.hasOfflineAudio(requireContext(), track.videoId)) continue;
+            if (OfflineAudioStore.hasOfflineAudio(appCtx, track.videoId)) continue;
 
             // Only resolve the immediate next into prefetchedNext fields
             final boolean isImmediate = (offset == 1);
@@ -1693,11 +1847,20 @@ public class SongPlayerFragment extends Fragment {
 
             final String videoId = track.videoId;
             streamResolverExecutor.submit(() -> {
-                String url = StreamResolver.resolveStreamUrl(requireContext(), videoId);
-                if (!TextUtils.isEmpty(url) && isImmediate) {
+                String url = StreamResolver.resolveStreamUrl(appCtx, videoId);
+                if (TextUtils.isEmpty(url) || !isImmediate) return;
+                // Commit on the main thread and re-validate: the user may have skipped or
+                // toggled shuffle while this resolve was in flight (invalidateNextTrackPreparations
+                // cleared/re-prefetched but cannot cancel this task). Writing a now-stale pair
+                // would overwrite the correct prefetch and defeat the instant transition.
+                localProgressHandler.post(() -> {
+                    if (!isAdded() || tracks.size() <= 1) return;
+                    int immediateIdx = (currentIndex + 1) % tracks.size();
+                    PlayerTrack immediate = tracks.get(immediateIdx);
+                    if (immediate == null || !TextUtils.equals(immediate.videoId, videoId)) return;
                     prefetchedNextVideoId = videoId;
                     prefetchedNextUrl = url;
-                }
+                });
             });
         }
     }
@@ -1828,14 +1991,26 @@ public class SongPlayerFragment extends Fragment {
         if (!TextUtils.isEmpty(url)) {
             prepareGaplessPlayer(nextTrack, url);
         } else {
+            // Capture the app context now: requireContext() inside the executor lambda
+            // throws if the fragment detaches mid-flight, silently killing the prebuffer.
+            final Context appCtx = requireContext().getApplicationContext();
             streamResolverExecutor.submit(() -> {
-                String resolved = StreamResolver.resolveStreamUrl(requireContext(), nextTrack.videoId);
+                String resolved = StreamResolver.resolveStreamUrl(appCtx, nextTrack.videoId);
                 localProgressHandler.post(() -> {
                     if (!isAdded()) return;
+                    // Cancelled (track change / pause) while resolving — don't prebuffer.
+                    if (!TextUtils.equals(gaplessPreBufferingVideoId, nextTrack.videoId)) return;
                     if (TextUtils.isEmpty(resolved)) {
-                        if (TextUtils.equals(gaplessPreBufferingVideoId, nextTrack.videoId)) {
-                            gaplessPreBufferingVideoId = "";
-                        }
+                        gaplessPreBufferingVideoId = "";
+                        return;
+                    }
+                    // Re-validate that this is still the upcoming track: the user may have
+                    // skipped or toggled shuffle while the resolution was in flight, and
+                    // prebuffering the wrong track wastes the player and the bandwidth.
+                    int upcoming = resolveNextIndexForCompletionCrossfade();
+                    if (upcoming < 0 || upcoming >= tracks.size()
+                            || !TextUtils.equals(tracks.get(upcoming).videoId, nextTrack.videoId)) {
+                        gaplessPreBufferingVideoId = "";
                         return;
                     }
                     prepareGaplessPlayer(nextTrack, resolved);
@@ -2367,6 +2542,7 @@ public class SongPlayerFragment extends Fragment {
     }
 
     private void cancelPendingStreamResolver() {
+        pendingResolutionVideoId = "";
         if (pendingStreamResolverFuture != null) {
             pendingStreamResolverFuture.cancel(true);
             pendingStreamResolverFuture = null;
@@ -2837,12 +3013,18 @@ public class SongPlayerFragment extends Fragment {
         pauseRequestedByUser = false;
         isPlaying = true;
         currentSeconds = 0;
+        // Per-track state that playCurrentTrack resets but this commit path used to miss:
+        // without these, every crossfade-adopted track lost its play count (the flag was
+        // still true from the previous track) and skipped its first snapshot persist.
+        playCountRecordedForCurrentTrack = false;
+        lastSnapshotPersistSecond = -1;
 
         PlayerTrack track = tracks.get(currentIndex);
         loadedVideoId = track.videoId;
         if (TextUtils.isEmpty(loadedVideoId)) {
             loadedVideoId = "";
         }
+        loadedTrackIsVideo = isVideoTrackId(loadedVideoId);
 
         // All playback is video
         currentSourceIsVideo = true;
@@ -2855,8 +3037,12 @@ public class SongPlayerFragment extends Fragment {
             if (localExoMediaPlayer != mp) {
                 return;
             }
-            stopLocalProgressTicker();
-            handleTrackEnded();
+            // Route through handleLocalPlaybackCompletion for its isInProgress() guard.
+            // Without it, when THIS track later crossfades into the next one and reaches
+            // its natural end mid-fade, this listener fired handleTrackEnded, which
+            // cancelled the in-flight fade and restarted the incoming track from zero —
+            // breaking every second crossfade in a continuously crossfading queue.
+            handleLocalPlaybackCompletion();
         });
         incoming.setOnErrorListener((mp, what, extra) -> {
             if (localExoMediaPlayer == mp) {
@@ -3044,10 +3230,21 @@ public class SongPlayerFragment extends Fragment {
             playerArtworkBootstrapPending = false;
         }
 
-        boolean isLocalVideo = isVideoTrack(track);
+        boolean isLocalVideo = isVideoPresentation(track);
 
         if (ivPlayerCover != null) {
+            // Invalidate any in-flight artwork delivery from a previous bind and cancel its
+            // Glide request. CustomTargets are not view-bound, so without this a late result
+            // from the PREVIOUS track repainted the cover over a playing video, applied the
+            // wrong hero ratio, or recolored the backdrop with another song's palette.
+            final int artworkGen = ++playerArtworkGeneration;
+            if (playerCoverTarget != null) {
+                Glide.with(this).clear(playerCoverTarget);
+                playerCoverTarget = null;
+            }
+
             if (isLocalVideo) {
+                // VIDEO: no backdrop, no cover — just the video surface on black.
                 if (ivPlayerCover.getVisibility() == View.VISIBLE) {
                     ivPlayerCover.animate().cancel();
                     ivPlayerCover.animate().alpha(0f).setDuration(250).withEndAction(() -> {
@@ -3060,64 +3257,64 @@ public class SongPlayerFragment extends Fragment {
                     animateBackgroundTransition(new android.graphics.drawable.ColorDrawable(Color.BLACK));
                 }
             } else {
+                // MUSIC (NewPipe stream / download / local file): smart-cropped cover with
+                // a dominant-color gradient backdrop.
+                boolean coverWasHidden = ivPlayerCover.getVisibility() != View.VISIBLE;
+                ivPlayerCover.animate().cancel();
                 ivPlayerCover.setVisibility(View.VISIBLE);
-                ivPlayerCover.setAlpha(1f);
+                if (coverWasHidden) {
+                    // Coming from video mode: the ImageView still holds artwork from an
+                    // older track. Keep it transparent until the new artwork lands so the
+                    // stale art never flashes; onResourceReady fades the new one in.
+                    ivPlayerCover.setImageDrawable(null);
+                    ivPlayerCover.setAlpha(0f);
+                } else {
+                    ivPlayerCover.setAlpha(1f);
+                }
 
                 // Convert low-res image URL to HD
                 String hdUrl = getHdImageUrl(track.imageUrl, track.videoId);
 
-                Glide.with(this)
-                    .asBitmap()
-                    .load(hdUrl)
-                    .transform(SHARED_YT_CROP)
-                    .diskCacheStrategy(DiskCacheStrategy.ALL)
-                    .error(
-                        Glide.with(this)
-                            .asBitmap()
-                            .load(track.imageUrl)
-                            .transform(SHARED_YT_CROP)
-                            .diskCacheStrategy(DiskCacheStrategy.ALL)
-                    )
-                    .into(new CustomTarget<Bitmap>() {
+                playerCoverTarget = new CustomTarget<Bitmap>() {
                         @Override
                         public void onResourceReady(@NonNull Bitmap resource, @Nullable Transition<? super Bitmap> transition) {
-                            if (!isAdded()) return;
+                            if (!isAdded() || artworkGen != playerArtworkGeneration) return;
 
-                            // Adjust flPlayerHero aspect ratio and margins based on loaded cover artwork
-                            float aspect = (float) resource.getWidth() / resource.getHeight();
-                            if (flPlayerHero != null && getContext() != null) {
-                                androidx.constraintlayout.widget.ConstraintLayout.LayoutParams p =
-                                        (androidx.constraintlayout.widget.ConstraintLayout.LayoutParams) flPlayerHero.getLayoutParams();
-                                if (p != null) {
-                                    float density = getResources().getDisplayMetrics().density;
-                                    if (aspect > 1.2f) {
-                                        p.leftMargin = 0;
-                                        p.rightMargin = 0;
-                                        p.dimensionRatio = "H," + resource.getWidth() + ":" + resource.getHeight();
-                                        flPlayerHero.setBackground(androidx.core.content.ContextCompat.getDrawable(getContext(), R.drawable.bg_player_cover_flat));
-                                    } else {
-                                        p.leftMargin = (int) (20 * density);
-                                        p.rightMargin = (int) (20 * density);
-                                        p.dimensionRatio = "H,1:1";
-                                        flPlayerHero.setBackground(androidx.core.content.ContextCompat.getDrawable(getContext(), R.drawable.bg_player_cover_rounded));
-                                    }
-                                    flPlayerHero.setLayoutParams(p);
-                                }
-                            }
-                            
-                            // Crossfade new cover image smoothly
+                            // Shape the hero to match THIS artwork during the alpha-0 swap below.
+                            // Reshaping while the previous bitmap is still visible re-crops that
+                            // bitmap (centerCrop) into the new aspect — that re-crop is the
+                            // "distortion" and the jump from full-bleed 16:9 to a bordered square
+                            // the user saw on every track change.
+                            final float aspect = (float) resource.getWidth() / Math.max(1, resource.getHeight());
+                            final int srcW = resource.getWidth();
+                            final int srcH = resource.getHeight();
+
+                            boolean coverHasContent = ivPlayerCover.getDrawable() != null
+                                    && ivPlayerCover.getAlpha() > 0.01f;
                             ivPlayerCover.animate().cancel();
-                            ivPlayerCover.animate().alpha(0f).setDuration(150).withEndAction(() -> {
+                            if (!coverHasContent) {
+                                // First paint — nothing to distort. Shape now and fade in.
+                                applyHeroShapeForAspect(aspect, srcW, srcH, artworkGen);
                                 ivPlayerCover.setImageBitmap(resource);
-                                ivPlayerCover.animate().alpha(1f).setDuration(250).start();
-                                if (pbVideoLoading != null && !isVideoTrack(track)) {
-                                    pbVideoLoading.setVisibility(View.GONE);
-                                }
-                            }).start();
+                                ivPlayerCover.setAlpha(0f);
+                                ivPlayerCover.animate().alpha(1f).setDuration(260).start();
+                            } else {
+                                // Fade old cover out, reshape + swap while invisible, fade new in.
+                                ivPlayerCover.animate().alpha(0f).setDuration(150).withEndAction(() -> {
+                                    if (artworkGen != playerArtworkGeneration) return;
+                                    applyHeroShapeForAspect(aspect, srcW, srcH, artworkGen);
+                                    ivPlayerCover.setImageBitmap(resource);
+                                    ivPlayerCover.animate().alpha(1f).setDuration(240).start();
+                                }).start();
+                            }
+                            if (pbVideoLoading != null) {
+                                pbVideoLoading.setVisibility(View.GONE);
+                            }
 
-                            // Extract dominant color and set vertical gradient
+                            // Extract dominant color and set vertical gradient (no boost — the raw
+                            // dominant swatch is used as-is per design preference).
                             Palette.from(resource).generate(palette -> {
-                                if (palette == null || !isAdded()) return;
+                                if (palette == null || !isAdded() || artworkGen != playerArtworkGeneration) return;
                                 int dominantColor = palette.getDominantColor(0xFF121212);
 
                                 if (playerBackgroundContainer != null) {
@@ -3137,8 +3334,37 @@ public class SongPlayerFragment extends Fragment {
                         }
 
                         @Override
+                        public void onLoadFailed(@Nullable Drawable errorDrawable) {
+                            if (!isAdded() || artworkGen != playerArtworkGeneration) return;
+                            // No artwork available (e.g. local file without album art): neutral
+                            // music icon on a square hero + dark backdrop, instead of inheriting
+                            // the previous track's shape or leaving the cover stuck at alpha 0.
+                            ivPlayerCover.animate().cancel();
+                            applyHeroShapeForAspect(1f, 1, 1, artworkGen);
+                            ivPlayerCover.setImageResource(R.drawable.ic_music);
+                            ivPlayerCover.setAlpha(1f);
+                            if (playerBackgroundContainer != null) {
+                                animateBackgroundTransition(new android.graphics.drawable.ColorDrawable(0xFF161616));
+                            }
+                        }
+
+                        @Override
                         public void onLoadCleared(@Nullable Drawable placeholder) {}
-                    });
+                    };
+
+                Glide.with(this)
+                    .asBitmap()
+                    .load(hdUrl)
+                    .transform(SHARED_YT_CROP)
+                    .diskCacheStrategy(DiskCacheStrategy.ALL)
+                    .error(
+                        Glide.with(this)
+                            .asBitmap()
+                            .load(track.imageUrl)
+                            .transform(SHARED_YT_CROP)
+                            .diskCacheStrategy(DiskCacheStrategy.ALL)
+                    )
+                    .into(playerCoverTarget);
             }
         }
 
@@ -3188,6 +3414,32 @@ public class SongPlayerFragment extends Fragment {
                       .replace("hqdefault.jpg", "hq720.jpg");
         }
         return url;
+    }
+
+    /** Applies the hero's aspect ratio + chrome for a given cover aspect, in one shot. Wide art
+     *  (aspect > 1.2) goes full-bleed and flat; everything else is a rounded square with side
+     *  margins. Centralised so the success and failure artwork paths shape the hero identically,
+     *  and so callers can apply it atomically with the bitmap swap (no mid-swap re-crop). */
+    private void applyHeroShapeForAspect(float aspect, int srcW, int srcH, int gen) {
+        if (flPlayerHero == null || getContext() == null) return;
+        androidx.constraintlayout.widget.ConstraintLayout.LayoutParams p =
+                (androidx.constraintlayout.widget.ConstraintLayout.LayoutParams) flPlayerHero.getLayoutParams();
+        if (p == null) return;
+        float density = getResources().getDisplayMetrics().density;
+        p.height = 0; // MATCH_CONSTRAINT
+        if (aspect > 1.2f) {
+            p.leftMargin = 0;
+            p.rightMargin = 0;
+            p.dimensionRatio = "H," + Math.max(1, srcW) + ":" + Math.max(1, srcH);
+            flPlayerHero.setBackground(androidx.core.content.ContextCompat.getDrawable(getContext(), R.drawable.bg_player_cover_flat));
+        } else {
+            p.leftMargin = (int) (20 * density);
+            p.rightMargin = (int) (20 * density);
+            p.dimensionRatio = "H,1:1";
+            flPlayerHero.setBackground(androidx.core.content.ContextCompat.getDrawable(getContext(), R.drawable.bg_player_cover_rounded));
+        }
+        flPlayerHero.setLayoutParams(p);
+        heroRatioAppliedGeneration = gen;
     }
 
     private void setupSocialActions() {
@@ -4343,20 +4595,58 @@ public class SongPlayerFragment extends Fragment {
     }
 
     private boolean isVideoTrackId(String videoId) {
-        if (TextUtils.isEmpty(videoId)) return false;
-        if (LocalFilesStore.isLocalVideoId(videoId)) {
-            return true;
-        }
-        Context context = getContext();
-        if (context != null && OfflineAudioStore.hasOfflineVideo(context, videoId)) {
-            return true;
-        }
+        // Static/no-source classification: never video. Video is decided ONLY from the active
+        // source (see isVideoTrack / isVideoPresentation): online (NewPipe audio) is always music,
+        // and a track merely HAVING an offline .mp4 does not make it video.
         return false;
     }
 
+    /** True when the track currently being played from an OFFLINE file whose .mp4 actually
+     *  contains a video track. Gating on {@link #usingOfflineSource} is what prevents the old bug
+     *  where a download landing mid-song flipped an online (audio) stream into black video mode. */
     private boolean isVideoTrack(PlayerTrack track) {
         if (track == null) return false;
-        return isVideoTrackId(track.videoId);
+        return usingOfflineSource && offlineFileHasVideoTrack(track.videoId);
+    }
+
+    /** Video/music classification for PRESENTATION (cover, backdrop, hero, surface). Only the
+     *  actively-loaded track can be video, and only while its live source is the offline video. */
+    private boolean isVideoPresentation(@Nullable PlayerTrack track) {
+        if (track == null) return false;
+        if (TextUtils.isEmpty(loadedVideoId) || !TextUtils.equals(loadedVideoId, track.videoId)) {
+            return false;
+        }
+        return usingOfflineSource && offlineFileHasVideoTrack(track.videoId);
+    }
+
+    /** Probes the offline file for a real video track (cached). Returns false for online-only or
+     *  audio-only (plain song) offline files, so those present as music. */
+    private boolean offlineFileHasVideoTrack(@Nullable String videoId) {
+        if (TextUtils.isEmpty(videoId) || !isAdded()) return false;
+        Boolean cached = offlineVideoProbeCache.get(videoId);
+        if (cached != null) return cached;
+
+        java.io.File file = OfflineAudioStore.getExistingOfflineAudioFile(requireContext(), videoId);
+        if (file == null || !file.isFile() || file.length() <= 0L) {
+            // Not downloaded yet — do not cache, so a later download is detected.
+            return false;
+        }
+
+        boolean hasVideo = false;
+        android.media.MediaExtractor extractor = new android.media.MediaExtractor();
+        try {
+            extractor.setDataSource(file.getAbsolutePath());
+            for (int i = 0; i < extractor.getTrackCount(); i++) {
+                String mime = extractor.getTrackFormat(i).getString(android.media.MediaFormat.KEY_MIME);
+                if (mime != null && mime.startsWith("video/")) { hasVideo = true; break; }
+            }
+        } catch (Exception e) {
+            hasVideo = false;
+        } finally {
+            try { extractor.release(); } catch (Exception ignored) {}
+        }
+        offlineVideoProbeCache.put(videoId, hasVideo);
+        return hasVideo;
     }
 
     private void updatePlayerSurfaceForSource() {
@@ -4365,7 +4655,7 @@ public class SongPlayerFragment extends Fragment {
         boolean isLocalVideo = false;
         if (currentIndex >= 0 && currentIndex < tracks.size()) {
             PlayerTrack current = tracks.get(currentIndex);
-            if (current != null && isVideoTrack(current)) {
+            if (current != null && isVideoPresentation(current)) {
                 isLocalVideo = true;
             }
         }
@@ -4382,31 +4672,21 @@ public class SongPlayerFragment extends Fragment {
                 }
             } else {
                 ivPlayerCover.setVisibility(View.VISIBLE);
-                ivPlayerCover.setAlpha(1f);
+                // Only force full opacity when the cover actually holds artwork. After a
+                // video→music switch the bind path deliberately keeps it transparent (with
+                // a null drawable) until the new artwork lands — forcing alpha 1 here would
+                // flash the previous track's art over the new song.
+                if (ivPlayerCover.getDrawable() != null) {
+                    ivPlayerCover.setAlpha(1f);
+                }
             }
         }
 
-        if (flPlayerHero != null && getContext() != null) {
-            androidx.constraintlayout.widget.ConstraintLayout.LayoutParams p =
-                    (androidx.constraintlayout.widget.ConstraintLayout.LayoutParams) flPlayerHero.getLayoutParams();
-            if (p != null) {
-                if (isLocalVideo) {
-                    p.leftMargin = 0;
-                    p.rightMargin = 0;
-                    p.height = 0; // MATCH_CONSTRAINT
-                    p.dimensionRatio = "H,16:9";
-                    flPlayerHero.setBackground(androidx.core.content.ContextCompat.getDrawable(getContext(), R.drawable.bg_player_cover_flat));
-                } else {
-                    float density = getResources().getDisplayMetrics().density;
-                    p.leftMargin = (int) (20 * density);
-                    p.rightMargin = (int) (20 * density);
-                    p.height = 0; // MATCH_CONSTRAINT
-                    p.dimensionRatio = "H,1:1";
-                    flPlayerHero.setBackground(androidx.core.content.ContextCompat.getDrawable(getContext(), R.drawable.bg_player_cover_rounded));
-                }
-                flPlayerHero.setLayoutParams(p);
-            }
-        }
+        // Hero aspect/shape is owned entirely by the cover artwork (bindCurrentTrack's
+        // onResourceReady → applyHeroShapeForAspect). We intentionally do NOT set a default
+        // ratio on every playback-start here: doing so stomped the previous cover's shape
+        // mid-swap and made the image jump/distort when changing tracks. Until the first
+        // artwork lands the hero keeps its 0dp fill from XML.
 
         // Hide spinner for audio tracks; only show for local video
         if (pbVideoLoading != null && !isLocalVideo) {
@@ -5246,16 +5526,24 @@ public class SongPlayerFragment extends Fragment {
                 holder.tvNextUpArtist.setTextColor(Color.parseColor("#A0A0A0")); // Default gray
             }
 
-            holder.ivNextUpArt.setImageDrawable(null);
             if (!TextUtils.isEmpty(item.imageUrl)) {
                 String imageUrl = item.imageUrl.trim();
-                // ✅ Use cached transformation instead of creating new one
+                // Do NOT null the drawable before loading — the placeholder replaces any
+                // recycled art the instant the request starts, and memory-cache hits bind
+                // synchronously, so rows never flash empty while scrolling the queue.
                 Glide.with(holder.itemView)
                     .load(imageUrl)
                     .transform(SHARED_YT_CROP)
+                    .format(com.bumptech.glide.load.DecodeFormat.PREFER_RGB_565)
+                    .override(160, 160)
                     .diskCacheStrategy(com.bumptech.glide.load.engine.DiskCacheStrategy.ALL)
+                    .placeholder(new android.graphics.drawable.ColorDrawable(
+                            ContextCompat.getColor(holder.itemView.getContext(), R.color.surface_high)))
                     .transition(com.bumptech.glide.load.resource.drawable.DrawableTransitionOptions.withCrossFade())
                     .into(holder.ivNextUpArt);
+            } else {
+                Glide.with(holder.itemView).clear(holder.ivNextUpArt);
+                holder.ivNextUpArt.setImageDrawable(null);
             }
 
             holder.itemView.setOnClickListener(v -> {

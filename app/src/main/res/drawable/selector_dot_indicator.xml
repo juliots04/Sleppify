@@ -1,15 +1,24 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- Page-indicator dot. The TabLayout tab is wider than tall, so a bare oval shape used as the
+     tab background gets stretched into a vertical pill. Wrapping the oval in a layer-list item
+     with a fixed size + center gravity keeps it a true centered circle regardless of tab size. -->
 <selector xmlns:android="http://schemas.android.com/apk/res/android">
     <item android:state_selected="true">
-        <shape android:shape="oval">
-            <solid android:color="@color/text_primary" />
-            <size android:width="6dp" android:height="6dp" />
-        </shape>
+        <layer-list>
+            <item android:width="11dp" android:height="11dp" android:gravity="center">
+                <shape android:shape="oval">
+                    <solid android:color="@color/text_primary" />
+                </shape>
+            </item>
+        </layer-list>
     </item>
     <item>
-        <shape android:shape="oval">
-            <solid android:color="@color/surface_high" />
-            <size android:width="6dp" android:height="6dp" />
-        </shape>
+        <layer-list>
+            <item android:width="9dp" android:height="9dp" android:gravity="center">
+                <shape android:shape="oval">
+                    <solid android:color="@color/surface_high" />
+                </shape>
+            </item>
+        </layer-list>
     </item>
 </selector>

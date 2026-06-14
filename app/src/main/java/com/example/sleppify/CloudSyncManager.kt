@@ -499,16 +499,20 @@ class CloudSyncManager private constructor(context: Context) {
             .get()
             .addOnSuccessListener { documents ->
                 for (doc in documents) {
-                    val playlistId = doc.id
-                    @Suppress("UNCHECKED_CAST")
-                    val rawList = doc.get("overrides") as? List<Map<String, Any?>> ?: continue
-                    val parsed = ArrayList<PlaylistOverrideStore.Override>(rawList.size)
-                    for (m in rawList) {
-                        val o = PlaylistOverrideStore.Override.fromMap(m) ?: continue
-                        parsed.add(o)
-                    }
-                    if (parsed.isNotEmpty()) {
-                        PlaylistOverrideStore.mergeFromCloud(appContext, playlistId, parsed)
+                    try {
+                        val playlistId = doc.id
+                        @Suppress("UNCHECKED_CAST")
+                        val rawList = doc.get("overrides") as? List<Map<String, Any?>> ?: continue
+                        val parsed = ArrayList<PlaylistOverrideStore.Override>(rawList.size)
+                        for (m in rawList) {
+                            val o = PlaylistOverrideStore.Override.fromMap(m) ?: continue
+                            parsed.add(o)
+                        }
+                        if (parsed.isNotEmpty()) {
+                            PlaylistOverrideStore.mergeFromCloud(appContext, playlistId, parsed)
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Error parsing playlist overrides for ${doc.id}", e)
                     }
                 }
                 endNetworkSync()
@@ -1272,15 +1276,19 @@ class CloudSyncManager private constructor(context: Context) {
             .addOnSuccessListener { documents ->
                 val result = HashMap<String, List<PlaylistOverrideStore.Override>>()
                 for (doc in documents) {
-                    val playlistId = doc.id
-                    @Suppress("UNCHECKED_CAST")
-                    val rawList = doc.get("overrides") as? List<Map<String, Any?>> ?: continue
-                    val parsed = ArrayList<PlaylistOverrideStore.Override>(rawList.size)
-                    for (m in rawList) {
-                        val o = PlaylistOverrideStore.Override.fromMap(m) ?: continue
-                        parsed.add(o)
+                    try {
+                        val playlistId = doc.id
+                        @Suppress("UNCHECKED_CAST")
+                        val rawList = doc.get("overrides") as? List<Map<String, Any?>> ?: continue
+                        val parsed = ArrayList<PlaylistOverrideStore.Override>(rawList.size)
+                        for (m in rawList) {
+                            val o = PlaylistOverrideStore.Override.fromMap(m) ?: continue
+                            parsed.add(o)
+                        }
+                        if (parsed.isNotEmpty()) result[playlistId] = parsed
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Error parsing cloud playlist overrides for ${doc.id}", e)
                     }
-                    if (parsed.isNotEmpty()) result[playlistId] = parsed
                 }
                 callback.onResult(result)
             }

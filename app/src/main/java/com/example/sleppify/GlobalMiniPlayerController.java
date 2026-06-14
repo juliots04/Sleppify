@@ -496,7 +496,9 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
 
     private void loadArtwork(@Nullable String imageUrl) {
         if (TextUtils.isEmpty(imageUrl) || activity.isFinishing() || activity.isDestroyed()) {
-            ivArt.setImageDrawable(null);
+            if (ivArt != null) {
+                ivArt.setImageDrawable(null);
+            }
             artworkLoading = false;
             updateMiniLoadingVisibility();
             return;

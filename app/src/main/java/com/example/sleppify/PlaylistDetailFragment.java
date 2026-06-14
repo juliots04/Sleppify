@@ -230,16 +230,39 @@ public class PlaylistDetailFragment extends Fragment
     private final Set<String> offlineDownloadingTrackIds = new HashSet<>();
     @NonNull
     private final Map<String, Float> offlineTrackProgressFractions = new HashMap<>();
+    /** Bounded auto-retry counter (per playlistId) for FAILED offline downloads, so a
+     *  deterministically-failing worker can't spin an unbounded re-enqueue loop. */
+    @NonNull
+    private final Map<String, Integer> offlineAutoRetryCountByPlaylist = new HashMap<>();
+    private static final int MAX_OFFLINE_AUTO_RETRY = 3;
+    private static final long OFFLINE_AUTO_RETRY_DELAY_MS = 20000L;
+    @Nullable
+    private Runnable offlineAutoRetryRunnable;
+    /** Unique-work name of the most recently enqueued offline download (auto QUEUE vs MANUAL
+     *  track queue), so lifecycle re-entry re-observes the queue that is actually active. */
+    @Nullable
+    private String lastActiveOfflineUniqueName;
     private boolean restoringHiddenPlayerFromSnapshot;
     private boolean awaitingInitialPlaylistRender = true;
     private boolean isScrolling = false;
     /** True only during a momentum fling (SCROLL_STATE_SETTLING). During a fling we defer
-     *  image decode + disk state lookups to avoid main-thread jank; the SCROLL_STATE_IDLE
-     *  handler loads only the visible range once the fling settles (YT Music behavior). */
+     *  the disk-based offline state lookups (MediaMetadataRetriever reads) to avoid flooding
+     *  the executor; the SCROLL_STATE_IDLE handler covers the visible range once it settles.
+     *  Image loads are NOT deferred — Glide decodes off the main thread and memory-cache
+     *  hits bind instantly, so rows fill in while flinging instead of staying grey. */
     private boolean isFlinging = false;
     /** Cached artwork decode size in px (50dp). Resolved once to avoid a DisplayMetrics
      *  lookup on every list bind. */
     private int cachedTrackArtPx = 0;
+    /** Cached surface_high color for the track art placeholder. Resolved once to avoid a
+     *  Resources lookup on every list bind. */
+    private int cachedTrackArtPlaceholderColor = 0;
+    /** How many rows past the viewport to warm in the scroll direction. ~1.5 screens of
+     *  60dp rows — enough that thumbnails are cached before their row binds. */
+    private static final int ART_PREFETCH_AHEAD = 12;
+    /** Last (anchor, direction) pair the artwork prefetcher ran for; prevents re-issuing
+     *  the same prefetch batch on every onScrolled frame while the anchor row is unchanged. */
+    private int lastArtPrefetchKey = Integer.MIN_VALUE;
     private boolean pendingOfflineToggle = false;
     private final Map<String, Long> lastOfflineStateLookupTimeByTrack = new LinkedHashMap<String, Long>(
             PLAYLIST_TRACKS_FETCH_MAX_LIMIT / 4 + 1, 0.75f, true) {
@@ -366,7 +389,7 @@ public class PlaylistDetailFragment extends Fragment
             );
         }
         currentPlaylistId = playlistId;
-        isRadioContext = playlistId.startsWith("RDAMVM") || playlistId.startsWith("RDEM") || playlistId.startsWith("RDTMAK");
+        isRadioContext = isRadioOrMixPlaylistId(playlistId);
         if (isRadioContext && playlistTitle.startsWith("Radio: ")) {
             playlistTitle = playlistTitle.substring(7);
         }
@@ -417,10 +440,12 @@ public class PlaylistDetailFragment extends Fragment
                         trackAdapter.flushDeferredNotifications();
                         if (recyclerView.getLayoutManager() instanceof LinearLayoutManager) {
                             LinearLayoutManager lm = (LinearLayoutManager) recyclerView.getLayoutManager();
-                            // ConcatAdapter: header at position 0, tracks start at 1
-                            int firstVisible = lm.findFirstVisibleItemPosition() - 1;
+                            // ConcatAdapter: header at position 0, tracks start at 1. When the
+                            // header is the first visible item, firstVisible maps to -1 — clamp
+                            // to 0 so the rows below the header still get their idle pass.
+                            int firstVisible = Math.max(0, lm.findFirstVisibleItemPosition() - 1);
                             int lastVisible  = lm.findLastVisibleItemPosition()  - 1;
-                            if (firstVisible >= 0) {
+                            if (lastVisible >= 0) {
                                 trackAdapter.loadStateForVisibleRange(firstVisible, lastVisible);
                                 trackAdapter.reloadImagesForRange(firstVisible, lastVisible);
                             }
@@ -440,6 +465,19 @@ public class PlaylistDetailFragment extends Fragment
                 if (nowMs - lastToolbarScrollUpdateMs >= 32L) {
                     lastToolbarScrollUpdateMs = nowMs;
                     updateToolbarScrollState(recyclerView);
+                }
+
+                // Warm artwork for the rows about to enter the viewport. Keyed on the
+                // (anchor row, direction) pair so it fires once per new edge row, not on
+                // every scroll frame.
+                if (trackAdapter != null && dy != 0) {
+                    int anchor = (dy > 0 ? layoutManager.findLastVisibleItemPosition()
+                                         : layoutManager.findFirstVisibleItemPosition()) - 1;
+                    int prefetchKey = anchor * 2 + (dy > 0 ? 1 : 0);
+                    if (anchor >= 0 && prefetchKey != lastArtPrefetchKey) {
+                        lastArtPrefetchKey = prefetchKey;
+                        trackAdapter.prefetchArtFrom(anchor, dy > 0 ? 1 : -1);
+                    }
                 }
 
                 if (dy <= 0 || !playlistTracksCanLoadMore || playlistTracksLoadMoreInFlight) return;
@@ -595,6 +633,10 @@ public class PlaylistDetailFragment extends Fragment
         stopObservingOfflineDownload();
         setOfflineDownloadVisualState(false, "");
         pendingImportTrackIds.clear();
+        if (offlineAutoRetryRunnable != null) {
+            mainHandler.removeCallbacks(offlineAutoRetryRunnable);
+            offlineAutoRetryRunnable = null;
+        }
         cancelPendingTracksTokenRetry();
         persistLibraryScreenIfReturningToMusic();
         offlineReadyStateGeneration.incrementAndGet();
@@ -932,7 +974,31 @@ public class PlaylistDetailFragment extends Fragment
         if (!isAdded() || TextUtils.isEmpty(currentPlaylistId)) {
             return;
         }
-        observeOfflineDownload(OFFLINE_DOWNLOAD_QUEUE_UNIQUE_NAME, false);
+        // Re-observe whichever queue most recently had this playlist's work. A manual per-row
+        // download lives on the MANUAL queue; always defaulting to the bulk QUEUE would detach
+        // the single observer slot from in-flight manual progress on every lifecycle re-entry.
+        String restoreName = !TextUtils.isEmpty(lastActiveOfflineUniqueName)
+                ? lastActiveOfflineUniqueName
+                : OFFLINE_DOWNLOAD_QUEUE_UNIQUE_NAME;
+        observeOfflineDownload(restoreName, false);
+    }
+
+    /** Keeps only the WorkInfos tagged for the currently-open playlist, so another playlist's
+     *  download (which shares the same global unique-work name) cannot bleed its progress,
+     *  header text, or terminal state into this screen. */
+    @Nullable
+    private List<WorkInfo> filterWorkInfosForCurrentPlaylist(@Nullable List<WorkInfo> workInfos) {
+        if (workInfos == null || workInfos.isEmpty()) {
+            return workInfos;
+        }
+        String tag = currentPlaylistOfflineTag();
+        List<WorkInfo> scoped = new ArrayList<>(workInfos.size());
+        for (WorkInfo info : workInfos) {
+            if (info != null && info.getTags().contains(tag)) {
+                scoped.add(info);
+            }
+        }
+        return scoped;
     }
 
     @NonNull
@@ -1093,6 +1159,21 @@ public class PlaylistDetailFragment extends Fragment
         loadTrackArt(target, imageUrl, com.bumptech.glide.Priority.HIGH);
     }
 
+    private int trackArtSizePx(@NonNull Context ctx) {
+        if (cachedTrackArtPx == 0) {
+            float density = ctx.getResources().getDisplayMetrics().density;
+            cachedTrackArtPx = Math.max(100, Math.round(50 * density));
+        }
+        return cachedTrackArtPx;
+    }
+
+    private int trackArtPlaceholderColor(@NonNull Context ctx) {
+        if (cachedTrackArtPlaceholderColor == 0) {
+            cachedTrackArtPlaceholderColor = ContextCompat.getColor(ctx, R.color.surface_high);
+        }
+        return cachedTrackArtPlaceholderColor;
+    }
+
     private void loadTrackArt(
             @NonNull ImageView target,
             @Nullable String imageUrl,
@@ -1104,15 +1185,11 @@ public class PlaylistDetailFragment extends Fragment
             target.setImageDrawable(null);
             return;
         }
-        // DO NOT call target.setImageDrawable(null) here — it causes a visible
-        // white flash before the new image loads. Glide's crossFade transition
-        // handles the swap smoothly from old→new image.
+        // The grey placeholder replaces a recycled holder's stale art immediately on
+        // request start, so a row can never briefly show the previous track's image.
+        // Memory-cache hits complete synchronously inside into() and never show it.
         boolean offlineOnly = !cachedHasValidatedInternet(ctx);
-        if (cachedTrackArtPx == 0) {
-            float density = ctx.getResources().getDisplayMetrics().density;
-            cachedTrackArtPx = Math.max(100, Math.round(50 * density));
-        }
-        int px = cachedTrackArtPx;
+        int px = trackArtSizePx(ctx);
         Glide.with(target)
                 .load(imageUrl.trim())
                 .transform(SHARED_YT_CROP)
@@ -1121,8 +1198,40 @@ public class PlaylistDetailFragment extends Fragment
                 .onlyRetrieveFromCache(offlineOnly)
                 .priority(priority)
                 .override(px, px)
+                .placeholder(new android.graphics.drawable.ColorDrawable(trackArtPlaceholderColor(ctx)))
                 .transition(DrawableTransitionOptions.withCrossFade(100))
                 .into(target);
+    }
+
+    /**
+     * Warms Glide's memory/disk caches for rows just beyond the viewport in the scroll
+     * direction, using the exact same request shape (size, transform, decode format) as
+     * {@link #loadTrackArt} so the cache keys match and the bind is a synchronous hit.
+     * LOW priority keeps these behind the visible rows' HIGH priority requests.
+     */
+    private void prefetchTrackArt(@NonNull List<PlaylistTrack> tracks, int anchorIndex, int direction, int count) {
+        if (!isAdded() || anchorIndex < 0 || anchorIndex >= tracks.size()) return;
+        Context ctx = requireContext();
+        boolean offlineOnly = !cachedHasValidatedInternet(ctx);
+        int px = trackArtSizePx(ctx);
+        for (int i = 1; i <= count; i++) {
+            int idx = anchorIndex + direction * i;
+            if (idx < 0 || idx >= tracks.size()) break;
+            PlaylistTrack track = tracks.get(idx);
+            if (track == null || TextUtils.isEmpty(track.imageUrl)
+                    || LocalFilesStore.isLocalVideoId(track.videoId)) {
+                continue;
+            }
+            Glide.with(this)
+                    .load(track.imageUrl.trim())
+                    .transform(SHARED_YT_CROP)
+                    .format(DecodeFormat.PREFER_RGB_565)
+                    .diskCacheStrategy(DiskCacheStrategy.ALL)
+                    .onlyRetrieveFromCache(offlineOnly)
+                    .priority(com.bumptech.glide.Priority.LOW)
+                    .override(px, px)
+                    .preload(px, px);
+        }
     }
 
     private void prefetchStreamUrlsForTracks(@NonNull List<PlaylistTrack> tracks, int limit) {
@@ -1323,6 +1432,14 @@ public class PlaylistDetailFragment extends Fragment
 
     private boolean isInternetAvailable() {
         return isAdded() && cachedHasValidatedInternet(requireContext());
+    }
+
+    /** True for YouTube Music radio/mix playlists. Every radio/mix id ("Mixes para ti", "My Mix",
+     *  song radios, etc.) starts with "RD"; regular playlists use PL/VL/OLAK/MPRE prefixes. These
+     *  must be loaded via the InnerTube watch endpoint (cookie) — the playlist endpoint returns
+     *  empty for them. */
+    private static boolean isRadioOrMixPlaylistId(@Nullable String playlistId) {
+        return playlistId != null && playlistId.startsWith("RD");
     }
 
     private void refreshPlaylistMeta(@NonNull String playlistId, @NonNull String accessToken) {
@@ -1578,8 +1695,11 @@ public class PlaylistDetailFragment extends Fragment
 
         notifyHeaderChanged();
 
-        // Radio/Mix playlists (RDAMVM, RDEM, RDTMAK) use InnerTube API with cookie
-        if (playlistId.startsWith("RDAMVM") || playlistId.startsWith("RDEM") || playlistId.startsWith("RDTMAK")) {
+        // Radio/Mix playlists (any "RD" id: RDAMVM, RDEM, RDTMAK, RDCLAK "Mixes para ti", …)
+        // use the InnerTube watch endpoint with the web cookie. Regular playlists (PL/VL/OLAK…)
+        // never start with "RD", so this only diverts genuine radios/mixes — which otherwise hit
+        // the playlist endpoint and come back EMPTY.
+        if (isRadioOrMixPlaylistId(playlistId)) {
             // Check no-internet before attempting network fetch
             if (!hasValidatedInternet(requireContext())) {
                 playlistTracksLoadMoreInFlight = false;
@@ -1821,6 +1941,10 @@ public class PlaylistDetailFragment extends Fragment
         if (!isAdded()) {
             return;
         }
+        // A fresh user-initiated download resets the auto-retry budget for this playlist.
+        if (userInitiated && !TextUtils.isEmpty(currentPlaylistId)) {
+            offlineAutoRetryCountByPlaylist.remove(currentPlaylistId);
+        }
         if (currentTracks.isEmpty()) {
             if (userInitiated) {
                 
@@ -1901,6 +2025,7 @@ public class PlaylistDetailFragment extends Fragment
                         .build();
 
                 enqueueOfflineDownloadUniqueWork(uniqueName, request);
+                lastActiveOfflineUniqueName = uniqueName;
 
                 offlineDownloadQueued = true;
                 notifyHeaderChanged();
@@ -2121,6 +2246,11 @@ public class PlaylistDetailFragment extends Fragment
                 return;
             }
 
+            // Scope to the current playlist's work only — the unique-work LiveData is shared
+            // across playlists, so without this filter another playlist's progress/terminal
+            // state would bleed into this screen.
+            workInfos = filterWorkInfosForCurrentPlaylist(workInfos);
+
             if (workInfos == null || workInfos.isEmpty()) {
                 if (!offlineDownloadQueued) {
                     setOfflineDownloadVisualState(false, "");
@@ -2242,7 +2372,11 @@ public class PlaylistDetailFragment extends Fragment
                 offlineDownloadQueued = queuedCount > 0;
 
                 if (!isInternetAvailable()) {
-                    setOfflineDownloadVisualState(false, "");
+                    // Transient connectivity blip (isInternetAvailable is stricter than the
+                    // worker's network constraint). Do NOT tear down the per-track progress we
+                    // just set above — the worker hasn't stopped. Only show a waiting header;
+                    // the next progress emission re-applies fresh values when the network returns.
+                    headerPlaylistInfo = "Descargando playlist • esperando conexión";
                     notifyHeaderChanged();
                     return;
                 }
@@ -2324,6 +2458,21 @@ public class PlaylistDetailFragment extends Fragment
                 int totalOut = output.getInt(OfflinePlaylistDownloadWorker.OUTPUT_TOTAL, currentTracks.size());
                 String reason = output.getString(OfflinePlaylistDownloadWorker.OUTPUT_REASON);
 
+                // A successful run clears the auto-retry budget for this playlist.
+                if (!TextUtils.isEmpty(currentPlaylistId)) {
+                    offlineAutoRetryCountByPlaylist.remove(currentPlaylistId);
+                }
+                // Mark complete immediately from the worker's authoritative count so the filled
+                // check lights without waiting for the async disk scan. maybeUpdateOfflineReadyState()
+                // below still runs as a confirmation pass that can flip it back if files are bad.
+                if (OfflinePlaylistDownloadWorker.OUTPUT_REASON_NONE.equals(reason)
+                        && totalOut > 0 && downloadedOut >= totalOut) {
+                    persistOfflineCompleteStateForCurrentPlaylist(true);
+                }
+                // Re-notify the library tile now that files actually landed (the enqueue-time
+                // notify fired before downloads finished, so the tile read stale state).
+                notifyMusicPlayerOfflineChanged();
+
                 if (!offlineObserverNotifyTerminalToasts) {
                     stopObservingOfflineDownload();
                     refreshVisibleTrackRows();
@@ -2351,9 +2500,30 @@ public class PlaylistDetailFragment extends Fragment
                 if (terminalInfo.getState() == WorkInfo.State.FAILED
                         && isCurrentPlaylistOfflineAutoEnabled()
                         && isInternetAvailable()) {
-                    Log.w(TAG_OFFLINE_DOWNLOAD, "terminal_failed: auto-retrying download for playlist=" + currentPlaylistId);
-                    startOfflinePlaylistDownload(false);
-                    return;
+                    final String retryPlaylistId = currentPlaylistId;
+                    int attempts = offlineAutoRetryCountByPlaylist.containsKey(retryPlaylistId)
+                            ? offlineAutoRetryCountByPlaylist.get(retryPlaylistId) : 0;
+                    if (attempts < MAX_OFFLINE_AUTO_RETRY) {
+                        offlineAutoRetryCountByPlaylist.put(retryPlaylistId, attempts + 1);
+                        Log.w(TAG_OFFLINE_DOWNLOAD, "terminal_failed: auto-retry "
+                                + (attempts + 1) + "/" + MAX_OFFLINE_AUTO_RETRY
+                                + " for playlist=" + retryPlaylistId);
+                        // Delayed + guarded re-enqueue (no synchronous loop): a deterministically
+                        // failing worker is now capped instead of spinning a battery-draining loop.
+                        if (offlineAutoRetryRunnable != null) {
+                            mainHandler.removeCallbacks(offlineAutoRetryRunnable);
+                        }
+                        offlineAutoRetryRunnable = () -> {
+                            if (!isAdded() || isHidden()) return;
+                            if (!TextUtils.equals(currentPlaylistId, retryPlaylistId)) return;
+                            if (!isCurrentPlaylistOfflineAutoEnabled() || !isInternetAvailable()) return;
+                            startOfflinePlaylistDownload(false);
+                        };
+                        mainHandler.postDelayed(offlineAutoRetryRunnable, OFFLINE_AUTO_RETRY_DELAY_MS);
+                        return;
+                    }
+                    Log.w(TAG_OFFLINE_DOWNLOAD,
+                            "terminal_failed: auto-retry budget exhausted for playlist=" + retryPlaylistId);
                 }
 
                 if (currentMeta != null) {
@@ -2751,8 +2921,18 @@ public class PlaylistDetailFragment extends Fragment
             boolean fromCache
     ) {
         String selectedVideoId = getCurrentTrackVideoId();
+        // Gate: when the local-music setting is OFF, local tracks ("local_*") that the user
+        // mixed into OTHER playlists must not surface in the display list, queue, now-playing,
+        // or counts. The dedicated Local Files playlist is exempt (it is gated by isEnabled at
+        // the library level and legitimately contains only local tracks).
+        boolean hideMixedLocalTracks = isAdded()
+                && !isLocalFilesContext(playlistId)
+                && !LocalFilesStore.isEnabled(requireContext());
         originalTracks.clear();
         for (PlaylistTrack t : tracks) {
+            if (hideMixedLocalTracks && t != null && LocalFilesStore.isLocalVideoId(t.videoId)) {
+                continue;
+            }
             if (!isLikelyShort(t)) {
                 originalTracks.add(t);
             }
@@ -3000,8 +3180,7 @@ public class PlaylistDetailFragment extends Fragment
 
         // Preload track thumbnails with SHARED_YT_CROP + same size as loadTrackArt
         // so the cache key matches and the first scroll doesn't re-decode
-        float density = ctx.getResources().getDisplayMetrics().density;
-        int trackPx = Math.max(100, Math.round(50 * density));
+        int trackPx = trackArtSizePx(ctx);
         for (String url : trackUrls) {
             Glide.with(ctx)
                     .load(url)
@@ -4021,6 +4200,17 @@ public class PlaylistDetailFragment extends Fragment
         boolean offlineAuto = cachePrefs.getBoolean(PREF_PLAYLIST_OFFLINE_AUTO_PREFIX + playlistId, false);
         if (!offlineAuto) return;
         if (OfflineAudioStore.hasOfflineAudio(requireContext(), videoId)) return;
+
+        // If the added track belongs to the playlist that is currently open, reuse the proper
+        // single-track path so the work is observable on this screen and uses the real title/tag.
+        if (TextUtils.equals(playlistKey, currentPlaylistId)) {
+            enqueueSingleTrackForOfflineDownload(videoId, title, artist, duration);
+            return;
+        }
+
+        // Off-screen playlist: still route through the MANUAL unique-work queue and tag with the
+        // target playlist's offline tag so the job is deduped and cancelable — instead of the old
+        // untagged raw enqueue() that nothing could observe, dedupe, or cancel.
         try {
             Data inputData = new Data.Builder()
                     .putString(OfflinePlaylistDownloadWorker.INPUT_PLAYLIST_ID, playlistId)
@@ -4042,9 +4232,10 @@ public class PlaylistDetailFragment extends Fragment
             OneTimeWorkRequest request = new OneTimeWorkRequest.Builder(OfflinePlaylistDownloadWorker.class)
                     .setInputData(inputData)
                     .setConstraints(constraints)
-                    .addTag("offline_add_track_" + videoId)
+                    .addTag(OFFLINE_DOWNLOAD_MANUAL_TRACK_QUEUE_UNIQUE_NAME)
+                    .addTag(OFFLINE_DOWNLOAD_UNIQUE_PREFIX + playlistId)
                     .build();
-            WorkManager.getInstance(requireContext()).enqueue(request);
+            enqueueOfflineDownloadUniqueWork(OFFLINE_DOWNLOAD_MANUAL_TRACK_QUEUE_UNIQUE_NAME, request);
         } catch (Exception e) {
             Log.w(TAG_OFFLINE_DOWNLOAD, "maybeEnqueueOfflineDownloadForAddedTrack failed", e);
         }
@@ -4524,6 +4715,7 @@ public class PlaylistDetailFragment extends Fragment
                 .build();
 
         enqueueOfflineDownloadUniqueWork(uniqueName, request);
+        lastActiveOfflineUniqueName = uniqueName;
 
         setOfflineDownloadVisualState(
             true,
@@ -4566,7 +4758,13 @@ public class PlaylistDetailFragment extends Fragment
                 if (!isAdded()) return;
                 if (trackAdapter != null) {
                     trackAdapter.invalidateTrackStateCache(videoId);
-                    trackAdapter.notifyItemChanged(position);
+                    // Re-find the row by videoId — the captured position may be stale if the
+                    // list changed during the async delete.
+                    int pos = -1;
+                    for (int i = 0; i < currentTracks.size(); i++) {
+                        if (TextUtils.equals(currentTracks.get(i).videoId, videoId)) { pos = i; break; }
+                    }
+                    if (pos >= 0) trackAdapter.notifyItemChanged(pos);
                 }
                 maybeUpdateOfflineReadyState();
                 maybeAutoDownloadForCurrentPlaylist();
@@ -4731,6 +4929,7 @@ public class PlaylistDetailFragment extends Fragment
                     .build();
 
             enqueueOfflineDownloadUniqueWork(uniqueName, request);
+            lastActiveOfflineUniqueName = uniqueName;
         } catch (Exception e) {
             Log.w(TAG_OFFLINE_DOWNLOAD, "enqueueSingleTrackForOfflineDownload failed", e);
         }
@@ -6130,9 +6329,11 @@ public class PlaylistDetailFragment extends Fragment
                                 RecyclerView.LayoutManager lm = rvPlaylistContent.getLayoutManager();
                                 if (lm instanceof LinearLayoutManager) {
                                     LinearLayoutManager llm = (LinearLayoutManager) lm;
-                                    int first = llm.findFirstVisibleItemPosition() - 1;
+                                    // Header occupies position 0 — clamp so the pass still runs
+                                    // when the header is the first visible item (first maps to -1).
+                                    int first = Math.max(0, llm.findFirstVisibleItemPosition() - 1);
                                     int last = llm.findLastVisibleItemPosition() - 1;
-                                    if (first >= 0) {
+                                    if (last >= 0) {
                                         trackAdapter.loadStateForVisibleRange(first, last);
                                         trackAdapter.reloadImagesForRange(first, last);
                                     }
@@ -6404,52 +6605,32 @@ public class PlaylistDetailFragment extends Fragment
         }
 
         /**
-         * Reloads track artwork for the visible range using a viewport-first wave:
-         * starts at the first visible item and loads outward one frame at a time
-         * so the user sees the tracks they are actually looking at fill in first,
-         * rather than loading top-to-bottom from off-screen items.
-         * Uses Priority.HIGH so these requests beat any queued background work.
+         * Re-issues artwork loads for the visible rows in a single pass. Glide treats an
+         * equivalent already-complete request as a no-op (it re-delivers the resource
+         * synchronously, no flicker), so this only does real work for rows whose earlier
+         * load failed — e.g. it fired while the connectivity check said offline — giving
+         * them a retry once scrolling settles. Images now load eagerly in onBindViewHolder,
+         * so this is a safety net, not the primary load path.
          */
         void reloadImagesForRange(int firstVisible, int lastVisible) {
             if (rvPlaylistContent == null) return;
             int safeStart = Math.max(0, firstVisible);
             int safeEnd = Math.min(items.size() - 1, lastVisible);
-            int count = safeEnd - safeStart + 1;
-            if (count <= 0) return;
-            // Build a viewport-first order: safeStart, safeStart+1, ..., safeEnd
-            // (already viewport-order since the user landed here after a fling;
-            // we just load one per frame to create the wave effect instead of
-            // issuing all requests in the same frame).
-            int[] order = new int[count];
-            for (int i = 0; i < count; i++) {
-                order[i] = safeStart + i;
-            }
-            scheduleWaveImageLoad(order, 0);
-        }
-
-        /** Loads artwork in batches of WAVE_BATCH_SIZE per frame so decode work is
-         *  spread across multiple frames instead of blocking a single one. */
-        private static final int WAVE_BATCH_SIZE = 4;
-        private void scheduleWaveImageLoad(int[] order, int index) {
-            if (order.length == 0 || rvPlaylistContent == null || index >= order.length) return;
-            mainHandler.post(() -> {
-                if (rvPlaylistContent == null) return;
-                int end = Math.min(index + WAVE_BATCH_SIZE, order.length);
-                for (int i = index; i < end; i++) {
-                    int adapterIdx = order[i];
-                    if (adapterIdx < 0 || adapterIdx >= items.size()) continue;
-                    RecyclerView.ViewHolder vh = rvPlaylistContent.findViewHolderForAdapterPosition(adapterIdx + 1);
-                    if (vh instanceof TrackViewHolder) {
-                        PlaylistTrack track = items.get(adapterIdx);
-                        if (track != null) {
-                            loadTrackArt(((TrackViewHolder) vh).ivTrackArt, track.imageUrl, com.bumptech.glide.Priority.HIGH);
-                        }
+            for (int i = safeStart; i <= safeEnd; i++) {
+                RecyclerView.ViewHolder vh = rvPlaylistContent.findViewHolderForAdapterPosition(i + 1);
+                if (vh instanceof TrackViewHolder) {
+                    PlaylistTrack track = items.get(i);
+                    if (track != null && !TextUtils.isEmpty(track.imageUrl)
+                            && !LocalFilesStore.isLocalVideoId(track.videoId)) {
+                        loadTrackArt(((TrackViewHolder) vh).ivTrackArt, track.imageUrl, com.bumptech.glide.Priority.HIGH);
                     }
                 }
-                if (end < order.length) {
-                    scheduleWaveImageLoad(order, end);
-                }
-            });
+            }
+        }
+
+        /** Warms artwork for rows just past the viewport in the scroll direction. */
+        void prefetchArtFrom(int anchorIndex, int direction) {
+            prefetchTrackArt(items, anchorIndex, direction, ART_PREFETCH_AHEAD);
         }
 
         @Override
@@ -6470,15 +6651,12 @@ public class PlaylistDetailFragment extends Fragment
         @Override
         public void onViewRecycled(@NonNull TrackViewHolder holder) {
             super.onViewRecycled(holder);
-            // Cancel any in-flight Glide request so it can't land on a rebound holder
-            // showing a different track — this is the root cause of wrong-image-on-wrong-row.
-            // Skip clearing for local tracks — they always show a static icon.
+            // Do NOT clear the Glide request here. Cancelling on recycle threw away every
+            // in-flight thumbnail during a fast scroll, so scrolling back re-fetched them
+            // all from scratch. Letting the request finish populates the memory cache, and
+            // the rebind's into() both cancels the stale request and shows the placeholder,
+            // so a wrong image can never land on a reused row.
             int pos = holder.getAdapterPosition();
-            boolean isLocal = pos >= 0 && pos < items.size() && LocalFilesStore.isLocalVideoId(items.get(pos).videoId);
-            if (!isLocal) {
-                Glide.with(holder.ivTrackArt.getContext()).clear(holder.ivTrackArt);
-                holder.ivTrackArt.setImageDrawable(null);
-            }
             if (pos >= 0 && pos < items.size()) {
                 String videoId = items.get(pos).videoId;
                 if (!TextUtils.isEmpty(videoId)) {
@@ -6502,7 +6680,7 @@ public class PlaylistDetailFragment extends Fragment
         @Override
         public void onViewAttachedToWindow(@NonNull TrackViewHolder holder) {
             super.onViewAttachedToWindow(holder);
-            // Do NOT load image here — onBindViewHolder already handles it with fling awareness.
+            // Do NOT load image here — onBindViewHolder already issues the Glide request.
             // Loading here too causes duplicate Glide requests and re-queues during fast scroll.
         }
 
@@ -6545,8 +6723,13 @@ public class PlaylistDetailFragment extends Fragment
             }
 
             boolean isActive = position == activeIndex;
-            holder.rootTrackRow.setBackgroundResource(
-                    isActive ? R.drawable.bg_playlist_track_active : R.drawable.bg_playlist_track_default);
+            // setBackgroundResource re-inflates the drawable every call; only touch it when
+            // the active state actually changed for this holder (it runs on every bind).
+            int rowBackgroundRes = isActive ? R.drawable.bg_playlist_track_active : R.drawable.bg_playlist_track_default;
+            if (holder.appliedRowBackgroundRes != rowBackgroundRes) {
+                holder.appliedRowBackgroundRes = rowBackgroundRes;
+                holder.rootTrackRow.setBackgroundResource(rowBackgroundRes);
+            }
 
             SongPlayerFragment sp = cachedSongPlayer;
             boolean isActuallyPlaying = sp != null && sp.isPlaying();
@@ -6564,7 +6747,9 @@ public class PlaylistDetailFragment extends Fragment
             if (!payloads.isEmpty() && payloads.contains(PAYLOAD_STATE_ONLY)) {
                 // State-only partial update — only refresh offline indicators
                 // WITHOUT reloading the image, re-creating click listeners, or re-resolving colors.
-                bindTrackState(holder, position, items.get(position));
+                if (position >= 0 && position < items.size()) {
+                    bindTrackState(holder, position, items.get(position));
+                }
                 return;
             }
             onBindViewHolder(holder, position);
@@ -6572,12 +6757,17 @@ public class PlaylistDetailFragment extends Fragment
 
         @Override
         public void onBindViewHolder(@NonNull TrackViewHolder holder, int position) {
+            if (position < 0 || position >= items.size()) {
+                return;
+            }
             PlaylistTrack track = items.get(position);
             holder.tvTrackTitle.setText(track.title);
             Context context = holder.itemView.getContext();
 
             // Image loading: local tracks show album art if available, otherwise music note icon.
-            // For remote tracks, during a fast fling show a grey placeholder only.
+            // Remote tracks ALWAYS load through Glide, even mid-fling: decode happens off the
+            // main thread, memory-cache hits bind synchronously, and the grey placeholder in
+            // loadTrackArt covers the in-flight gap — so scrolling never shows blank rows.
             boolean isLocalTrack = LocalFilesStore.isLocalVideoId(track.videoId);
             if (isLocalTrack) {
                 if (!TextUtils.isEmpty(track.imageUrl)) {
@@ -6597,14 +6787,6 @@ public class PlaylistDetailFragment extends Fragment
                     holder.ivTrackArt.setBackgroundColor(ContextCompat.getColor(context, R.color.surface_high));
                     holder.ivTrackArt.setImageResource(R.drawable.ic_music);
                 }
-            } else if (isFlinging) {
-                // During a momentum fling, defer the decode. Clear any stale image left on
-                // the recycled holder and show the grey placeholder; reloadImagesForRange()
-                // (fired on SCROLL_STATE_IDLE) loads only the visible rows once the fling stops.
-                holder.ivTrackArt.setScaleType(ImageView.ScaleType.CENTER_CROP);
-                Glide.with(context).clear(holder.ivTrackArt);
-                holder.ivTrackArt.setImageDrawable(null);
-                holder.ivTrackArt.setBackgroundColor(ContextCompat.getColor(context, R.color.surface_high));
             } else {
                 holder.ivTrackArt.setScaleType(ImageView.ScaleType.CENTER_CROP);
                 holder.ivTrackArt.setBackgroundColor(android.graphics.Color.TRANSPARENT);
@@ -6632,6 +6814,8 @@ public class PlaylistDetailFragment extends Fragment
             final ImageView ivMore;
             final FrameLayout flOfflineProgress;
             final View vOfflineProgressFill;
+            /** Background drawable currently applied to the row; starts as the XML default. */
+            int appliedRowBackgroundRes = R.drawable.bg_playlist_track_default;
 
             TrackViewHolder(@NonNull View itemView) {
                 super(itemView);

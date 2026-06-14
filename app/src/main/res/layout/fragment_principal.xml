@@ -116,13 +116,13 @@
                 android:paddingTop="12dp"
                 android:paddingBottom="8dp">
 
-                <com.google.android.material.imageview.ShapeableImageView
-                    android:id="@+id/ivShortcutProfilePhoto"
-                    android:layout_width="32dp"
-                    android:layout_height="32dp"
-                    android:background="@color/surface_high"
-                    android:scaleType="centerCrop"
-                    app:shapeAppearanceOverlay="@style/ShapeAppearance.Material3.Corner.Full" />
+                <ImageView
+                    android:id="@+id/ivShortcutsIcon"
+                    android:layout_width="26dp"
+                    android:layout_height="26dp"
+                    android:contentDescription="Accesos directos"
+                    android:src="@drawable/ic_apps"
+                    app:tint="@color/text_primary" />
 
                 <TextView
                     android:id="@+id/tvShortcutsLabel"
@@ -157,18 +157,18 @@
             <com.google.android.material.tabs.TabLayout
                 android:id="@+id/tabDotsShortcuts"
                 android:layout_width="wrap_content"
-                android:layout_height="24dp"
+                android:layout_height="28dp"
                 android:layout_gravity="center_horizontal"
-                android:layout_marginTop="4dp"
+                android:layout_marginTop="6dp"
                 android:background="@android:color/transparent"
                 app:tabBackground="@drawable/selector_dot_indicator"
                 app:tabGravity="center"
                 app:tabIndicator="@null"
                 app:tabIndicatorHeight="0dp"
-                app:tabMaxWidth="8dp"
-                app:tabMinWidth="8dp"
-                app:tabPaddingEnd="5dp"
-                app:tabPaddingStart="5dp" />
+                app:tabMaxWidth="18dp"
+                app:tabMinWidth="18dp"
+                app:tabPaddingEnd="4dp"
+                app:tabPaddingStart="4dp" />
 
             <!-- Section: Mixes para ti (generic) -->
             <TextView
@@ -280,18 +280,18 @@
             <com.google.android.material.tabs.TabLayout
                 android:id="@+id/tabDotsCovers"
                 android:layout_width="wrap_content"
-                android:layout_height="24dp"
+                android:layout_height="28dp"
                 android:layout_gravity="center_horizontal"
-                android:layout_marginTop="4dp"
+                android:layout_marginTop="6dp"
                 android:background="@android:color/transparent"
                 app:tabBackground="@drawable/selector_dot_indicator"
                 app:tabGravity="center"
                 app:tabIndicator="@null"
                 app:tabIndicatorHeight="0dp"
-                app:tabMaxWidth="8dp"
-                app:tabMinWidth="8dp"
-                app:tabPaddingEnd="5dp"
-                app:tabPaddingStart="5dp"
+                app:tabMaxWidth="18dp"
+                app:tabMinWidth="18dp"
+                app:tabPaddingEnd="4dp"
+                app:tabPaddingStart="4dp"
                 android:visibility="gone" />
 
         </LinearLayout>

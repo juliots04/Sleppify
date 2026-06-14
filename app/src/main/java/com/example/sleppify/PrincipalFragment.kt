@@ -47,6 +47,9 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         private const val CACHE_KEY_HOME_MIXES = "home_mixes_data"
         private const val SHORTCUTS_PER_PAGE = 9
         private const val SHORTCUTS_MAX_PAGES = 3
+        // Partial-bind payload: refresh only the play/equalizer icon without reloading artwork or
+        // re-creating click listeners (avoids the flash/jank when tapping a shortcut).
+        private const val PAYLOAD_EQ = "eq"
         private const val COVERS_PER_PAGE = 4
         private const val NETWORK_REFRESH_THROTTLE_MS = 180_000L
         private val SHARED_YT_CROP = YouTubeCropTransformation()
@@ -66,7 +69,6 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
     private var tabDotsShortcuts: TabLayout? = null
     private var rvMixes: RecyclerView? = null
     private var tvMixesEmpty: TextView? = null
-    private var ivShortcutProfilePhoto: ShapeableImageView? = null
     private var tvPersonalMixesLabel: TextView? = null
     private var rvPersonalMixes: RecyclerView? = null
     private var llCoversHeader: View? = null
@@ -77,6 +79,9 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
     // State
     private val handler = Handler(Looper.getMainLooper())
+    // Off-main-thread worker for disk/DB/JSON reads (PlayCountStore, prefs scans, grid art urls)
+    // that were previously done on the UI thread and made entering the module janky.
+    private val bgExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
     private var cachedSongPlayer: SongPlayerFragment? = null
     private var lastCachedSongPlayerTime = 0L
     private lateinit var youTubeMusicService: YouTubeMusicService
@@ -132,7 +137,6 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         tabDotsShortcuts = view.findViewById(R.id.tabDotsShortcuts)
         rvMixes = view.findViewById(R.id.rvMixes)
         tvMixesEmpty = view.findViewById(R.id.tvMixesEmpty)
-        ivShortcutProfilePhoto = view.findViewById(R.id.ivShortcutProfilePhoto)
         tvPersonalMixesLabel = view.findViewById(R.id.tvPersonalMixesLabel)
         rvPersonalMixes = view.findViewById(R.id.rvPersonalMixes)
         llCoversHeader = view.findViewById(R.id.llCoversHeader)
@@ -158,13 +162,13 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         refreshFragHeaderProfilePhoto()
         refreshShortcuts()
         refreshMixes()
-        loadGoogleProfilePhoto()
         refreshCovers()
     }
 
     override fun onDestroyView() {
         super.onDestroyView()
         PlaybackEventBus.removeListener(this)
+        handler.removeCallbacksAndMessages(null)
         playlistGridUrlsCache.clear()
         vpShortcuts = null
         tabDotsShortcuts = null
@@ -175,7 +179,6 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         btnFragHeaderSearch = null
         btnFragSignIn = null
         btnFragProfilePhoto = null
-        ivShortcutProfilePhoto = null
         tvPersonalMixesLabel = null
         rvPersonalMixes = null
         llCoversHeader = null
@@ -196,9 +199,13 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             }, 200)
             refreshFragHeaderProfilePhoto()
             refreshMixes()
-            loadGoogleProfilePhoto()
             refreshCovers()
         }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        bgExecutor.shutdownNow()
     }
 
     // ========== Brand Header ==========
@@ -309,51 +316,70 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
     private fun setupShortcuts() {
         vpShortcuts?.adapter = ShortcutsPagerAdapter()
-        vpShortcuts?.offscreenPageLimit = SHORTCUTS_MAX_PAGES
+        // Keep only the current page + one neighbour resident instead of all 3, so entering the
+        // module doesn't inflate/bind 27 cells up front. The first swipe is still instant.
+        vpShortcuts?.offscreenPageLimit = 1
         TabLayoutMediator(tabDotsShortcuts!!, vpShortcuts!!) { _, _ -> }.attach()
     }
 
     private fun refreshShortcuts() {
         val now = System.currentTimeMillis()
         if (now - lastShortcutsFetchTimeMs < 15_000L && shortcutEntries.isNotEmpty()) return
-
-        val totalNeeded = SHORTCUTS_PER_PAGE * SHORTCUTS_MAX_PAGES
+        if (!isAdded) return
         lastShortcutsFetchTimeMs = now
+        val appContext = requireContext().applicationContext
 
-        val topTracks = ArrayList(PlayCountStore.getTopEntries(requireContext(), totalNeeded))
-        val topPlaylists = ArrayList(PlayCountStore.getTopPlaylists(requireContext(), 5))
+        // All of this (PlayCountStore/PlaybackHistory/Favorites reads + JSON parsing + grid-art
+        // resolution) is disk/DB work that used to run on the UI thread and stalled module entry.
+        bgExecutor.execute {
+            val totalNeeded = SHORTCUTS_PER_PAGE * SHORTCUTS_MAX_PAGES
 
-        topPlaylists.removeAll { LocalFilesStore.PLAYLIST_ID == it.playlistId }
-        if (topPlaylists.size > 1) topPlaylists.subList(1, topPlaylists.size).clear()
+            val topTracks = ArrayList(PlayCountStore.getTopEntries(appContext, totalNeeded))
+            val topPlaylists = ArrayList(PlayCountStore.getTopPlaylists(appContext, 5))
 
-        val seenIds = HashSet<String>()
-        val merged = mutableListOf<PlayCountStore.PlayCountEntry>()
-        for (p in topPlaylists) { merged.add(p); seenIds.add(p.videoId) }
-        for (t in topTracks) {
-            if (t.videoId in seenIds) continue
-            seenIds.add(t.videoId)
-            merged.add(t)
-        }
-        merged.sortWith(compareByDescending<PlayCountStore.PlayCountEntry> { it.count }.thenByDescending { it.lastPlayedAtMs })
+            topPlaylists.removeAll { LocalFilesStore.PLAYLIST_ID == it.playlistId }
+            if (topPlaylists.size > 1) topPlaylists.subList(1, topPlaylists.size).clear()
 
-        val top = ArrayList(merged.take(totalNeeded))
-        if (top.size < totalNeeded) fillShortcutsFromHistory(top, totalNeeded)
+            val seenIds = HashSet<String>()
+            val merged = mutableListOf<PlayCountStore.PlayCountEntry>()
+            for (p in topPlaylists) { merged.add(p); seenIds.add(p.videoId) }
+            for (t in topTracks) {
+                if (t.videoId in seenIds) continue
+                seenIds.add(t.videoId)
+                merged.add(t)
+            }
+            merged.sortWith(compareByDescending<PlayCountStore.PlayCountEntry> { it.count }.thenByDescending { it.lastPlayedAtMs })
 
-        shortcutEntries.clear()
-        shortcutEntries.addAll(top)
+            val top = ArrayList(merged.take(totalNeeded))
+            if (top.size < totalNeeded) fillShortcutsFromHistory(appContext, top, totalNeeded)
 
-        vpShortcuts?.adapter?.notifyDataSetChanged()
-        tabDotsShortcuts?.let {
-            val pageCount = Math.max(1, Math.ceil(shortcutEntries.size / SHORTCUTS_PER_PAGE.toFloat().toDouble()).toInt())
-            it.visibility = if (pageCount > 1) View.VISIBLE else View.GONE
+            // Warm the grid-art cache off the UI thread so cell binds don't touch disk.
+            val gridCache = HashMap<String, List<String>>()
+            for (e in top) {
+                val pid = e.playlistId
+                if (!pid.isNullOrEmpty() && e.videoId == pid) {
+                    gridCache[pid] = computePlaylistGridUrls(appContext, pid)
+                }
+            }
+
+            handler.post {
+                if (!isAdded) return@post
+                shortcutEntries.clear()
+                shortcutEntries.addAll(top)
+                playlistGridUrlsCache.putAll(gridCache)
+                vpShortcuts?.adapter?.notifyDataSetChanged()
+                tabDotsShortcuts?.let {
+                    val pageCount = Math.max(1, Math.ceil(shortcutEntries.size / SHORTCUTS_PER_PAGE.toFloat().toDouble()).toInt())
+                    it.visibility = if (pageCount > 1) View.VISIBLE else View.GONE
+                }
+            }
         }
     }
 
-    private fun fillShortcutsFromHistory(existing: MutableList<PlayCountStore.PlayCountEntry>, totalNeeded: Int) {
-        if (!isAdded) return
+    private fun fillShortcutsFromHistory(appContext: Context, existing: MutableList<PlayCountStore.PlayCountEntry>, totalNeeded: Int) {
         val existingIds = existing.map { it.videoId }.toHashSet()
 
-        val snapshot = PlaybackHistoryStore.load(requireContext())
+        val snapshot = PlaybackHistoryStore.load(appContext)
         for (track in snapshot.queue) {
             if (existing.size >= totalNeeded) break
             if (track.videoId in existingIds) continue
@@ -362,7 +388,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         }
 
         try {
-            val favs = FavoritesPlaylistStore.loadFavorites(requireContext())
+            val favs = FavoritesPlaylistStore.loadFavorites(appContext)
             for (fav in favs) {
                 if (existing.size >= totalNeeded) break
                 if (fav.videoId in existingIds) continue
@@ -422,19 +448,6 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         })
     }
 
-    private fun loadGoogleProfilePhoto() {
-        if (!isAdded || ivShortcutProfilePhoto == null) return
-        var photoUri: Uri? = FirebaseAuth.getInstance().currentUser?.photoUrl
-        if (photoUri == null) {
-            val cached = requireContext().getSharedPreferences(AppConstants.PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
-                .getString("cached_google_profile_photo_url", "") ?: ""
-            if (cached.isNotEmpty()) photoUri = Uri.parse(cached)
-        }
-        if (photoUri != null) {
-            try { Glide.with(this).load(photoUri).circleCrop().into(ivShortcutProfilePhoto!!) } catch (_: Exception) {}
-        }
-    }
-
     private fun setupPersonalMixes() {
         rvPersonalMixes ?: return
         rvPersonalMixes?.layoutManager = LinearLayoutManager(requireContext(), LinearLayoutManager.HORIZONTAL, false)
@@ -446,7 +459,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
     private fun setupCovers() {
         vpCovers ?: return
         vpCovers?.adapter = CoversPagerAdapter()
-        vpCovers?.offscreenPageLimit = 3
+        vpCovers?.offscreenPageLimit = 1
         tabDotsCovers?.let { TabLayoutMediator(it, vpCovers!!) { _, _ -> }.attach() }
         btnCoversPlayAll?.setOnClickListener {
             if (coversResults.isNotEmpty()) playTrackList(coversResults, 0)
@@ -459,56 +472,66 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
         val cookie = getCookieHeader()
         if (cookie.isEmpty()) return
+        if (!isAdded) return
+        val appContext = requireContext().applicationContext
 
-        val topTitles = PlayCountStore.getTopEntries(requireContext(), 10)
-            .mapNotNull { it.title.takeIf { t -> t.isNotEmpty() } }
-            .toMutableList()
+        // The title-collection scan iterates EVERY cached playlist's track JSON — heavy disk +
+        // parsing that must not run on the UI thread. Compute the seed titles off-main, then kick
+        // off the network request back on the UI thread.
+        bgExecutor.execute {
+            val topTitles = PlayCountStore.getTopEntries(appContext, 10)
+                .mapNotNull { it.title.takeIf { t -> t.isNotEmpty() } }
+                .toMutableList()
 
-        val extraTitles = mutableListOf<String>()
-        try {
-            val cachePrefs = requireContext().getSharedPreferences(PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
-            val topSet = topTitles.toHashSet()
-            for (key in cachePrefs.all.keys) {
-                if (!key.startsWith("playlist_tracks_data_")) continue
-                val raw = cachePrefs.getString(key, "") ?: ""
-                if (raw.isEmpty()) continue
-                try {
-                    val arr = JSONArray(raw)
-                    for (i in 0 until arr.length()) {
-                        val title = arr.optJSONObject(i)?.optString("title", "")?.trim() ?: ""
-                        if (title.isNotEmpty() && title !in topSet) extraTitles.add(title)
+            val extraTitles = mutableListOf<String>()
+            try {
+                val cachePrefs = appContext.getSharedPreferences(PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
+                val topSet = topTitles.toHashSet()
+                for (key in cachePrefs.all.keys) {
+                    if (!key.startsWith("playlist_tracks_data_")) continue
+                    val raw = cachePrefs.getString(key, "") ?: ""
+                    if (raw.isEmpty()) continue
+                    try {
+                        val arr = JSONArray(raw)
+                        for (i in 0 until arr.length()) {
+                            val title = arr.optJSONObject(i)?.optString("title", "")?.trim() ?: ""
+                            if (title.isNotEmpty() && title !in topSet) extraTitles.add(title)
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Unexpected error", e)
                     }
-                } catch (e: Exception) {
-                    Log.w(TAG, "Unexpected error", e)
                 }
+            } catch (e: Exception) {
+                Log.w(TAG, "Unexpected error", e)
             }
-        } catch (e: Exception) {
-            Log.w(TAG, "Unexpected error", e)
-        }
 
-        val selected = mutableListOf<String>()
-        topTitles.shuffle()
-        selected.addAll(topTitles.take(6))
-        if (extraTitles.isNotEmpty()) {
-            extraTitles.shuffle()
-            selected.addAll(extraTitles.take(8 - selected.size))
-        }
-        if (selected.size < 8) {
-            for (t in topTitles) { if (selected.size >= 8) break; if (t !in selected) selected.add(t) }
-        }
-        if (selected.isEmpty()) return
-
-        youTubeMusicService.fetchCoversAndRemixes(cookie, selected, object : YouTubeMusicService.CoversRemixesCallback {
-            override fun onSuccess(tracks: List<YouTubeMusicService.TrackResult>) {
-                if (!isAdded) return
-                lastCoversNetworkFetchTimeMs = System.currentTimeMillis()
-                coversResults.clear()
-                coversResults.addAll(tracks.shuffled())
-                cacheCovers(coversResults)
-                updateCoversUi()
+            val selected = mutableListOf<String>()
+            topTitles.shuffle()
+            selected.addAll(topTitles.take(6))
+            if (extraTitles.isNotEmpty()) {
+                extraTitles.shuffle()
+                selected.addAll(extraTitles.take(8 - selected.size))
             }
-            override fun onError(error: String) {}
-        })
+            if (selected.size < 8) {
+                for (t in topTitles) { if (selected.size >= 8) break; if (t !in selected) selected.add(t) }
+            }
+            if (selected.isEmpty()) return@execute
+
+            handler.post {
+                if (!isAdded) return@post
+                youTubeMusicService.fetchCoversAndRemixes(cookie, selected, object : YouTubeMusicService.CoversRemixesCallback {
+                    override fun onSuccess(tracks: List<YouTubeMusicService.TrackResult>) {
+                        if (!isAdded) return
+                        lastCoversNetworkFetchTimeMs = System.currentTimeMillis()
+                        coversResults.clear()
+                        coversResults.addAll(tracks.shuffled())
+                        cacheCovers(coversResults)
+                        updateCoversUi()
+                    }
+                    override fun onError(error: String) {}
+                })
+            }
+        }
     }
 
     private fun updateCoversUi() {
@@ -668,7 +691,12 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         val internalRv = vp.getChildAt(0) as? RecyclerView ?: return
         for (i in 0 until internalRv.childCount) {
             val pageView = internalRv.getChildAt(i)
-            if (pageView is RecyclerView) pageView.adapter?.notifyDataSetChanged()
+            if (pageView is RecyclerView) {
+                val a = pageView.adapter ?: continue
+                // Partial bind (PAYLOAD_EQ): only the play/eq icon flips — no artwork reload or
+                // listener churn — so tapping a shortcut no longer flashes/feels heavy.
+                if (a.itemCount > 0) a.notifyItemRangeChanged(0, a.itemCount, PAYLOAD_EQ)
+            }
         }
     }
 
@@ -690,13 +718,24 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
     private fun resolvePlaylistGridUrls(playlistId: String): List<String> {
         if (playlistId.isEmpty() || !isAdded) return emptyList()
         playlistGridUrlsCache[playlistId]?.let { return it }
+        // Fallback for a playlist not pre-warmed by refreshShortcuts. The common path hits the
+        // cache above (warmed off the UI thread); this only runs for a newly-appeared id and is
+        // then cached so subsequent binds are free.
+        val result = computePlaylistGridUrls(requireContext().applicationContext, playlistId)
+        playlistGridUrlsCache[playlistId] = result
+        return result
+    }
 
-        val cachePrefs = requireContext().getSharedPreferences(PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
+    /** Pure disk/DB resolution of up to 4 grid-art urls for a playlist. Safe to call off the UI
+     *  thread (no fragment state, no shared-cache access). */
+    private fun computePlaylistGridUrls(appContext: Context, playlistId: String): List<String> {
+        if (playlistId.isEmpty()) return emptyList()
+        val cachePrefs = appContext.getSharedPreferences(PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
 
         val gridRaw = cachePrefs.getString("playlist_grid_urls_$playlistId", "") ?: ""
         if (gridRaw.isNotEmpty()) {
             val result = gridRaw.split("\n").map { it.trim() }.filter { it.isNotEmpty() }
-            if (result.size >= 4) { playlistGridUrlsCache[playlistId] = result; return result }
+            if (result.size >= 4) return result
         }
 
         val tracksRaw = cachePrefs.getString("playlist_tracks_data_$playlistId", "") ?: ""
@@ -710,15 +749,13 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                     val imgUrl = arr.optJSONObject(i)?.optString("imageUrl", "")?.trim() ?: ""
                     if (imgUrl.isNotEmpty() && seen.add(imgUrl)) urls.add(imgUrl)
                 }
-                if (urls.size >= 4) { playlistGridUrlsCache[playlistId] = urls; return urls }
+                if (urls.size >= 4) return urls
             } catch (e: Exception) {
                 Log.w(TAG, "Unexpected error", e)
             }
         }
 
-        val dbUrls = PlayCountStore.getPlaylistTrackImages(requireContext(), playlistId, 4)
-        if (dbUrls != null) { playlistGridUrlsCache[playlistId] = dbUrls; return dbUrls }
-        return emptyList()
+        return PlayCountStore.getPlaylistTrackImages(appContext, playlistId, 4)
     }
 
     private fun getCookieHeader(): String {
@@ -900,7 +937,14 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         inner class PageVH(itemView: View) : RecyclerView.ViewHolder(itemView) {
             private val rv = itemView as RecyclerView
             fun bind(items: List<PlayCountStore.PlayCountEntry>) {
-                rv.layoutManager = GridLayoutManager(rv.context, 3)
+                // Non-scrolling grid: the 9 cells fit the fixed page height, so the inner
+                // RecyclerView must NOT claim drag gestures. If it does, it fights the parent
+                // ViewPager2 and makes swiping between pages hard. With scrolling disabled,
+                // horizontal drags reach the pager and vertical drags reach the NestedScrollView.
+                rv.layoutManager = object : GridLayoutManager(rv.context, 3) {
+                    override fun canScrollVertically(): Boolean = false
+                    override fun canScrollHorizontally(): Boolean = false
+                }
                 rv.adapter = ShortcutCellAdapter(items)
             }
         }
@@ -945,6 +989,23 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 }
             }
 
+            bindEqState(holder, entry)
+
+            holder.clCell.setOnClickListener { onShortcutClicked(entry) }
+        }
+
+        override fun onBindViewHolder(holder: CellVH, position: Int, payloads: MutableList<Any>) {
+            // Lightweight path used by refreshShortcutEqIcons(): only flip the play/eq icon,
+            // leaving artwork and click listeners untouched so nothing flashes on tap.
+            if (payloads.isNotEmpty() && payloads.contains(PAYLOAD_EQ)) {
+                bindEqState(holder, items[position])
+                return
+            }
+            super.onBindViewHolder(holder, position, payloads)
+        }
+
+        private fun bindEqState(holder: CellVH, entry: PlayCountStore.PlayCountEntry) {
+            val isPlaylist = !entry.playlistId.isNullOrEmpty() && entry.videoId == entry.playlistId
             val nowPlaying = getCurrentPlayingVideoId()
             val isThisPlaying = !isPlaylist && nowPlaying.isNotEmpty() && (entry.videoId == nowPlaying || entry.videoId == currentlyPlayingShortcutVideoId)
             val sp = findSongPlayerFragment()
@@ -959,13 +1020,14 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 holder.eqView.visibility = View.GONE
                 holder.ivPlay.visibility = View.VISIBLE
             }
-
-            holder.itemView.setOnClickListener { onShortcutClicked(entry) }
         }
 
         override fun getItemCount() = items.size
 
         inner class CellVH(itemView: View) : RecyclerView.ViewHolder(itemView) {
+            // The inner ConstraintLayout is clickable=true, so it consumes the touch — the click
+            // listener MUST be set on it, not on the root itemView, or taps never fire.
+            val clCell: View = itemView.findViewById(R.id.clShortcutCell)
             val ivThumb: ImageView = itemView.findViewById(R.id.ivShortcutThumb)
             val tvTitle: TextView = itemView.findViewById(R.id.tvShortcutTitle)
             val ivPlay: ImageView = itemView.findViewById(R.id.ivShortcutPlay)

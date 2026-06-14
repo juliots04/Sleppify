@@ -158,14 +158,12 @@
                     android:id="@+id/pbPlaylistLoading"
                     android:layout_width="62dp"
                     android:layout_height="62dp"
-                    android:alpha="0.76"
                     android:indeterminate="true"
                     android:indeterminateTint="@android:color/white"
                     app:layout_constraintBottom_toBottomOf="parent"
                     app:layout_constraintEnd_toEndOf="parent"
                     app:layout_constraintStart_toStartOf="parent"
-                    app:layout_constraintTop_toTopOf="parent"
-                    app:layout_constraintVertical_bias="0.45" />
+                    app:layout_constraintTop_toTopOf="parent" />
             </androidx.constraintlayout.widget.ConstraintLayout>
 
     </androidx.constraintlayout.widget.ConstraintLayout>

@@ -367,7 +367,10 @@ class SearchFragment : Fragment() {
             // 3. All cached YT Music playlists (playlist_tracks_data_*)
             try {
                 val cache = ctx.getSharedPreferences(AppConstants.PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
-                for ((key, value) in cache.all) {
+                // Snapshot to a copy: cache.all can throw ConcurrentModificationException if the
+                // offline worker commits to this prefs file while we iterate it.
+                val allEntries = try { cache.all.toMap() } catch (e: Exception) { emptyMap() }
+                for ((key, value) in allEntries) {
                     if (key.startsWith("playlist_tracks_data_") && value is String) {
                         val arr = org.json.JSONArray(value)
                         for (i in 0 until arr.length()) {
@@ -545,7 +548,13 @@ class SearchFragment : Fragment() {
                     setSearchLoadingState(false, "")
                     allTracks.firstOrNull()?.videoId?.let { id ->
                         lifecycleScope.launch(Dispatchers.IO) {
-                            StreamResolver.resolveStreamUrl(requireContext(), id)
+                            try {
+                                kotlinx.coroutines.withTimeout(5000L) {
+                                    StreamResolver.resolveStreamUrl(requireContext(), id)
+                                }
+                            } catch (e: Exception) {
+                                Log.d(TAG, "Prefetch timeout/error for $id", e)
+                            }
                         }
                     }
                     revealModuleContent()
@@ -2423,7 +2432,10 @@ class SearchFragment : Fragment() {
         normalizedFilterCache[value]?.let { return it }
         val decomposed = Normalizer.normalize(value, Normalizer.Form.NFD)
         val norm = decomposed.filter { Character.getType(it) != Character.NON_SPACING_MARK.toInt() }.lowercase().trim()
-        if (normalizedFilterCache.size > 2048) normalizedFilterCache.clear()
+        // Bounded eviction instead of wiping the whole cache once it grows large.
+        if (normalizedFilterCache.size >= 256) {
+            normalizedFilterCache.keys.firstOrNull()?.let { normalizedFilterCache.remove(it) }
+        }
         normalizedFilterCache[value] = norm
         return norm
     }
@@ -2487,11 +2499,14 @@ class SearchFragment : Fragment() {
         private val lookupExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
         private val handler = Handler(Looper.getMainLooper())
 
+        fun shutdown() {
+            try { lookupExecutor.shutdownNow() } catch (e: Exception) { Log.w(TAG, "lookup executor shutdown failed", e) }
+        }
+
         init { setHasStableIds(true) }
 
         override fun getItemId(position: Int) = data[position].let { "${it.resultType}|${it.contentId}|${it.title}".hashCode().toLong() }
 
-        @OptIn(kotlinx.coroutines.DelicateCoroutinesApi::class)
         fun submitResults(newData: List<YouTubeMusicService.TrackResult>) {
             val old = data.toList()
             val callback = object : DiffUtil.Callback() {
@@ -2500,9 +2515,13 @@ class SearchFragment : Fragment() {
                 override fun areItemsTheSame(op: Int, np: Int) = old[op].contentId == newData[np].contentId && old[op].resultType == newData[np].resultType
                 override fun areContentsTheSame(op: Int, np: Int) = old[op] == newData[np]
             }
-            kotlinx.coroutines.GlobalScope.launch(kotlinx.coroutines.Dispatchers.Default) {
+            // lifecycleScope auto-cancels on fragment destroy — avoids the GlobalScope leak that
+            // kept computing/dispatching diffs into a dead adapter after the user left Search.
+            this@SearchFragment.lifecycleScope.launch(kotlinx.coroutines.Dispatchers.Default) {
+                if (!isAdded) return@launch
                 val diff = DiffUtil.calculateDiff(callback)
                 kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    if (!isAdded) return@withContext
                     data.clear()
                     data.addAll(newData)
                     diff.dispatchUpdatesTo(this@SearchResultsAdapter)
@@ -2608,6 +2627,15 @@ class SearchFragment : Fragment() {
         super.onPause()
         suggestionsDebounceRunnable?.let { suggestionsDebounceHandler.removeCallbacks(it) }
         suggestionsJob?.cancel()
+    }
+
+    override fun onDestroyView() {
+        // Cover the rare case where the view is torn down without onPause running first, and
+        // shut down the adapter's single-thread lookup executor so it doesn't leak a thread.
+        suggestionsDebounceRunnable?.let { suggestionsDebounceHandler.removeCallbacks(it) }
+        suggestionsJob?.cancel()
+        adapter?.shutdown()
+        super.onDestroyView()
     }
 
     override fun onHiddenChanged(hidden: Boolean) {

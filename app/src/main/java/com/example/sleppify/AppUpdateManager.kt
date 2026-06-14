@@ -183,19 +183,19 @@ object AppUpdateManager {
                         tvPercent.text = ""
                         downloadInFlight = false
                     }
+                    response.close()
                     return@execute
                 }
 
                 val contentLength = body.contentLength()
                 val inputStream = body.byteStream()
-                val outputStream = FileOutputStream(targetFile)
                 val buffer = ByteArray(8192)
                 var bytesRead: Int
                 var totalBytesRead = 0L
                 var lastProgressUpdate = 0L
 
                 inputStream.use { input ->
-                    outputStream.use { output ->
+                    FileOutputStream(targetFile).use { output ->
                         while (input.read(buffer).also { bytesRead = it } != -1) {
                             output.write(buffer, 0, bytesRead)
                             totalBytesRead += bytesRead
@@ -222,8 +222,10 @@ object AppUpdateManager {
                     tvStatus.text = "Descarga completa. Instalando..."
                     downloadInFlight = false
 
-                    dialog.dismiss()
-                    installApk(activity, targetFile)
+                    if (!activity.isFinishing && !activity.isDestroyed) {
+                        dialog.dismiss()
+                        installApk(activity, targetFile)
+                    }
                 }
 
             } catch (e: Exception) {

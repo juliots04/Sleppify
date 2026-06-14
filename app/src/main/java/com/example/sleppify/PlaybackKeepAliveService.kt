@@ -110,11 +110,15 @@ class PlaybackKeepAliveService : Service() {
         val channelId = "sleppify_playback"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val nm = getSystemService(android.app.NotificationManager::class.java)
-            if (nm?.getNotificationChannel(channelId) == null) {
-                val channel = android.app.NotificationChannel(
-                    channelId, "Playback", android.app.NotificationManager.IMPORTANCE_LOW
-                )
-                nm?.createNotificationChannel(channel)
+            if (nm != null) {
+                if (nm.getNotificationChannel(channelId) == null) {
+                    val channel = android.app.NotificationChannel(
+                        channelId, "Playback", android.app.NotificationManager.IMPORTANCE_LOW
+                    )
+                    nm.createNotificationChannel(channel)
+                }
+            } else {
+                Log.w("PlaybackKeepAlive", "NotificationManager is null, notification may fail to display")
             }
         }
         return Notification.Builder(this, channelId)

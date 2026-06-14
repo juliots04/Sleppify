@@ -134,7 +134,9 @@ object ExoPlayerManager {
     /**
      * Verifica si el ExoPlayer compartido está inicializado.
      */
-    fun isInitialized(): Boolean = initialized && sharedExoPlayer != null
+    fun isInitialized(): Boolean = synchronized(initLock) {
+        initialized && sharedExoPlayer != null
+    }
 
     /**
      * Libera la instancia compartida de ExoPlayer. Llamar esto cuando la app se está cerrando.
@@ -143,6 +145,7 @@ object ExoPlayerManager {
         synchronized(initLock) {
             sharedExoPlayer?.release()
             sharedExoPlayer = null
+            appContextRef = null
             initialized = false
         }
     }

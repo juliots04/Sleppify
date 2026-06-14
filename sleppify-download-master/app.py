@@ -86,6 +86,20 @@ def _stream_and_cleanup(file_path, chunk_size=65536):
         try: os.rmdir(parent)
         except: pass
 
+
+def _stream_and_cleanup_dir(file_path, tmpdir, chunk_size=65536):
+    """Generator that streams a file in chunks, then removes its whole temp dir."""
+    import shutil
+    try:
+        with open(file_path, 'rb') as f:
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                yield chunk
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
 # Format priority for STREAMING (must return a single URL, no ffmpeg merge):
 #  1. 22              → 720p pre-muxed mp4 (ideal, single URL)
 #  2. 18              → 360p pre-muxed mp4 (fallback, single URL)
@@ -104,6 +118,21 @@ STREAM_FORMAT = '22/18/best[ext=mp4]/bestaudio[ext=m4a]/bestaudio'
 # In-memory stream URL cache (avoids re-resolving on each Range/seek request)
 _stream_url_cache = {}  # {video_id: {'url': str, 'content_length': int, 'ts': float}}
 _STREAM_CACHE_TTL = 4 * 3600  # 4 hours (googlevideo URLs expire ~6h)
+
+import threading
+
+# Server-side downloads (yt-dlp) are the real bottleneck on free hosting. Cap how many run at
+# once so that when a playlist download fans out across the 3 proxies, a single host is not
+# overwhelmed (which is what caused timeouts / failed tracks). Tune per host via env var.
+_MAX_CONCURRENT_DOWNLOADS = max(1, int(os.environ.get('MAX_CONCURRENT_DOWNLOADS', '2')))
+_DOWNLOAD_SEMAPHORE = threading.Semaphore(_MAX_CONCURRENT_DOWNLOADS)
+
+# Audio-only download: a single pre-muxed m4a file — NO ffmpeg merge — which is exactly what the
+# app stores and plays (it is audio-first: the offline .mp4 holds music, never video). This is far
+# lighter/faster than downloading 720p video and is the main reliability win for playlist offline.
+AUDIO_DOWNLOAD_FORMAT = 'bestaudio[ext=m4a]/140/bestaudio'
+# Optional full video download (pre-muxed 22/18 first to avoid a merge).
+VIDEO_DOWNLOAD_FORMAT = '22/18/best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best'
 
 
 @app.route('/api/info', methods=['GET'])
@@ -130,58 +159,91 @@ def api_info():
 
 @app.route('/api/video', methods=['POST'])
 def api_video():
-    """Download 720p mp4 (fallback 360p) to temp file, then stream to client."""
-    data = request.get_json()
-    if not data or 'url' not in data:
+    """
+    Download a single track server-side (yt-dlp) and stream it back to the client.
+
+    Body JSON: {"url": "<youtube url>"} or {"video_id": "<id>"}; optional {"format": "audio"|"video"}.
+    Defaults to AUDIO (single-file m4a, no ffmpeg merge) — light and reliable for offline music; the
+    app saves the bytes as .mp4 and plays the audio. Concurrency is capped so a playlist fan-out
+    across the 3 proxy servers doesn't overwhelm one free-tier host (the cause of the old failures).
+    The whole track is downloaded to a temp dir first, then streamed with a correct Content-Length
+    (so the client can show real progress and detect truncation), and the temp dir is removed after.
+    """
+    data = request.get_json(silent=True) or {}
+    youtube_url = data.get('url')
+    if not youtube_url:
+        vid = str(data.get('video_id') or data.get('id') or '').strip()
+        if vid:
+            youtube_url = f'https://www.youtube.com/watch?v={vid}'
+    if not youtube_url:
         return jsonify({"error": "URL missing"}), 400
 
-    youtube_url = data['url']
+    want = str(data.get('format') or request.args.get('format') or 'audio').strip().lower()
+    if want == 'video':
+        fmt, mimetype = VIDEO_DOWNLOAD_FORMAT, 'video/mp4'
+    else:
+        want, fmt, mimetype = 'audio', AUDIO_DOWNLOAD_FORMAT, 'audio/mp4'
 
-    import tempfile, glob, shutil
+    import glob, shutil
+
+    # Wait briefly for a free download slot; if the host is saturated, tell the client to retry
+    # (it will fall back to another of the 3 proxies) instead of piling on.
+    if not _DOWNLOAD_SEMAPHORE.acquire(timeout=45):
+        return jsonify({"error": "Server busy, retry"}), 503
 
     tmpdir = None
+    out_file = None
+    file_size = 0
     try:
         tmpdir = tempfile.mkdtemp()
         _ffmpeg = os.path.join(_SCRIPT_DIR, 'ffmpeg')
-        
+
         with get_ydl_opts(request.headers) as base_opts:
             dl_opts = {
                 **base_opts,
-                'format': '22/18/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+                'format': fmt,
                 'outtmpl': os.path.join(tmpdir, '%(id)s.%(ext)s'),
                 'http_chunk_size': 10485760,
                 'merge_output_format': 'mp4',
+                'socket_timeout': 30,
+                'retries': 3,
+                'fragment_retries': 5,
+                'concurrent_fragment_downloads': 4,
             }
             if os.path.isfile(_ffmpeg):
                 dl_opts['ffmpeg_location'] = _ffmpeg
 
-            print(f"[VIDEO] downloading: {youtube_url}")
+            print(f"[VIDEO] {want} downloading: {youtube_url}")
             with yt_dlp.YoutubeDL(dl_opts) as ydl:
                 ydl.download([youtube_url])
 
-        files = glob.glob(os.path.join(tmpdir, '*'))
-        if not files:
-            print(f"[VIDEO] no file produced: {youtube_url}")
-            shutil.rmtree(tmpdir, ignore_errors=True)
-            return jsonify({"error": "Download produced no file"}), 500
-
-        out_file = files[0]
+        candidates = [f for f in glob.glob(os.path.join(tmpdir, '*'))
+                      if os.path.isfile(f) and os.path.getsize(f) > 0]
+        if not candidates:
+            raise RuntimeError("Download produced no file")
+        out_file = max(candidates, key=os.path.getsize)
         file_size = os.path.getsize(out_file)
-        print(f"[VIDEO] success: {youtube_url} size={file_size}")
-
-        return Response(
-            _stream_and_cleanup(out_file),
-            mimetype="video/mp4",
-            headers={
-                "Content-Disposition": "attachment; filename=\"video.mp4\"",
-                "Content-Length": str(file_size),
-            }
-        )
+        print(f"[VIDEO] {want} success: {youtube_url} size={file_size}")
     except Exception as e:
-        print(f"[VIDEO] error: {youtube_url} — {e}")
         if tmpdir:
             shutil.rmtree(tmpdir, ignore_errors=True)
-        return jsonify({"error": str(e)}), 500
+        print(f"[VIDEO] error: {youtube_url} — {e}")
+        return jsonify({"error": str(e)}), 502
+    finally:
+        # Free the slot as soon as the heavy server-side download is done — streaming the finished
+        # file from disk is cheap and must not keep a download slot occupied.
+        _DOWNLOAD_SEMAPHORE.release()
+
+    return Response(
+        _stream_and_cleanup_dir(out_file, tmpdir),
+        mimetype=mimetype,
+        headers={
+            "Content-Length": str(file_size),
+            "Content-Disposition": "attachment; filename=\"track.mp4\"",
+            "Accept-Ranges": "none",
+            "X-Download-Format": want,
+        }
+    )
 
 
 
@@ -233,9 +295,9 @@ def api_stream_cached(video_id):
                     'ts': now,
                 }
                 cached = _stream_url_cache[video_id]
-        except Exception as e:
-            print(f"[STREAM] resolve error: {video_id} — {e}")
-            return jsonify({"error": str(e)}), 500
+            except Exception as e:
+                print(f"[STREAM] resolve error: {video_id} — {e}")
+                return jsonify({"error": str(e)}), 500
 
     # Now proxy from cached URL
     stream_url = cached['url']
