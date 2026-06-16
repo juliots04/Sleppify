@@ -56,8 +56,15 @@ class SleppifyApp : Application() {
         // ExoPlayer is now lazy-initialized on first use via ExoPlayerManager.getSharedExoPlayer()
         // — no need to block the main thread here.
 
-        // Background: ProviderInstaller for TLS security
+        // Background: pre-warm data caches + ProviderInstaller for TLS security
         Executors.newSingleThreadExecutor().execute {
+            // Pre-load caches so MainActivity.onCreate finds them warm (O(1) read)
+            try { PlaybackHistoryStore.load(this) } catch (e: Exception) {
+                Log.w("SleppifyApp", "PlaybackHistoryStore pre-warm failed", e)
+            }
+            try { FavoritesPlaylistStore.loadFavorites(this) } catch (e: Exception) {
+                Log.w("SleppifyApp", "FavoritesPlaylistStore pre-warm failed", e)
+            }
             try {
                 com.google.android.gms.security.ProviderInstaller.installIfNeeded(this)
             } catch (e: Exception) {

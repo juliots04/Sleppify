@@ -1,12 +1,12 @@
 package com.example.sleppify
 
+import android.animation.ValueAnimator
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Paint
-import android.os.Handler
-import android.os.Looper
 import android.util.AttributeSet
 import android.view.View
+import android.view.animation.LinearInterpolator
 
 class AnimatedEqualizerView @JvmOverloads constructor(
     context: Context,
@@ -23,32 +23,25 @@ class AnimatedEqualizerView @JvmOverloads constructor(
     private val phaseIndex = intArrayOf(0, 3, 5) // staggered start phases per bar
 
     private var animating = false
-    private val handler = Handler(Looper.getMainLooper())
     private var barColor = -0x1
 
-    private val animationRunnable = object : Runnable {
-        override fun run() {
-            if (!animating) return
-
-            var changed = false
+    private val animator = ValueAnimator.ofFloat(0f, 1f).apply {
+        duration = 60L
+        repeatCount = ValueAnimator.INFINITE
+        interpolator = LinearInterpolator()
+        addUpdateListener {
             for (i in 0..2) {
                 if (Math.abs(barHeights[i] - targetHeights[i]) < 0.05f) {
                     phaseIndex[i] = (phaseIndex[i] + 1) % keyframes.size
                     targetHeights[i] = keyframes[phaseIndex[i]]
                 }
-
                 if (barHeights[i] < targetHeights[i]) {
                     barHeights[i] += 0.04f
                 } else {
                     barHeights[i] -= 0.04f
                 }
-                changed = true
             }
-
-            if (changed) {
-                invalidate()
-            }
-            handler.postDelayed(this, 60)
+            invalidate()
         }
     }
 
@@ -60,6 +53,7 @@ class AnimatedEqualizerView @JvmOverloads constructor(
         }
         paint.color = barColor
         paint.style = Paint.Style.FILL
+        setLayerType(LAYER_TYPE_HARDWARE, null)
     }
 
     fun setBarColor(color: Int) {
@@ -72,9 +66,9 @@ class AnimatedEqualizerView @JvmOverloads constructor(
         if (this.animating == animating) return
         this.animating = animating
         if (animating) {
-            handler.post(animationRunnable)
+            animator.start()
         } else {
-            handler.removeCallbacks(animationRunnable)
+            animator.cancel()
             // Reset to low height
             for (i in 0..2) {
                 barHeights[i] = 0.2f
@@ -83,6 +77,11 @@ class AnimatedEqualizerView @JvmOverloads constructor(
             }
             invalidate()
         }
+    }
+
+    override fun onDetachedFromWindow() {
+        super.onDetachedFromWindow()
+        animator.cancel()
     }
 
     override fun onDraw(canvas: Canvas) {

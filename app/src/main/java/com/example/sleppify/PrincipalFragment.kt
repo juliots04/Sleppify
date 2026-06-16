@@ -2,13 +2,18 @@ package com.example.sleppify
 
 import android.app.Activity
 import android.content.Context
+import android.graphics.RenderEffect
+import android.graphics.Shader
 import android.graphics.Typeface
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.LayoutInflater
+import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.util.Log
 import android.widget.ImageView
@@ -20,7 +25,6 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.fragment.app.Fragment
 import androidx.recyclerview.widget.GridLayoutManager
-import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import androidx.viewpager2.widget.ViewPager2
 import com.bumptech.glide.Glide
@@ -44,7 +48,6 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         private const val PREFS_PLAYER_STATE = "player_state"
         private const val PREF_LAST_YOUTUBE_WEB_COOKIE = "stream_last_youtube_web_cookie"
         private const val PREFS_STREAMING_CACHE = "streaming_cache"
-        private const val CACHE_KEY_HOME_MIXES = "home_mixes_data"
         private const val SHORTCUTS_PER_PAGE = 9
         private const val SHORTCUTS_MAX_PAGES = 3
         // Partial-bind payload: refresh only the play/equalizer icon without reloading artwork or
@@ -64,13 +67,14 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
     private var btnFragSignIn: MaterialButton? = null
     private var btnFragProfilePhoto: ShapeableImageView? = null
 
+    // Backdrop
+    private var ivHomeBackdrop: ImageView? = null
+    private var lastBackdropUrl: String? = null
+    private var vStatusBarOverlay: View? = null
+
     // Content views
     private var vpShortcuts: ViewPager2? = null
     private var tabDotsShortcuts: TabLayout? = null
-    private var rvMixes: RecyclerView? = null
-    private var tvMixesEmpty: TextView? = null
-    private var tvPersonalMixesLabel: TextView? = null
-    private var rvPersonalMixes: RecyclerView? = null
     private var llCoversHeader: View? = null
     private var tvCoversLabel: TextView? = null
     private var btnCoversPlayAll: TextView? = null
@@ -87,7 +91,6 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
     private lateinit var youTubeMusicService: YouTubeMusicService
 
     // Throttling
-    private var lastMixesNetworkFetchTimeMs = 0L
     private var lastCoversNetworkFetchTimeMs = 0L
     private var lastShortcutsFetchTimeMs = 0L
     private val playlistGridUrlsCache = HashMap<String, List<String>>()
@@ -98,8 +101,6 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
     // Data
     private val shortcutEntries = mutableListOf<PlayCountStore.PlayCountEntry>()
-    private val mixResults = mutableListOf<YouTubeMusicService.MixResult>()
-    private val personalMixResults = mutableListOf<YouTubeMusicService.MixResult>()
     private val coversResults = mutableListOf<YouTubeMusicService.TrackResult>()
 
     // Helper structure
@@ -133,12 +134,11 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
         setupFragBrandHeader(view)
 
+        ivHomeBackdrop = view.findViewById(R.id.ivHomeBackdrop)
+        applyBackdropBlur()
+
         vpShortcuts = view.findViewById(R.id.vpShortcuts)
         tabDotsShortcuts = view.findViewById(R.id.tabDotsShortcuts)
-        rvMixes = view.findViewById(R.id.rvMixes)
-        tvMixesEmpty = view.findViewById(R.id.tvMixesEmpty)
-        tvPersonalMixesLabel = view.findViewById(R.id.tvPersonalMixesLabel)
-        rvPersonalMixes = view.findViewById(R.id.rvPersonalMixes)
         llCoversHeader = view.findViewById(R.id.llCoversHeader)
         tvCoversLabel = view.findViewById(R.id.tvCoversLabel)
         btnCoversPlayAll = view.findViewById(R.id.btnCoversPlayAll)
@@ -147,11 +147,28 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
         youTubeMusicService = YouTubeMusicService()
 
+        // Status bar overlay: set height to status bar size and fade on scroll
+        vStatusBarOverlay = view.findViewById(R.id.vStatusBarOverlay)
+        vStatusBarOverlay?.let { overlay ->
+            ViewCompat.setOnApplyWindowInsetsListener(overlay) { v, insets ->
+                val statusBarHeight = insets.getInsets(WindowInsetsCompat.Type.statusBars()).top
+                v.layoutParams = v.layoutParams.apply { height = statusBarHeight }
+                insets
+            }
+            overlay.requestApplyInsets()
+        }
+        val nsv = view.findViewById<androidx.core.widget.NestedScrollView>(R.id.nsvPrincipalContent)
+        nsv?.setOnScrollChangeListener(androidx.core.widget.NestedScrollView.OnScrollChangeListener { _, _, scrollY, _, _ ->
+            val shortcutsHeader = view.findViewById<View>(R.id.llShortcutsHeader)
+            if (shortcutsHeader != null && vStatusBarOverlay != null) {
+                val target = shortcutsHeader.top.toFloat()
+                val fraction = if (target <= 0f) 1f else (scrollY / target).coerceIn(0f, 1f)
+                vStatusBarOverlay?.alpha = fraction
+            }
+        })
+
         setupShortcuts()
-        setupMixes()
-        setupPersonalMixes()
         setupCovers()
-        loadCachedMixes()
         loadCachedCovers()
     }
 
@@ -159,9 +176,10 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         super.onResume()
         PlaybackEventBus.addListener(this)
         if (isHidden) return
+        vpShortcuts?.setCurrentItem(0, false)
+        vpCovers?.setCurrentItem(0, false)
         refreshFragHeaderProfilePhoto()
         refreshShortcuts()
-        refreshMixes()
         refreshCovers()
     }
 
@@ -172,15 +190,14 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         playlistGridUrlsCache.clear()
         vpShortcuts = null
         tabDotsShortcuts = null
-        rvMixes = null
-        tvMixesEmpty = null
+        ivHomeBackdrop = null
+        lastBackdropUrl = null
+        vStatusBarOverlay = null
         llFragBrandHeader = null
         tvFragBrandTitle = null
         btnFragHeaderSearch = null
         btnFragSignIn = null
         btnFragProfilePhoto = null
-        tvPersonalMixesLabel = null
-        rvPersonalMixes = null
         llCoversHeader = null
         tvCoversLabel = null
         btnCoversPlayAll = null
@@ -194,11 +211,13 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             view?.findViewById<View>(R.id.nsvPrincipalContent)?.let { nsv ->
                 nsv.post { nsv.scrollTo(0, 0) }
             }
+            // Always reset to first page when re-entering
+            vpShortcuts?.setCurrentItem(0, false)
+            vpCovers?.setCurrentItem(0, false)
             handler.postDelayed({
                 if (isAdded && !isHidden) refreshShortcuts()
             }, 200)
             refreshFragHeaderProfilePhoto()
-            refreshMixes()
             refreshCovers()
         }
     }
@@ -319,7 +338,67 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         // Keep only the current page + one neighbour resident instead of all 3, so entering the
         // module doesn't inflate/bind 27 cells up front. The first swipe is still instant.
         vpShortcuts?.offscreenPageLimit = 1
+        // Don't persist page position across config changes / re-entries
+        vpShortcuts?.isSaveEnabled = false
+        // Increase touch slop so slight vertical finger drift doesn't cancel the horizontal swipe
+        reduceTouchSlopForViewPager(vpShortcuts)
         TabLayoutMediator(tabDotsShortcuts!!, vpShortcuts!!) { _, _ -> }.attach()
+    }
+
+    private fun reduceTouchSlopForViewPager(vp: ViewPager2?) {
+        try {
+            val recyclerView = vp?.getChildAt(0) as? RecyclerView ?: return
+            val touchSlopField = RecyclerView::class.java.getDeclaredField("mTouchSlop")
+            touchSlopField.isAccessible = true
+            val currentSlop = touchSlopField.getInt(recyclerView)
+            // Reduce the internal RV slop so the pager starts scrolling sooner
+            touchSlopField.setInt(recyclerView, (currentSlop * 0.5).toInt())
+
+            // Prevent the parent NestedScrollView from stealing a predominantly-horizontal swipe.
+            // Claim the gesture early (half the normal slop) so slight vertical drift while
+            // swiping diagonally doesn't cancel the page change.
+            val halfSlop = ViewConfiguration.get(recyclerView.context).scaledTouchSlop / 2
+            recyclerView.addOnItemTouchListener(object : RecyclerView.OnItemTouchListener {
+                private var startX = 0f
+                private var startY = 0f
+                private var locked = false
+
+                override fun onInterceptTouchEvent(rv: RecyclerView, e: MotionEvent): Boolean {
+                    when (e.actionMasked) {
+                        MotionEvent.ACTION_DOWN -> {
+                            startX = e.x
+                            startY = e.y
+                            locked = false
+                            // Eagerly request parent to not intercept on DOWN so we get MOVE events
+                            rv.parent?.requestDisallowInterceptTouchEvent(true)
+                        }
+                        MotionEvent.ACTION_MOVE -> {
+                            val dx = Math.abs(e.x - startX)
+                            val dy = Math.abs(e.y - startY)
+                            if (!locked) {
+                                if (dx > halfSlop && dx > dy * 0.6f) {
+                                    // Horizontal intent — keep the lock
+                                    locked = true
+                                    rv.parent?.requestDisallowInterceptTouchEvent(true)
+                                } else if (dy > halfSlop && dy > dx) {
+                                    // Vertical intent — release to parent
+                                    locked = false
+                                    rv.parent?.requestDisallowInterceptTouchEvent(false)
+                                }
+                            }
+                        }
+                        MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                            locked = false
+                            rv.parent?.requestDisallowInterceptTouchEvent(false)
+                        }
+                    }
+                    return false
+                }
+
+                override fun onTouchEvent(rv: RecyclerView, e: MotionEvent) {}
+                override fun onRequestDisallowInterceptTouchEvent(disallowIntercept: Boolean) {}
+            })
+        } catch (_: Exception) { }
     }
 
     private fun refreshShortcuts() {
@@ -334,23 +413,37 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         bgExecutor.execute {
             val totalNeeded = SHORTCUTS_PER_PAGE * SHORTCUTS_MAX_PAGES
 
-            val topTracks = ArrayList(PlayCountStore.getTopEntries(appContext, totalNeeded))
-            val topPlaylists = ArrayList(PlayCountStore.getTopPlaylists(appContext, 5))
+            // YT Music Speed Dial logic: recency-first, with the single most-played playlist pinned at pos 0.
+            val topPlaylist = PlayCountStore.getTopPlaylists(appContext, 1)
+                .firstOrNull { it.playlistId != LocalFilesStore.PLAYLIST_ID }
 
-            topPlaylists.removeAll { LocalFilesStore.PLAYLIST_ID == it.playlistId }
-            if (topPlaylists.size > 1) topPlaylists.subList(1, topPlaylists.size).clear()
+            // Composite score: frequency weighted by recency decay.
+            // score = count / (1 + daysSinceLastPlayed / 3)
+            val nowMs = System.currentTimeMillis()
+            val allEntries = PlayCountStore.getAllEntries(appContext)
+                .sortedByDescending { entry ->
+                    val daysSince = (nowMs - entry.lastPlayedAtMs) / 86_400_000.0
+                    entry.count / (1.0 + daysSince / 3.0)
+                }
 
             val seenIds = HashSet<String>()
             val merged = mutableListOf<PlayCountStore.PlayCountEntry>()
-            for (p in topPlaylists) { merged.add(p); seenIds.add(p.videoId) }
-            for (t in topTracks) {
+
+            // Pin the most-played playlist at position 0
+            if (topPlaylist != null) {
+                merged.add(topPlaylist)
+                seenIds.add(topPlaylist.videoId)
+            }
+
+            // Fill remaining slots with composite score (recency + frequency)
+            for (t in allEntries) {
+                if (merged.size >= totalNeeded) break
                 if (t.videoId in seenIds) continue
                 seenIds.add(t.videoId)
                 merged.add(t)
             }
-            merged.sortWith(compareByDescending<PlayCountStore.PlayCountEntry> { it.count }.thenByDescending { it.lastPlayedAtMs })
 
-            val top = ArrayList(merged.take(totalNeeded))
+            val top = ArrayList(merged)
             if (top.size < totalNeeded) fillShortcutsFromHistory(appContext, top, totalNeeded)
 
             // Warm the grid-art cache off the UI thread so cell binds don't touch disk.
@@ -359,6 +452,15 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 val pid = e.playlistId
                 if (!pid.isNullOrEmpty() && e.videoId == pid) {
                     gridCache[pid] = computePlaylistGridUrls(appContext, pid)
+                }
+            }
+
+            // Sync shortcuts to Firebase if user is signed in
+            if (top.isNotEmpty()) {
+                try {
+                    CloudSyncManager.getInstance(appContext).syncShortcutsToCloud(top)
+                } catch (e: Exception) {
+                    Log.w(TAG, "syncShortcutsToCloud failed", e)
                 }
             }
 
@@ -372,6 +474,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                     val pageCount = Math.max(1, Math.ceil(shortcutEntries.size / SHORTCUTS_PER_PAGE.toFloat().toDouble()).toInt())
                     it.visibility = if (pageCount > 1) View.VISIBLE else View.GONE
                 }
+                updateBackdropImage()
             }
         }
     }
@@ -400,59 +503,6 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         }
     }
 
-    // ========== Mixes ==========
-
-    private fun setupMixes() {
-        rvMixes?.layoutManager = LinearLayoutManager(requireContext(), LinearLayoutManager.HORIZONTAL, false)
-        rvMixes?.adapter = MixesAdapter(mixResults)
-    }
-
-    private fun refreshMixes() {
-        val now = System.currentTimeMillis()
-        if (now - lastMixesNetworkFetchTimeMs < NETWORK_REFRESH_THROTTLE_MS && mixResults.isNotEmpty()) return
-
-        val cookie = getCookieHeader()
-        if (cookie.isEmpty()) {
-            tvMixesEmpty?.visibility = View.GONE
-            return
-        }
-
-        youTubeMusicService.fetchHomeBrowse(cookie, object : YouTubeMusicService.HomeBrowseCallback {
-            override fun onSuccess(result: YouTubeMusicService.HomeBrowseResult) {
-                if (!isAdded) return
-                lastMixesNetworkFetchTimeMs = System.currentTimeMillis()
-
-                mixResults.clear()
-                mixResults.addAll(result.genericMixes)
-                cacheMixes(result.genericMixes, result.personalMixes)
-                rvMixes?.adapter?.notifyDataSetChanged()
-                val empty = mixResults.isEmpty()
-                tvMixesEmpty?.visibility = if (empty) View.VISIBLE else View.GONE
-                rvMixes?.visibility = if (empty) View.GONE else View.VISIBLE
-
-                personalMixResults.clear()
-                personalMixResults.addAll(result.personalMixes)
-                rvPersonalMixes?.adapter?.notifyDataSetChanged()
-                val personalEmpty = personalMixResults.isEmpty()
-                tvPersonalMixesLabel?.visibility = if (personalEmpty) View.GONE else View.VISIBLE
-                rvPersonalMixes?.visibility = if (personalEmpty) View.GONE else View.VISIBLE
-            }
-
-            override fun onError(error: String) {
-                if (!isAdded) return
-                if (mixResults.isEmpty()) {
-                    tvMixesEmpty?.visibility = View.VISIBLE
-                    rvMixes?.visibility = View.GONE
-                }
-            }
-        })
-    }
-
-    private fun setupPersonalMixes() {
-        rvPersonalMixes ?: return
-        rvPersonalMixes?.layoutManager = LinearLayoutManager(requireContext(), LinearLayoutManager.HORIZONTAL, false)
-        rvPersonalMixes?.adapter = MixesAdapter(personalMixResults)
-    }
 
     // ========== Covers ==========
 
@@ -549,10 +599,6 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
     // ========== Actions ==========
 
-    private fun onMixClicked(mix: YouTubeMusicService.MixResult) {
-        if (!isAdded || mix.playlistId.isEmpty()) return
-        openPlaylistDetailFromPrincipal(mix.playlistId, mix.title, mix.thumbnailUrl)
-    }
 
     private fun playTrackList(tracks: List<YouTubeMusicService.TrackResult>, startIndex: Int) {
         if (!isAdded || tracks.isEmpty()) return
@@ -704,6 +750,36 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         return findSongPlayerFragment()?.takeIf { it.isAdded }?.externalGetCurrentVideoId() ?: ""
     }
 
+    // ========== Backdrop ==========
+
+    private fun applyBackdropBlur() {
+        val backdrop = ivHomeBackdrop ?: return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            backdrop.setRenderEffect(
+                RenderEffect.createBlurEffect(60f, 60f, Shader.TileMode.CLAMP)
+            )
+        }
+    }
+
+    private fun updateBackdropImage() {
+        val backdrop = ivHomeBackdrop ?: return
+        if (!isAdded || shortcutEntries.isEmpty()) return
+        val firstEntry = shortcutEntries[0]
+        val url = firstEntry.imageUrl
+        if (url.isNullOrEmpty() || url == lastBackdropUrl) return
+        lastBackdropUrl = url
+        try {
+            Glide.with(this)
+                .load(url)
+                .diskCacheStrategy(DiskCacheStrategy.ALL)
+                .override(320, 320)
+                .transform(SHARED_CENTER_CROP)
+                .into(backdrop)
+        } catch (e: Exception) {
+            Log.w(TAG, "Backdrop load error", e)
+        }
+    }
+
     // ========== Helpers ==========
 
     private fun findSongPlayerFragment(): SongPlayerFragment? {
@@ -780,84 +856,6 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             .commit()
     }
 
-    // ========== Cache Mixes ==========
-
-    private fun cacheMixes(generic: List<YouTubeMusicService.MixResult>, personal: List<YouTubeMusicService.MixResult>) {
-        if (!isAdded) return
-        try {
-            val arr = JSONArray()
-            for (mix in generic) {
-                arr.put(JSONObject().apply {
-                    put("playlistId", mix.playlistId)
-                    put("title", mix.title)
-                    put("subtitle", mix.subtitle)
-                    put("thumbnailUrl", mix.thumbnailUrl)
-                })
-            }
-            val arrPers = JSONArray()
-            for (mix in personal) {
-                arrPers.put(JSONObject().apply {
-                    put("playlistId", mix.playlistId)
-                    put("title", mix.title)
-                    put("subtitle", mix.subtitle)
-                    put("thumbnailUrl", mix.thumbnailUrl)
-                })
-            }
-            requireContext().getSharedPreferences(PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
-                .edit()
-                .putString(CACHE_KEY_HOME_MIXES, arr.toString())
-                .putString("home_personal_mixes_data", arrPers.toString())
-                .apply()
-        } catch (e: Exception) {
-            Log.w(TAG, "Unexpected error", e)
-        }
-    }
-
-    private fun loadCachedMixes() {
-        if (!isAdded) return
-        try {
-            val cache = requireContext().getSharedPreferences(PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
-            val raw = cache.getString(CACHE_KEY_HOME_MIXES, "") ?: ""
-            if (raw.isNotEmpty()) {
-                val arr = JSONArray(raw)
-                mixResults.clear()
-                for (i in 0 until arr.length()) {
-                    val obj = arr.optJSONObject(i) ?: continue
-                    mixResults.add(YouTubeMusicService.MixResult(
-                        obj.optString("playlistId", ""),
-                        obj.optString("title", ""),
-                        obj.optString("subtitle", ""),
-                        obj.optString("thumbnailUrl", "")
-                    ))
-                }
-                rvMixes?.adapter?.notifyDataSetChanged()
-                val empty = mixResults.isEmpty()
-                tvMixesEmpty?.visibility = if (empty) View.VISIBLE else View.GONE
-                rvMixes?.visibility = if (empty) View.GONE else View.VISIBLE
-            }
-
-            val rawPers = cache.getString("home_personal_mixes_data", "") ?: ""
-            if (rawPers.isNotEmpty()) {
-                val arr = JSONArray(rawPers)
-                personalMixResults.clear()
-                for (i in 0 until arr.length()) {
-                    val obj = arr.optJSONObject(i) ?: continue
-                    personalMixResults.add(YouTubeMusicService.MixResult(
-                        obj.optString("playlistId", ""),
-                        obj.optString("title", ""),
-                        obj.optString("subtitle", ""),
-                        obj.optString("thumbnailUrl", "")
-                    ))
-                }
-                rvPersonalMixes?.adapter?.notifyDataSetChanged()
-                val personalEmpty = personalMixResults.isEmpty()
-                tvPersonalMixesLabel?.visibility = if (personalEmpty) View.GONE else View.VISIBLE
-                rvPersonalMixes?.visibility = if (personalEmpty) View.GONE else View.VISIBLE
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Unexpected error", e)
-        }
-    }
 
     // ========== Cache Covers ==========
 
@@ -1032,33 +1030,6 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             val tvTitle: TextView = itemView.findViewById(R.id.tvShortcutTitle)
             val ivPlay: ImageView = itemView.findViewById(R.id.ivShortcutPlay)
             val eqView: AnimatedEqualizerView = itemView.findViewById(R.id.eqShortcut)
-        }
-    }
-
-    private inner class MixesAdapter(private val items: List<YouTubeMusicService.MixResult>) :
-        RecyclerView.Adapter<MixesAdapter.MixVH>() {
-
-        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): MixVH {
-            val v = LayoutInflater.from(parent.context).inflate(R.layout.item_mix_card, parent, false)
-            return MixVH(v)
-        }
-
-        override fun onBindViewHolder(holder: MixVH, position: Int) {
-            val mix = items[position]
-            holder.tvTitle.text = mix.title
-            holder.tvSubtitle.text = mix.subtitle
-            if (mix.thumbnailUrl.isNotEmpty() && isAdded) {
-                try { Glide.with(this@PrincipalFragment).load(mix.thumbnailUrl).placeholder(R.color.surface_high).transform(SHARED_CENTER_CROP, SHARED_ROUNDED_16).into(holder.ivThumb) } catch (_: Exception) {}
-            }
-            holder.itemView.setOnClickListener { onMixClicked(mix) }
-        }
-
-        override fun getItemCount() = items.size
-
-        inner class MixVH(itemView: View) : RecyclerView.ViewHolder(itemView) {
-            val ivThumb: ImageView = itemView.findViewById(R.id.ivMixThumb)
-            val tvTitle: TextView = itemView.findViewById(R.id.tvMixTitle)
-            val tvSubtitle: TextView = itemView.findViewById(R.id.tvMixSubtitle)
         }
     }
 

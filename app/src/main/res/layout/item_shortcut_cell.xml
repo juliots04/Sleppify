@@ -3,12 +3,14 @@
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
-    android:padding="2dp">
+    android:padding="3dp">
 
     <androidx.constraintlayout.widget.ConstraintLayout
         android:id="@+id/clShortcutCell"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
+        android:background="@drawable/bg_shortcut_cell_rounded"
+        android:clipToOutline="true"
         android:clickable="true"
         android:focusable="true"
         android:foreground="?attr/selectableItemBackground">

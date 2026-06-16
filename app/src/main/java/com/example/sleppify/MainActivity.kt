@@ -118,7 +118,6 @@ class MainActivity : AppCompatActivity() {
 
     private var inSettings = false
     private var inEqualizerFromSettings = false
-    private var inEqualizerFromPlayer = false
     private var inScannerFromSettings = false
     private var isNavigating = false
     private var suppressNavListener = false
@@ -177,16 +176,12 @@ class MainActivity : AppCompatActivity() {
                 returnFromScanner()
                 return
             }
-            if (inEqualizerFromPlayer) {
-                exitEqualizerToMusic()
-                return
-            }
             if (inEqualizerFromSettings) {
                 exitEqualizerToSettings()
                 return
             }
             if (inSettings) {
-                returnFromSettings()
+                (settingsFragment as? SettingsFragment)?.onBackPressed()
                 return
             }
 
@@ -219,11 +214,8 @@ class MainActivity : AppCompatActivity() {
         initViews()
         globalMiniPlayer = GlobalMiniPlayerController(this)
         audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-        syncAudioProfile(false) // Initial sync on startup
-        // Cargar cookies de la sesión web YouTube Music (si existen) lo más
-        // temprano posible para que las primeras peticiones InnerTube ya estén
-        // autenticadas y eviten LOGIN_REQUIRED / 403 en el CDN.
-        StreamResolver.loadAuthCookiesFromPrefs(this)
+        // Auth cookies + NewPipe warmup run on background thread inside warmUp
+        StreamResolver.warmUp(this)
         setupListeners()
         configureHeaderActionForMainModules()
         configureAudioAuthorizationFlow()
@@ -233,21 +225,37 @@ class MainActivity : AppCompatActivity() {
         localPrefs = getSharedPreferences("sleppify_local_config", Context.MODE_PRIVATE)
         updateNavigationForScreenSize()
 
-        // Pre-warm caches before fragments are created so first render has no I/O
-        PlaybackHistoryStore.load(this)
-        FavoritesPlaylistStore.loadFavorites(this)
+        // Caches are pre-warmed by SleppifyApp on a background thread.
+        // By now they are likely ready (O(1) read from in-memory cache).
 
-        // Always open directly on Biblioteca — no login gate.
+        // Always open directly on Principal — no login gate.
         suppressNavListener = true
-        bottomNav.selectedItemId = R.id.nav_music
+        bottomNav.selectedItemId = R.id.nav_principal
         suppressNavListener = false
-        currentMainNavItemId = R.id.nav_music
-        switchToMainModule(R.id.nav_music)
+        currentMainNavItemId = R.id.nav_principal
+        switchToMainModule(R.id.nav_principal)
         showMainShell()
+
+        // Pre-create MusicPlayerFragment hidden so its onViewCreated triggers the
+        // web session auto-launch (login prompt). Previously it was created immediately
+        // because Biblioteca was the default module; now Principal is first.
+        fragmentContainer.post {
+            if (isFinishing || isDestroyed) return@post
+            if (supportFragmentManager.findFragmentByTag(TAG_MODULE_MUSIC) == null) {
+                val music = getOrCreateMainModuleFragment(R.id.nav_music) ?: return@post
+                supportFragmentManager.beginTransaction()
+                    .setReorderingAllowed(true)
+                    .add(R.id.fragmentContainer, music, TAG_MODULE_MUSIC)
+                    .hide(music)
+                    .setMaxLifecycle(music, Lifecycle.State.STARTED)
+                    .commitAllowingStateLoss()
+            }
+        }
 
         // Defer heavy startup work to background thread
         lifecycleScope.launch {
             delay(100) // Allow UI to render first
+            syncAudioProfile(false)
             withContext(Dispatchers.IO) {
                 syncAudioEffectsServiceFromPreferences(forceSync = true)
             }
@@ -309,7 +317,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateNavigationForScreenSize() {
-        bottomNav.visibility = if (inSettings || inEqualizerFromSettings || inScannerFromSettings) View.GONE else View.VISIBLE
+        if (inEqualizerFromSettings || inScannerFromSettings) {
+            bottomNav.visibility = View.GONE
+        } else if (inSettings) {
+            // SettingsFragment controls bottomNav visibility per sub-section
+            val showNav = (settingsFragment as? SettingsFragment)?.isHistoryOrAccountActive() == true
+            bottomNav.visibility = if (showNav) View.VISIBLE else View.GONE
+        } else {
+            bottomNav.visibility = View.VISIBLE
+        }
     }
 
     private fun setupListeners() {
@@ -813,7 +829,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun showMainShell() {
         // Do not force header/bottomNav visible when inside overlay screens
-        if (inSettings || inEqualizerFromSettings || inEqualizerFromPlayer || inScannerFromSettings || isAnyOverlayModuleVisible()) return
+        if (inSettings || inEqualizerFromSettings || inScannerFromSettings || isAnyOverlayModuleVisible()) return
         if (!isSearchFragmentVisible() && !isPlaylistDetailVisible()) {
             // Music and Principal fragments own their own header — hide topAppBar for them
             val isFragOwnedHeader = currentMainNavItemId == R.id.nav_music || currentMainNavItemId == R.id.nav_principal
@@ -821,8 +837,8 @@ class MainActivity : AppCompatActivity() {
         }
         fragmentContainer.visibility = View.VISIBLE
         bottomNav.visibility = View.VISIBLE
-        // Refresh profile photo / sign-in button every time the shell becomes visible
-        loadProfilePhoto()
+        // Defer profile photo load so it doesn't block the first rendered frame
+        bottomNav.post { loadProfilePhoto() }
     }
 
     private fun handleSignedInUser(user: FirebaseUser, onSuccess: Runnable?) {
@@ -1033,35 +1049,9 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    fun openEqualizerFromPlayer() {
-        if (isNavigating) return
-        inEqualizerFromPlayer = true
-        inEqualizerFromSettings = false
-        globalMiniPlayer?.hide()
-        val target = equalizerFragment ?: EqualizerFragment().also { equalizerFragment = it }
-        val isNew = !target.isAdded
-        setOverlayFullscreen(true)
-        showModuleLoadingOverlay()
-        fragmentContainer.post {
-            if (isFinishing || isDestroyed) return@post
-            supportFragmentManager.beginTransaction().apply {
-                setReorderingAllowed(true)
-                hideAllMainScreens(this, target)
-                if (target.isAdded) show(target) else add(R.id.fragmentContainer, target, TAG_MODULE_EQUALIZER)
-                setMaxLifecycle(target, Lifecycle.State.RESUMED)
-                commit()
-            }
-            topAppBar.visibility = View.GONE
-            setSolidNavigationBar(true)
-            bottomNav.visibility = View.GONE
-            fragmentContainer.post { fragmentContainer.post { revealModuleContent() } }
-        }
-    }
-
     fun returnFromEqualizer() {
         when {
             inEqualizerFromSettings -> exitEqualizerToSettings()
-            inEqualizerFromPlayer -> exitEqualizerToMusic()
             // Flags got lost (e.g. after process recreation) but the EQ is still on screen — the
             // close button must still get the user out. Recover instead of doing nothing.
             else -> recoverFromStuckEqualizerOverlay()
@@ -1069,8 +1059,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Safety net for a stuck full-screen equalizer overlay: the EQ is opened from the player or
-     * settings with bottomNav hidden, but inEqualizerFromPlayer/Settings were reset (process
+     * Safety net for a stuck full-screen equalizer overlay: the EQ was opened from
+     * settings with bottomNav hidden, but inEqualizerFromSettings was reset (process
      * recreation, a racing transaction, etc.). In that state neither the system back nor the EQ's
      * own close button can dismiss it. This detects that situation and routes out to the most
      * sensible origin. Returns true if it handled a stuck overlay; false otherwise (so callers can
@@ -1078,55 +1068,32 @@ class MainActivity : AppCompatActivity() {
      * bottom-nav module (bottom nav visible), which is a valid flags-false state.
      */
     private fun recoverFromStuckEqualizerOverlay(): Boolean {
-        if (inEqualizerFromPlayer || inEqualizerFromSettings) return false
+        if (inEqualizerFromSettings) return false
         val eq = supportFragmentManager.findFragmentByTag(TAG_MODULE_EQUALIZER) ?: return false
         if (!eq.isAdded || eq.isHidden) return false
         // EQ shown as the regular bottom-nav module — not stuck; let normal navigation handle it.
         if (currentMainNavItemId == R.id.nav_equalizer && bottomNav.visibility == View.VISIBLE) return false
 
         Log.w("MainActivity", "recoverFromStuckEqualizerOverlay: dismissing EQ with no flag set")
-        val player = supportFragmentManager.findFragmentByTag(TAG_SONG_PLAYER)
         val settings = supportFragmentManager.findFragmentByTag(TAG_MODULE_SETTINGS)
-        when {
-            player != null && player.isAdded -> {
-                inEqualizerFromPlayer = true
-                exitEqualizerToMusic()
-            }
-            settings != null && settings.isAdded -> {
-                inEqualizerFromSettings = true
-                exitEqualizerToSettings()
-            }
-            else -> {
-                hideEqualizerImmediately()
-                val fallbackNav = if (currentMainNavItemId == R.id.nav_equalizer) R.id.nav_music else currentMainNavItemId
-                switchToMainModule(fallbackNav)
+        if (settings != null && settings.isAdded) {
+            inEqualizerFromSettings = true
+            exitEqualizerToSettings()
+        } else {
+            hideEqualizerImmediately()
+            // isNavigating may be stuck true from a previous deferred post — reset it so
+            // switchToMainModule doesn't silently bail, leaving bottomNav hidden with nothing shown.
+            isNavigating = false
+            val fallbackNav = if (currentMainNavItemId == R.id.nav_equalizer || currentMainNavItemId == View.NO_ID)
+                R.id.nav_music else currentMainNavItemId
+            val switched = switchToMainModule(fallbackNav)
+            if (!switched) {
+                // Last resort: at minimum make the UI interactable again
+                bottomNav.visibility = View.VISIBLE
+                topAppBar.visibility = View.GONE
             }
         }
         return true
-    }
-
-    private fun exitEqualizerToMusic() {
-        if (!inEqualizerFromPlayer) return
-        inEqualizerFromPlayer = false
-        val songPlayer = supportFragmentManager.findFragmentByTag(TAG_SONG_PLAYER)
-        hideEqualizerImmediately()
-        setOverlayFullscreen(false)
-        showModuleLoadingOverlay()
-        fragmentContainer.post {
-            if (isFinishing || isDestroyed) return@post
-            supportFragmentManager.beginTransaction().apply {
-                setReorderingAllowed(true)
-                if (songPlayer != null && songPlayer.isAdded) {
-                    show(songPlayer)
-                    setMaxLifecycle(songPlayer, Lifecycle.State.RESUMED)
-                }
-                commit()
-            }
-            topAppBar.visibility = View.GONE
-            setSolidNavigationBar(true)
-            bottomNav.visibility = View.GONE
-            fragmentContainer.post { fragmentContainer.post { revealModuleContent() } }
-        }
     }
 
     fun openEqualizerFromSettings() {
@@ -1296,7 +1263,11 @@ class MainActivity : AppCompatActivity() {
 
     fun isMiniPlayerAllowedForCurrentScreen(): Boolean {
         // Mini-player only in these 4 screens — block all overlay screens
-        if (inSettings || inEqualizerFromSettings || inEqualizerFromPlayer || inScannerFromSettings) return false
+        if (inEqualizerFromSettings || inScannerFromSettings) return false
+        if (inSettings) {
+            // Allow mini-player in History and Account sub-sections
+            return (settingsFragment as? SettingsFragment)?.isHistoryOrAccountActive() == true
+        }
         if (isSearchFragmentVisible()) return true
         if (isPlaylistDetailVisible()) return true
         return when (currentMainNavItemId) {
@@ -1504,9 +1475,12 @@ class MainActivity : AppCompatActivity() {
         if (isNavigating) return true
         isNavigating = true
 
-        // Reset stale sub-navigation flags
-        inEqualizerFromPlayer = false
-        inEqualizerFromSettings = false
+        // Reset stale sub-navigation flags — but only if the EQ overlay is no longer shown,
+        // otherwise resetting inEqualizerFromSettings here would orphan the overlay with no
+        // back-press handler, causing the stuck-EQ bug.
+        val eqFrag = equalizerFragment
+        val eqOverlayVisible = eqFrag != null && eqFrag.isAdded && !eqFrag.isHidden
+        if (!eqOverlayVisible) inEqualizerFromSettings = false
         inScannerFromSettings = false
 
         supportFragmentManager.executePendingTransactions()
@@ -1537,8 +1511,32 @@ class MainActivity : AppCompatActivity() {
         val isNew = !target.isAdded
         // Update immediately so any re-entrant calls see the correct module id
         currentMainNavItemId = itemId
-        // Show overlay immediately — post the heavy fragment work so this frame
-        // is rendered before the FragmentManager blocks the UI thread.
+
+        // For the very first module on cold start (isNew + nothing visible to hide),
+        // skip the overlay + deferred post pattern entirely — execute synchronously
+        // to shave ~32-48ms (2-3 frames) off the critical path.
+        val isColdStartFirstModule = isNew && supportFragmentManager.fragments.none { it.isAdded && !it.isHidden }
+
+        if (isColdStartFirstModule) {
+            supportFragmentManager.beginTransaction().apply {
+                setReorderingAllowed(true)
+                add(R.id.fragmentContainer, target, tag)
+                setMaxLifecycle(target, Lifecycle.State.RESUMED)
+                commitAllowingStateLoss()
+            }
+            isNavigating = false
+            getSharedPreferences(PREFS_BOOTSTRAP, Context.MODE_PRIVATE)
+                .edit().putInt(PREF_LAST_MAIN_MODULE, itemId).apply()
+            if (!isSearchFragmentVisible()) {
+                val isFragOwnedHeader = itemId == R.id.nav_music || itemId == R.id.nav_principal
+                topAppBar.visibility = if (isFragOwnedHeader) View.GONE else View.VISIBLE
+            }
+            configureHeaderActionForMainModules()
+            updateHeaderTitleForModule(itemId)
+            return true
+        }
+
+        // Normal path: show overlay, then post fragment work
         setOverlayFullscreen(false)
         showModuleLoadingOverlay()
         fragmentContainer.post {
@@ -1586,7 +1584,7 @@ class MainActivity : AppCompatActivity() {
                 globalMiniPlayer?.hide()
             }
 
-            fragmentContainer.post { fragmentContainer.post { revealModuleContent() } }
+            fragmentContainer.post { revealModuleContent() }
         }
         return true
     }
@@ -1597,13 +1595,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setOverlayFullscreen(fullscreen: Boolean) {
-        // Always position the loading overlay full-screen so the navigation spinner lands in a
-        // FIXED, screen-centered spot on every transition. The old 'above-nav' variant raised the
-        // spinner on some screens, which made it appear to jump between navigations. The param is
-        // kept for call-site compatibility.
         val lp = moduleLoadingOverlay.layoutParams as? androidx.constraintlayout.widget.ConstraintLayout.LayoutParams ?: return
-        lp.bottomToTop = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.UNSET
-        lp.bottomToBottom = R.id.main
+        if (fullscreen) {
+            // Settings / equalizer: cover everything except mini player & footer
+            lp.bottomToTop = R.id.llGlobalMiniPlayer
+            lp.bottomToBottom = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.UNSET
+        } else {
+            // Normal module switch: stop above the mini player (which chains to bottomNav)
+            lp.bottomToTop = R.id.llGlobalMiniPlayer
+            lp.bottomToBottom = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.UNSET
+        }
         lp.bottomMargin = 0
         moduleLoadingOverlay.layoutParams = lp
     }
@@ -1620,7 +1621,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun markStreamingEntryAsLibrary() {
         persistStreamingScreenState(STREAM_SCREEN_LIBRARY)
-        (supportFragmentManager.findFragmentByTag(TAG_SONG_PLAYER) as? SongPlayerFragment)?.externalSetReturnTargetTag(TAG_MODULE_MUSIC)
+        val player = supportFragmentManager.findFragmentByTag(TAG_SONG_PLAYER) as? SongPlayerFragment ?: return
+        // Only override return target if the player was originally opened from Music or has no target
+        val currentTarget = player.externalGetReturnTargetTag()
+        if (currentTarget.isEmpty() || currentTarget == TAG_MODULE_MUSIC) {
+            player.externalSetReturnTargetTag(TAG_MODULE_MUSIC)
+        }
     }
 
     private fun persistStreamingScreenState(screen: String) {
@@ -1736,10 +1742,13 @@ class MainActivity : AppCompatActivity() {
         if (!preferredTag.isNullOrEmpty()) {
             supportFragmentManager.findFragmentByTag(preferredTag)?.let { if (it.isAdded) return it }
         }
-        supportFragmentManager.findFragmentByTag(TAG_PLAYLIST_DETAIL)?.let { if (it.isAdded) return it }
-        supportFragmentManager.findFragmentByTag(TAG_MODULE_MUSIC)?.let { if (it.isAdded) return it }
+        supportFragmentManager.findFragmentByTag(TAG_PLAYLIST_DETAIL)?.let { if (it.isAdded && !it.isHidden) return it }
+        // Return to the currently selected main module (Principal, Music, etc.)
         val current = getMainModuleFragment(currentMainNavItemId)
-        return current?.takeIf { it.isAdded && currentMainNavItemId != R.id.nav_equalizer }
+        if (current != null && current.isAdded && currentMainNavItemId != R.id.nav_equalizer) return current
+        // Final fallback
+        supportFragmentManager.findFragmentByTag(TAG_MODULE_MUSIC)?.let { if (it.isAdded) return it }
+        return null
     }
 
     private fun hideEqualizerImmediately() {
@@ -1783,7 +1792,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     fun ensureHeaderVisibleForMusic() {
-        if (inSettings || inEqualizerFromSettings || inEqualizerFromPlayer || inScannerFromSettings) return
+        if (inSettings || inEqualizerFromSettings || inScannerFromSettings) return
         // Music fragment now owns its own header — just ensure bottomNav is visible
         topAppBar.visibility = View.GONE
         bottomNav.visibility = View.VISIBLE

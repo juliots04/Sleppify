@@ -3,7 +3,7 @@
     xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="@color/surface_dark"
+    android:background="@android:color/black"
     tools:context=".PlaylistDetailFragment">
 
     <androidx.constraintlayout.widget.ConstraintLayout

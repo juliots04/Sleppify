@@ -558,9 +558,11 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         String previousPlaylistId = currentPlayingPlaylistId;
         boolean previousIsPlaying = currentIsActuallyPlaying;
 
-        SharedPreferences prefs = requireContext().getSharedPreferences(PREFS_PLAYER_STATE, Activity.MODE_PRIVATE);
-        boolean isPlaying = prefs.getBoolean(PREF_LAST_IS_PLAYING, false);
-        String playlistId = prefs.getString(PREF_LAST_PLAYLIST_ID, "");
+        if (cachedPlayerStatePrefs == null) {
+            cachedPlayerStatePrefs = requireContext().getSharedPreferences(PREFS_PLAYER_STATE, Activity.MODE_PRIVATE);
+        }
+        boolean isPlaying = cachedPlayerStatePrefs.getBoolean(PREF_LAST_IS_PLAYING, false);
+        String playlistId = cachedPlayerStatePrefs.getString(PREF_LAST_PLAYLIST_ID, "");
         String normalizedPlaylistId = playlistId == null ? "" : playlistId.trim();
 
         if (TextUtils.isEmpty(normalizedPlaylistId)) {
@@ -606,6 +608,8 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     private MaterialButton btnFeaturedSave;
     private SwipeRefreshLayout swipeLibraryRefresh;
     private View flLibraryLoadingOverlay;
+    @Nullable private ImageView ivLibraryBackdrop;
+    @Nullable private View vStatusBarOverlay;
     private boolean libraryGridOverlayActive;
     private boolean suppressGridOverlay;
     private int libraryGridPendingCount;
@@ -632,6 +636,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             return size() > 100;
         }
     };
+    private final Set<String> gridUrlsAsyncInFlight = new HashSet<>();
     private MusicResultsAdapter adapter;
     private LinearLayoutManager musicResultsLayoutManager;
     private boolean loadingLibrary;
@@ -668,18 +673,26 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     private boolean currentPlayingPlaylistActive;
     private boolean currentIsActuallyPlaying;
     @Nullable
+    private SharedPreferences cachedPlayerStatePrefs;
+    @Nullable
     private Observer<List<WorkInfo>> offlineQueueObserver;
     @Nullable
     private Observer<List<WorkInfo>> offlineManualQueueObserver;
     private boolean offlineAutoQueueScanInFlight;
+    private boolean offlineAutoQueueDirty;
     private boolean offlineQueueHadActiveWork;
     private boolean offlineManualQueueHadActiveWork;
+    private final Set<String> pendingOfflineStateRefreshWhenVisible = new HashSet<>();
+    private boolean pendingDownloadProgressDispatch;
     private final Map<String, Float> autoQueueProgressByPlaylist = new HashMap<>();
     private final Set<String> autoQueueDownloading = new HashSet<>();
     private final Map<String, Float> manualQueueProgressByPlaylist = new HashMap<>();
     private final Set<String> manualQueueDownloading = new HashSet<>();
     private boolean cloudPlaylistFetchInFlight;
     private boolean lastMiniPlayerIsPlaying;
+    private boolean snapshotOfflineRecalcDirty;
+    private long lastSnapshotHandledAtMs;
+    private static final long SNAPSHOT_UI_DEBOUNCE_MS = 500L;
     private ActivityResultLauncher<Intent> signInLauncher;
     private ActivityResultLauncher<Intent> recoverAuthLauncher;
     private ActivityResultLauncher<Intent> webSessionLauncher;
@@ -753,6 +766,8 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         super.onViewCreated(view, savedInstanceState);
         PlaybackEventBus.addListener(this);
         setupFragBrandHeader(view);
+        ivLibraryBackdrop = view.findViewById(R.id.ivLibraryBackdrop);
+        applyLibraryBackdropBlur();
         llLibraryHeaderRow = view.findViewById(R.id.llLibraryHeaderRow);
         tvLibraryTitle = view.findViewById(R.id.tvLibraryTitle);
         llMusicState = view.findViewById(R.id.llMusicState);
@@ -769,10 +784,34 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         btnFeaturedSave = view.findViewById(R.id.btnFeaturedSave);
         swipeLibraryRefresh = view.findViewById(R.id.swipeLibraryRefresh);
         flLibraryLoadingOverlay = view.findViewById(R.id.flLibraryLoadingOverlay);
+
+        // Status bar overlay: set height to status bar, fade to solid on scroll
+        vStatusBarOverlay = view.findViewById(R.id.vStatusBarOverlay);
+        if (vStatusBarOverlay != null) {
+            androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(vStatusBarOverlay, (v, insets) -> {
+                int sbHeight = insets.getInsets(androidx.core.view.WindowInsetsCompat.Type.statusBars()).top;
+                v.getLayoutParams().height = sbHeight;
+                v.setLayoutParams(v.getLayoutParams());
+                return insets;
+            });
+            vStatusBarOverlay.requestApplyInsets();
+        }
+        androidx.core.widget.NestedScrollView nsvLib = view.findViewById(R.id.nsvLibraryContent);
+        if (nsvLib != null) {
+            nsvLib.setOnScrollChangeListener((androidx.core.widget.NestedScrollView.OnScrollChangeListener)
+                (v, scrollX, scrollY, oldScrollX, oldScrollY) -> {
+                    if (vStatusBarOverlay == null) return;
+                    View target = view.findViewById(R.id.llLibraryHeaderRow);
+                    if (target == null) return;
+                    float triggerY = target.getTop();
+                    float fraction = triggerY <= 0f ? 1f : Math.min(1f, Math.max(0f, scrollY / triggerY));
+                    vStatusBarOverlay.setAlpha(fraction);
+                });
+        }
         adapter = new MusicResultsAdapter(this::openTrack, this::onMusicResultMoreClicked);
         musicResultsLayoutManager = new LinearLayoutManager(requireContext());
         rvMusicResults.setLayoutManager(musicResultsLayoutManager);
-        rvMusicResults.setHasFixedSize(true);
+        rvMusicResults.setHasFixedSize(false);
         rvMusicResults.setItemViewCacheSize(5);
         rvMusicResults.setItemAnimator(null);
         rvMusicResults.setAdapter(adapter);
@@ -808,9 +847,6 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         });
         updateYoutubeButtonLabel();
 
-        // Restore mini-player BEFORE first render so it's immediately usable
-        maybeRestoreHiddenMiniPlayerFromPausedSnapshot();
-
         switchScreen(ScreenMode.LIBRARY);
         if (!isPlaylistDetailStatePending()) {
             persistStreamingScreen(STREAM_SCREEN_LIBRARY);
@@ -820,6 +856,12 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         // so a download already RUNNING on cold start is reflected in the tiles right away
         // instead of after the 800ms defer.
         startObservingOfflineQueue();
+
+        // Defer mini-player restore so it doesn't block first frame (SongPlayerFragment inflate is heavy)
+        view.postDelayed(() -> {
+            if (!isAdded() || isRemoving() || isDetached()) return;
+            maybeRestoreHiddenMiniPlayerFromPausedSnapshot();
+        }, 200L);
 
         // Defer non-critical work
         view.postDelayed(() -> {
@@ -849,8 +891,10 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         }
 
         refreshFragHeaderProfilePhoto();
+        updateLibraryBackdropImage();
         refreshCurrentPlayingPlaylistState();
-        if (adapter != null) {
+        if (snapshotOfflineRecalcDirty && adapter != null) {
+            snapshotOfflineRecalcDirty = false;
             adapter.invalidatePlaylistOfflineState(null);
         }
         maybeRestoreHiddenMiniPlayerFromPausedSnapshot();
@@ -873,6 +917,14 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     }
     public void scrollToTop() {
         pendingScrollToTop = true;
+        View v = getView();
+        if (v != null) {
+            androidx.core.widget.NestedScrollView nsv = v.findViewById(R.id.nsvLibraryContent);
+            if (nsv != null) {
+                nsv.post(() -> nsv.scrollTo(0, 0));
+                return;
+            }
+        }
         if (rvMusicResults != null && musicResultsLayoutManager != null) {
             rvMusicResults.post(() -> {
                 if (rvMusicResults != null) musicResultsLayoutManager.scrollToPositionWithOffset(0, 0);
@@ -888,9 +940,12 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         refreshFragHeaderProfilePhoto();
         scrollToTop();
         refreshCurrentPlayingPlaylistState();
-        if (adapter != null) {
+        // Only force full offline invalidate if snapshot events were deferred while hidden
+        if (snapshotOfflineRecalcDirty && adapter != null) {
+            snapshotOfflineRecalcDirty = false;
             adapter.invalidatePlaylistOfflineState(null);
         }
+        flushDeferredOfflineWork();
         maybeRestoreHiddenMiniPlayerFromPausedSnapshot();
         maybeSyncLibraryIfAuthorized();
         // Defer expensive offline work
@@ -899,6 +954,23 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             startObservingOfflineQueue();
             maybeEnqueueNextOfflineAutoPlaylist();
         }, 400L);
+    }
+
+    private void flushDeferredOfflineWork() {
+        if (!isAdded()) return;
+        if (pendingDownloadProgressDispatch) {
+            dispatchMergedDownloadProgress();
+        }
+        if (!pendingOfflineStateRefreshWhenVisible.isEmpty() && adapter != null) {
+            for (String pid : pendingOfflineStateRefreshWhenVisible) {
+                adapter.invalidatePlaylistOfflineState(pid, true);
+            }
+            pendingOfflineStateRefreshWhenVisible.clear();
+        }
+        if (offlineAutoQueueDirty) {
+            offlineAutoQueueDirty = false;
+            maybeEnqueueNextOfflineAutoPlaylist();
+        }
     }
 
     private void setupFragBrandHeader(@NonNull View root) {
@@ -1386,10 +1458,27 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         // the user has successfully logged in via the web session.
         if (isAdded()) {
             ((SleppifyApp) requireContext().getApplicationContext()).performDeferredInit();
+            // Pre-initialize shared ExoPlayer on main thread immediately so it's
+            // ready when SongPlayerFragment.playCurrentTrack runs (~500ms later).
+            // This avoids the ExoPlayer init blocking the first playback frame.
+            requireView().post(() -> {
+                if (isAdded()) ExoPlayerManager.INSTANCE.initialize(requireContext());
+            });
         }
         // Activar inmediatamente la cookie en StreamResolver para que las
         // siguientes peticiones de resolución y playback estén autenticadas.
         StreamResolver.setAuthCookies(cookieHeader);
+        // Pre-resolve stream URLs for queued tracks so playback starts faster
+        if (isAdded()) {
+            PlaybackHistoryStore.Snapshot snap = PlaybackHistoryStore.load(requireContext());
+            if (!snap.queue.isEmpty()) {
+                java.util.List<String> ids = new java.util.ArrayList<>();
+                for (PlaybackHistoryStore.QueueTrack t : snap.queue) {
+                    ids.add(t.videoId);
+                }
+                StreamResolver.preResolveQueue(requireContext(), ids);
+            }
+        }
         streamingOauthCompleted = true;
         updateYoutubeButtonLabel();
         // Keep user-agent available for future web-session API extensions.
@@ -1829,6 +1918,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         }
         maybeEnqueueNextOfflineAutoPlaylist();
         maybeAppendCloudPlaylists();
+        updateLibraryBackdropImage();
     }
     private void showLibraryEmptyState() {
         if (tvLibraryTitle != null) tvLibraryTitle.setVisibility(View.GONE);
@@ -2664,7 +2754,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                         boolean gridJustResolved = false;
                         if (!playlistGridUrlsCache.containsKey(targetPlaylistId)) {
                             playlistGridUrlsCache.remove(targetPlaylistId);
-                            List<String> resolved = resolvePlaylistGridUrls(targetPlaylistId);
+                            List<String> resolved = resolveGridUrlsSync(targetPlaylistId, isYtPlaylist);
                             gridJustResolved = resolved.size() >= 4;
                         } else if (!isYtPlaylist) {
                             playlistGridUrlsCache.remove(targetPlaylistId);
@@ -4345,12 +4435,14 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         autoQueueDownloading.addAll(downloading);
         dispatchMergedDownloadProgress();
 
-        // Any playlist that just left the active set finished (or was cancelled) — force an
-        // immediate, un-throttled disk recompute so its tile flips to the check icon now.
-        if (adapter != null) {
-            for (String pid : previouslyDownloadingAuto) {
-                if (!downloading.contains(pid)) {
+        // Playlists that just finished: record them. If visible, refresh immediately;
+        // if hidden, defer until the fragment becomes visible again.
+        for (String pid : previouslyDownloadingAuto) {
+            if (!downloading.contains(pid)) {
+                if (!isHidden() && adapter != null) {
                     adapter.invalidatePlaylistOfflineState(pid, true);
+                } else {
+                    pendingOfflineStateRefreshWhenVisible.add(pid);
                 }
             }
         }
@@ -4362,7 +4454,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             }
             return;
         }
-        if (offlineQueueHadActiveWork && adapter != null) {
+        if (offlineQueueHadActiveWork && !isHidden() && adapter != null) {
             adapter.invalidatePlaylistOfflineState(null);
         }
         offlineQueueHadActiveWork = false;
@@ -4434,10 +4526,12 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         manualQueueDownloading.addAll(downloading);
         dispatchMergedDownloadProgress();
 
-        if (adapter != null) {
-            for (String pid : previouslyDownloadingManual) {
-                if (!downloading.contains(pid)) {
+        for (String pid : previouslyDownloadingManual) {
+            if (!downloading.contains(pid)) {
+                if (!isHidden() && adapter != null) {
                     adapter.invalidatePlaylistOfflineState(pid, true);
+                } else {
+                    pendingOfflineStateRefreshWhenVisible.add(pid);
                 }
             }
         }
@@ -4447,7 +4541,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             offlineManualQueueHadActiveWork = true;
             return;
         }
-        if (offlineManualQueueHadActiveWork && adapter != null) {
+        if (offlineManualQueueHadActiveWork && !isHidden() && adapter != null) {
             adapter.invalidatePlaylistOfflineState(null);
         }
         offlineManualQueueHadActiveWork = false;
@@ -4467,6 +4561,11 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     }
     private void dispatchMergedDownloadProgress() {
         if (adapter == null) return;
+        if (isHidden()) {
+            pendingDownloadProgressDispatch = true;
+            return;
+        }
+        pendingDownloadProgressDispatch = false;
         Map<String, Float> merged = new HashMap<>(autoQueueProgressByPlaylist);
         merged.putAll(manualQueueProgressByPlaylist);
         Set<String> mergedDownloading = new HashSet<>(autoQueueDownloading);
@@ -4569,6 +4668,10 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     }
     private void maybeEnqueueNextOfflineAutoPlaylist() {
         if (!isAdded()) return;
+        if (isHidden()) {
+            offlineAutoQueueDirty = true;
+            return;
+        }
         synchronized (fragmentLock) {
             if (isOfflineSyncInFlight || offlineAutoQueueScanInFlight) {
                 return;
@@ -4990,6 +5093,48 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             }
         }
 
+        // Cache miss: dispatch async resolution instead of blocking the UI thread
+        if (!gridUrlsAsyncInFlight.contains(playlistId) && !offlineStateExecutor.isShutdown()) {
+            gridUrlsAsyncInFlight.add(playlistId);
+            final Context appContext = isAdded() ? requireContext().getApplicationContext() : null;
+            final boolean ytPlaylist = isYouTubePlaylist;
+            offlineStateExecutor.execute(() -> {
+                if (appContext == null) {
+                    gridUrlsAsyncInFlight.remove(playlistId);
+                    return;
+                }
+                ArrayList<CachedPlaylistTrack> tracks = loadCachedPlaylistTracksForOffline(appContext, playlistId);
+                List<String> urls = new ArrayList<>(4);
+                Set<String> seen = new HashSet<>();
+                for (CachedPlaylistTrack t : tracks) {
+                    if (urls.size() >= 4) break;
+                    if (t == null || TextUtils.isEmpty(t.imageUrl)) continue;
+                    String url = t.imageUrl.trim();
+                    if (url.isEmpty() || !seen.add(url)) continue;
+                    urls.add(url);
+                }
+                final List<String> resolvedUrls = urls;
+                mainHandler.post(() -> {
+                    gridUrlsAsyncInFlight.remove(playlistId);
+                    if (resolvedUrls.size() >= 4) {
+                        playlistGridUrlsCache.put(playlistId, resolvedUrls);
+                        if (ytPlaylist && isAdded()) {
+                            persistGridUrls(playlistId, resolvedUrls);
+                        }
+                        if (adapter != null) {
+                            int pos = adapter.findPlaylistPositionById(playlistId);
+                            if (pos >= 0) {
+                                adapter.safeNotify(() -> adapter.notifyItemChanged(pos));
+                            }
+                        }
+                    }
+                });
+            });
+        }
+        return java.util.Collections.emptyList();
+    }
+    @NonNull
+    private List<String> resolveGridUrlsSync(@NonNull String playlistId, boolean isYouTubePlaylist) {
         ArrayList<CachedPlaylistTrack> tracks = loadCachedPlaylistTracksForOffline(playlistId);
         List<String> urls = new ArrayList<>(4);
         Set<String> seen = new HashSet<>();
@@ -5002,7 +5147,6 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         }
         if (urls.size() >= 4) {
             playlistGridUrlsCache.put(playlistId, urls);
-            // Persist for YouTube playlists so grid survives pull-to-refresh and restarts
             if (isYouTubePlaylist && isAdded()) {
                 persistGridUrls(playlistId, urls);
             }
@@ -5537,6 +5681,25 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 .setNegativeButton("Cancelar", null)
                 .show();
     }
+    // ========== Library Backdrop ==========
+
+    private void applyLibraryBackdropBlur() {
+        ImageView backdrop = ivLibraryBackdrop;
+        if (backdrop == null) return;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            backdrop.setRenderEffect(
+                android.graphics.RenderEffect.createBlurEffect(60f, 60f, android.graphics.Shader.TileMode.CLAMP)
+            );
+        }
+    }
+
+    public void updateLibraryBackdropImage() {
+        ImageView backdrop = ivLibraryBackdrop;
+        if (backdrop == null || !isAdded()) return;
+        backdrop.setImageDrawable(null);
+        backdrop.setBackgroundResource(R.drawable.bg_music_liked_gradient);
+    }
+
     @Override
     public void onDestroyView() {
         cancelPendingLibraryInlineSearch();
@@ -5546,6 +5709,8 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         normalizedFilterCache.evictAll();
         // Cancel ALL pending mainHandler callbacks to prevent leaks and stale UI updates
         mainHandler.removeCallbacksAndMessages(null);
+        ivLibraryBackdrop = null;
+        vStatusBarOverlay = null;
         PlaybackEventBus.removeListener(this);
         super.onDestroyView();
     }
@@ -5557,23 +5722,39 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         super.onDestroy();
     }
 
+    private final Runnable snapshotDebouncedFlushRunnable = () -> {
+        if (!isAdded() || isHidden() || !snapshotOfflineRecalcDirty) return;
+        snapshotOfflineRecalcDirty = false;
+        lastSnapshotHandledAtMs = android.os.SystemClock.elapsedRealtime();
+        refreshCurrentPlayingPlaylistState();
+        scheduleOfflineStateRecalc();
+    };
     @Override
     public void onPlaybackSnapshotUpdated() {
         if (isAdded() && getActivity() != null) {
             getActivity().runOnUiThread(() -> {
-                refreshCurrentPlayingPlaylistState();
+                if (!isAdded()) return;
                 syncPlaybackStateToAdapter();
-                // The offline download worker fires this per finished track and once on batch
-                // completion; recompute the tiles' offline state so the check icon flips live.
+                if (isHidden()) {
+                    snapshotOfflineRecalcDirty = true;
+                    return;
+                }
+                long now = android.os.SystemClock.elapsedRealtime();
+                if (now - lastSnapshotHandledAtMs < SNAPSHOT_UI_DEBOUNCE_MS) {
+                    snapshotOfflineRecalcDirty = true;
+                    mainHandler.removeCallbacks(snapshotDebouncedFlushRunnable);
+                    mainHandler.postDelayed(snapshotDebouncedFlushRunnable, SNAPSHOT_UI_DEBOUNCE_MS);
+                    return;
+                }
+                lastSnapshotHandledAtMs = now;
+                refreshCurrentPlayingPlaylistState();
                 scheduleOfflineStateRecalc();
             });
         }
     }
     private final Runnable offlineStateRecalcRunnable = () -> {
         if (isAdded() && adapter != null) {
-            // Forced (un-throttled) per the 5s full-invalidate gate, since this is a real state
-            // change (a track just finished), not spammy rebinding.
-            adapter.invalidatePlaylistOfflineState(null, true);
+            adapter.invalidatePlaylistOfflineState(null, false);
         }
     };
     private void scheduleOfflineStateRecalc() {

@@ -49,15 +49,6 @@
             android:layout_height="1dp"
             android:layout_weight="1" />
 
-        <ImageButton
-            android:id="@+id/btnPlayerMore"
-            android:layout_width="48dp"
-            android:layout_height="48dp"
-            android:background="?attr/selectableItemBackgroundBorderless"
-            android:contentDescription="Opciones"
-            android:padding="12dp"
-            android:src="@drawable/ic_more_vert"
-            app:tint="@color/text_primary" />
     </LinearLayout>
 
     <!-- Dummy invisible view to keep svSongPlayerContent ID alive for Java references -->
@@ -133,6 +124,7 @@
             android:focusable="true"
             android:focusableInTouchMode="true"
             android:fontFamily="sans-serif-black"
+            android:layerType="hardware"
             android:marqueeRepeatLimit="marquee_forever"
             android:scrollHorizontally="true"
             android:singleLine="true"
@@ -166,7 +158,7 @@
         android:scrollbars="none"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintBottom_toTopOf="@id/sbPlaybackProgress">
+        app:layout_constraintBottom_toTopOf="@id/flSeekBarContainer">
 
         <LinearLayout
             android:id="@+id/llSocialActionsRow"
@@ -330,19 +322,40 @@
         </LinearLayout>
     </HorizontalScrollView>
 
-    <SeekBar
-        android:id="@+id/sbPlaybackProgress"
+    <FrameLayout
+        android:id="@+id/flSeekBarContainer"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
-        android:minHeight="48dp"
         android:layout_marginTop="4dp"
         android:layout_marginHorizontal="24dp"
-        android:max="1000"
-        android:progress="0"
-        android:thumbTint="@color/stitch_blue"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintBottom_toTopOf="@id/tvCurrentTime" />
+        app:layout_constraintBottom_toTopOf="@id/tvCurrentTime">
+
+        <SeekBar
+            android:id="@+id/sbPlaybackProgress"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:minHeight="48dp"
+            android:max="1000"
+            android:progress="0"
+            android:thumb="@drawable/ic_seekbar_thumb"
+            android:thumbOffset="7dp"
+            android:splitTrack="false"
+            android:thumbTint="@android:color/transparent" />
+
+        <ProgressBar
+            android:id="@+id/pbSeekBarLoading"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="4dp"
+            android:layout_gravity="center_vertical"
+            android:paddingHorizontal="16dp"
+            android:indeterminate="true"
+            android:indeterminateTint="@color/stitch_blue"
+            android:visibility="gone" />
+
+    </FrameLayout>
 
     <TextView
         android:id="@+id/tvCurrentTime"

@@ -543,7 +543,7 @@ public class PlaylistDetailFragment extends Fragment
 
     @Override
     public void onPlaybackSnapshotUpdated() {
-        if (isAdded() && getActivity() != null) {
+        if (isAdded() && !isHidden() && getActivity() != null) {
             getActivity().runOnUiThread(this::syncTrackStateFromPlayer);
         }
     }

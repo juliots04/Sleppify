@@ -104,7 +104,7 @@ public class SongPlayerFragment extends Fragment {
     public static final String ARG_START_PLAYING = "arg_start_playing";
     public static final String ARG_IS_TEMPORARY_PLAYER = "arg_is_temporary_player";
 
-    private static final long PROGRESS_TICK_MS = 200L;
+    private static final long PROGRESS_TICK_MS = 500L;
     private static final String PREFS_PLAYER_STATE = AppConstants.PREFS_PLAYER_STATE;
     private static final String PREF_SOCIAL_STATS_PREFIX = "yt_social_stats_";
     private static final String PREF_LAST_PLAYLIST_ID = "stream_last_playlist_id";
@@ -166,8 +166,15 @@ public class SongPlayerFragment extends Fragment {
     private View llQueueTrigger;
     private View llPlayerNavBar;
     private ImageButton btnPlayerClose;
-    private ImageButton btnPlayerMore;
     private SeekBar sbPlaybackProgress;
+    @Nullable
+    private android.widget.ProgressBar pbSeekBarLoading;
+    @Nullable
+    private android.graphics.drawable.Drawable seekBarOriginalThumb;
+    private boolean seekBarThumbVisible = false;
+    private static final long SEEK_THUMB_HIDE_DELAY_MS = 2000L;
+    @Nullable
+    private android.animation.ValueAnimator seekThumbAnimator;
     private ImageButton btnShuffle;
     private ImageButton btnRepeat;
     private View vPlayerShuffleIndicator;
@@ -376,6 +383,8 @@ public class SongPlayerFragment extends Fragment {
         }
     };
     private long lastPlaybackStartRequestAtMs = 0L;
+    private long lastSnapshotDispatchedAtMs = 0L;
+    private static final long SNAPSHOT_DEBOUNCE_MS = 300L;
     private long lastPrevPressAtMs = 0L;
     private static final long PREV_DOUBLE_TAP_WINDOW_MS = 3000L;
     private static final int PREV_RESTART_THRESHOLD_SECONDS = 3;
@@ -507,6 +516,7 @@ public class SongPlayerFragment extends Fragment {
                                 currentPlaylistContextId.isEmpty() ? null : currentPlaylistContextId,
                                 currentPlaylistContextName.isEmpty() ? null : currentPlaylistContextName
                         );
+                        ListenHistoryStore.record(requireContext(), _t.videoId, _t.title, _t.artist, _t.imageUrl);
                     }
                 }
                 // The ticker fires 5x per second, so "% 5 == 0" alone re-persisted the whole
@@ -521,7 +531,7 @@ public class SongPlayerFragment extends Fragment {
                 Log.w(TAG, "Progress ticker error", e);
             }
 
-            localProgressHandler.postDelayed(this, 200L);
+            localProgressHandler.postDelayed(this, 500L);
         }
     };
 
@@ -657,6 +667,8 @@ public class SongPlayerFragment extends Fragment {
         tvCurrentTime = view.findViewById(R.id.tvCurrentTime);
         tvTotalTime = view.findViewById(R.id.tvTotalTime);
         sbPlaybackProgress = view.findViewById(R.id.sbPlaybackProgress);
+        pbSeekBarLoading = view.findViewById(R.id.pbSeekBarLoading);
+        seekBarOriginalThumb = null; // unused — thumb visibility controlled via tint alpha
         btnShuffle = view.findViewById(R.id.btnShuffle);
         btnRepeat = view.findViewById(R.id.btnRepeat);
         vPlayerShuffleIndicator = view.findViewById(R.id.vPlayerShuffleIndicator);
@@ -666,12 +678,8 @@ public class SongPlayerFragment extends Fragment {
         llQueueTrigger.setOnClickListener(v -> showQueueBottomSheet());
         llPlayerNavBar = view.findViewById(R.id.llPlayerNavBar);
         btnPlayerClose = view.findViewById(R.id.btnPlayerClose);
-        btnPlayerMore = view.findViewById(R.id.btnPlayerMore);
         if (btnPlayerClose != null) {
             btnPlayerClose.setOnClickListener(v -> collapseToMiniMode(true));
-        }
-        if (btnPlayerMore != null) {
-            btnPlayerMore.setOnClickListener(v -> showPlayerOptionsSheet());
         }
 
         // Apply status-bar inset to the internal nav bar so buttons sit below the status bar
@@ -692,8 +700,12 @@ public class SongPlayerFragment extends Fragment {
             llSimilarTrigger.setOnClickListener(v -> openRadioForCurrentTrack());
         }
 
+        // When created hidden (mini-player background restore), skip the entry animation
+        // delay and run both phases faster to start playback sooner.
+        final boolean createdHidden = isHidden();
+
         // ✅ PHASE 1: Lightweight UI wiring only — runs during first frame, no heavy I/O
-        view.post(() -> {
+        Runnable phase1 = () -> {
             if (!isAdded()) return;
 
             setupSwipeToDismiss(view);
@@ -703,6 +715,33 @@ public class SongPlayerFragment extends Fragment {
             btnShuffle.setOnClickListener(v -> toggleShuffleMode());
             btnRepeat.setOnClickListener(v -> cycleRepeatMode());
             btnPlayPause.setOnClickListener(v -> togglePlayback());
+
+            view.setOnTouchListener((v, event) -> {
+                if (event.getAction() == android.view.MotionEvent.ACTION_DOWN) {
+                    if (seekBarThumbVisible && sbPlaybackProgress != null) {
+                        int[] loc = new int[2];
+                        sbPlaybackProgress.getLocationOnScreen(loc);
+                        float x = event.getRawX(), y = event.getRawY();
+                        boolean overSeekBar = x >= loc[0] && x <= loc[0] + sbPlaybackProgress.getWidth()
+                                && y >= loc[1] && y <= loc[1] + sbPlaybackProgress.getHeight();
+                        if (!overSeekBar) {
+                            hideSeekBarThumb();
+                        }
+                    }
+                }
+                return false;
+            });
+
+            sbPlaybackProgress.setOnTouchListener((v, event) -> {
+                int action = event.getAction();
+                if (action == android.view.MotionEvent.ACTION_DOWN) {
+                    showSeekBarThumb();
+                } else if (action == android.view.MotionEvent.ACTION_UP
+                        || action == android.view.MotionEvent.ACTION_CANCEL) {
+                    scheduleSeekBarThumbHide();
+                }
+                return false;
+            });
 
             sbPlaybackProgress.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
                 @Override
@@ -717,11 +756,13 @@ public class SongPlayerFragment extends Fragment {
                 @Override
                 public void onStartTrackingTouch(SeekBar seekBar) {
                     userSeeking = true;
+                    showSeekBarThumb();
                 }
 
                 @Override
                 public void onStopTrackingTouch(SeekBar seekBar) {
                     userSeeking = false;
+                    scheduleSeekBarThumbHide();
                     lastSnapshotPersistSecond = -1;
                     cancelOfflineCrossfade();
                     if (localExoMediaPlayer != null) {
@@ -742,11 +783,10 @@ public class SongPlayerFragment extends Fragment {
                     }
                 }
             });
-        });
+        };
 
-        // ✅ PHASE 2: Heavy initialization — deferred until after entry animation (280ms) finishes
-        // SharedPreferences reads, track hydration, MediaSession, and playback start here
-        view.postDelayed(() -> {
+        // ✅ PHASE 2: Heavy initialization — SharedPreferences, track hydration, MediaSession, playback
+        Runnable phase2 = () -> {
             if (!isAdded()) return;
 
             playerStatePrefs = requireContext().getSharedPreferences(PREFS_PLAYER_STATE, Activity.MODE_PRIVATE);
@@ -769,7 +809,17 @@ public class SongPlayerFragment extends Fragment {
             currentIndex = Math.max(0, Math.min(currentIndex, tracks.size() - 1));
             bindCurrentTrack(true);
             playCurrentTrack();
-        }, 320L);
+        };
+
+        if (createdHidden) {
+            // Hidden path (mini-player restore): no entry animation, run immediately
+            phase1.run();
+            view.post(phase2);
+        } else {
+            // Visible path: defer to allow entry animation to complete
+            view.post(phase1);
+            view.postDelayed(phase2, 320L);
+        }
     }
 
     @Override
@@ -949,6 +999,9 @@ public class SongPlayerFragment extends Fragment {
         crossfadeManager.destroy();
         settingsPrefs = null;
         flPlayerHero = null;
+        if (seekThumbAnimator != null) { seekThumbAnimator.cancel(); seekThumbAnimator = null; }
+        sbPlaybackProgress = null;
+        pbSeekBarLoading = null;
         streamResolverExecutor.shutdownNow();
         backgroundExecutor.shutdownNow();
         backgroundDownloadExecutor.shutdownNow();
@@ -1125,8 +1178,19 @@ public class SongPlayerFragment extends Fragment {
         }
 
         if (fromCompletion && repeatMode == REPEAT_MODE_ONE) {
-            currentSeconds = Math.max(0, totalSeconds);
-            isPlaying = false;
+            // Repeat current track from the beginning
+            currentSeconds = 0;
+            isPlaying = true;
+            if (localExoMediaPlayer != null) {
+                try {
+                    localExoMediaPlayer.seekTo(0);
+                    if (!localExoMediaPlayer.isPlaying()) localExoMediaPlayer.start();
+                } catch (Exception e) {
+                    playCurrentTrack();
+                }
+            } else {
+                playCurrentTrack();
+            }
             updatePlayPauseIcon();
             updateMediaSessionState();
             syncMiniStateWithPlaylist();
@@ -1250,6 +1314,7 @@ public class SongPlayerFragment extends Fragment {
                     finished.imageUrl,
                     null, null
             );
+            ListenHistoryStore.record(requireContext(), finished.videoId, finished.title, finished.artist, finished.imageUrl);
         }
 
         moveTrack(1, true);
@@ -1624,7 +1689,7 @@ public class SongPlayerFragment extends Fragment {
                 releaseSingleExoMediaPlayer(adoptablePreBuffered);
                 adoptablePreBuffered = null;
             }
-            PlaybackLoadingBus.clearLoading();
+            PlaybackLoadingBus.notifyAudioConfirmed(track.videoId);
             bindCurrentTrackInternal(true, false); // Keep current time and UI intact
             usingOfflineSource = true;
             localSourcePreparing = false;
@@ -1782,6 +1847,7 @@ public class SongPlayerFragment extends Fragment {
         }
 
         PlaybackLoadingBus.notifyLoadingStarted(track.videoId);
+        updateSeekBarLoadingState();
         // Stop the previous track's audio/ticker immediately so a rapid skip does not keep the
         // OLD song playing (and the seekbar tracking it) during the async resolution window.
         // Pause rather than release: re-resolve/failure callers may still reference the player,
@@ -1816,8 +1882,8 @@ public class SongPlayerFragment extends Fragment {
                     if (!tryReresolveOrSkipCurrentTrack("No se pudo resolver el stream directo. Reintentando.", false)
                             && !isNetworkAvailable()) {
                         // Offline dead-end: tryReresolveOrSkipCurrentTrack returns false without
-                        // advancing or clearing the spinner. Clear it so loading does not hang.
-                        PlaybackLoadingBus.clearLoading();
+                        // advancing or clearing the spinner. Notify confirmed to dismiss spinner.
+                        PlaybackLoadingBus.notifyAudioConfirmed(track.videoId);
                     }
                 }
             });
@@ -1889,11 +1955,17 @@ public class SongPlayerFragment extends Fragment {
                     return;
                 }
 
-                java.io.File targetFile = OfflineAudioStore.getOfflineVideoFile(appContext, normalized);
-                int serverIndex = Math.abs(normalized.hashCode()) % SleppifyDownloaderResolver.SERVER_COUNT;
+                // Prefer direct CDN download (URL already resolved by NewPipe)
+                boolean ok = downloadDirectFromCdn(appContext, normalized);
 
-                boolean ok = SleppifyDownloaderResolver.INSTANCE.downloadVideoViaProxy(
-                        appContext, normalized, targetFile, serverIndex, null);
+                // Fallback to proxy if direct download failed
+                if (!ok) {
+                    java.io.File targetFile = OfflineAudioStore.getOfflineVideoFile(appContext, normalized);
+                    int serverIndex = Math.abs(normalized.hashCode()) % SleppifyDownloaderResolver.SERVER_COUNT;
+                    ok = SleppifyDownloaderResolver.INSTANCE.downloadVideoViaProxy(
+                            appContext, normalized, targetFile, serverIndex, null);
+                    if (!ok && targetFile.isFile()) targetFile.delete();
+                }
 
                 if (ok) {
                     OfflineAudioStore.markOfflineAudioState(normalized, true);
@@ -1911,7 +1983,6 @@ public class SongPlayerFragment extends Fragment {
                     });
                 } else {
                     OfflineAudioStore.markOfflineAudioState(normalized, false);
-                    if (targetFile.isFile()) targetFile.delete();
                 }
             } catch (Exception e) {
                 Log.w(TAG, "stream-as-download: failed " + normalized + " " + e.getMessage());
@@ -1921,6 +1992,69 @@ public class SongPlayerFragment extends Fragment {
                 }
             }
         });
+    }
+
+    /**
+     * Downloads audio directly from the CDN URL cached by StreamResolver (NewPipe).
+     * Returns true if the file was saved successfully.
+     */
+    private boolean downloadDirectFromCdn(@NonNull Context context, @NonNull String videoId) {
+        try {
+            String cdnUrl = StreamResolver.resolveStreamUrl(context, videoId);
+            if (TextUtils.isEmpty(cdnUrl)) return false;
+
+            // Determine extension from URL content type or default to m4a
+            boolean isWebm = cdnUrl.contains("mime=audio%2Fwebm") || cdnUrl.contains("mime=audio/webm");
+            java.io.File targetFile = OfflineAudioStore.getOfflineAudioFileForFormat(context, videoId, isWebm);
+            java.io.File tempFile = new java.io.File(targetFile.getAbsolutePath() + ".tmp");
+            if (tempFile.isFile()) tempFile.delete();
+            targetFile.getParentFile().mkdirs();
+
+            Map<String, String> headers = StreamResolver.getHeadersFor(videoId);
+            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) new java.net.URL(cdnUrl).openConnection();
+            conn.setConnectTimeout(15_000);
+            conn.setReadTimeout(30_000);
+            for (Map.Entry<String, String> h : headers.entrySet()) {
+                conn.setRequestProperty(h.getKey(), h.getValue());
+            }
+
+            int code = conn.getResponseCode();
+            if (code < 200 || code >= 300) {
+                conn.disconnect();
+                Log.w(TAG, "cdn-download: HTTP " + code + " for " + videoId);
+                return false;
+            }
+
+            try (java.io.InputStream in = conn.getInputStream();
+                 java.io.FileOutputStream out = new java.io.FileOutputStream(tempFile)) {
+                byte[] buf = new byte[16384];
+                int read;
+                while ((read = in.read(buf)) != -1) {
+                    out.write(buf, 0, read);
+                }
+                out.flush();
+            } finally {
+                conn.disconnect();
+            }
+
+            if (tempFile.length() < 24 * 1024) {
+                tempFile.delete();
+                Log.w(TAG, "cdn-download: file too small for " + videoId);
+                return false;
+            }
+
+            if (targetFile.isFile()) targetFile.delete();
+            boolean renamed = tempFile.renameTo(targetFile);
+            if (!renamed) {
+                tempFile.delete();
+                return false;
+            }
+            Log.d(TAG, "cdn-download: saved " + videoId + " (" + targetFile.length() / 1024 + " KB)");
+            return true;
+        } catch (Exception e) {
+            Log.w(TAG, "cdn-download: failed " + videoId + " " + e.getMessage());
+            return false;
+        }
     }
 
     private boolean isGaplessPlaybackEnabled() {
@@ -2261,6 +2395,7 @@ public class SongPlayerFragment extends Fragment {
         player.setOnPreparedListener(mp -> {
             cancelSourcePrepareTimeout();
             localSourcePreparing = false;
+            updateSeekBarLoadingState();
 
             Log.d(TAG, "[PLAYBACK_DBG] onPrepared fired for videoId=" + track.videoId
                     + " isAdded=" + isAdded()
@@ -2335,6 +2470,12 @@ public class SongPlayerFragment extends Fragment {
                     onFailure.run();
                     return;
                 }
+            }
+
+            // Always clear loading state once prepared, even if not auto-starting.
+            // This ensures the mini-player spinner is dismissed.
+            if (!LocalFilesStore.isLocalVideoId(track.videoId)) {
+                PlaybackLoadingBus.notifyAudioConfirmed(track.videoId);
             }
 
             setPlaybackUiForPreparedSource();
@@ -3390,30 +3531,42 @@ public class SongPlayerFragment extends Fragment {
     }
 
     private String getHdImageUrl(String url, String videoId) {
+        boolean limitData = shouldLimitImageQuality();
         if (TextUtils.isEmpty(url)) {
             if (!TextUtils.isEmpty(videoId)) {
-                return "https://i.ytimg.com/vi/" + videoId + "/hq720.jpg";
+                return "https://i.ytimg.com/vi/" + videoId + (limitData ? "/hqdefault.jpg" : "/hq720.jpg");
             }
             return "";
         }
         // If it is a Google user content URL (YouTube Music thumbnail)
         if (url.contains("googleusercontent.com") || url.contains("ggpht.com")) {
-            String hdUrl = url.replaceAll("=[ws]\\d+(-[ws]\\d+)*.*", "=w720-h720-l90-rj");
-            if (!hdUrl.contains("=w720")) {
-                hdUrl = url + "=w720-h720-l90-rj";
+            String suffix = limitData ? "=w360-h360-l90-rj" : "=w720-h720-l90-rj";
+            String hdUrl = url.replaceAll("=[ws]\\d+(-[ws]\\d+)*.*", suffix);
+            if (!hdUrl.contains(limitData ? "=w360" : "=w720")) {
+                hdUrl = url + suffix;
             }
             return hdUrl;
         }
         // If it is a standard YouTube thumbnail URL
         if (url.contains("i.ytimg.com") || url.contains("img.youtube.com")) {
             if (!TextUtils.isEmpty(videoId)) {
-                return "https://i.ytimg.com/vi/" + videoId + "/hq720.jpg";
+                return "https://i.ytimg.com/vi/" + videoId + (limitData ? "/hqdefault.jpg" : "/hq720.jpg");
             }
-            return url.replace("default.jpg", "hq720.jpg")
-                      .replace("mqdefault.jpg", "hq720.jpg")
-                      .replace("hqdefault.jpg", "hq720.jpg");
+            String target = limitData ? "hqdefault.jpg" : "hq720.jpg";
+            return url.replace("default.jpg", target)
+                      .replace("mqdefault.jpg", target)
+                      .replace("hqdefault.jpg", target);
         }
         return url;
+    }
+
+    private boolean shouldLimitImageQuality() {
+        if (getContext() == null) return false;
+        android.content.SharedPreferences prefs = getContext().getSharedPreferences(
+                AppConstants.PREFS_SETTINGS, android.content.Context.MODE_PRIVATE);
+        boolean limitMobile = prefs.getBoolean(CloudSyncManager.KEY_LIMIT_MOBILE_DATA, false);
+        if (!limitMobile) return false;
+        return !StreamResolver.isOnWifi(getContext());
     }
 
     /** Applies the hero's aspect ratio + chrome for a given cover aspect, in one shot. Wide art
@@ -4620,7 +4773,9 @@ public class SongPlayerFragment extends Fragment {
     }
 
     /** Probes the offline file for a real video track (cached). Returns false for online-only or
-     *  audio-only (plain song) offline files, so those present as music. */
+     *  audio-only (plain song) offline files, so those present as music.
+     *  If the result is not yet cached, the probe is dispatched to backgroundExecutor and
+     *  false is returned immediately so the main thread is never blocked on disk I/O. */
     private boolean offlineFileHasVideoTrack(@Nullable String videoId) {
         if (TextUtils.isEmpty(videoId) || !isAdded()) return false;
         Boolean cached = offlineVideoProbeCache.get(videoId);
@@ -4632,21 +4787,34 @@ public class SongPlayerFragment extends Fragment {
             return false;
         }
 
-        boolean hasVideo = false;
-        android.media.MediaExtractor extractor = new android.media.MediaExtractor();
-        try {
-            extractor.setDataSource(file.getAbsolutePath());
-            for (int i = 0; i < extractor.getTrackCount(); i++) {
-                String mime = extractor.getTrackFormat(i).getString(android.media.MediaFormat.KEY_MIME);
-                if (mime != null && mime.startsWith("video/")) { hasVideo = true; break; }
+        final String probeVideoId = videoId;
+        final String filePath = file.getAbsolutePath();
+        backgroundExecutor.execute(() -> {
+            boolean hasVideo = false;
+            android.media.MediaExtractor extractor = new android.media.MediaExtractor();
+            try {
+                extractor.setDataSource(filePath);
+                for (int i = 0; i < extractor.getTrackCount(); i++) {
+                    String mime = extractor.getTrackFormat(i).getString(android.media.MediaFormat.KEY_MIME);
+                    if (mime != null && mime.startsWith("video/")) { hasVideo = true; break; }
+                }
+            } catch (Exception e) {
+                hasVideo = false;
+            } finally {
+                try { extractor.release(); } catch (Exception ignored) {}
             }
-        } catch (Exception e) {
-            hasVideo = false;
-        } finally {
-            try { extractor.release(); } catch (Exception ignored) {}
-        }
-        offlineVideoProbeCache.put(videoId, hasVideo);
-        return hasVideo;
+            final boolean result = hasVideo;
+            offlineVideoProbeCache.put(probeVideoId, result);
+            localProgressHandler.post(() -> {
+                if (!isAdded()) return;
+                if (currentIndex >= 0 && currentIndex < tracks.size()
+                        && TextUtils.equals(tracks.get(currentIndex).videoId, probeVideoId)
+                        && TextUtils.equals(loadedVideoId, probeVideoId)) {
+                    updatePlayerSurfaceForSource();
+                }
+            });
+        });
+        return false;
     }
 
     private void updatePlayerSurfaceForSource() {
@@ -4912,6 +5080,75 @@ public class SongPlayerFragment extends Fragment {
         
         if (animatedEqPlayer != null) {
             animatedEqPlayer.setAnimating(isEffectivePlaying());
+        }
+        updateSeekBarLoadingState();
+    }
+
+    private void showSeekBarThumb() {
+        if (sbPlaybackProgress == null) return;
+        localProgressHandler.removeCallbacks(seekBarThumbHideRunnable);
+        if (seekBarThumbVisible) return;
+        seekBarThumbVisible = true;
+        sbPlaybackProgress.setThumbTintList(android.content.res.ColorStateList.valueOf(
+                requireContext().getColor(R.color.stitch_blue)));
+        animateSeekThumbScale(0f, 1f, 150);
+    }
+
+    private void hideSeekBarThumb() {
+        if (sbPlaybackProgress == null) return;
+        localProgressHandler.removeCallbacks(seekBarThumbHideRunnable);
+        seekBarThumbVisible = false;
+        animateSeekThumbScale(1f, 0f, 250);
+    }
+
+    private void animateSeekThumbScale(float fromScale, float toScale, long durationMs) {
+        if (sbPlaybackProgress == null) return;
+        if (seekThumbAnimator != null) seekThumbAnimator.cancel();
+        final android.graphics.drawable.Drawable thumb = sbPlaybackProgress.getThumb();
+        if (thumb == null) return;
+        final int fullSize = (int) (14 * getResources().getDisplayMetrics().density);
+        final int half = fullSize / 2;
+        seekThumbAnimator = android.animation.ValueAnimator.ofFloat(fromScale, toScale);
+        seekThumbAnimator.setDuration(durationMs);
+        seekThumbAnimator.setInterpolator(new android.view.animation.OvershootInterpolator(1.5f));
+        seekThumbAnimator.addUpdateListener(anim -> {
+            if (sbPlaybackProgress == null) return;
+            float s = (float) anim.getAnimatedValue();
+            int half2 = Math.round(half * s);
+            thumb.setBounds(-half2, -half2, half2, half2);
+            sbPlaybackProgress.invalidate();
+        });
+        if (toScale == 0f) {
+            seekThumbAnimator.addListener(new android.animation.AnimatorListenerAdapter() {
+                @Override
+                public void onAnimationEnd(android.animation.Animator animation) {
+                    if (sbPlaybackProgress == null) return;
+                    sbPlaybackProgress.setThumbTintList(
+                            android.content.res.ColorStateList.valueOf(android.graphics.Color.TRANSPARENT));
+                    thumb.setBounds(-half, -half, half, half);
+                }
+            });
+        }
+        seekThumbAnimator.start();
+    }
+
+    private void scheduleSeekBarThumbHide() {
+        localProgressHandler.removeCallbacks(seekBarThumbHideRunnable);
+        localProgressHandler.postDelayed(seekBarThumbHideRunnable, SEEK_THUMB_HIDE_DELAY_MS);
+    }
+
+    private final Runnable seekBarThumbHideRunnable = this::hideSeekBarThumb;
+
+    private void updateSeekBarLoadingState() {
+        if (sbPlaybackProgress == null) return;
+        boolean loading = localSourcePreparing || hasPendingStreamResolution();
+        sbPlaybackProgress.setEnabled(!loading);
+        if (loading) {
+            hideSeekBarThumb();
+            if (pbSeekBarLoading != null) pbSeekBarLoading.setVisibility(View.VISIBLE);
+        } else {
+            if (pbSeekBarLoading != null) pbSeekBarLoading.setVisibility(View.GONE);
+            // Don't force-show thumb here — it appears only on user touch
         }
     }
 
@@ -5228,6 +5465,14 @@ public class SongPlayerFragment extends Fragment {
     private void persistPlaybackSnapshot(boolean forcePaused, boolean synchronous) {
         if (!isAdded() || tracks.isEmpty()) {
             return;
+        }
+
+        if (!forcePaused && !synchronous) {
+            long now = android.os.SystemClock.elapsedRealtime();
+            if (now - lastSnapshotDispatchedAtMs < SNAPSHOT_DEBOUNCE_MS) {
+                return;
+            }
+            lastSnapshotDispatchedAtMs = now;
         }
 
         final List<PlayerTrack> tracksCopy = new ArrayList<>(tracks);
@@ -5579,119 +5824,6 @@ public class SongPlayerFragment extends Fragment {
         }
     }
 
-    private void showPlayerOptionsSheet() {
-        if (!isAdded() || btnPlayerMore == null) return;
-
-        float density = getResources().getDisplayMetrics().density;
-
-        // Root container — vertical, solid black
-        android.widget.LinearLayout root = new android.widget.LinearLayout(requireContext());
-        root.setOrientation(android.widget.LinearLayout.VERTICAL);
-        root.setBackgroundResource(R.drawable.bg_popup_menu);
-        root.setClipToOutline(true);
-        root.setOutlineProvider(new android.view.ViewOutlineProvider() {
-            @Override
-            public void getOutline(View view, android.graphics.Outline outline) {
-                outline.setRoundRect(0, 0, view.getWidth(), view.getHeight(), 14 * density);
-            }
-        });
-        int padV = (int) (4 * density);
-        root.setPadding(0, padV, 0, padV);
-
-        // Menu items
-        int[] icons = { R.drawable.ic_equalizer };
-        String[] labels = { "Ecualizador" };
-        Runnable[] actions = {
-                () -> {
-                    if (getActivity() instanceof MainActivity) {
-                        ((MainActivity) getActivity()).openEqualizerFromPlayer();
-                    }
-                },
-        };
-
-        android.widget.PopupWindow popup = new android.widget.PopupWindow(
-                root,
-                android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
-                android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
-                false);
-        popup.setFocusable(false);
-        popup.setOutsideTouchable(true);
-        popup.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(android.graphics.Color.TRANSPARENT));
-        popup.setElevation(16 * density);
-        popup.setTouchInterceptor((v, event) -> {
-            if (event.getActionMasked() == MotionEvent.ACTION_OUTSIDE) {
-                popup.dismiss();
-                return true;
-            }
-            return false;
-        });
-
-        for (int i = 0; i < labels.length; i++) {
-            android.widget.LinearLayout row = new android.widget.LinearLayout(requireContext());
-            row.setOrientation(android.widget.LinearLayout.HORIZONTAL);
-            row.setGravity(android.view.Gravity.CENTER_VERTICAL);
-            row.setBackgroundResource(R.drawable.bg_popup_item_ripple);
-            row.setClickable(true);
-            row.setFocusable(true);
-            int rowHPad = (int) (14 * density);
-            int rowVPad = (int) (12 * density);
-            row.setPadding(rowHPad, rowVPad, rowHPad, rowVPad);
-
-            ImageView icon = new ImageView(requireContext());
-            icon.setImageResource(icons[i]);
-            icon.setColorFilter(0xFFFFFFFF);
-            int iconSize = (int) (18 * density);
-            android.widget.LinearLayout.LayoutParams iconLp =
-                    new android.widget.LinearLayout.LayoutParams(iconSize, iconSize);
-            icon.setLayoutParams(iconLp);
-            row.addView(icon);
-
-            TextView label = new TextView(requireContext());
-            label.setText(labels[i]);
-            label.setTextColor(0xFFFFFFFF);
-            label.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 13f);
-            label.setTypeface(android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL));
-            label.setMaxLines(1);
-            label.setEllipsize(android.text.TextUtils.TruncateAt.END);
-            android.widget.LinearLayout.LayoutParams labelLp =
-                    new android.widget.LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.WRAP_CONTENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT);
-            labelLp.setMarginStart((int) (10 * density));
-            label.setLayoutParams(labelLp);
-            row.addView(label);
-
-            final int idx = i;
-            row.setOnClickListener(v -> {
-                popup.dismiss();
-                btnPlayerMore.postDelayed(() -> actions[idx].run(), 120);
-            });
-
-            root.addView(row);
-        }
-
-        // Start invisible — animate after shown
-        root.setScaleX(0.7f);
-        root.setScaleY(0.7f);
-        root.setAlpha(0f);
-
-        // Position: drop down below the button, right-aligned
-        int yOff = (int) (4 * density);
-        popup.showAsDropDown(btnPlayerMore, 0, yOff, android.view.Gravity.END | android.view.Gravity.TOP);
-
-        // Scale from top-right corner (set pivot after layout)
-        root.post(() -> {
-            root.setPivotX(root.getWidth());
-            root.setPivotY(0);
-            root.animate()
-                    .scaleX(1f)
-                    .scaleY(1f)
-                    .alpha(1f)
-                    .setDuration(180)
-                    .setInterpolator(new android.view.animation.DecelerateInterpolator(2.5f))
-                    .start();
-        });
-
-        popup.setOnDismissListener(() -> {});
-    }
 
     private void showSaveToPlaylistSheetFromPlayer() {
         if (!isAdded() || tracks.isEmpty() || currentIndex < 0 || currentIndex >= tracks.size()) return;

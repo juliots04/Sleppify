@@ -116,11 +116,11 @@
         android:layout_width="0dp"
         android:layout_height="0dp"
         android:background="@color/surface_dark"
-        android:elevation="35dp"
+        android:elevation="7dp"
         android:visibility="gone"
         android:clickable="true"
         android:focusable="true"
-        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintBottom_toTopOf="@id/llGlobalMiniPlayer"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toTopOf="parent">

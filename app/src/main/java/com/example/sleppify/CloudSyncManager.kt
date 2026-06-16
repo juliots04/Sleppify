@@ -138,6 +138,12 @@ class CloudSyncManager private constructor(context: Context) {
             string(KEY_OFFLINE_DOWNLOAD_QUALITY, DOWNLOAD_QUALITY_HIGH)
             bool(KEY_OFFLINE_DOWNLOAD_ALLOW_MOBILE_DATA, false)
             bool(KEY_OFFLINE_MODE_ENABLED, false)
+            string(KEY_STREAMING_QUALITY_WIFI, STREAMING_QUALITY_MEDIUM)
+            string(KEY_STREAMING_QUALITY_MOBILE, STREAMING_QUALITY_MEDIUM)
+            bool(KEY_LIMIT_MOBILE_DATA, false)
+            bool(KEY_WIFI_ONLY_PLAYBACK, false)
+            bool(KEY_NO_MUSIC_VIDEOS, true)
+            bool(KEY_NO_PODCAST_VIDEOS, false)
         }
     }
 
@@ -267,6 +273,29 @@ class CloudSyncManager private constructor(context: Context) {
         syncSettingsFromCloudThenLocal(pending)
         syncStreamingFavoritesFromCloudThenLocal(pending)
         syncPlaylistOverridesFromCloudThenLocal(pending)
+
+        // Hydrate shortcuts grid (fire-and-forget, non-blocking)
+        fetchCloudShortcuts(appContext) { cloudEntries ->
+            if (cloudEntries.isNotEmpty()) {
+                PlayCountStore.importFromJson(appContext, org.json.JSONArray().apply {
+                    for (e in cloudEntries) {
+                        put(org.json.JSONObject().apply {
+                            put("videoId", e.videoId)
+                            put("title", e.title)
+                            put("artist", e.artist)
+                            put("imageUrl", e.imageUrl)
+                            put("playlistId", e.playlistId)
+                            put("playlistName", e.playlistName)
+                            put("count", e.count)
+                            put("lastPlayedAtMs", e.lastPlayedAtMs)
+                        })
+                    }
+                })
+            }
+        }
+
+        // Hydrate listen history (fire-and-forget, non-blocking)
+        fetchCloudListenHistory(appContext)
     }
 
     fun onUserSignedOut() {
@@ -1338,6 +1367,109 @@ class CloudSyncManager private constructor(context: Context) {
             .addOnFailureListener { e -> Log.e(TAG, "Error fetching cloud play counts", e) }
     }
 
+    fun syncListenHistoryToCloud(context: Context) {
+        val uid = activeUserId
+        if (uid.isNullOrEmpty()) return
+        val entries = ListenHistoryStore.exportToJson(context)
+        val data = hashMapOf<String, Any>(
+            "entries" to entries.toString(),
+            FIELD_UPDATED_AT to com.google.firebase.firestore.FieldValue.serverTimestamp()
+        )
+        firestore.collection(USERS_COLLECTION).document(uid)
+            .collection(APP_SCOPE_COLLECTION).document(DOC_LISTEN_HISTORY)
+            .set(data, SetOptions.merge())
+            .addOnFailureListener { e -> Log.e(TAG, "Error syncing listen history", e) }
+    }
+
+    fun fetchCloudListenHistory(context: Context) {
+        val uid = activeUserId
+        if (uid.isNullOrEmpty()) return
+        firestore.collection(USERS_COLLECTION).document(uid)
+            .collection(APP_SCOPE_COLLECTION).document(DOC_LISTEN_HISTORY)
+            .get()
+            .addOnSuccessListener { doc ->
+                val raw = doc.getString("entries") ?: return@addOnSuccessListener
+                try {
+                    val arr = org.json.JSONArray(raw)
+                    ListenHistoryStore.importFromJson(context, arr)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error parsing cloud listen history", e)
+                }
+            }
+            .addOnFailureListener { e -> Log.e(TAG, "Error fetching cloud listen history", e) }
+    }
+
+    fun syncShortcutsToCloud(entries: List<PlayCountStore.PlayCountEntry>) {
+        val uid = activeUserId
+        if (uid.isNullOrEmpty() || entries.isEmpty()) return
+        val arr = org.json.JSONArray()
+        for (e in entries) {
+            arr.put(org.json.JSONObject().apply {
+                put("videoId", e.videoId)
+                put("title", e.title)
+                put("artist", e.artist)
+                put("imageUrl", e.imageUrl)
+                put("playlistId", e.playlistId)
+                put("playlistName", e.playlistName)
+                put("count", e.count)
+                put("lastPlayedAtMs", e.lastPlayedAtMs)
+            })
+        }
+        val data = hashMapOf<String, Any>(
+            "entries" to arr.toString(),
+            FIELD_UPDATED_AT to FieldValue.serverTimestamp()
+        )
+        firestore.collection(USERS_COLLECTION).document(uid)
+            .collection(APP_SCOPE_COLLECTION).document(DOC_SHORTCUTS)
+            .set(data, SetOptions.merge())
+            .addOnFailureListener { e -> Log.e(TAG, "Error syncing shortcuts", e) }
+    }
+
+    fun fetchCloudShortcuts(context: Context, callback: (List<PlayCountStore.PlayCountEntry>) -> Unit) {
+        val uid = activeUserId
+        if (uid.isNullOrEmpty()) {
+            callback(emptyList())
+            return
+        }
+        firestore.collection(USERS_COLLECTION).document(uid)
+            .collection(APP_SCOPE_COLLECTION).document(DOC_SHORTCUTS)
+            .get()
+            .addOnSuccessListener { doc ->
+                val raw = doc.getString("entries")
+                if (raw.isNullOrEmpty()) {
+                    callback(emptyList())
+                    return@addOnSuccessListener
+                }
+                try {
+                    val arr = org.json.JSONArray(raw)
+                    val result = mutableListOf<PlayCountStore.PlayCountEntry>()
+                    for (i in 0 until arr.length()) {
+                        val obj = arr.optJSONObject(i) ?: continue
+                        val videoId = obj.optString("videoId", "").trim()
+                        if (videoId.isEmpty()) continue
+                        result.add(PlayCountStore.PlayCountEntry(
+                            videoId = videoId,
+                            title = obj.optString("title", ""),
+                            artist = obj.optString("artist", ""),
+                            imageUrl = obj.optString("imageUrl", ""),
+                            playlistId = obj.optString("playlistId", ""),
+                            playlistName = obj.optString("playlistName", ""),
+                            count = obj.optInt("count", 1),
+                            lastPlayedAtMs = obj.optLong("lastPlayedAtMs", 0L)
+                        ))
+                    }
+                    callback(result)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error parsing cloud shortcuts", e)
+                    callback(emptyList())
+                }
+            }
+            .addOnFailureListener { e ->
+                Log.e(TAG, "Error fetching cloud shortcuts", e)
+                callback(emptyList())
+            }
+    }
+
     fun deleteCloudPlaylist(playlistName: String) {
         val uid = activeUserId
         if (uid.isNullOrEmpty()) return
@@ -1440,6 +1572,13 @@ class CloudSyncManager private constructor(context: Context) {
         @JvmField val DOWNLOAD_QUALITY_HIGH = "high"
         @JvmField val DOWNLOAD_QUALITY_VERY_HIGH = "very_high"
 
+        @JvmField val KEY_STREAMING_QUALITY_WIFI = "streaming_quality_wifi"
+        @JvmField val KEY_STREAMING_QUALITY_MOBILE = "streaming_quality_mobile"
+        @JvmField val KEY_LIMIT_MOBILE_DATA = "limit_mobile_data"
+        @JvmField val KEY_WIFI_ONLY_PLAYBACK = "wifi_only_playback"
+        @JvmField val KEY_NO_MUSIC_VIDEOS = "no_music_videos"
+        @JvmField val KEY_NO_PODCAST_VIDEOS = "no_podcast_videos"
+
         @JvmField val KEY_DOWNLOAD_CANVAS_ENABLED = "download_canvas_enabled"
         @JvmField val KEY_GAPLESS_PLAYBACK = "gapless_playback_enabled"
 
@@ -1449,6 +1588,8 @@ class CloudSyncManager private constructor(context: Context) {
         private const val DOC_SETTINGS = "settings"
         private const val DOC_STREAMING = "streaming"
         private const val DOC_PLAY_COUNTS = "play_counts"
+        private const val DOC_LISTEN_HISTORY = "listen_history"
+        private const val DOC_SHORTCUTS = "shortcuts"
         private const val COLLECTION_PLAYLISTS = "playlists"
         private const val COLLECTION_PLAYLIST_OVERRIDES = "playlist_overrides"
 

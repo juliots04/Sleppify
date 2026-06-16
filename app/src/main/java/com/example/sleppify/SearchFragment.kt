@@ -93,7 +93,7 @@ class SearchFragment : Fragment() {
     )
 
     private val youTubeMusicService = YouTubeMusicService()
-    private val normalizedFilterCache = mutableMapOf<String, String>()
+    private val normalizedFilterCache = java.util.concurrent.ConcurrentHashMap<String, String>()
     private val allTracks = mutableListOf<YouTubeMusicService.TrackResult>()
     private val tracks = mutableListOf<YouTubeMusicService.TrackResult>()
     private val recentSearchData = mutableListOf<RecentSearch>()
@@ -2434,7 +2434,7 @@ class SearchFragment : Fragment() {
         val norm = decomposed.filter { Character.getType(it) != Character.NON_SPACING_MARK.toInt() }.lowercase().trim()
         // Bounded eviction instead of wiping the whole cache once it grows large.
         if (normalizedFilterCache.size >= 256) {
-            normalizedFilterCache.keys.firstOrNull()?.let { normalizedFilterCache.remove(it) }
+            normalizedFilterCache.clear()
         }
         normalizedFilterCache[value] = norm
         return norm

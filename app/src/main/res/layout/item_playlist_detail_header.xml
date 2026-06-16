@@ -12,7 +12,7 @@
             android:id="@+id/flPlaylistHeaderContainer"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginBottom="-36dp"
+            android:layout_marginBottom="-24dp"
             android:clipChildren="false"
             android:clipToPadding="false">
 
@@ -41,8 +41,9 @@
             <View
                 android:id="@+id/vPlaylistBackdropBottomFade"
                 android:layout_width="0dp"
-                android:layout_height="280dp"
+                android:layout_height="320dp"
                 android:background="@drawable/bg_playlist_backdrop_bottom_fade"
+                android:layout_marginBottom="-40dp"
                 app:layout_constraintBottom_toBottomOf="parent"
                 app:layout_constraintEnd_toEndOf="parent"
                 app:layout_constraintStart_toStartOf="parent" />

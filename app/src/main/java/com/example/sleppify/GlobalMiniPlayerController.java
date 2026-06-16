@@ -67,6 +67,7 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
         ivArt = activity.findViewById(R.id.ivGlobalMiniPlayerArt);
         pbMiniLoading = activity.findViewById(R.id.pbMiniPlayerLoading);
         tvTitle = activity.findViewById(R.id.tvGlobalMiniPlayerTitle);
+        tvTitle.setSelected(true);
         tvSubtitle = activity.findViewById(R.id.tvGlobalMiniPlayerSubtitle);
         btnPlayPause = activity.findViewById(R.id.btnGlobalMiniPlayPause);
         sbProgress = activity.findViewById(R.id.sbGlobalMiniPlayerProgress);
@@ -96,6 +97,7 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
     @Override
     public void onPlaybackSnapshotUpdated() {
         if (activity.isFinishing() || activity.isDestroyed()) return;
+        if (activity.isSongPlayerVisible()) return;
         activity.runOnUiThread(this::updateUi);
     }
 
