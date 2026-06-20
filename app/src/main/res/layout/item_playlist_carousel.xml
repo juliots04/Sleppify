@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:paddingHorizontal="6dp">
+
+    <com.google.android.material.card.MaterialCardView
+        android:id="@+id/cardPlaylist"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        app:cardCornerRadius="16dp"
+        app:cardElevation="0dp"
+        app:strokeWidth="0dp"
+        android:clickable="false"
+        android:focusable="false">
+
+        <com.google.android.material.imageview.ShapeableImageView
+            android:id="@+id/ivPlaylistCover"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:adjustViewBounds="true"
+            android:scaleType="centerCrop"
+            android:background="@color/surface_high" />
+
+    </com.google.android.material.card.MaterialCardView>
+
+    <TextView
+        android:id="@+id/tvPlaylistName"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:paddingTop="12dp"
+        android:paddingBottom="2dp"
+        android:text="Playlist"
+        android:alpha="0.6"
+        android:textColor="@color/text_primary"
+        android:textSize="14sp"
+        android:textStyle="bold"
+        android:fontFamily="@font/inter_variable"
+        android:maxLines="2"
+        android:ellipsize="end"
+        android:includeFontPadding="false" />
+
+</LinearLayout>

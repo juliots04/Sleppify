@@ -1006,82 +1006,46 @@ class SearchFragment : Fragment() {
             return
         }
 
-        // First, try to find the track in a local playlist for full playlist playback
-        val videoId = track.videoId ?: ""
-        val playlistQueue = buildPlaylistQueueForTrack(videoId)
-
-        val tracksArray: JSONArray
-        if (playlistQueue.length() > 0) {
-            // Use the playlist queue (contains the full playlist starting from selected track)
-            tracksArray = playlistQueue
-        } else {
-            // Fall back to search results as queue
-            val allResults = listOfNotNull(featuredTrack) + tracks
-            val videoResults = allResults.filter { it.videoId?.isNotEmpty() == true }
-            tracksArray = JSONArray()
-            videoResults.forEach {
-                val obj = JSONObject()
-                obj.put("resultType", it.resultType)
-                obj.put("videoId", it.videoId)
-                obj.put("contentId", it.contentId)
-                obj.put("title", it.title)
-                obj.put("subtitle", it.subtitle)
-                obj.put("thumbnailUrl", it.thumbnailUrl)
-                tracksArray.put(obj)
-            }
-        }
-
-        val playbackIntent = Intent(requireContext(), MainActivity::class.java).apply {
-            action = MainActivity.ACTION_PLAY_FROM_SEARCH
-            putExtra(EXTRA_RESULT_TYPE, track.resultType ?: "")
-            putExtra(EXTRA_RESULT_VIDEO_ID, track.videoId ?: "")
-            putExtra(EXTRA_RESULT_CONTENT_ID, track.contentId ?: "")
-            putExtra(EXTRA_RESULT_TITLE, track.title ?: "")
-            putExtra(EXTRA_RESULT_SUBTITLE, extractArtistFromSubtitle(track.subtitle))
-            putExtra(EXTRA_RESULT_THUMBNAIL, track.thumbnailUrl ?: "")
-            putExtra(EXTRA_RESULT_TRACKS_JSON, tracksArray.toString())
-        }
-        
         // Save to recent searches only when user plays a track from search results
         if (activeSearchQuery.isNotEmpty()) {
             rememberRecentSearchQuery(activeSearchQuery, track)
         }
 
-        if (requireActivity() is MainActivity) {
-            (requireActivity() as MainActivity).handlePlayFromSearchIntent(playbackIntent)
-        }
+        playTrackDirectlyInternal(track)
     }
 
     private fun playTrackDirectly(track: YouTubeMusicService.TrackResult) {
+        playTrackDirectlyInternal(track)
+    }
+
+    /**
+     * Plays a track directly through SongPlayerFragment without routing through
+     * MainActivity (which would switch tabs to Biblioteca).
+     */
+    private fun playTrackDirectlyInternal(track: YouTubeMusicService.TrackResult) {
+        if (!isAdded || track.videoId.isNullOrEmpty()) return
+
+        // Try to find the track in a local playlist for full playlist playback
         val videoId = track.videoId ?: ""
-        val tracksArray = buildPlaylistQueueForTrack(videoId)
+        val playlistQueue = buildPlaylistQueueForTrack(videoId)
 
-        // If no playlist was found, fall back to just the single track
-        if (tracksArray.length() == 0) {
-            val obj = JSONObject()
-            obj.put("resultType", track.resultType)
-            obj.put("videoId", track.videoId)
-            obj.put("contentId", track.contentId)
-            obj.put("title", track.title)
-            obj.put("subtitle", extractArtistFromSubtitle(track.subtitle))
-            obj.put("thumbnailUrl", track.thumbnailUrl)
-            tracksArray.put(obj)
-        }
-
-        val cleanArtist = extractArtistFromSubtitle(track.subtitle)
-        val playbackIntent = Intent(requireContext(), MainActivity::class.java).apply {
-            action = MainActivity.ACTION_PLAY_FROM_SEARCH
-            putExtra(EXTRA_RESULT_TYPE, track.resultType ?: "")
-            putExtra(EXTRA_RESULT_VIDEO_ID, track.videoId ?: "")
-            putExtra(EXTRA_RESULT_CONTENT_ID, track.contentId ?: "")
-            putExtra(EXTRA_RESULT_TITLE, track.title ?: "")
-            putExtra(EXTRA_RESULT_SUBTITLE, cleanArtist)
-            putExtra(EXTRA_RESULT_THUMBNAIL, track.thumbnailUrl ?: "")
-            putExtra(EXTRA_RESULT_TRACKS_JSON, tracksArray.toString())
-        }
-
-        if (requireActivity() is MainActivity) {
-            (requireActivity() as MainActivity).handlePlayFromSearchIntent(playbackIntent)
+        if (playlistQueue.length() > 0) {
+            // Build TrackResult list from the playlist queue JSON
+            val queueTracks = mutableListOf<YouTubeMusicService.TrackResult>()
+            for (i in 0 until playlistQueue.length()) {
+                val obj = playlistQueue.getJSONObject(i)
+                queueTracks.add(YouTubeMusicService.TrackResult(
+                    obj.optString("resultType", "video"),
+                    obj.optString("videoId", ""),
+                    obj.optString("title", ""),
+                    obj.optString("subtitle", ""),
+                    obj.optString("thumbnailUrl", "")
+                ))
+            }
+            searchPlayTrackList(queueTracks, 0)
+        } else {
+            // No local playlist found — play the single track + fetch radio in background
+            searchPlayTrackWithRadio(track)
         }
     }
 
@@ -2300,15 +2264,11 @@ class SearchFragment : Fragment() {
             val current = snapshot.currentTrack()
             if (current != null) {
                 val artist = current.artist.trim()
-                val title = current.title.trim()
                 if (artist.isNotEmpty()) pool.add(artist)
-                if (title.isNotEmpty()) pool.add(title)
             }
             for (track in snapshot.queue) {
                 val artist = track.artist.trim()
-                val title = track.title.trim()
                 if (artist.isNotEmpty()) pool.add(artist)
-                if (title.isNotEmpty() && pool.size < 20) pool.add(title)
             }
             pool.toList().also { cachedSmartSuggestions = it }
         }
@@ -2680,6 +2640,56 @@ class SearchFragment : Fragment() {
         data class RecentImages(val items: List<RecentSearch>) : SuggestionItem()
     }
 
+    private fun improveHorizontalScrollDetection(recyclerView: RecyclerView?) {
+        if (recyclerView == null) return
+        try {
+            val touchSlopField = RecyclerView::class.java.getDeclaredField("mTouchSlop")
+            touchSlopField.isAccessible = true
+            val currentSlop = touchSlopField.getInt(recyclerView)
+            touchSlopField.setInt(recyclerView, (currentSlop * 0.5).toInt())
+
+            val halfSlop = android.view.ViewConfiguration.get(recyclerView.context).scaledTouchSlop / 2
+            recyclerView.addOnItemTouchListener(object : RecyclerView.OnItemTouchListener {
+                private var startX = 0f
+                private var startY = 0f
+                private var locked = false
+
+                override fun onInterceptTouchEvent(rv: RecyclerView, e: android.view.MotionEvent): Boolean {
+                    when (e.actionMasked) {
+                        android.view.MotionEvent.ACTION_DOWN -> {
+                            startX = e.x
+                            startY = e.y
+                            locked = false
+                            rv.parent?.requestDisallowInterceptTouchEvent(true)
+                        }
+                        android.view.MotionEvent.ACTION_MOVE -> {
+                            val dx = Math.abs(e.x - startX)
+                            val dy = Math.abs(e.y - startY)
+                            if (!locked) {
+                                if (dx > halfSlop && dx > dy * 0.6f) {
+                                    locked = true
+                                    rv.parent?.requestDisallowInterceptTouchEvent(true)
+                                } else if (dy > halfSlop && dy > dx) {
+                                    locked = false
+                                    rv.parent?.requestDisallowInterceptTouchEvent(false)
+                                }
+                            }
+                        }
+                        android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> {
+                            locked = false
+                            rv.parent?.requestDisallowInterceptTouchEvent(false)
+                        }
+                    }
+                    return false
+                }
+                override fun onTouchEvent(rv: RecyclerView, e: android.view.MotionEvent) {}
+                override fun onRequestDisallowInterceptTouchEvent(disallowIntercept: Boolean) {}
+            })
+        } catch (e: Exception) {
+            android.util.Log.e("SearchFragment", "Error improving horizontal scroll", e)
+        }
+    }
+
     private inner class SuggestionsAdapter(val onClick: (String) -> Unit) : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
         private val data = mutableListOf<SuggestionItem>()
 
@@ -2810,6 +2820,7 @@ class SearchFragment : Fragment() {
                             }
                         }.also {
                             vh.rv.layoutManager = LinearLayoutManager(vh.rv.context, LinearLayoutManager.HORIZONTAL, false)
+                            improveHorizontalScrollDetection(vh.rv)
                             vh.rv.adapter = it
                             vh.rv.itemAnimator = null
                         }
@@ -2938,6 +2949,114 @@ class SearchFragment : Fragment() {
             val image: ImageView = v.findViewById(R.id.ivRecentSearchImage)
             val loadingPlaceholder: View = v.findViewById(R.id.vLoadingPlaceholder)
             val title: TextView = v.findViewById(R.id.tvRecentSearchTitle)
+        }
+    }
+
+    // ========== Direct Playback Helpers ==========
+
+    private class SearchQueueData {
+        val ids = ArrayList<String>()
+        val titles = ArrayList<String>()
+        val artists = ArrayList<String>()
+        val durations = ArrayList<String>()
+        val images = ArrayList<String>()
+    }
+
+    private fun extractSearchQueueData(tracks: List<YouTubeMusicService.TrackResult>): SearchQueueData {
+        val data = SearchQueueData()
+        for (t in tracks) {
+            if (t.videoId.isNullOrEmpty()) continue
+            data.ids.add(t.videoId)
+            data.titles.add(t.title)
+            data.artists.add(t.subtitle ?: "")
+            data.durations.add("--:--")
+            data.images.add(t.thumbnailUrl ?: "")
+        }
+        return data
+    }
+
+    private fun findSongPlayerFragment(): SongPlayerFragment? {
+        return parentFragmentManager.findFragmentByTag("song_player") as? SongPlayerFragment
+    }
+
+    private fun showSongPlayerWithEnterAnimation(player: SongPlayerFragment) {
+        parentFragmentManager.beginTransaction()
+            .setReorderingAllowed(true)
+            .show(player)
+            .runOnCommit { player.externalAnimateEnterSlide() }
+            .commit()
+    }
+
+    private fun addSongPlayerWithEnterAnimation(player: SongPlayerFragment) {
+        parentFragmentManager.beginTransaction()
+            .setReorderingAllowed(true)
+            .add(R.id.playerContainer, player, "song_player")
+            .runOnCommit { player.externalAnimateEnterSlide() }
+            .commit()
+    }
+
+    private fun searchPlayTrackList(tracksList: List<YouTubeMusicService.TrackResult>, startIndex: Int) {
+        if (!isAdded || tracksList.isEmpty()) return
+        val data = extractSearchQueueData(tracksList)
+        if (data.ids.isEmpty()) return
+        val safeIndex = startIndex.coerceIn(0, data.ids.size - 1)
+
+        (activity as? MainActivity)?.getGlobalMiniPlayer()?.animateOut()
+
+        val existingPlayer = findSongPlayerFragment()
+        if (existingPlayer != null && existingPlayer.isAdded) {
+            existingPlayer.externalSetReturnTargetTag("module_search")
+            existingPlayer.externalReplaceQueue(data.ids, data.titles, data.artists, data.durations, data.images, safeIndex, true)
+            showSongPlayerWithEnterAnimation(existingPlayer)
+            return
+        }
+
+        val playerFragment = SongPlayerFragment.newInstance(data.ids, data.titles, data.artists, data.durations, data.images, safeIndex, true)
+        playerFragment.externalSetReturnTargetTag("module_search")
+        addSongPlayerWithEnterAnimation(playerFragment)
+    }
+
+    private fun searchPlayTrackWithRadio(track: YouTubeMusicService.TrackResult) {
+        if (!isAdded || track.videoId.isNullOrEmpty()) return
+
+        // 1. Play track immediately and open player
+        searchPlayTrackList(listOf(track), 0)
+
+        // 2. Fetch radio/mix in background
+        val cookie = getCookieHeader()
+        if (cookie.isNotEmpty()) {
+            val radioPlaylistId = "RDAMVM${track.videoId}"
+            val selectedVideoId = track.videoId
+            youTubeMusicService.fetchMixTracks(cookie, radioPlaylistId, object : YouTubeMusicService.MixTracksCallback {
+                override fun onSuccess(tracksList: List<YouTubeMusicService.TrackResult>) {
+                    if (!isAdded || tracksList.isEmpty()) return
+                    val radioList = mutableListOf(track)
+                    for (t in tracksList) { if (t.videoId != selectedVideoId) radioList.add(t) }
+
+                    findSongPlayerFragment()?.let { sp ->
+                        if (sp.isAdded) {
+                            val qd = extractSearchQueueData(radioList)
+                            if (qd.ids.isNotEmpty()) {
+                                sp.externalReplaceQueue(qd.ids, qd.titles, qd.artists, qd.durations, qd.images, 0, true)
+                            }
+                        }
+                    }
+
+                    val radioStoreTracks = mutableListOf<RadioHistoryStore.RadioTrack>()
+                    radioStoreTracks.add(RadioHistoryStore.RadioTrack(
+                        selectedVideoId,
+                        track.title.ifEmpty { "Tema" },
+                        track.subtitle ?: "",
+                        track.thumbnailUrl ?: ""
+                    ))
+                    for (t in tracksList) {
+                        if (t.videoId.isNullOrEmpty() || t.videoId == selectedVideoId) continue
+                        radioStoreTracks.add(RadioHistoryStore.RadioTrack(t.videoId, t.title ?: "", t.subtitle ?: "", t.thumbnailUrl ?: ""))
+                    }
+                    RadioHistoryStore.saveRadio(requireContext(), radioPlaylistId, track.title.ifEmpty { "Tema" }, track.thumbnailUrl ?: "", radioStoreTracks)
+                }
+                override fun onError(error: String) {}
+            })
         }
     }
 }

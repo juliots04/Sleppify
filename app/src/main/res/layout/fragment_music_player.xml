@@ -68,7 +68,7 @@
                 android:background="@android:color/transparent"
                 android:gravity="center_vertical"
                 android:orientation="horizontal"
-                android:paddingHorizontal="16dp"
+                android:paddingHorizontal="18dp"
                 android:paddingTop="0dp"
                 android:paddingBottom="4dp">
 
@@ -79,12 +79,11 @@
                     android:drawablePadding="10dp"
                     android:gravity="start|center_vertical"
                     android:minHeight="0dp"
-                    android:paddingStart="0dp"
                     android:paddingEnd="10dp"
                     android:paddingVertical="2dp"
-                    android:text="@string/header_brand_title"
+                    android:text="Biblioteca"
                     android:textColor="@color/text_primary"
-                    android:textSize="18sp"
+                    android:textSize="26sp"
                     android:textStyle="bold" />
 
                 <Space
@@ -136,40 +135,109 @@
                     app:shapeAppearanceOverlay="@style/ShapeAppearance.Material3.Corner.Full" />
             </LinearLayout>
 
-            <!-- Library title row (scrolls with content) -->
-            <LinearLayout
-                android:id="@+id/llLibraryHeaderRow"
+            <!-- Library filter chips carousel -->
+            <HorizontalScrollView
+                android:id="@+id/hsvLibraryChips"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:background="@android:color/transparent"
-                android:gravity="center_vertical"
-                android:orientation="horizontal"
-                android:paddingStart="12dp"
-                android:paddingEnd="12dp"
-                android:paddingTop="4dp"
-                android:paddingBottom="4dp">
+                android:clipToPadding="false"
+                android:overScrollMode="never"
+                android:paddingHorizontal="12dp"
+                android:paddingVertical="8dp"
+                android:scrollbars="none">
 
-                <TextView
-                    android:id="@+id/tvLibraryTitle"
+                <LinearLayout
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="Biblioteca"
-                    android:textColor="@color/text_primary"
-                    android:textSize="22sp"
-                    android:textStyle="bold" />
-            </LinearLayout>
+                    android:orientation="horizontal">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="36dp"
+                        android:layout_marginEnd="8dp"
+                        android:background="@drawable/bg_library_filter_chip"
+                        android:clickable="true"
+                        android:focusable="true"
+                        android:fontFamily="@font/inter_variable"
+                        android:gravity="center"
+                        android:paddingHorizontal="16dp"
+                        android:text="Playlists"
+                        android:textColor="@color/text_primary"
+                        android:textSize="14sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="36dp"
+                        android:layout_marginEnd="8dp"
+                        android:background="@drawable/bg_library_filter_chip"
+                        android:clickable="true"
+                        android:focusable="true"
+                        android:fontFamily="@font/inter_variable"
+                        android:gravity="center"
+                        android:paddingHorizontal="16dp"
+                        android:text="Canciones"
+                        android:textColor="@color/text_primary"
+                        android:textSize="14sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="36dp"
+                        android:layout_marginEnd="8dp"
+                        android:background="@drawable/bg_library_filter_chip"
+                        android:clickable="true"
+                        android:focusable="true"
+                        android:fontFamily="@font/inter_variable"
+                        android:gravity="center"
+                        android:paddingHorizontal="16dp"
+                        android:text="Álbumes"
+                        android:textColor="@color/text_primary"
+                        android:textSize="14sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="36dp"
+                        android:layout_marginEnd="8dp"
+                        android:background="@drawable/bg_library_filter_chip"
+                        android:clickable="true"
+                        android:focusable="true"
+                        android:fontFamily="@font/inter_variable"
+                        android:gravity="center"
+                        android:paddingHorizontal="16dp"
+                        android:text="Artistas"
+                        android:textColor="@color/text_primary"
+                        android:textSize="14sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="36dp"
+                        android:background="@drawable/bg_library_filter_chip"
+                        android:clickable="true"
+                        android:focusable="true"
+                        android:fontFamily="@font/inter_variable"
+                        android:gravity="center"
+                        android:paddingHorizontal="16dp"
+                        android:text="Perfiles"
+                        android:textColor="@color/text_primary"
+                        android:textSize="14sp"
+                        android:textStyle="bold" />
+                </LinearLayout>
+            </HorizontalScrollView>
 
             <!-- Music state row (scrolls with content) -->
             <LinearLayout
                 android:id="@+id/llMusicState"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="10dp"
+                android:layout_marginTop="0dp"
                 android:background="@android:color/transparent"
                 android:gravity="center_vertical"
                 android:orientation="horizontal"
-                android:paddingStart="12dp"
-                android:paddingEnd="12dp">
+                android:paddingStart="10dp"
+                android:paddingEnd="0dp">
 
                 <ProgressBar
                     android:id="@+id/progressMusic"
@@ -198,8 +266,8 @@
                 android:orientation="vertical"
                 android:paddingTop="10dp"
                 android:paddingBottom="6dp"
-                android:paddingStart="12dp"
-                android:paddingEnd="12dp"
+                android:paddingStart="15dp"
+                android:paddingEnd="15dp"
                 android:visibility="gone">
 
                 <LinearLayout
@@ -309,7 +377,9 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:background="@android:color/transparent"
-                android:orientation="horizontal">
+                android:orientation="horizontal"
+                android:paddingStart="16dp"
+                android:paddingEnd="16dp">
 
                 <com.example.sleppify.widget.SafeRecyclerView
                     android:id="@+id/rvMusicResults"
@@ -391,7 +461,7 @@
         android:id="@+id/vStatusBarOverlay"
         android:layout_width="0dp"
         android:layout_height="0dp"
-        android:background="@color/surface_dark"
+        android:background="@android:color/black"
         android:alpha="0"
         android:translationZ="50dp"
         app:layout_constraintEnd_toEndOf="parent"

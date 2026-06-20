@@ -86,6 +86,45 @@
             android:clipToPadding="false"
             android:paddingHorizontal="16dp" />
 
+        <LinearLayout
+            android:id="@+id/llAccountTopPlayedEmpty"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:gravity="center"
+            android:paddingHorizontal="20dp"
+            android:paddingTop="36dp"
+            android:paddingBottom="36dp"
+            android:visibility="gone">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Está todo muy tranquilo por aquí.\nEscucha algo para ver tus estadísticas."
+                android:textColor="#9E9E9E"
+                android:textSize="14sp"
+                android:gravity="center"
+                android:lineSpacingMultiplier="1.2" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnAccountDiscover"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="20dp"
+                android:text="Descubre música"
+                android:textColor="@color/text_primary"
+                app:icon="@drawable/ic_nav_principal"
+                app:iconSize="18dp"
+                app:iconTint="@color/text_primary"
+                android:backgroundTint="#15FFFFFF"
+                app:cornerRadius="24dp"
+                style="@style/Widget.Material3.Button.UnelevatedButton"
+                android:paddingHorizontal="24dp"
+                android:paddingVertical="12dp"
+                android:textAllCaps="false" />
+
+        </LinearLayout>
+
         <View
             android:layout_width="match_parent"
             android:layout_height="1dp"

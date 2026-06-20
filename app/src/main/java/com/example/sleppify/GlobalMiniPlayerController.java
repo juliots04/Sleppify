@@ -40,6 +40,7 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
     private final View llMiniPlayer;
     private final ImageView ivArt;
     private final android.widget.ProgressBar pbMiniLoading;
+    private final android.widget.ProgressBar pbSeekBarLoading;
     private final TextView tvTitle;
     private final TextView tvSubtitle;
     private final ImageButton btnPlayPause;
@@ -60,12 +61,14 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
     @NonNull private String lastArtUrl = "";
     private int lastProgressValue = -1;
     private boolean animatingOut = false;
+    private boolean coldStart = true;
 
     public GlobalMiniPlayerController(@NonNull MainActivity activity) {
         this.activity = activity;
         llMiniPlayer = activity.findViewById(R.id.llGlobalMiniPlayer);
         ivArt = activity.findViewById(R.id.ivGlobalMiniPlayerArt);
         pbMiniLoading = activity.findViewById(R.id.pbMiniPlayerLoading);
+        pbSeekBarLoading = activity.findViewById(R.id.pbGlobalMiniPlayerSeekBarLoading);
         tvTitle = activity.findViewById(R.id.tvGlobalMiniPlayerTitle);
         tvTitle.setSelected(true);
         tvSubtitle = activity.findViewById(R.id.tvGlobalMiniPlayerSubtitle);
@@ -148,13 +151,21 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
         int currentSeconds = 0;
 
         if (playerAttached) {
+            coldStart = false;
             totalSeconds = Math.max(1, songPlayer.externalGetTotalSeconds());
             currentSeconds = Math.max(0, songPlayer.externalGetCurrentSeconds());
             title = songPlayer.externalGetCurrentTitle();
             subtitle = songPlayer.externalGetCurrentArtist();
             imageUrl = songPlayer.externalGetCurrentImageUrl();
             miniPlaying = songPlayer.externalIsPlaying();
+            playbackLoading = songPlayer.externalIsLoading();
         } else if (snapshotTrack != null) {
+            // On cold start, don't show mini-player from snapshot alone;
+            // wait until the player is actually attached and ready.
+            if (coldStart) {
+                llMiniPlayer.setVisibility(View.GONE);
+                return;
+            }
             title = TextUtils.isEmpty(snapshotTrack.title) ? "Última reproducción" : snapshotTrack.title;
             subtitle = snapshotTrack.artist;
             imageUrl = snapshotTrack.imageUrl;
@@ -163,11 +174,13 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
             currentSeconds = 0;
             // If there's no live player, treat as paused
             if (!playerAttached) miniPlaying = false;
+            playbackLoading = false;
         } else {
             if (llMiniPlayer.getVisibility() != View.GONE) {
                 llMiniPlayer.setVisibility(View.GONE);
             }
             miniPlaying = false;
+            playbackLoading = false;
             return;
         }
 
@@ -224,6 +237,8 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
             lastArtVideoId = videoId;
             lastArtUrl = imageUrl;
         }
+
+        updateMiniLoadingVisibility();
     }
 
     // ── Actions ───────────────────────────────────────────────────
@@ -484,6 +499,7 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
     private void updateMiniLoadingVisibility() {
         boolean show = playbackLoading || artworkLoading;
         if (pbMiniLoading != null) pbMiniLoading.setVisibility(show ? View.VISIBLE : View.GONE);
+        if (pbSeekBarLoading != null) pbSeekBarLoading.setVisibility(playbackLoading ? View.VISIBLE : View.GONE);
         if (ivArt != null) {
             ivArt.animate().cancel();
             if (show) {

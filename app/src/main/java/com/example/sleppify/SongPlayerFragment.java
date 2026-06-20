@@ -516,6 +516,7 @@ public class SongPlayerFragment extends Fragment {
                                 currentPlaylistContextId.isEmpty() ? null : currentPlaylistContextId,
                                 currentPlaylistContextName.isEmpty() ? null : currentPlaylistContextName
                         );
+                        CloudSyncManager.getInstance(requireContext()).syncPlayCountsToCloud(requireContext());
                         ListenHistoryStore.record(requireContext(), _t.videoId, _t.title, _t.artist, _t.imageUrl);
                     }
                 }
@@ -1314,6 +1315,7 @@ public class SongPlayerFragment extends Fragment {
                     finished.imageUrl,
                     null, null
             );
+            CloudSyncManager.getInstance(requireContext()).syncPlayCountsToCloud(requireContext());
             ListenHistoryStore.record(requireContext(), finished.videoId, finished.title, finished.artist, finished.imageUrl);
         }
 
@@ -1888,6 +1890,7 @@ public class SongPlayerFragment extends Fragment {
                 }
             });
         });
+        updateSeekBarLoadingState();
     }
 
     private void prefetchNextTrackStream() {
@@ -2323,6 +2326,7 @@ public class SongPlayerFragment extends Fragment {
         currentSourceIsVideo = true;
         currentVideoFilePath = (!networkSource) ? source : null;
         localSourcePreparing = true;
+        updateSeekBarLoadingState();
         updatePlayerSurfaceForSource();
 
         // Show player loading spinner only for local video tracks
@@ -2378,9 +2382,21 @@ public class SongPlayerFragment extends Fragment {
         // Show/hide loading spinner based on buffering state, but only hide when
         // audio is actually playing (not just when prepare finishes with isPlaying=false).
         player.setOnBufferingListener((mp, isBuffering) -> {
-            if (mp == localExoMediaPlayer && pbVideoLoading != null) {
-                if (isBuffering && isVideoTrack(track)) {
-                    pbVideoLoading.setVisibility(View.VISIBLE);
+            if (!isAdded()) return;
+            if (mp == localExoMediaPlayer) {
+                if (pbVideoLoading != null) {
+                    if (isBuffering && isVideoTrack(track)) {
+                        pbVideoLoading.setVisibility(View.VISIBLE);
+                    } else if (!isBuffering) {
+                        pbVideoLoading.setVisibility(View.GONE);
+                    }
+                }
+                if (!usingOfflineSource && !loadedVideoId.isEmpty()) {
+                    if (isBuffering) {
+                        PlaybackLoadingBus.notifyLoadingStarted(loadedVideoId);
+                    } else {
+                        PlaybackLoadingBus.notifyAudioConfirmed(loadedVideoId);
+                    }
                 }
             }
         });
@@ -3531,42 +3547,30 @@ public class SongPlayerFragment extends Fragment {
     }
 
     private String getHdImageUrl(String url, String videoId) {
-        boolean limitData = shouldLimitImageQuality();
         if (TextUtils.isEmpty(url)) {
             if (!TextUtils.isEmpty(videoId)) {
-                return "https://i.ytimg.com/vi/" + videoId + (limitData ? "/hqdefault.jpg" : "/hq720.jpg");
+                return "https://i.ytimg.com/vi/" + videoId + "/hq720.jpg";
             }
             return "";
         }
         // If it is a Google user content URL (YouTube Music thumbnail)
         if (url.contains("googleusercontent.com") || url.contains("ggpht.com")) {
-            String suffix = limitData ? "=w360-h360-l90-rj" : "=w720-h720-l90-rj";
-            String hdUrl = url.replaceAll("=[ws]\\d+(-[ws]\\d+)*.*", suffix);
-            if (!hdUrl.contains(limitData ? "=w360" : "=w720")) {
-                hdUrl = url + suffix;
+            String hdUrl = url.replaceAll("=[ws]\\d+(-[ws]\\d+)*.*", "=w720-h720-l90-rj");
+            if (!hdUrl.contains("=w720")) {
+                hdUrl = url + "=w720-h720-l90-rj";
             }
             return hdUrl;
         }
         // If it is a standard YouTube thumbnail URL
         if (url.contains("i.ytimg.com") || url.contains("img.youtube.com")) {
             if (!TextUtils.isEmpty(videoId)) {
-                return "https://i.ytimg.com/vi/" + videoId + (limitData ? "/hqdefault.jpg" : "/hq720.jpg");
+                return "https://i.ytimg.com/vi/" + videoId + "/hq720.jpg";
             }
-            String target = limitData ? "hqdefault.jpg" : "hq720.jpg";
-            return url.replace("default.jpg", target)
-                      .replace("mqdefault.jpg", target)
-                      .replace("hqdefault.jpg", target);
+            return url.replace("default.jpg", "hq720.jpg")
+                      .replace("mqdefault.jpg", "hq720.jpg")
+                      .replace("hqdefault.jpg", "hq720.jpg");
         }
         return url;
-    }
-
-    private boolean shouldLimitImageQuality() {
-        if (getContext() == null) return false;
-        android.content.SharedPreferences prefs = getContext().getSharedPreferences(
-                AppConstants.PREFS_SETTINGS, android.content.Context.MODE_PRIVATE);
-        boolean limitMobile = prefs.getBoolean(CloudSyncManager.KEY_LIMIT_MOBILE_DATA, false);
-        if (!limitMobile) return false;
-        return !StreamResolver.isOnWifi(getContext());
     }
 
     /** Applies the hero's aspect ratio + chrome for a given cover aspect, in one shot. Wide art
@@ -4447,6 +4451,10 @@ public class SongPlayerFragment extends Fragment {
         return Math.max(1, totalSeconds);
     }
 
+    public boolean externalIsLoading() {
+        return localSourcePreparing || hasPendingStreamResolution();
+    }
+
     @NonNull
     public String externalGetCurrentVideoId() {
         if (currentIndex < 0 || currentIndex >= tracks.size()) {
@@ -5089,46 +5097,31 @@ public class SongPlayerFragment extends Fragment {
         localProgressHandler.removeCallbacks(seekBarThumbHideRunnable);
         if (seekBarThumbVisible) return;
         seekBarThumbVisible = true;
-        sbPlaybackProgress.setThumbTintList(android.content.res.ColorStateList.valueOf(
-                requireContext().getColor(R.color.stitch_blue)));
-        animateSeekThumbScale(0f, 1f, 150);
+        animateSeekThumb(0, 255, 120);
     }
 
     private void hideSeekBarThumb() {
         if (sbPlaybackProgress == null) return;
         localProgressHandler.removeCallbacks(seekBarThumbHideRunnable);
         seekBarThumbVisible = false;
-        animateSeekThumbScale(1f, 0f, 250);
+        animateSeekThumb(255, 0, 300);
     }
 
-    private void animateSeekThumbScale(float fromScale, float toScale, long durationMs) {
+    private void animateSeekThumb(int fromAlpha, int toAlpha, long durationMs) {
         if (sbPlaybackProgress == null) return;
         if (seekThumbAnimator != null) seekThumbAnimator.cancel();
-        final android.graphics.drawable.Drawable thumb = sbPlaybackProgress.getThumb();
-        if (thumb == null) return;
-        final int fullSize = (int) (14 * getResources().getDisplayMetrics().density);
-        final int half = fullSize / 2;
-        seekThumbAnimator = android.animation.ValueAnimator.ofFloat(fromScale, toScale);
+        final int baseColor = requireContext().getColor(R.color.stitch_blue);
+        final int r = android.graphics.Color.red(baseColor);
+        final int g = android.graphics.Color.green(baseColor);
+        final int b = android.graphics.Color.blue(baseColor);
+        seekThumbAnimator = android.animation.ValueAnimator.ofInt(fromAlpha, toAlpha);
         seekThumbAnimator.setDuration(durationMs);
-        seekThumbAnimator.setInterpolator(new android.view.animation.OvershootInterpolator(1.5f));
         seekThumbAnimator.addUpdateListener(anim -> {
             if (sbPlaybackProgress == null) return;
-            float s = (float) anim.getAnimatedValue();
-            int half2 = Math.round(half * s);
-            thumb.setBounds(-half2, -half2, half2, half2);
-            sbPlaybackProgress.invalidate();
+            int alpha = (int) anim.getAnimatedValue();
+            sbPlaybackProgress.setThumbTintList(android.content.res.ColorStateList.valueOf(
+                    android.graphics.Color.argb(alpha, r, g, b)));
         });
-        if (toScale == 0f) {
-            seekThumbAnimator.addListener(new android.animation.AnimatorListenerAdapter() {
-                @Override
-                public void onAnimationEnd(android.animation.Animator animation) {
-                    if (sbPlaybackProgress == null) return;
-                    sbPlaybackProgress.setThumbTintList(
-                            android.content.res.ColorStateList.valueOf(android.graphics.Color.TRANSPARENT));
-                    thumb.setBounds(-half, -half, half, half);
-                }
-            });
-        }
         seekThumbAnimator.start();
     }
 
@@ -6413,6 +6406,13 @@ public class SongPlayerFragment extends Fragment {
 
             @Override
             public void onSwiped(@NonNull RecyclerView.ViewHolder viewHolder, int direction) {}
+
+            @Override
+            public int interpolateOutOfBoundsScroll(@NonNull RecyclerView recyclerView, int viewSize, int viewSizeOutOfBounds, int totalSize, long msSinceStartScroll) {
+                int direction = (int) Math.signum(viewSizeOutOfBounds);
+                int baseValue = super.interpolateOutOfBoundsScroll(recyclerView, viewSize, viewSizeOutOfBounds, totalSize, Math.max(msSinceStartScroll, 2000L));
+                return baseValue * 3;
+            }
 
             @Override
             public void clearView(@NonNull RecyclerView recyclerView, @NonNull RecyclerView.ViewHolder viewHolder) {

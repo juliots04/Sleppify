@@ -92,20 +92,35 @@
             app:tint="@color/stitch_blue" />
     </LinearLayout>
 
-    <SeekBar
-        android:id="@+id/sbGlobalMiniPlayerProgress"
+    <FrameLayout
         android:layout_width="match_parent"
-        android:layout_height="16dp"
-        android:layout_marginTop="0dp"
-        android:clickable="false"
-        android:enabled="false"
-        android:focusable="false"
-        android:max="1000"
-        android:paddingStart="0dp"
-        android:paddingEnd="0dp"
-        android:progress="0"
-        android:progressTint="@color/stitch_blue"
-        android:splitTrack="false"
-        android:thumb="@null"
-        android:thumbTint="@android:color/transparent" />
+        android:layout_height="16dp">
+
+        <SeekBar
+            android:id="@+id/sbGlobalMiniPlayerProgress"
+            android:layout_width="match_parent"
+            android:layout_height="16dp"
+            android:layout_marginTop="0dp"
+            android:clickable="false"
+            android:enabled="false"
+            android:focusable="false"
+            android:max="1000"
+            android:paddingStart="0dp"
+            android:paddingEnd="0dp"
+            android:progress="0"
+            android:progressTint="@color/stitch_blue"
+            android:splitTrack="false"
+            android:thumb="@null"
+            android:thumbTint="@android:color/transparent" />
+
+        <ProgressBar
+            android:id="@+id/pbGlobalMiniPlayerSeekBarLoading"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="4dp"
+            android:layout_gravity="center_vertical"
+            android:indeterminate="true"
+            android:indeterminateTint="@color/stitch_blue"
+            android:visibility="gone" />
+    </FrameLayout>
 </LinearLayout>

@@ -15,6 +15,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.ViewGroup
+import android.graphics.drawable.GradientDrawable
 import android.util.Log
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -24,7 +25,9 @@ import androidx.core.content.res.ResourcesCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.fragment.app.Fragment
+import androidx.palette.graphics.Palette
 import androidx.recyclerview.widget.GridLayoutManager
+import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import androidx.viewpager2.widget.ViewPager2
 import com.bumptech.glide.Glide
@@ -55,6 +58,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         private const val PAYLOAD_EQ = "eq"
         private const val COVERS_PER_PAGE = 4
         private const val NETWORK_REFRESH_THROTTLE_MS = 180_000L
+        private const val COVERS_CACHE_TTL_MS = 12L * 60 * 60 * 1000 // 12 hours
         private val SHARED_YT_CROP = YouTubeCropTransformation()
         private val SHARED_CENTER_CROP = CenterCrop()
         private val SHARED_ROUNDED_16 = RoundedCorners(16)
@@ -66,6 +70,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
     private var btnFragHeaderSearch: ImageView? = null
     private var btnFragSignIn: MaterialButton? = null
     private var btnFragProfilePhoto: ShapeableImageView? = null
+    private var ivShortcutsProfilePhoto: ShapeableImageView? = null
 
     // Backdrop
     private var ivHomeBackdrop: ImageView? = null
@@ -80,6 +85,19 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
     private var btnCoversPlayAll: TextView? = null
     private var vpCovers: ViewPager2? = null
     private var tabDotsCovers: TabLayout? = null
+
+    // Radios section
+    private var llRadiosHeader: View? = null
+    private var rvRadios: RecyclerView? = null
+    private val radioEntries = mutableListOf<RadioHistoryStore.RadioEntry>()
+    private val radioDominantColorCache = HashMap<String, Int>()
+    private val radioArtistTextCache = HashMap<String, String>()
+    private val radioSideUrlsCache = HashMap<String, Pair<String, String>>()
+
+    // Playlists recientes section
+    private var llPlaylistsHeader: View? = null
+    private var rvPlaylists: RecyclerView? = null
+    private val playlistEntries = mutableListOf<PlayCountStore.PlayCountEntry>()
 
     // State
     private val handler = Handler(Looper.getMainLooper())
@@ -170,6 +188,14 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         setupShortcuts()
         setupCovers()
         loadCachedCovers()
+
+        llRadiosHeader = view.findViewById(R.id.llRadiosHeader)
+        rvRadios = view.findViewById(R.id.rvRadios)
+        setupRadios()
+
+        llPlaylistsHeader = view.findViewById(R.id.llPlaylistsHeader)
+        rvPlaylists = view.findViewById(R.id.rvPlaylists)
+        setupPlaylists()
     }
 
     override fun onResume() {
@@ -181,6 +207,8 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         refreshFragHeaderProfilePhoto()
         refreshShortcuts()
         refreshCovers()
+        refreshRadios()
+        refreshPlaylists()
     }
 
     override fun onDestroyView() {
@@ -198,11 +226,16 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         btnFragHeaderSearch = null
         btnFragSignIn = null
         btnFragProfilePhoto = null
+        ivShortcutsProfilePhoto = null
         llCoversHeader = null
         tvCoversLabel = null
         btnCoversPlayAll = null
         vpCovers = null
         tabDotsCovers = null
+        llRadiosHeader = null
+        rvRadios = null
+        llPlaylistsHeader = null
+        rvPlaylists = null
     }
 
     override fun onHiddenChanged(hidden: Boolean) {
@@ -219,6 +252,8 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             }, 200)
             refreshFragHeaderProfilePhoto()
             refreshCovers()
+            refreshRadios()
+            refreshPlaylists()
         }
     }
 
@@ -235,6 +270,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         btnFragHeaderSearch = root.findViewById(R.id.btnFragHeaderSearch)
         btnFragSignIn = root.findViewById(R.id.btnFragSignIn)
         btnFragProfilePhoto = root.findViewById(R.id.btnFragProfilePhoto)
+        ivShortcutsProfilePhoto = root.findViewById(R.id.ivShortcutsProfilePhoto)
 
         llFragBrandHeader?.let { header ->
             ViewCompat.setOnApplyWindowInsetsListener(header) { v, insets ->
@@ -275,6 +311,10 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                     btnFragSignIn?.isEnabled = true
                     btnFragSignIn?.alpha = 1f
                     refreshFragHeaderProfilePhoto()
+                    lastShortcutsFetchTimeMs = 0L
+                    lastCoversNetworkFetchTimeMs = 0L
+                    refreshShortcuts()
+                    refreshCovers()
                 },
                 {
                     btnFragSignIn?.isEnabled = true
@@ -308,13 +348,22 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                     .diskCacheStrategy(DiskCacheStrategy.ALL)
                     .circleCrop()
                     .into(btnFragProfilePhoto!!)
+                ivShortcutsProfilePhoto?.let { iv ->
+                    Glide.with(this)
+                        .load(photoUri)
+                        .diskCacheStrategy(DiskCacheStrategy.ALL)
+                        .circleCrop()
+                        .into(iv)
+                }
             } else {
                 btnFragProfilePhoto?.setImageResource(android.R.drawable.ic_menu_myplaces)
+                ivShortcutsProfilePhoto?.setImageResource(android.R.drawable.ic_menu_myplaces)
             }
         } else {
             btnFragProfilePhoto?.visibility = View.GONE
             btnFragProfilePhoto?.setImageDrawable(null)
             btnFragSignIn?.visibility = View.VISIBLE
+            ivShortcutsProfilePhoto?.setImageResource(android.R.drawable.ic_menu_myplaces)
         }
     }
 
@@ -334,6 +383,13 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
     // ========== Shortcuts (ViewPager2 with 3x3 grids) ==========
 
     private fun setupShortcuts() {
+        vpShortcuts ?: return
+
+        // Dynamically set height to exactly match a 3x3 square grid (ScreenWidth)
+        val screenWidth = resources.displayMetrics.widthPixels
+        vpShortcuts?.layoutParams?.height = screenWidth
+        vpShortcuts?.requestLayout()
+
         vpShortcuts?.adapter = ShortcutsPagerAdapter()
         // Keep only the current page + one neighbour resident instead of all 3, so entering the
         // module doesn't inflate/bind 27 cells up front. The first swipe is still instant.
@@ -341,13 +397,14 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         // Don't persist page position across config changes / re-entries
         vpShortcuts?.isSaveEnabled = false
         // Increase touch slop so slight vertical finger drift doesn't cancel the horizontal swipe
-        reduceTouchSlopForViewPager(vpShortcuts)
+        val shortcutsRv = vpShortcuts?.getChildAt(0) as? RecyclerView
+        improveHorizontalScrollDetection(shortcutsRv)
         TabLayoutMediator(tabDotsShortcuts!!, vpShortcuts!!) { _, _ -> }.attach()
     }
 
-    private fun reduceTouchSlopForViewPager(vp: ViewPager2?) {
+    private fun improveHorizontalScrollDetection(recyclerView: RecyclerView?) {
+        if (recyclerView == null) return
         try {
-            val recyclerView = vp?.getChildAt(0) as? RecyclerView ?: return
             val touchSlopField = RecyclerView::class.java.getDeclaredField("mTouchSlop")
             touchSlopField.isAccessible = true
             val currentSlop = touchSlopField.getInt(recyclerView)
@@ -510,6 +567,8 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         vpCovers ?: return
         vpCovers?.adapter = CoversPagerAdapter()
         vpCovers?.offscreenPageLimit = 1
+        val coversRv = vpCovers?.getChildAt(0) as? RecyclerView
+        improveHorizontalScrollDetection(coversRv)
         tabDotsCovers?.let { TabLayoutMediator(it, vpCovers!!) { _, _ -> }.attach() }
         btnCoversPlayAll?.setOnClickListener {
             if (coversResults.isNotEmpty()) playTrackList(coversResults, 0)
@@ -518,7 +577,13 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
     private fun refreshCovers() {
         val now = System.currentTimeMillis()
-        if (now - lastCoversNetworkFetchTimeMs < NETWORK_REFRESH_THROTTLE_MS && coversResults.isNotEmpty()) return
+        // Use persisted timestamp for 12h TTL check (survives process death)
+        if (coversResults.isNotEmpty()) {
+            val cachedAt = if (lastCoversNetworkFetchTimeMs > 0L) lastCoversNetworkFetchTimeMs
+            else requireContext().getSharedPreferences(PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
+                .getLong("home_covers_updated_at", 0L)
+            if (now - cachedAt < COVERS_CACHE_TTL_MS) return
+        }
 
         val cookie = getCookieHeader()
         if (cookie.isEmpty()) return
@@ -629,41 +694,51 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             return
         }
 
-        currentlyPlayingShortcutVideoId = entry.videoId
+        val clickedTrack = YouTubeMusicService.TrackResult("video", entry.videoId, entry.title, entry.artist, entry.imageUrl)
+        playTrackWithRadio(clickedTrack)
+    }
+
+    private fun playTrackWithRadio(track: YouTubeMusicService.TrackResult) {
+        if (!isAdded || track.videoId.isNullOrEmpty()) return
+
+        currentlyPlayingShortcutVideoId = track.videoId
         refreshShortcutEqIcons()
 
-        val clickedTrack = YouTubeMusicService.TrackResult("video", entry.videoId, entry.title, entry.artist, entry.imageUrl)
-        playTrackInBackground(listOf(clickedTrack), 0)
+        // 1. Play track immediately and open player
+        playTrackList(listOf(track), 0)
 
+        // 2. Fetch radio/mix in background
         val cookie = getCookieHeader()
         if (cookie.isNotEmpty()) {
-            val radioPlaylistId = "RDAMVM${entry.videoId}"
-            val selectedVideoId = entry.videoId
+            val radioPlaylistId = "RDAMVM${track.videoId}"
+            val selectedVideoId = track.videoId
             youTubeMusicService.fetchMixTracks(cookie, radioPlaylistId, object : YouTubeMusicService.MixTracksCallback {
-                override fun onSuccess(tracks: List<YouTubeMusicService.TrackResult>) {
-                    if (!isAdded || tracks.isEmpty()) return
-                    val radioList = mutableListOf(clickedTrack)
-                    for (t in tracks) { if (t.videoId != selectedVideoId) radioList.add(t) }
+                override fun onSuccess(tracksList: List<YouTubeMusicService.TrackResult>) {
+                    if (!isAdded || tracksList.isEmpty()) return
+                    val radioList = mutableListOf(track)
+                    for (t in tracksList) { if (t.videoId != selectedVideoId) radioList.add(t) }
 
                     findSongPlayerFragment()?.let { sp ->
                         if (sp.isAdded) {
                             val qd = extractQueueData(radioList)
-                            if (qd.ids.isNotEmpty()) sp.externalReplaceQueue(qd.ids, qd.titles, qd.artists, qd.durations, qd.images, 0, true)
+                            if (qd.ids.isNotEmpty()) {
+                                sp.externalReplaceQueue(qd.ids, qd.titles, qd.artists, qd.durations, qd.images, 0, true)
+                            }
                         }
                     }
 
                     val radioStoreTracks = mutableListOf<RadioHistoryStore.RadioTrack>()
                     radioStoreTracks.add(RadioHistoryStore.RadioTrack(
                         selectedVideoId,
-                        clickedTrack.title.ifEmpty { "Tema" },
-                        clickedTrack.subtitle ?: "",
-                        clickedTrack.thumbnailUrl ?: ""
+                        track.title.ifEmpty { "Tema" },
+                        track.subtitle ?: "",
+                        track.thumbnailUrl ?: ""
                     ))
-                    for (t in tracks) {
+                    for (t in tracksList) {
                         if (t.videoId.isNullOrEmpty() || t.videoId == selectedVideoId) continue
                         radioStoreTracks.add(RadioHistoryStore.RadioTrack(t.videoId, t.title ?: "", t.subtitle ?: "", t.thumbnailUrl ?: ""))
                     }
-                    RadioHistoryStore.saveRadio(requireContext(), radioPlaylistId, clickedTrack.title.ifEmpty { "Tema" }, clickedTrack.thumbnailUrl ?: "", radioStoreTracks)
+                    RadioHistoryStore.saveRadio(requireContext(), radioPlaylistId, track.title.ifEmpty { "Tema" }, track.thumbnailUrl ?: "", radioStoreTracks)
                 }
                 override fun onError(error: String) {}
             })
@@ -874,7 +949,10 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             requireContext().getSharedPreferences(PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
                 .edit()
                 .putString("home_covers_data", arr.toString())
+                .putLong("home_covers_updated_at", System.currentTimeMillis())
                 .apply()
+            // Sync covers to Firebase for persistence across installs
+            CloudSyncManager.getInstance(requireContext()).syncCoversToCloud(arr.toString())
         } catch (e: Exception) {
             Log.w(TAG, "Unexpected error", e)
         }
@@ -886,7 +964,28 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         try {
             val cache = requireContext().getSharedPreferences(PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
             val raw = cache.getString("home_covers_data", "") ?: ""
-            if (raw.isEmpty()) return
+            if (raw.isEmpty()) {
+                // Try loading from Firebase if local cache is empty
+                CloudSyncManager.getInstance(requireContext()).fetchCloudCovers(requireContext()) { restoredRaw ->
+                    if (restoredRaw.isNotEmpty() && isAdded && coversResults.isEmpty()) {
+                        parseCoversCacheString(restoredRaw)
+                        if (coversResults.isNotEmpty()) {
+                            handler.post { if (isAdded) updateCoversUi() }
+                        }
+                    }
+                }
+                return
+            }
+            lastCoversNetworkFetchTimeMs = cache.getLong("home_covers_updated_at", 0L)
+            parseCoversCacheString(raw)
+            if (coversResults.isNotEmpty()) updateCoversUi()
+        } catch (e: Exception) {
+            Log.w(TAG, "Unexpected error", e)
+        }
+    }
+
+    private fun parseCoversCacheString(raw: String) {
+        try {
             val arr = JSONArray(raw)
             coversResults.clear()
             for (i in 0 until arr.length()) {
@@ -902,9 +1001,332 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                     obj.optString("thumbnailUrl", "")
                 ))
             }
-            if (coversResults.isNotEmpty()) updateCoversUi()
         } catch (e: Exception) {
-            Log.w(TAG, "Unexpected error", e)
+            Log.w(TAG, "Error parsing covers cache", e)
+        }
+    }
+
+    // ========== Radios ==========
+
+    private fun setupRadios() {
+        rvRadios?.layoutManager = LinearLayoutManager(requireContext(), LinearLayoutManager.HORIZONTAL, false)
+        improveHorizontalScrollDetection(rvRadios)
+        rvRadios?.adapter = RadioCarouselAdapter()
+    }
+
+    private fun refreshRadios() {
+        if (!isAdded) return
+        val radios = RadioHistoryStore.getRadios(requireContext()).take(10)
+        radioEntries.clear()
+        radioEntries.addAll(radios)
+        val hasRadios = radioEntries.isNotEmpty()
+        llRadiosHeader?.visibility = if (hasRadios) View.VISIBLE else View.GONE
+        rvRadios?.visibility = if (hasRadios) View.VISIBLE else View.GONE
+        (rvRadios?.adapter as? RadioCarouselAdapter)?.notifyDataSetChanged()
+    }
+
+    private fun onRadioClicked(radio: RadioHistoryStore.RadioEntry) {
+        if (!isAdded) return
+        openPlaylistDetailFromPrincipal(
+            radio.radioPlaylistId,
+            "${radio.songTitle} Radio",
+            radio.songThumbnail
+        )
+    }
+
+    private inner class RadioCarouselAdapter : RecyclerView.Adapter<RadioCarouselAdapter.RadioVH>() {
+
+        override fun getItemCount() = radioEntries.size
+
+        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RadioVH {
+            val view = LayoutInflater.from(parent.context).inflate(R.layout.item_radio_carousel, parent, false)
+            // Narrow cards, almost 1:1 aspect for stacked circle illusion
+            val cardWidth = (parent.context.resources.displayMetrics.widthPixels * 0.46).toInt()
+            view.layoutParams = ViewGroup.LayoutParams(cardWidth, ViewGroup.LayoutParams.WRAP_CONTENT)
+            return RadioVH(view)
+        }
+
+        override fun onBindViewHolder(holder: RadioVH, position: Int) {
+            val radio = radioEntries[position]
+            holder.bind(radio)
+        }
+
+        inner class RadioVH(itemView: View) : RecyclerView.ViewHolder(itemView) {
+            private val cardRadio: View = itemView.findViewById(R.id.cardRadio)
+            private val vBg: View = itemView.findViewById(R.id.vRadioBg)
+            private val ivCenter: ShapeableImageView = itemView.findViewById(R.id.ivRadioCenter)
+            private val ivLeft: ShapeableImageView = itemView.findViewById(R.id.ivRadioLeft)
+            private val ivRight: ShapeableImageView = itemView.findViewById(R.id.ivRadioRight)
+            private val tvName: TextView = itemView.findViewById(R.id.tvRadioName)
+            private val tvTitle: TextView = itemView.findViewById(R.id.tvRadioTitle)
+
+            fun bind(radio: RadioHistoryStore.RadioEntry) {
+                val text = radioArtistTextCache.getOrPut(radio.radioPlaylistId) {
+                    val uniqueArtists = radio.tracks.map { it.artist }.filter { it.isNotEmpty() }.distinct()
+                    val random = java.util.Random(radio.radioPlaylistId.hashCode().toLong())
+                    val shuffledArtists = uniqueArtists.shuffled(random)
+                    val top3 = shuffledArtists.take(3)
+                    when (top3.size) {
+                        0 -> "Con varios artistas"
+                        1 -> "Con ${top3[0]} y más"
+                        2 -> "Con ${top3[0]}, ${top3[1]} y más"
+                        else -> "Con ${top3[0]}, ${top3[1]}, ${top3[2]} y más"
+                    }
+                }
+                tvName.text = text
+                tvTitle.text = radio.songTitle
+                val clickListener = View.OnClickListener { onRadioClicked(radio) }
+                itemView.setOnClickListener(clickListener)
+                cardRadio.setOnClickListener(clickListener)
+
+                // Center = seed song thumbnail
+                val centerUrl = radio.songThumbnail
+                if (centerUrl.isNotEmpty() && isAdded) {
+                    try {
+                        Glide.with(this@PrincipalFragment)
+                            .load(centerUrl)
+                            .centerCrop()
+                            .placeholder(R.color.surface_high)
+                            .into(ivCenter)
+
+                        // Use cached dominant color or extract it
+                        val cachedColor = radioDominantColorCache[centerUrl]
+                        if (cachedColor != null) {
+                            vBg.background = GradientDrawable(
+                                GradientDrawable.Orientation.TOP_BOTTOM,
+                                intArrayOf(cachedColor, darkenColor(cachedColor, 0.6f))
+                            ).apply { cornerRadius = 0f }
+                        } else {
+                            Glide.with(this@PrincipalFragment)
+                                .asBitmap()
+                                .load(centerUrl)
+                                .override(64, 64)
+                                .centerCrop()
+                                .into(object : com.bumptech.glide.request.target.CustomTarget<android.graphics.Bitmap>() {
+                                    override fun onResourceReady(resource: android.graphics.Bitmap, transition: com.bumptech.glide.request.transition.Transition<in android.graphics.Bitmap>?) {
+                                        Palette.from(resource).generate { palette ->
+                                            val dominant = palette?.getDarkMutedColor(
+                                                palette.getMutedColor(0xFF333333.toInt())
+                                            ) ?: 0xFF333333.toInt()
+                                            radioDominantColorCache[centerUrl] = dominant
+                                            vBg.background = GradientDrawable(
+                                                GradientDrawable.Orientation.TOP_BOTTOM,
+                                                intArrayOf(dominant, darkenColor(dominant, 0.6f))
+                                            ).apply { cornerRadius = 0f }
+                                        }
+                                    }
+                                    override fun onLoadCleared(placeholder: android.graphics.drawable.Drawable?) {}
+                                })
+                        }
+                    } catch (_: Exception) {}
+                }
+
+                // Left and Right = 2 deterministic tracks from the radio (excluding seed)
+                val (leftUrl, rightUrl) = radioSideUrlsCache.getOrPut(radio.radioPlaylistId) {
+                    val otherTracks = radio.tracks.filter { it.thumbnailUrl.isNotEmpty() && it.thumbnailUrl != centerUrl }
+                    val seed = radio.radioPlaylistId.hashCode().toLong()
+                    val seeded = otherTracks.sortedBy { it.videoId.hashCode().toLong() xor seed }
+                    Pair(seeded.getOrNull(0)?.thumbnailUrl ?: "", seeded.getOrNull(1)?.thumbnailUrl ?: "")
+                }
+
+                if (leftUrl.isNotEmpty() && isAdded) {
+                    try { Glide.with(this@PrincipalFragment).load(leftUrl).centerCrop().placeholder(R.color.surface_high).into(ivLeft) } catch (_: Exception) {}
+                } else {
+                    ivLeft.setImageResource(R.color.surface_high)
+                }
+                if (rightUrl.isNotEmpty() && isAdded) {
+                    try { Glide.with(this@PrincipalFragment).load(rightUrl).centerCrop().placeholder(R.color.surface_high).into(ivRight) } catch (_: Exception) {}
+                } else {
+                    ivRight.setImageResource(R.color.surface_high)
+                }
+            }
+        }
+    }
+
+    private fun darkenColor(color: Int, factor: Float): Int {
+        val r = ((color shr 16 and 0xFF) * factor).toInt().coerceIn(0, 255)
+        val g = ((color shr 8 and 0xFF) * factor).toInt().coerceIn(0, 255)
+        val b = ((color and 0xFF) * factor).toInt().coerceIn(0, 255)
+        return (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+    }
+
+    // ========== Playlists recientes ==========
+
+    private fun setupPlaylists() {
+        rvPlaylists?.layoutManager = LinearLayoutManager(requireContext(), LinearLayoutManager.HORIZONTAL, false)
+        improveHorizontalScrollDetection(rvPlaylists)
+        rvPlaylists?.adapter = PlaylistCarouselAdapter()
+    }
+
+    private fun refreshPlaylists() {
+        if (!isAdded) return
+        val playlists = PlayCountStore.getTopPlaylists(requireContext(), 10)
+        playlistEntries.clear()
+        playlistEntries.addAll(playlists)
+        val hasPlaylists = playlistEntries.isNotEmpty()
+        llPlaylistsHeader?.visibility = if (hasPlaylists) View.VISIBLE else View.GONE
+        rvPlaylists?.visibility = if (hasPlaylists) View.VISIBLE else View.GONE
+        (rvPlaylists?.adapter as? PlaylistCarouselAdapter)?.notifyDataSetChanged()
+    }
+
+    private fun onPlaylistClicked(entry: PlayCountStore.PlayCountEntry) {
+        if (!isAdded) return
+        openPlaylistDetailFromPrincipal(
+            entry.playlistId,
+            entry.playlistName,
+            entry.imageUrl
+        )
+    }
+
+    private inner class PlaylistCarouselAdapter : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
+
+        private val TYPE_PLAYLIST = 0
+        private val TYPE_RADIO = 1
+
+        override fun getItemCount() = playlistEntries.size
+
+        override fun getItemViewType(position: Int): Int {
+            return if (playlistEntries[position].playlistId.startsWith("RD")) TYPE_RADIO else TYPE_PLAYLIST
+        }
+
+        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecyclerView.ViewHolder {
+            val screenWidth = resources.displayMetrics.widthPixels
+            val width = (screenWidth * 0.46f).toInt()
+            if (viewType == TYPE_RADIO) {
+                val view = LayoutInflater.from(parent.context).inflate(R.layout.item_radio_carousel, parent, false)
+                view.layoutParams.width = width
+                return RadioPlaylistVH(view)
+            }
+            val view = LayoutInflater.from(parent.context).inflate(R.layout.item_playlist_carousel, parent, false)
+            view.layoutParams.width = width
+            return PlaylistVH(view)
+        }
+
+        override fun onBindViewHolder(holder: RecyclerView.ViewHolder, position: Int) {
+            val entry = playlistEntries[position]
+            when (holder) {
+                is PlaylistVH -> holder.bind(entry)
+                is RadioPlaylistVH -> holder.bind(entry)
+            }
+        }
+
+        inner class PlaylistVH(itemView: View) : RecyclerView.ViewHolder(itemView) {
+            private val cardPlaylist: View = itemView.findViewById(R.id.cardPlaylist)
+            private val ivCover: ShapeableImageView = itemView.findViewById(R.id.ivPlaylistCover)
+            private val tvName: TextView = itemView.findViewById(R.id.tvPlaylistName)
+
+            fun bind(entry: PlayCountStore.PlayCountEntry) {
+                tvName.text = entry.playlistName
+                val clickListener = View.OnClickListener { onPlaylistClicked(entry) }
+                itemView.setOnClickListener(clickListener)
+                cardPlaylist.setOnClickListener(clickListener)
+
+                if (isAdded) {
+                    val gridUrls = resolvePlaylistGridUrls(entry.playlistId)
+                    if (gridUrls.size >= 4) {
+                        val density = itemView.context.resources.displayMetrics.density
+                        val sizePx = (180 * density).toInt()
+                        PlaylistGridArtLoader.load(ivCover, gridUrls, sizePx)
+                    } else {
+                        val fallbackUrl = gridUrls.firstOrNull() ?: entry.imageUrl
+                        if (fallbackUrl.isNotEmpty()) {
+                            try {
+                                Glide.with(this@PrincipalFragment)
+                                    .load(fallbackUrl)
+                                    .centerCrop()
+                                    .placeholder(R.color.surface_high)
+                                    .into(ivCover)
+                            } catch (_: Exception) {}
+                        } else {
+                            ivCover.setImageResource(R.color.surface_high)
+                        }
+                    }
+                }
+            }
+        }
+
+        inner class RadioPlaylistVH(itemView: View) : RecyclerView.ViewHolder(itemView) {
+            private val cardRadio: View = itemView.findViewById(R.id.cardRadio)
+            private val vBg: View = itemView.findViewById(R.id.vRadioBg)
+            private val ivCenter: ShapeableImageView = itemView.findViewById(R.id.ivRadioCenter)
+            private val ivLeft: ShapeableImageView = itemView.findViewById(R.id.ivRadioLeft)
+            private val ivRight: ShapeableImageView = itemView.findViewById(R.id.ivRadioRight)
+            private val tvName: TextView = itemView.findViewById(R.id.tvRadioName)
+            private val tvTitle: TextView = itemView.findViewById(R.id.tvRadioTitle)
+
+            fun bind(entry: PlayCountStore.PlayCountEntry) {
+                tvName.text = "Radio de ${entry.title}"
+                tvTitle.text = entry.title
+                val clickListener = View.OnClickListener { onPlaylistClicked(entry) }
+                itemView.setOnClickListener(clickListener)
+                cardRadio.setOnClickListener(clickListener)
+
+                // Try to find matching radio history to get real side track thumbnails
+                val radio = if (isAdded) {
+                    RadioHistoryStore.getRadios(requireContext()).find { it.radioPlaylistId == entry.playlistId }
+                } else null
+                val centerUrl = radio?.songThumbnail?.takeIf { it.isNotEmpty() } ?: entry.imageUrl
+                val (leftUrl, rightUrl) = radioSideUrlsCache.getOrPut(entry.playlistId) {
+                    val otherTracks = radio?.tracks?.filter { it.thumbnailUrl.isNotEmpty() && it.thumbnailUrl != centerUrl } ?: emptyList()
+                    val seed = entry.playlistId.hashCode().toLong()
+                    val seeded = otherTracks.sortedBy { it.videoId.hashCode().toLong() xor seed }
+                    Pair(seeded.getOrNull(0)?.thumbnailUrl ?: "", seeded.getOrNull(1)?.thumbnailUrl ?: "")
+                }
+
+                if (centerUrl.isNotEmpty() && isAdded) {
+                    try {
+                        Glide.with(this@PrincipalFragment)
+                            .load(centerUrl)
+                            .centerCrop()
+                            .placeholder(R.color.surface_high)
+                            .into(ivCenter)
+
+                        val cachedColor = radioDominantColorCache[centerUrl]
+                        if (cachedColor != null) {
+                            vBg.background = GradientDrawable(
+                                GradientDrawable.Orientation.TOP_BOTTOM,
+                                intArrayOf(cachedColor, darkenColor(cachedColor, 0.6f))
+                            ).apply { cornerRadius = 0f }
+                        } else {
+                            Glide.with(this@PrincipalFragment)
+                                .asBitmap()
+                                .load(centerUrl)
+                                .override(64, 64)
+                                .centerCrop()
+                                .into(object : com.bumptech.glide.request.target.CustomTarget<android.graphics.Bitmap>() {
+                                    override fun onResourceReady(resource: android.graphics.Bitmap, transition: com.bumptech.glide.request.transition.Transition<in android.graphics.Bitmap>?) {
+                                        Palette.from(resource).generate { palette ->
+                                            val dominant = palette?.getDarkMutedColor(
+                                                palette.getMutedColor(0xFF333333.toInt())
+                                            ) ?: 0xFF333333.toInt()
+                                            radioDominantColorCache[centerUrl] = dominant
+                                            vBg.background = GradientDrawable(
+                                                GradientDrawable.Orientation.TOP_BOTTOM,
+                                                intArrayOf(dominant, darkenColor(dominant, 0.6f))
+                                            ).apply { cornerRadius = 0f }
+                                        }
+                                    }
+                                    override fun onLoadCleared(placeholder: android.graphics.drawable.Drawable?) {}
+                                })
+                        }
+
+                        if (leftUrl.isNotEmpty()) {
+                            Glide.with(this@PrincipalFragment).load(leftUrl).centerCrop().placeholder(R.color.surface_high).into(ivLeft)
+                        } else {
+                            ivLeft.setImageResource(R.color.surface_high)
+                        }
+                        if (rightUrl.isNotEmpty()) {
+                            Glide.with(this@PrincipalFragment).load(rightUrl).centerCrop().placeholder(R.color.surface_high).into(ivRight)
+                        } else {
+                            ivRight.setImageResource(R.color.surface_high)
+                        }
+                    } catch (_: Exception) {}
+                } else {
+                    ivCenter.setImageResource(R.color.surface_high)
+                    ivLeft.setImageResource(R.color.surface_high)
+                    ivRight.setImageResource(R.color.surface_high)
+                }
+            }
         }
     }
 
@@ -916,6 +1338,9 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
                 overScrollMode = View.OVER_SCROLL_NEVER
                 isNestedScrollingEnabled = false
+                clipToPadding = false
+                val padding = (16 * resources.displayMetrics.density).toInt()
+                setPadding(padding, 0, padding, 0)
             }
             return PageVH(rv)
         }
@@ -923,7 +1348,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         override fun onBindViewHolder(holder: PageVH, position: Int) {
             val start = position * SHORTCUTS_PER_PAGE
             val end = Math.min(start + SHORTCUTS_PER_PAGE, shortcutEntries.size)
-            val pageItems = if (start < shortcutEntries.size) shortcutEntries.subList(start, end) else emptyList()
+            val pageItems = if (start < shortcutEntries.size) ArrayList(shortcutEntries.subList(start, end)) else emptyList()
             holder.bind(pageItems)
         }
 
@@ -1073,7 +1498,6 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
     private fun onCoversTrackClicked(track: YouTubeMusicService.TrackResult) {
         if (!isAdded || track.videoId.isNullOrEmpty()) return
-        val startIndex = coversResults.indexOfFirst { it.videoId == track.videoId }.coerceAtLeast(0)
-        playTrackList(coversResults, startIndex)
+        playTrackWithRadio(track)
     }
 }

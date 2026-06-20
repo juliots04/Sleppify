@@ -176,18 +176,15 @@ class MainActivity : AppCompatActivity() {
                 returnFromScanner()
                 return
             }
-            if (inEqualizerFromSettings) {
-                exitEqualizerToSettings()
+            val eq = supportFragmentManager.findFragmentByTag(TAG_MODULE_EQUALIZER)
+            if (eq != null && eq.isAdded && !eq.isHidden) {
+                returnFromEqualizer()
                 return
             }
             if (inSettings) {
                 (settingsFragment as? SettingsFragment)?.onBackPressed()
                 return
             }
-
-            // Safety net: a full-screen EQ overlay whose tracking flags were lost would otherwise
-            // fall through to moveTaskToBack and feel "stuck". Recover before that.
-            if (recoverFromStuckEqualizerOverlay()) return
 
             if (handleSongPlayerBackPressed()) return
             if (handlePlaylistDetailBackPressed()) return
@@ -220,6 +217,11 @@ class MainActivity : AppCompatActivity() {
         configureHeaderActionForMainModules()
         configureAudioAuthorizationFlow()
         restoreMainModuleReferences()
+        if (savedInstanceState != null) {
+            inSettings = settingsFragment != null
+            inEqualizerFromSettings = equalizerFragment != null
+            inScannerFromSettings = scannerFragment != null
+        }
 
         settingsPrefs = getSharedPreferences(CloudSyncManager.PREFS_SETTINGS, Context.MODE_PRIVATE)
         localPrefs = getSharedPreferences("sleppify_local_config", Context.MODE_PRIVATE)
@@ -1050,50 +1052,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     fun returnFromEqualizer() {
-        when {
-            inEqualizerFromSettings -> exitEqualizerToSettings()
-            // Flags got lost (e.g. after process recreation) but the EQ is still on screen — the
-            // close button must still get the user out. Recover instead of doing nothing.
-            else -> recoverFromStuckEqualizerOverlay()
-        }
-    }
-
-    /**
-     * Safety net for a stuck full-screen equalizer overlay: the EQ was opened from
-     * settings with bottomNav hidden, but inEqualizerFromSettings was reset (process
-     * recreation, a racing transaction, etc.). In that state neither the system back nor the EQ's
-     * own close button can dismiss it. This detects that situation and routes out to the most
-     * sensible origin. Returns true if it handled a stuck overlay; false otherwise (so callers can
-     * fall through to normal handling). It deliberately ignores the EQ when it is the normal
-     * bottom-nav module (bottom nav visible), which is a valid flags-false state.
-     */
-    private fun recoverFromStuckEqualizerOverlay(): Boolean {
-        if (inEqualizerFromSettings) return false
-        val eq = supportFragmentManager.findFragmentByTag(TAG_MODULE_EQUALIZER) ?: return false
-        if (!eq.isAdded || eq.isHidden) return false
-        // EQ shown as the regular bottom-nav module — not stuck; let normal navigation handle it.
-        if (currentMainNavItemId == R.id.nav_equalizer && bottomNav.visibility == View.VISIBLE) return false
-
-        Log.w("MainActivity", "recoverFromStuckEqualizerOverlay: dismissing EQ with no flag set")
-        val settings = supportFragmentManager.findFragmentByTag(TAG_MODULE_SETTINGS)
-        if (settings != null && settings.isAdded) {
-            inEqualizerFromSettings = true
-            exitEqualizerToSettings()
-        } else {
-            hideEqualizerImmediately()
-            // isNavigating may be stuck true from a previous deferred post — reset it so
-            // switchToMainModule doesn't silently bail, leaving bottomNav hidden with nothing shown.
-            isNavigating = false
-            val fallbackNav = if (currentMainNavItemId == R.id.nav_equalizer || currentMainNavItemId == View.NO_ID)
-                R.id.nav_music else currentMainNavItemId
-            val switched = switchToMainModule(fallbackNav)
-            if (!switched) {
-                // Last resort: at minimum make the UI interactable again
-                bottomNav.visibility = View.VISIBLE
-                topAppBar.visibility = View.GONE
-            }
-        }
-        return true
+        inEqualizerFromSettings = false
+        supportFragmentManager.popBackStackImmediate(TAG_MODULE_EQUALIZER, androidx.fragment.app.FragmentManager.POP_BACK_STACK_INCLUSIVE)
+        
+        topAppBar.visibility = View.GONE
+        setSolidNavigationBar(true)
+        bottomNav.visibility = View.GONE
+        
+        val settings = supportFragmentManager.findFragmentByTag(TAG_MODULE_SETTINGS) as? SettingsFragment
+        settings?.refreshCurrentSectionVisibility()
     }
 
     fun openEqualizerFromSettings() {
@@ -1101,45 +1068,17 @@ class MainActivity : AppCompatActivity() {
         inEqualizerFromSettings = true
         globalMiniPlayer?.hide()
         val target = equalizerFragment ?: EqualizerFragment().also { equalizerFragment = it }
-        val isNew = !target.isAdded
-        setOverlayFullscreen(true)
-        showModuleLoadingOverlay()
-        fragmentContainer.post {
-            if (isFinishing || isDestroyed) return@post
-            supportFragmentManager.beginTransaction().apply {
-                setReorderingAllowed(true)
-                hideAllMainScreens(this, target)
-                if (target.isAdded) show(target) else add(R.id.fragmentContainer, target, TAG_MODULE_EQUALIZER)
-                setMaxLifecycle(target, Lifecycle.State.RESUMED)
-                commit()
-            }
-            topAppBar.visibility = View.GONE
-            setSolidNavigationBar(true)
-            bottomNav.visibility = View.GONE
-            fragmentContainer.post { fragmentContainer.post { revealModuleContent() } }
+        
+        supportFragmentManager.beginTransaction().apply {
+            setReorderingAllowed(true)
+            replace(R.id.fragmentContainer, target, TAG_MODULE_EQUALIZER)
+            addToBackStack(TAG_MODULE_EQUALIZER)
+            commit()
         }
-    }
-
-    private fun exitEqualizerToSettings() {
-        if (!inEqualizerFromSettings) return
-        inEqualizerFromSettings = false
-        val target = settingsFragment ?: SettingsFragment().also { settingsFragment = it }
-        val isNew = !target.isAdded
-        hideEqualizerImmediately()
-        showModuleLoadingOverlay()
-        fragmentContainer.post {
-            if (isFinishing || isDestroyed) return@post
-            supportFragmentManager.beginTransaction().apply {
-                setReorderingAllowed(true)
-                if (target.isAdded) show(target) else add(R.id.fragmentContainer, target, TAG_MODULE_SETTINGS)
-                setMaxLifecycle(target, Lifecycle.State.RESUMED)
-                commit()
-            }
-            topAppBar.visibility = View.GONE
-            setSolidNavigationBar(true)
-            bottomNav.visibility = View.GONE
-            fragmentContainer.post { fragmentContainer.post { revealModuleContent() } }
-        }
+        
+        topAppBar.visibility = View.GONE
+        setSolidNavigationBar(true)
+        bottomNav.visibility = View.GONE
     }
 
     private fun configureHeaderActionForEqualizer() {
@@ -1156,7 +1095,7 @@ class MainActivity : AppCompatActivity() {
             typeface = resolveHeaderSettingsTypeface()
             setCompoundDrawablesRelativeWithIntrinsicBounds(R.drawable.ic_arrow_back, 0, 0, 0)
             compoundDrawablePadding = (10 * resources.displayMetrics.density).toInt()
-            setOnClickListener { exitEqualizerToSettings() }
+            setOnClickListener { returnFromEqualizer() }
         }
     }
 
@@ -1752,13 +1691,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun hideEqualizerImmediately() {
-        val eq = equalizerFragment ?: return
+        val eq = supportFragmentManager.findFragmentByTag(TAG_MODULE_EQUALIZER) ?: return
         if (!eq.isAdded || eq.isHidden || isFinishing || isDestroyed) return
-        supportFragmentManager.beginTransaction()
-            .setReorderingAllowed(true)
-            .hide(eq)
-            .setMaxLifecycle(eq, Lifecycle.State.STARTED)
-            .commitNowAllowingStateLoss()
+        supportFragmentManager.popBackStackImmediate(TAG_MODULE_EQUALIZER, androidx.fragment.app.FragmentManager.POP_BACK_STACK_INCLUSIVE)
+        inEqualizerFromSettings = false
     }
 
     private fun handlePlaylistDetailBackPressed(): Boolean {

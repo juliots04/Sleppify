@@ -50,7 +50,8 @@ class SettingsFragment : Fragment() {
         private const val SECTION_HISTORY = 3
         private const val SECTION_ACCOUNT = 4
         private const val SECTION_DATA_SAVER = 5
-        private const val HISTORY_PAGE_SIZE = 50
+        private const val HISTORY_PAGE_SIZE = 20
+        private const val HISTORY_DAY_VISIBLE_LIMIT = 20
         private const val KEY_USE_SD_CARD = "use_sd_card"
     }
 
@@ -103,6 +104,7 @@ class SettingsFragment : Fragment() {
     private lateinit var tvAccountName: TextView
     private lateinit var tvAccountEmail: TextView
     private lateinit var rvTopPlayed: RecyclerView
+    private lateinit var llAccountTopPlayedEmpty: View
 
     private val settingsPrefs: SharedPreferences by lazy {
         requireContext().getSharedPreferences(CloudSyncManager.PREFS_SETTINGS, Context.MODE_PRIVATE)
@@ -169,12 +171,14 @@ class SettingsFragment : Fragment() {
         setupHistorySection(view)
         setupAccountSection(view)
 
-        showSection(SECTION_ROOT)
+        showSection(currentSection)
     }
 
     override fun onHiddenChanged(hidden: Boolean) {
         super.onHiddenChanged(hidden)
-        // Preserve current section state — don't reset to root on every show
+        if (!hidden) {
+            showSection(SECTION_ROOT)
+        }
     }
 
     override fun onResume() {
@@ -188,6 +192,12 @@ class SettingsFragment : Fragment() {
             showSection(SECTION_ROOT)
         } else {
             (activity as? MainActivity)?.returnFromSettings()
+        }
+    }
+
+    fun refreshCurrentSectionVisibility() {
+        if (isAdded) {
+            showSection(currentSection)
         }
     }
 
@@ -751,6 +761,13 @@ class SettingsFragment : Fragment() {
         tvAccountEmail = view.findViewById(R.id.tvAccountEmail)
         rvTopPlayed = view.findViewById(R.id.rvAccountTopPlayed)
         rvTopPlayed.layoutManager = LinearLayoutManager(requireContext(), LinearLayoutManager.HORIZONTAL, false)
+        llAccountTopPlayedEmpty = view.findViewById(R.id.llAccountTopPlayedEmpty)
+
+        view.findViewById<View>(R.id.btnAccountDiscover)?.setOnClickListener {
+            val mainActivity = activity as? MainActivity
+            mainActivity?.returnFromSettings()
+            mainActivity?.findViewById<com.google.android.material.bottomnavigation.BottomNavigationView>(R.id.bottomNavigation)?.selectedItemId = R.id.nav_principal
+        }
 
         view.findViewById<View>(R.id.rowAccountSignOut)?.setOnClickListener { performSignOut() }
         view.findViewById<View>(R.id.rowAccountDelete)?.setOnClickListener { showDeleteAccountDataConfirmation() }
@@ -775,15 +792,32 @@ class SettingsFragment : Fragment() {
             ivAccountPhoto.setImageDrawable(ColorDrawable(ContextCompat.getColor(requireContext(), R.color.surface_high)))
         }
 
-        // Top played carousel — only songs from last 7 days
+        // Top played carousel — songs played since last Monday 00:00 local time
         viewLifecycleOwner.lifecycleScope.launch(Dispatchers.IO) {
-            val sevenDaysAgo = System.currentTimeMillis() - 7L * 24 * 60 * 60 * 1000
+            val mondayMidnight = Calendar.getInstance().apply {
+                // Roll back to Monday of the current week
+                while (get(Calendar.DAY_OF_WEEK) != Calendar.MONDAY) {
+                    add(Calendar.DAY_OF_YEAR, -1)
+                }
+                set(Calendar.HOUR_OF_DAY, 0)
+                set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+            }.timeInMillis
             val top = PlayCountStore.getTopEntries(requireContext(), 50)
-                .filter { it.lastPlayedAtMs >= sevenDaysAgo && it.playlistId.isEmpty() && it.count >= 3 }
+                .filter { it.lastPlayedAtMs >= mondayMidnight && it.videoId != it.playlistId }
                 .take(20)
             withContext(Dispatchers.Main) {
                 if (!isAdded) return@withContext
                 rvTopPlayed.adapter = TopPlayedAdapter(top) { entry -> playTopEntry(entry) }
+
+                if (top.isEmpty()) {
+                    rvTopPlayed.visibility = View.GONE
+                    llAccountTopPlayedEmpty.visibility = View.VISIBLE
+                } else {
+                    rvTopPlayed.visibility = View.VISIBLE
+                    llAccountTopPlayedEmpty.visibility = View.GONE
+                }
             }
         }
     }
@@ -814,6 +848,46 @@ class SettingsFragment : Fragment() {
         }
 
         (activity as? MainActivity)?.getGlobalMiniPlayer()?.updateUi()
+
+        // Fetch radio for this song and append to queue
+        fetchRadioForTopEntry(entry)
+    }
+
+    private fun fetchRadioForTopEntry(entry: PlayCountStore.PlayCountEntry) {
+        val cookie = StreamResolver.getAuthCookieHeader()
+        if (cookie.isNullOrEmpty()) return
+        val radioPlaylistId = "RDAMVM${entry.videoId}"
+        val service = YouTubeMusicService()
+        service.fetchMixTracks(cookie, radioPlaylistId, object : YouTubeMusicService.MixTracksCallback {
+            override fun onSuccess(tracksList: List<YouTubeMusicService.TrackResult>) {
+                if (!isAdded || tracksList.isEmpty()) return
+                val qIds = ArrayList<String>()
+                val qTitles = ArrayList<String>()
+                val qArtists = ArrayList<String>()
+                val qDurations = ArrayList<String>()
+                val qImages = ArrayList<String>()
+                // Include the seed track first
+                qIds.add(entry.videoId)
+                qTitles.add(entry.title)
+                qArtists.add(entry.artist)
+                qDurations.add("")
+                qImages.add(entry.imageUrl)
+                for (t in tracksList) {
+                    if (t.videoId.isNullOrEmpty() || t.videoId == entry.videoId) continue
+                    qIds.add(t.videoId)
+                    qTitles.add(t.title ?: "")
+                    qArtists.add(t.subtitle ?: "")
+                    qDurations.add("")
+                    qImages.add(t.thumbnailUrl ?: "")
+                }
+                val fm = parentFragmentManager
+                val sp = fm.findFragmentByTag("song_player") as? SongPlayerFragment
+                if (sp != null && sp.isAdded) {
+                    sp.externalReplaceQueue(qIds, qTitles, qArtists, qDurations, qImages, 0, true)
+                }
+            }
+            override fun onError(error: String) {}
+        })
     }
 
     // --- Account actions ---
@@ -961,61 +1035,106 @@ class SettingsFragment : Fragment() {
         companion object {
             private const val TYPE_HEADER = 0
             private const val TYPE_ENTRY = 1
+            private const val TYPE_SHOW_MORE = 2
+            private const val DAY_VISIBLE_LIMIT = HISTORY_DAY_VISIBLE_LIMIT
         }
 
         private sealed class Item {
-            data class DayHeader(val label: String) : Item()
+            data class DayHeader(val label: String, val dayKey: String) : Item()
             data class Entry(val entry: ListenHistoryStore.HistoryEntry) : Item()
+            data class ShowMore(val dayKey: String, val remaining: Int) : Item()
         }
 
+        // All entries grouped by day key
+        private val allEntriesByDay = LinkedHashMap<String, MutableList<ListenHistoryStore.HistoryEntry>>()
+        // How many entries are currently visible per day
+        private val visibleCountByDay = HashMap<String, Int>()
         private val items = mutableListOf<Item>()
-        private val monthFormat = SimpleDateFormat("MMMM 'de' yyyy", Locale("es"))
+        private val dayFormat = SimpleDateFormat("d 'de' MMMM 'de' yyyy", Locale("es"))
         private val timeFormat = SimpleDateFormat("HH:mm", Locale.getDefault())
 
         fun setItems(entries: List<ListenHistoryStore.HistoryEntry>) {
-            items.clear()
-            appendInternal(entries)
+            allEntriesByDay.clear()
+            visibleCountByDay.clear()
+            appendToStorage(entries)
+            rebuildItems()
             notifyDataSetChanged()
         }
 
         fun appendItems(entries: List<ListenHistoryStore.HistoryEntry>) {
             if (entries.isEmpty()) return
-            val startPos = items.size
-            appendInternal(entries)
-            notifyItemRangeInserted(startPos, items.size - startPos)
+            appendToStorage(entries)
+            rebuildItems()
+            notifyDataSetChanged()
         }
 
-        private fun appendInternal(entries: List<ListenHistoryStore.HistoryEntry>) {
-            var currentMonthKey: String? = if (items.isNotEmpty()) {
-                val last = items.lastOrNull { it is Item.Entry } as? Item.Entry
-                last?.let { monthKey(it.entry.timestampMs) }
-            } else null
+        fun expandDay(dayKey: String) {
+            val current = visibleCountByDay[dayKey] ?: DAY_VISIBLE_LIMIT
+            visibleCountByDay[dayKey] = current + DAY_VISIBLE_LIMIT
+            rebuildItems()
+            notifyDataSetChanged()
+        }
 
+        private fun appendToStorage(entries: List<ListenHistoryStore.HistoryEntry>) {
             for (e in entries) {
-                val mKey = monthKey(e.timestampMs)
-                if (mKey != currentMonthKey) {
-                    val label = monthFormat.format(Date(e.timestampMs)).replaceFirstChar { it.uppercase() }
-                    items.add(Item.DayHeader(label))
-                    currentMonthKey = mKey
-                }
-                items.add(Item.Entry(e))
+                val dKey = dayKey(e.timestampMs)
+                allEntriesByDay.getOrPut(dKey) { mutableListOf() }.add(e)
             }
         }
 
-        private fun monthKey(ms: Long): String {
-            val c = Calendar.getInstance().apply { timeInMillis = ms }
-            return "${c.get(Calendar.YEAR)}-${c.get(Calendar.MONTH)}"
+        private fun rebuildItems() {
+            items.clear()
+            for ((dKey, dayEntries) in allEntriesByDay) {
+                if (dayEntries.isEmpty()) continue
+                val label = dayFormat.format(Date(dayEntries[0].timestampMs)).replaceFirstChar { it.uppercase() }
+                items.add(Item.DayHeader(label, dKey))
+                val limit = visibleCountByDay[dKey] ?: DAY_VISIBLE_LIMIT
+                val visible = dayEntries.take(limit)
+                for (e in visible) items.add(Item.Entry(e))
+                val remaining = dayEntries.size - visible.size
+                if (remaining > 0) {
+                    items.add(Item.ShowMore(dKey, remaining))
+                }
+            }
         }
 
-        override fun getItemViewType(position: Int) = if (items[position] is Item.DayHeader) TYPE_HEADER else TYPE_ENTRY
+        private fun dayKey(ms: Long): String {
+            val c = Calendar.getInstance().apply { timeInMillis = ms }
+            return "${c.get(Calendar.YEAR)}-${c.get(Calendar.MONTH)}-${c.get(Calendar.DAY_OF_MONTH)}"
+        }
+
+        override fun getItemViewType(position: Int) = when (items[position]) {
+            is Item.DayHeader -> TYPE_HEADER
+            is Item.Entry -> TYPE_ENTRY
+            is Item.ShowMore -> TYPE_SHOW_MORE
+        }
         override fun getItemCount() = items.size
 
         override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecyclerView.ViewHolder {
             val inflater = LayoutInflater.from(parent.context)
-            return if (viewType == TYPE_HEADER) {
-                HeaderVH(inflater.inflate(R.layout.item_history_day_header, parent, false))
-            } else {
-                EntryVH(inflater.inflate(R.layout.item_history_entry, parent, false))
+            return when (viewType) {
+                TYPE_HEADER -> HeaderVH(inflater.inflate(R.layout.item_history_day_header, parent, false))
+                TYPE_SHOW_MORE -> ShowMoreVH(TextView(parent.context).apply {
+                    layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                    setPadding(
+                        (16 * resources.displayMetrics.density).toInt(),
+                        (12 * resources.displayMetrics.density).toInt(),
+                        (16 * resources.displayMetrics.density).toInt(),
+                        (12 * resources.displayMetrics.density).toInt()
+                    )
+                    setTextColor(ContextCompat.getColor(parent.context, R.color.stitch_blue))
+                    textSize = 14f
+                    typeface = android.graphics.Typeface.DEFAULT_BOLD
+                    isClickable = true
+                    isFocusable = true
+                    setBackgroundResource(android.R.attr.selectableItemBackground.let {
+                        val ta = parent.context.obtainStyledAttributes(intArrayOf(it))
+                        val resId = ta.getResourceId(0, 0)
+                        ta.recycle()
+                        resId
+                    })
+                })
+                else -> EntryVH(inflater.inflate(R.layout.item_history_entry, parent, false))
             }
         }
 
@@ -1023,12 +1142,21 @@ class SettingsFragment : Fragment() {
             when (val item = items[position]) {
                 is Item.DayHeader -> (holder as HeaderVH).bind(item.label)
                 is Item.Entry -> (holder as EntryVH).bind(item.entry)
+                is Item.ShowMore -> (holder as ShowMoreVH).bind(item)
             }
         }
 
         inner class HeaderVH(v: View) : RecyclerView.ViewHolder(v) {
             private val tv = v.findViewById<TextView>(R.id.tvHistoryDayHeader)
             fun bind(label: String) { tv.text = label }
+        }
+
+        inner class ShowMoreVH(v: View) : RecyclerView.ViewHolder(v) {
+            private val tv = v as TextView
+            fun bind(item: Item.ShowMore) {
+                tv.text = "Ver más (${item.remaining})"
+                tv.setOnClickListener { expandDay(item.dayKey) }
+            }
         }
 
         inner class EntryVH(v: View) : RecyclerView.ViewHolder(v) {

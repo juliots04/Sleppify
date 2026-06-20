@@ -3588,35 +3588,35 @@ public class PlaylistDetailFragment extends Fragment
         }
 
         SongPlayerFragment existingPlayer = findSongPlayerFragment();
-        if (existingPlayer != null) {
-            if (existingPlayer.isAdded()) {
-                existingPlayer.externalSetReturnTargetTag(TAG_PLAYLIST_DETAIL);
-                existingPlayer.externalSetPlaylistContext(currentPlaylistId, currentPlaylistTitle);
-                
-                // If the selected track is already playing, just open the player
-                if (TextUtils.equals(selectedVideoId, existingPlayer.getLoadedVideoId())) {
-                    showSongPlayerWithEnterAnimation(existingPlayer);
-                    return;
-                }
-
-                if (existingPlayer.externalMatchesQueue(ids)) {
-                    existingPlayer.externalPlayTrackFromStart(queueIndex);
-                } else {
-                    existingPlayer.externalReplaceQueueFromStart(ids, titles, artists, durations, images, queueIndex, true);
-                    injectOriginalQueueOrderIfShuffled(existingPlayer);
-                }
-
-                currentTrackIndex = position;
-                miniPlaying = true;
-                if (trackAdapter != null) {
-                    trackAdapter.setActiveIndex(position);
-                }
-                syncTrackStateFromPlayer();
+        if (existingPlayer != null && existingPlayer.isAdded()) {
+            existingPlayer.externalSetReturnTargetTag(TAG_PLAYLIST_DETAIL);
+            existingPlayer.externalSetPlaylistContext(currentPlaylistId, currentPlaylistTitle);
+            
+            // If the selected track is already playing, just open the player
+            if (TextUtils.equals(selectedVideoId, existingPlayer.getLoadedVideoId())) {
+                showSongPlayerWithEnterAnimation(existingPlayer);
+                return;
             }
+
+            if (existingPlayer.externalMatchesQueue(ids)) {
+                existingPlayer.externalPlayTrackFromStart(queueIndex);
+            } else {
+                existingPlayer.externalReplaceQueueFromStart(ids, titles, artists, durations, images, queueIndex, true);
+                injectOriginalQueueOrderIfShuffled(existingPlayer);
+            }
+
+            showSongPlayerWithEnterAnimation(existingPlayer);
+
+            currentTrackIndex = position;
+            miniPlaying = true;
+            if (trackAdapter != null) {
+                trackAdapter.setActiveIndex(position);
+            }
+            syncTrackStateFromPlayer();
             return;
         }
 
-        startHiddenIntegratedPlayerAt(position, true);
+        openIntegratedPlayerAt(position, true);
     }
 
     private void onTrackMorePressed(int position, @NonNull View anchor) {
@@ -5275,7 +5275,15 @@ public class PlaylistDetailFragment extends Fragment
                 .beginTransaction()
                 .setReorderingAllowed(true)
                 .show(player)
-                .runOnCommit(player::externalAnimateEnterSlide)
+                .runOnCommit(() -> {
+                    mainHandler.post(() -> {
+                        if (!isAdded()) return;
+                        View view = player.getView();
+                        if (view != null) {
+                            view.post(player::externalAnimateEnterSlide);
+                        }
+                    });
+                })
                 .commit();
     }
 
@@ -5284,7 +5292,15 @@ public class PlaylistDetailFragment extends Fragment
                 .beginTransaction()
                 .setReorderingAllowed(true)
                 .add(R.id.playerContainer, player, "song_player")
-                .runOnCommit(player::externalAnimateEnterSlide)
+                .runOnCommit(() -> {
+                    mainHandler.post(() -> {
+                        if (!isAdded()) return;
+                        View view = player.getView();
+                        if (view != null) {
+                            view.post(player::externalAnimateEnterSlide);
+                        }
+                    });
+                })
                 .commit();
     }
 
@@ -5489,8 +5505,9 @@ public class PlaylistDetailFragment extends Fragment
 
         SongPlayerFragment songPlayer = findSongPlayerFragment();
         boolean playerAttached = songPlayer != null && songPlayer.isAdded();
-        PlaybackHistoryStore.Snapshot snapshot = loadPlaybackSnapshot();
-        PlaybackHistoryStore.QueueTrack snapshotTrack = snapshot.currentTrack();
+        
+        PlaybackHistoryStore.Snapshot snapshot = null;
+        PlaybackHistoryStore.QueueTrack snapshotTrack = null;
 
         if (playerAttached) {
             miniPlaying = songPlayer.externalIsPlaying();
@@ -5501,6 +5518,8 @@ public class PlaylistDetailFragment extends Fragment
                 if (mappedIndex >= 0) {
                     currentTrackIndex = mappedIndex;
                 } else {
+                    snapshot = loadPlaybackSnapshot();
+                    snapshotTrack = snapshot.currentTrack();
                     int snapshotMappedIndex = snapshotTrack == null
                             ? -1
                             : findTrackIndexByVideoId(currentTracks, snapshotTrack.videoId);
@@ -5510,14 +5529,18 @@ public class PlaylistDetailFragment extends Fragment
                     trackAdapter.setActiveIndex(currentTrackIndex);
                 }
             }
-        } else if (snapshotTrack != null) {
-            miniPlaying = snapshot.isPlaying;
-            int mappedIndex = currentTracks.isEmpty()
-                    ? -1
-                    : findTrackIndexByVideoId(currentTracks, snapshotTrack.videoId);
-            currentTrackIndex = mappedIndex >= 0 ? mappedIndex : -1;
-            if (trackAdapter != null) {
-                trackAdapter.setActiveIndex(currentTrackIndex);
+        } else {
+            snapshot = loadPlaybackSnapshot();
+            snapshotTrack = snapshot.currentTrack();
+            if (snapshotTrack != null) {
+                miniPlaying = snapshot.isPlaying;
+                int mappedIndex = currentTracks.isEmpty()
+                        ? -1
+                        : findTrackIndexByVideoId(currentTracks, snapshotTrack.videoId);
+                currentTrackIndex = mappedIndex >= 0 ? mappedIndex : -1;
+                if (trackAdapter != null) {
+                    trackAdapter.setActiveIndex(currentTrackIndex);
+                }
             }
         }
 

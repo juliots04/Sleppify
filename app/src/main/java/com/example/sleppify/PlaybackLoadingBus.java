@@ -47,9 +47,13 @@ public final class PlaybackLoadingBus {
         dispatch(videoId, false);
     }
 
-    /** Clear loading state without notifying (e.g. when track is offline/instant). */
+    /** Clear loading state and notify listeners to dismiss any active spinners. */
     public static void clearLoading() {
+        String oldId = loadingVideoId;
         loadingVideoId = null;
+        if (oldId != null) {
+            dispatch(oldId, false);
+        }
     }
 
     /** Returns the videoId currently in loading state, or null if none. */

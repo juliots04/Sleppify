@@ -25,20 +25,24 @@ class AnimatedEqualizerView @JvmOverloads constructor(
     private var animating = false
     private var barColor = -0x1
 
+    private var frameCounter = 0
+
     private val animator = ValueAnimator.ofFloat(0f, 1f).apply {
-        duration = 60L
+        duration = 400L
         repeatCount = ValueAnimator.INFINITE
         interpolator = LinearInterpolator()
         addUpdateListener {
+            frameCounter++
+            if (frameCounter % 4 != 0) return@addUpdateListener
             for (i in 0..2) {
-                if (Math.abs(barHeights[i] - targetHeights[i]) < 0.05f) {
+                if (Math.abs(barHeights[i] - targetHeights[i]) < 0.02f) {
                     phaseIndex[i] = (phaseIndex[i] + 1) % keyframes.size
                     targetHeights[i] = keyframes[phaseIndex[i]]
                 }
                 if (barHeights[i] < targetHeights[i]) {
-                    barHeights[i] += 0.04f
+                    barHeights[i] += 0.015f
                 } else {
-                    barHeights[i] -= 0.04f
+                    barHeights[i] -= 0.015f
                 }
             }
             invalidate()

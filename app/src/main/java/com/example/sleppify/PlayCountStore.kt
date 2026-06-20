@@ -96,6 +96,11 @@ object PlayCountStore {
         }
         val result = mutableListOf<PlayCountEntry>()
         for ((pid, tracks) in byPlaylist) {
+            // Exclude pseudo-playlists that only contain a single song played outside a real playlist
+            // (where the only track's videoId equals the playlistId).
+            val uniqueTrackIds = tracks.map { it.videoId }.distinct()
+            if (uniqueTrackIds.size == 1 && uniqueTrackIds[0] == pid) continue
+
             val totalCount = tracks.sumOf { it.count }
             val mostRecent = tracks.maxOf { it.lastPlayedAtMs }
             val bestTrack = tracks.maxByOrNull { it.count } ?: continue

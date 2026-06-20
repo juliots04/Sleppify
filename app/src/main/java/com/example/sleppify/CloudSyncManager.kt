@@ -296,6 +296,9 @@ class CloudSyncManager private constructor(context: Context) {
 
         // Hydrate listen history (fire-and-forget, non-blocking)
         fetchCloudListenHistory(appContext)
+
+        // Hydrate play counts (fire-and-forget, non-blocking)
+        fetchCloudPlayCounts(appContext)
     }
 
     fun onUserSignedOut() {
@@ -1543,6 +1546,46 @@ class CloudSyncManager private constructor(context: Context) {
         }
     }
 
+    fun syncCoversToCloud(coversJson: String) {
+        val uid = activeUserId
+        if (uid.isNullOrEmpty() || coversJson.isEmpty()) return
+        val data = hashMapOf<String, Any>(
+            "entries" to coversJson,
+            FIELD_UPDATED_AT to com.google.firebase.firestore.FieldValue.serverTimestamp()
+        )
+        firestore.collection(USERS_COLLECTION).document(uid)
+            .collection(APP_SCOPE_COLLECTION).document(DOC_HOME_COVERS)
+            .set(data, SetOptions.merge())
+            .addOnFailureListener { e -> Log.e(TAG, "Error syncing covers to cloud", e) }
+    }
+
+    fun fetchCloudCovers(context: Context, callback: (String) -> Unit) {
+        val uid = activeUserId
+        if (uid.isNullOrEmpty()) {
+            callback("")
+            return
+        }
+        firestore.collection(USERS_COLLECTION).document(uid)
+            .collection(APP_SCOPE_COLLECTION).document(DOC_HOME_COVERS)
+            .get()
+            .addOnSuccessListener { doc ->
+                val raw = doc.getString("entries") ?: ""
+                if (raw.isNotEmpty()) {
+                    // Also persist locally so next load is instant
+                    context.getSharedPreferences(PREFS_STREAMING_CACHE, android.content.Context.MODE_PRIVATE)
+                        .edit()
+                        .putString("home_covers_data", raw)
+                        .putLong("home_covers_updated_at", System.currentTimeMillis())
+                        .apply()
+                }
+                callback(raw)
+            }
+            .addOnFailureListener { e ->
+                Log.e(TAG, "Error fetching cloud covers", e)
+                callback("")
+            }
+    }
+
     companion object {
         private const val TAG = "CloudSyncManager"
 
@@ -1590,6 +1633,7 @@ class CloudSyncManager private constructor(context: Context) {
         private const val DOC_PLAY_COUNTS = "play_counts"
         private const val DOC_LISTEN_HISTORY = "listen_history"
         private const val DOC_SHORTCUTS = "shortcuts"
+        private const val DOC_HOME_COVERS = "home_covers"
         private const val COLLECTION_PLAYLISTS = "playlists"
         private const val COLLECTION_PLAYLIST_OVERRIDES = "playlist_overrides"
 

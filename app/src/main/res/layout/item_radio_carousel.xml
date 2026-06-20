@@ -1,0 +1,119 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:paddingHorizontal="6dp">
+
+    <com.google.android.material.card.MaterialCardView
+        android:id="@+id/cardRadio"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        app:cardCornerRadius="16dp"
+        app:cardElevation="0dp"
+        app:strokeWidth="0dp"
+        android:clickable="false"
+        android:focusable="false">
+
+        <FrameLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content">
+
+            <!-- Colored background -->
+            <View
+                android:id="@+id/vRadioBg"
+                android:layout_width="match_parent"
+                android:layout_height="180dp"
+                android:background="#333333" />
+
+            <!-- 3 circular images with overlap effect -->
+            <FrameLayout
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:layout_marginVertical="12dp">
+
+                <com.google.android.material.imageview.ShapeableImageView
+                    android:id="@+id/ivRadioLeft"
+                    android:layout_width="68dp"
+                    android:layout_height="68dp"
+                    android:scaleType="centerCrop"
+                    android:layout_gravity="center_vertical|start"
+                    android:layout_marginStart="-12dp"
+                    android:elevation="1dp"
+                    app:shapeAppearanceOverlay="@style/ShapeAppearance.Material3.Corner.Full" />
+
+                <com.google.android.material.imageview.ShapeableImageView
+                    android:id="@+id/ivRadioCenter"
+                    android:layout_width="95dp"
+                    android:layout_height="95dp"
+                    android:scaleType="centerCrop"
+                    android:layout_gravity="center"
+                    android:elevation="4dp"
+                    app:shapeAppearanceOverlay="@style/ShapeAppearance.Material3.Corner.Full" />
+
+                <com.google.android.material.imageview.ShapeableImageView
+                    android:id="@+id/ivRadioRight"
+                    android:layout_width="68dp"
+                    android:layout_height="68dp"
+                    android:scaleType="centerCrop"
+                    android:layout_gravity="center_vertical|end"
+                    android:layout_marginEnd="-12dp"
+                    android:elevation="1dp"
+                    app:shapeAppearanceOverlay="@style/ShapeAppearance.Material3.Corner.Full" />
+            </FrameLayout>
+
+            <!-- "RADIO" badge top-right -->
+            <TextView
+                android:id="@+id/tvRadioBadge"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="top|end"
+                android:layout_marginTop="10dp"
+                android:layout_marginEnd="10dp"
+                android:text="RADIO"
+                android:textColor="#FFFFFF"
+                android:textSize="10sp"
+                android:textStyle="bold"
+                android:textFontWeight="900"
+                android:fontFamily="@font/inter_variable"
+                android:letterSpacing="0.15" />
+
+            <!-- Radio song title inside card, below circles -->
+            <TextView
+                android:id="@+id/tvRadioTitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_gravity="bottom"
+                android:layout_marginHorizontal="12dp"
+                android:layout_marginBottom="10dp"
+                android:singleLine="true"
+                android:ellipsize="none"
+                android:text="Canción"
+                android:textColor="#FFFFFF"
+                android:textSize="14sp"
+                android:textStyle="bold"
+                android:fontFamily="sans-serif-black"
+                android:letterSpacing="0.04" />
+
+        </FrameLayout>
+    </com.google.android.material.card.MaterialCardView>
+
+    <!-- Song name outside card, below image -->
+    <TextView
+        android:id="@+id/tvRadioName"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:paddingTop="16dp"
+        android:paddingBottom="2dp"
+        android:text="Radio de Canción"
+        android:alpha="0.6"
+        android:textColor="@color/text_primary"
+        android:textSize="14sp"
+        android:textStyle="bold"
+        android:fontFamily="@font/inter_variable"
+        android:maxLines="2"
+        android:ellipsize="end"
+        android:includeFontPadding="false" />
+
+</LinearLayout>

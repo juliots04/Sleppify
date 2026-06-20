@@ -428,22 +428,6 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 }
             }
 
-            // Radio history entries
-            List<RadioHistoryStore.RadioEntry> radios = RadioHistoryStore.INSTANCE.getRadios(requireContext());
-            for (RadioHistoryStore.RadioEntry radio : radios) {
-                if (!allCandidates.containsKey(radio.getRadioPlaylistId())) {
-                    int radioCount = radio.getTracks().size();
-                    String radioSubtitle = "Radio \u2022 " + radioCount + (radioCount == 1 ? " canción" : " canciones");
-                    allCandidates.put(radio.getRadioPlaylistId(), new YouTubeMusicService.TrackResult(
-                            "playlist",
-                            radio.getRadioPlaylistId(),
-                            radio.getSongTitle() + " Radio",
-                            radioSubtitle,
-                            radio.getSongThumbnail()
-                    ));
-                }
-            }
-
             // Insert pinned items first (in pin order)
             for (String pinnedId : pinnedIds) {
                 if (seenIds.contains(pinnedId)) continue;
@@ -469,14 +453,6 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 String cid = item.contentId == null ? "" : item.contentId;
                 if (seenIds.add(cid)) {
                     display.add(item);
-                }
-            }
-
-            // Then non-pinned radios at the end
-            for (RadioHistoryStore.RadioEntry radio : radios) {
-                if (seenIds.add(radio.getRadioPlaylistId())) {
-                    YouTubeMusicService.TrackResult candidate = allCandidates.get(radio.getRadioPlaylistId());
-                    if (candidate != null) display.add(candidate);
                 }
             }
 
@@ -592,7 +568,6 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     private ImageView btnFragHeaderSearch;
     private com.google.android.material.button.MaterialButton btnFragSignIn;
     private com.google.android.material.imageview.ShapeableImageView btnFragProfilePhoto;
-    private View llLibraryHeaderRow;
     private View tvLibraryTitle;
     private View llMusicState;
     private MaterialButton btnYoutubeLogin;
@@ -768,8 +743,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         setupFragBrandHeader(view);
         ivLibraryBackdrop = view.findViewById(R.id.ivLibraryBackdrop);
         applyLibraryBackdropBlur();
-        llLibraryHeaderRow = view.findViewById(R.id.llLibraryHeaderRow);
-        tvLibraryTitle = view.findViewById(R.id.tvLibraryTitle);
+        tvLibraryTitle = tvFragBrandTitle;
         llMusicState = view.findViewById(R.id.llMusicState);
         btnYoutubeLogin = view.findViewById(R.id.btnYoutubeLogin);
         llLibraryEmptyState = view.findViewById(R.id.llLibraryEmptyState);
@@ -801,10 +775,12 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             nsvLib.setOnScrollChangeListener((androidx.core.widget.NestedScrollView.OnScrollChangeListener)
                 (v, scrollX, scrollY, oldScrollX, oldScrollY) -> {
                     if (vStatusBarOverlay == null) return;
-                    View target = view.findViewById(R.id.llLibraryHeaderRow);
+                    View target = rvMusicResults;
                     if (target == null) return;
-                    float triggerY = target.getTop();
-                    float fraction = triggerY <= 0f ? 1f : Math.min(1f, Math.max(0f, scrollY / triggerY));
+                    float density = getResources().getDisplayMetrics().density;
+                    float startY = target.getTop();
+                    float endY = startY + (120 * density);
+                    float fraction = endY <= startY ? 1f : Math.min(1f, Math.max(0f, (scrollY - startY) / (endY - startY)));
                     vStatusBarOverlay.setAlpha(fraction);
                 });
         }
@@ -990,25 +966,8 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             llFragBrandHeader.requestApplyInsets();
         }
 
-        // Brand title with icon — mirrors MainActivity.configureHeaderActionForMainModules()
-        if (tvFragBrandTitle != null) {
-            tvFragBrandTitle.setAllCaps(true);
-            tvFragBrandTitle.setLetterSpacing(0.08f);
-            try {
-                Typeface brandFont = androidx.core.content.res.ResourcesCompat.getFont(requireContext(), R.font.manrope_variable);
-                if (brandFont != null) tvFragBrandTitle.setTypeface(brandFont);
-            } catch (Exception e) {
-                Log.w(TAG, "Unexpected error", e);
-            }
-            float density = getResources().getDisplayMetrics().density;
-            int iconSize = (int) (26 * density);
-            android.graphics.drawable.Drawable icon = androidx.core.content.ContextCompat.getDrawable(requireContext(), R.mipmap.ic_launcher);
-            if (icon != null) {
-                icon.setBounds(0, 0, iconSize, iconSize);
-                tvFragBrandTitle.setCompoundDrawablesRelative(icon, null, null, null);
-            }
-            tvFragBrandTitle.setCompoundDrawablePadding((int) (8 * density));
-        }
+        // Brand title — "Biblioteca" text (no app icon, same style as old tvLibraryTitle)
+        // No custom styling needed; XML handles textSize=22sp, bold, text_primary
 
         // Search button → opens SearchFragment via MainActivity
         if (btnFragHeaderSearch != null) {
@@ -3533,7 +3492,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             List<String> gridUrls = playlistId.isEmpty() ? java.util.Collections.emptyList() : resolvePlaylistGridUrls(playlistId);
             if (gridUrls.size() >= 4) {
                 float density = getResources().getDisplayMetrics().density;
-                int sizePx = Math.round(60 * density);
+                int sizePx = Math.round(50 * density);
                 PlaylistGridArtLoader.load(ivArt, gridUrls, sizePx);
             } else {
                 loadArtworkInto(ivArt, track.thumbnailUrl);
@@ -5082,6 +5041,22 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         List<String> cached = playlistGridUrlsCache.get(playlistId);
         if (cached != null) return cached;
 
+        // Favorites: resolve synchronously from in-memory cache (always warm)
+        if (FavoritesPlaylistStore.PLAYLIST_ID.equals(playlistId) && isAdded()) {
+            List<FavoritesPlaylistStore.FavoriteTrack> favs = FavoritesPlaylistStore.loadFavorites(requireContext());
+            List<String> urls = new ArrayList<>(4);
+            Set<String> seen = new HashSet<>();
+            for (FavoritesPlaylistStore.FavoriteTrack ft : favs) {
+                if (urls.size() >= 4) break;
+                String img = ft.imageUrl == null ? "" : ft.imageUrl.trim();
+                if (!img.isEmpty() && seen.add(img)) urls.add(img);
+            }
+            if (urls.size() >= 4) {
+                playlistGridUrlsCache.put(playlistId, urls);
+                return urls;
+            }
+        }
+
         // For YouTube playlists, check persisted grid first (generate-once)
         boolean isYouTubePlaylist = !FavoritesPlaylistStore.PLAYLIST_ID.equals(playlistId)
                 && !playlistId.startsWith("custom_");
@@ -6307,7 +6282,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                     List<String> gridUrls = pid.isEmpty() ? java.util.Collections.emptyList() : resolvePlaylistGridUrls(pid);
                     if (gridUrls.size() >= 4) {
                         float density = holder.itemView.getContext().getResources().getDisplayMetrics().density;
-                        int sizePx = Math.round(60 * density);
+                        int sizePx = Math.round(50 * density);
                         PlaylistGridArtLoader.load(holder.ivTrackThumb, gridUrls, sizePx);
                     } else if (!TextUtils.isEmpty(item.thumbnailUrl)) {
                         loadArtworkInto(holder.ivTrackThumb, item.thumbnailUrl);
