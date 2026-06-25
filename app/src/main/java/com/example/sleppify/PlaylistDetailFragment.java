@@ -138,11 +138,19 @@ public class PlaylistDetailFragment extends Fragment
 
     /** Shared singleton — avoids allocation per bind and ensures consistent Glide cache keys. */
     private static final YouTubeCropTransformation SHARED_YT_CROP = new YouTubeCropTransformation();
+    /** Shared crossfade — built once, reused on every bind so no transition object is allocated
+     *  per row. Glide skips the animation on memory-cache hits, so it only fades on first load. */
+    private static final DrawableTransitionOptions SHARED_CROSSFADE =
+            DrawableTransitionOptions.withCrossFade(100);
     /** Payload marker for state-only adapter updates (skip image reload). */
     private static final String PAYLOAD_STATE_ONLY = "state_only";
     /** Material standard easing — pre-built once, never re-allocated per animation. */
     private static final android.view.animation.Interpolator MATERIAL_EASE =
             new android.view.animation.PathInterpolator(0.4f, 0f, 0.2f, 1f);
+    /** Shared decelerate easing for the offline progress fill — avoids allocating a new
+     *  interpolator on every downloading-row bind. */
+    private static final android.view.animation.Interpolator DECELERATE_EASE =
+            new android.view.animation.DecelerateInterpolator();
 
     public static final String ARG_PLAYLIST_ID = "arg_playlist_id";
     public static final String ARG_PLAYLIST_TITLE = "arg_playlist_title";
@@ -1174,6 +1182,17 @@ public class PlaylistDetailFragment extends Fragment
         return cachedTrackArtPlaceholderColor;
     }
 
+    /** Cached grey placeholder drawable — built once and reused on every bind instead of
+     *  allocating a new ColorDrawable per row (a per-frame GC source during scroll). */
+    private android.graphics.drawable.ColorDrawable cachedTrackArtPlaceholder;
+
+    private android.graphics.drawable.ColorDrawable trackArtPlaceholder(@NonNull Context ctx) {
+        if (cachedTrackArtPlaceholder == null) {
+            cachedTrackArtPlaceholder = new android.graphics.drawable.ColorDrawable(trackArtPlaceholderColor(ctx));
+        }
+        return cachedTrackArtPlaceholder;
+    }
+
     private void loadTrackArt(
             @NonNull ImageView target,
             @Nullable String imageUrl,
@@ -1181,25 +1200,36 @@ public class PlaylistDetailFragment extends Fragment
     ) {
         Context ctx = target.getContext();
         if (TextUtils.isEmpty(imageUrl)) {
+            target.setTag(R.id.tag_artwork_signature, null);
             Glide.with(ctx).clear(target);
             target.setImageDrawable(null);
             return;
         }
+        // Anti-rebind guard: skip rebuilding the whole Glide request graph when this
+        // ImageView already shows the same artwork. Prevents redundant work on re-binds
+        // to the same track (notifyItemChanged, recycled holders) without affecting fresh
+        // scroll (each new row has a different URL, so the signature differs).
+        String url = imageUrl.trim();
+        Object previousSignature = target.getTag(R.id.tag_artwork_signature);
+        if (url.equals(previousSignature)) {
+            return;
+        }
+        target.setTag(R.id.tag_artwork_signature, url);
         // The grey placeholder replaces a recycled holder's stale art immediately on
         // request start, so a row can never briefly show the previous track's image.
         // Memory-cache hits complete synchronously inside into() and never show it.
         boolean offlineOnly = !cachedHasValidatedInternet(ctx);
         int px = trackArtSizePx(ctx);
-        Glide.with(target)
-                .load(imageUrl.trim())
+        Glide.with(this)
+                .load(url)
                 .transform(SHARED_YT_CROP)
                 .format(DecodeFormat.PREFER_RGB_565)
                 .diskCacheStrategy(DiskCacheStrategy.ALL)
                 .onlyRetrieveFromCache(offlineOnly)
                 .priority(priority)
                 .override(px, px)
-                .placeholder(new android.graphics.drawable.ColorDrawable(trackArtPlaceholderColor(ctx)))
-                .transition(DrawableTransitionOptions.withCrossFade(100))
+                .placeholder(trackArtPlaceholder(ctx))
+                .transition(SHARED_CROSSFADE)
                 .into(target);
     }
 
@@ -6706,6 +6736,10 @@ public class PlaylistDetailFragment extends Fragment
                     PlaylistTrack track = items.get(i);
                     if (track != null && !TextUtils.isEmpty(track.imageUrl)
                             && !LocalFilesStore.isLocalVideoId(track.videoId)) {
+                        // Clear the signature so the anti-rebind guard doesn't skip the retry of
+                        // a load that previously failed (e.g. fired while offline). This runs only
+                        // on idle, so re-issuing for the ~10 visible rows is cheap (cache hits).
+                        ((TrackViewHolder) vh).ivTrackArt.setTag(R.id.tag_artwork_signature, null);
                         loadTrackArt(((TrackViewHolder) vh).ivTrackArt, track.imageUrl, com.bumptech.glide.Priority.HIGH);
                     }
                 }
@@ -6802,7 +6836,7 @@ public class PlaylistDetailFragment extends Fragment
                 if (holder.vOfflineProgressFill.getScaleX() < 0.01f) {
                     holder.vOfflineProgressFill.setScaleX(0f);
                 }
-                holder.vOfflineProgressFill.animate().scaleX(target).setDuration(500L).setInterpolator(new android.view.animation.DecelerateInterpolator()).start();
+                holder.vOfflineProgressFill.animate().scaleX(target).setDuration(500L).setInterpolator(DECELERATE_EASE).start();
             } else {
                 holder.vOfflineProgressFill.animate().cancel();
                 holder.vOfflineProgressFill.setScaleX(0f);
@@ -6818,10 +6852,20 @@ public class PlaylistDetailFragment extends Fragment
                 holder.rootTrackRow.setBackgroundResource(rowBackgroundRes);
             }
 
-            SongPlayerFragment sp = cachedSongPlayer;
-            boolean isActuallyPlaying = sp != null && sp.isPlaying();
-            String currentVideoId = sp != null ? sp.getLoadedVideoId() : "";
-            boolean shouldShowOverlay = isActive && !TextUtils.isEmpty(currentVideoId) && TextUtils.equals(currentVideoId, track.videoId);
+            // Only the active row can show the now-playing overlay, so skip the player
+            // queries (getLoadedVideoId / isPlaying) on every other row — a per-bind win
+            // that runs on every full and state-only bind.
+            boolean shouldShowOverlay = false;
+            boolean isActuallyPlaying = false;
+            if (isActive) {
+                SongPlayerFragment sp = cachedSongPlayer;
+                if (sp != null) {
+                    String currentVideoId = sp.getLoadedVideoId();
+                    shouldShowOverlay = !TextUtils.isEmpty(currentVideoId)
+                            && TextUtils.equals(currentVideoId, track.videoId);
+                    isActuallyPlaying = sp.isPlaying();
+                }
+            }
             holder.llNowPlayingOverlay.setVisibility(shouldShowOverlay ? View.VISIBLE : View.GONE);
             if (holder.animatedEq != null) {
                 holder.animatedEq.setAnimating(shouldShowOverlay && isActuallyPlaying);
@@ -6857,6 +6901,9 @@ public class PlaylistDetailFragment extends Fragment
             // loadTrackArt covers the in-flight gap — so scrolling never shows blank rows.
             boolean isLocalTrack = LocalFilesStore.isLocalVideoId(track.videoId);
             if (isLocalTrack) {
+                // Local tracks don't go through loadTrackArt, so clear the artwork signature
+                // to prevent a stale URL match if this holder is later reused for a remote track.
+                holder.ivTrackArt.setTag(R.id.tag_artwork_signature, null);
                 if (!TextUtils.isEmpty(track.imageUrl)) {
                     holder.ivTrackArt.setScaleType(ImageView.ScaleType.CENTER_CROP);
                     holder.ivTrackArt.setBackgroundColor(android.graphics.Color.TRANSPARENT);
