@@ -57,6 +57,7 @@ class SettingsFragment : Fragment() {
 
     // --- Navigation state ---
     private var currentSection = SECTION_ROOT
+    private var pendingSection: Int? = null
 
     // --- Views ---
     private lateinit var tvToolbarTitle: TextView
@@ -171,13 +172,17 @@ class SettingsFragment : Fragment() {
         setupHistorySection(view)
         setupAccountSection(view)
 
-        showSection(currentSection)
+        val initialSection = pendingSection ?: currentSection
+        pendingSection = null
+        showSection(initialSection)
     }
 
     override fun onHiddenChanged(hidden: Boolean) {
         super.onHiddenChanged(hidden)
         if (!hidden) {
-            showSection(SECTION_ROOT)
+            val target = pendingSection ?: SECTION_ROOT
+            pendingSection = null
+            showSection(target)
         }
     }
 
@@ -198,6 +203,14 @@ class SettingsFragment : Fragment() {
     fun refreshCurrentSectionVisibility() {
         if (isAdded) {
             showSection(currentSection)
+        }
+    }
+
+    fun navigateToHistory() {
+        if (isAdded && !isHidden) {
+            showSection(SECTION_HISTORY)
+        } else {
+            pendingSection = SECTION_HISTORY
         }
     }
 
@@ -859,8 +872,8 @@ class SettingsFragment : Fragment() {
         val radioPlaylistId = "RDAMVM${entry.videoId}"
         val service = YouTubeMusicService()
         service.fetchMixTracks(cookie, radioPlaylistId, object : YouTubeMusicService.MixTracksCallback {
-            override fun onSuccess(tracksList: List<YouTubeMusicService.TrackResult>) {
-                if (!isAdded || tracksList.isEmpty()) return
+            override fun onSuccess(tracks: List<YouTubeMusicService.TrackResult>) {
+                if (!isAdded || tracks.isEmpty()) return
                 val qIds = ArrayList<String>()
                 val qTitles = ArrayList<String>()
                 val qArtists = ArrayList<String>()
@@ -872,7 +885,7 @@ class SettingsFragment : Fragment() {
                 qArtists.add(entry.artist)
                 qDurations.add("")
                 qImages.add(entry.imageUrl)
-                for (t in tracksList) {
+                for (t in tracks) {
                     if (t.videoId.isNullOrEmpty() || t.videoId == entry.videoId) continue
                     qIds.add(t.videoId)
                     qTitles.add(t.title ?: "")

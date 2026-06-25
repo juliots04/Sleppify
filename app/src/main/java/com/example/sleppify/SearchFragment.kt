@@ -3028,10 +3028,10 @@ class SearchFragment : Fragment() {
             val radioPlaylistId = "RDAMVM${track.videoId}"
             val selectedVideoId = track.videoId
             youTubeMusicService.fetchMixTracks(cookie, radioPlaylistId, object : YouTubeMusicService.MixTracksCallback {
-                override fun onSuccess(tracksList: List<YouTubeMusicService.TrackResult>) {
-                    if (!isAdded || tracksList.isEmpty()) return
+                override fun onSuccess(tracks: List<YouTubeMusicService.TrackResult>) {
+                    if (!isAdded || tracks.isEmpty()) return
                     val radioList = mutableListOf(track)
-                    for (t in tracksList) { if (t.videoId != selectedVideoId) radioList.add(t) }
+                    for (t in tracks) { if (t.videoId != selectedVideoId) radioList.add(t) }
 
                     findSongPlayerFragment()?.let { sp ->
                         if (sp.isAdded) {
@@ -3049,7 +3049,7 @@ class SearchFragment : Fragment() {
                         track.subtitle ?: "",
                         track.thumbnailUrl ?: ""
                     ))
-                    for (t in tracksList) {
+                    for (t in tracks) {
                         if (t.videoId.isNullOrEmpty() || t.videoId == selectedVideoId) continue
                         radioStoreTracks.add(RadioHistoryStore.RadioTrack(t.videoId, t.title ?: "", t.subtitle ?: "", t.thumbnailUrl ?: ""))
                     }

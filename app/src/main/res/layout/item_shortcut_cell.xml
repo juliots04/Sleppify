@@ -26,6 +26,32 @@
             app:layout_constraintTop_toTopOf="parent" />
 
         <View
+            android:id="@+id/vShortcutLikedBg"
+            android:layout_width="0dp"
+            android:layout_height="0dp"
+            android:background="@drawable/bg_music_liked_gradient"
+            android:visibility="gone"
+            app:layout_constraintDimensionRatio="1:1"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toTopOf="parent" />
+
+        <ImageView
+            android:id="@+id/ivShortcutLikedIcon"
+            android:layout_width="0dp"
+            android:layout_height="0dp"
+            android:src="@drawable/ic_thumb_up_liked"
+            android:scaleType="fitCenter"
+            app:tint="@android:color/white"
+            android:visibility="gone"
+            app:layout_constraintDimensionRatio="1:1"
+            app:layout_constraintWidth_percent="0.4"
+            app:layout_constraintBottom_toBottomOf="@id/ivShortcutThumb"
+            app:layout_constraintEnd_toEndOf="@id/ivShortcutThumb"
+            app:layout_constraintStart_toStartOf="@id/ivShortcutThumb"
+            app:layout_constraintTop_toTopOf="@id/ivShortcutThumb" />
+
+        <View
             android:layout_width="0dp"
             android:layout_height="40dp"
             android:background="@drawable/bg_shortcut_gradient"

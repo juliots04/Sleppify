@@ -16,22 +16,30 @@
         android:clickable="false"
         android:focusable="false">
 
-        <FrameLayout
+        <androidx.constraintlayout.widget.ConstraintLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content">
 
-            <!-- Colored background -->
+            <!-- Colored background forced to 1:1 -->
             <View
                 android:id="@+id/vRadioBg"
-                android:layout_width="match_parent"
-                android:layout_height="180dp"
-                android:background="#333333" />
+                android:layout_width="0dp"
+                android:layout_height="0dp"
+                android:background="#333333"
+                app:layout_constraintDimensionRatio="1:1"
+                app:layout_constraintTop_toTopOf="parent"
+                app:layout_constraintStart_toStartOf="parent"
+                app:layout_constraintEnd_toEndOf="parent" />
 
             <!-- 3 circular images with overlap effect -->
             <FrameLayout
-                android:layout_width="match_parent"
-                android:layout_height="match_parent"
-                android:layout_marginVertical="12dp">
+                android:layout_width="0dp"
+                android:layout_height="0dp"
+                android:layout_marginVertical="12dp"
+                app:layout_constraintTop_toTopOf="@id/vRadioBg"
+                app:layout_constraintBottom_toBottomOf="@id/vRadioBg"
+                app:layout_constraintStart_toStartOf="@id/vRadioBg"
+                app:layout_constraintEnd_toEndOf="@id/vRadioBg">
 
                 <com.google.android.material.imageview.ShapeableImageView
                     android:id="@+id/ivRadioLeft"
@@ -68,23 +76,23 @@
                 android:id="@+id/tvRadioBadge"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_gravity="top|end"
-                android:layout_marginTop="10dp"
-                android:layout_marginEnd="10dp"
                 android:text="RADIO"
                 android:textColor="#FFFFFF"
                 android:textSize="10sp"
                 android:textStyle="bold"
                 android:textFontWeight="900"
                 android:fontFamily="@font/inter_variable"
-                android:letterSpacing="0.15" />
+                android:letterSpacing="0.15"
+                android:layout_marginTop="10dp"
+                android:layout_marginEnd="10dp"
+                app:layout_constraintTop_toTopOf="@id/vRadioBg"
+                app:layout_constraintEnd_toEndOf="@id/vRadioBg" />
 
-            <!-- Radio song title inside card, below circles -->
+            <!-- Radio song title inside card, bottom -->
             <TextView
                 android:id="@+id/tvRadioTitle"
-                android:layout_width="match_parent"
+                android:layout_width="0dp"
                 android:layout_height="wrap_content"
-                android:layout_gravity="bottom"
                 android:layout_marginHorizontal="12dp"
                 android:layout_marginBottom="10dp"
                 android:singleLine="true"
@@ -94,9 +102,12 @@
                 android:textSize="14sp"
                 android:textStyle="bold"
                 android:fontFamily="sans-serif-black"
-                android:letterSpacing="0.04" />
+                android:letterSpacing="0.04"
+                app:layout_constraintBottom_toBottomOf="@id/vRadioBg"
+                app:layout_constraintStart_toStartOf="@id/vRadioBg"
+                app:layout_constraintEnd_toEndOf="@id/vRadioBg" />
 
-        </FrameLayout>
+        </androidx.constraintlayout.widget.ConstraintLayout>
     </com.google.android.material.card.MaterialCardView>
 
     <!-- Song name outside card, below image -->

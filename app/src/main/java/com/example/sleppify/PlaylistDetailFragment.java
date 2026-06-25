@@ -1584,11 +1584,49 @@ public class PlaylistDetailFragment extends Fragment
             return;
         }
 
-        List<PlaylistTrack> cachedTracks = sanitizeTracksForPlaylist(
-                playlistId,
-                loadCachedTracks(playlistId)
-        );
+        // Offload cache read + JSON parse + sanitize to background to avoid blocking the UI.
+        // The result is posted back to the main thread for rendering and network decisions.
+        final Context bgCtx = requireContext().getApplicationContext();
+        final String bgPlaylistId = playlistId;
+        final String bgAccessToken = effectiveAccessToken;
+        final int bgRequestedLimit = requestedLimit;
+        final boolean bgFav = favoritesContext;
+        final boolean bgCustom = customContext;
+        final boolean bgForceRefresh = forceRefresh;
+        final boolean bgLoadMore = loadMore;
+        final Handler mainHandler = new Handler(Looper.getMainLooper());
 
+        trackStateLookupExecutor.execute(() -> {
+            final List<PlaylistTrack> bgCachedTracks;
+            try {
+                bgCachedTracks = sanitizeTracksForPlaylist(bgCtx, bgPlaylistId,
+                        loadCachedTracksInternal(bgCtx, bgPlaylistId, true));
+            } catch (Exception e) {
+                mainHandler.post(() -> {
+                    if (!isAdded()) return;
+                    continueBindAfterCacheLoad(bgPlaylistId, bgAccessToken, bgRequestedLimit,
+                            bgFav, bgCustom, bgForceRefresh, bgLoadMore, new ArrayList<>());
+                });
+                return;
+            }
+            mainHandler.post(() -> {
+                if (!isAdded()) return;
+                continueBindAfterCacheLoad(bgPlaylistId, bgAccessToken, bgRequestedLimit,
+                        bgFav, bgCustom, bgForceRefresh, bgLoadMore, bgCachedTracks);
+            });
+        });
+    }
+
+    private void continueBindAfterCacheLoad(
+            @NonNull String playlistId,
+            @NonNull String effectiveAccessToken,
+            int requestedLimit,
+            boolean favoritesContext,
+            boolean customContext,
+            boolean forceRefresh,
+            boolean loadMore,
+            @NonNull List<PlaylistTrack> cachedTracks
+    ) {
         if (favoritesContext || customContext) {
             // Clean HTML entities from stored titles/artists
             List<PlaylistTrack> cleaned = new ArrayList<>(cachedTracks.size());
@@ -2711,14 +2749,26 @@ public class PlaylistDetailFragment extends Fragment
             @NonNull String playlistId,
             @NonNull List<PlaylistTrack> source
     ) {
-        if (isFavoritesPlaylistContext(playlistId) && isAdded()) {
-            List<FavoritesPlaylistStore.FavoriteTrack> favorites = FavoritesPlaylistStore.loadFavorites(requireContext());
+        Context ctx = getContext();
+        if (ctx == null) return new ArrayList<>(source);
+        return sanitizeTracksForPlaylist(ctx, playlistId, source);
+    }
+
+    /** Thread-safe overload that accepts an explicit Context for use off the UI thread. */
+    @NonNull
+    private List<PlaylistTrack> sanitizeTracksForPlaylist(
+            @NonNull Context ctx,
+            @NonNull String playlistId,
+            @NonNull List<PlaylistTrack> source
+    ) {
+        if (isFavoritesPlaylistContext(playlistId)) {
+            List<FavoritesPlaylistStore.FavoriteTrack> favorites = FavoritesPlaylistStore.loadFavorites(ctx);
             List<PlaylistTrack> mapped = new ArrayList<>(favorites.size());
             for (FavoritesPlaylistStore.FavoriteTrack track : favorites) {
                 mapped.add(new PlaylistTrack(track.videoId, track.title, track.artist, track.duration, track.imageUrl));
             }
             java.util.Map<String, PlaylistOverrideStore.Override> favOverrides =
-                    PlaylistOverrideStore.INSTANCE.getOverrides(requireContext(), playlistId);
+                    PlaylistOverrideStore.INSTANCE.getOverrides(ctx, playlistId);
             if (!favOverrides.isEmpty()) {
                 mapped = PlaylistOverrideStore.INSTANCE.applyOverridesTo(
                         mapped, favOverrides,
@@ -2732,15 +2782,15 @@ public class PlaylistDetailFragment extends Fragment
             return mapped;
         }
 
-        if (isCustomPlaylistContext(playlistId) && isAdded()) {
+        if (isCustomPlaylistContext(playlistId)) {
             String name = playlistId.substring(CustomPlaylistsStore.CUSTOM_PLAYLIST_PREFIX.length());
-            List<FavoritesPlaylistStore.FavoriteTrack> custom = CustomPlaylistsStore.INSTANCE.getTracksFromPlaylist(requireContext(), name);
+            List<FavoritesPlaylistStore.FavoriteTrack> custom = CustomPlaylistsStore.INSTANCE.getTracksFromPlaylist(ctx, name);
             List<PlaylistTrack> mapped = new ArrayList<>(custom.size());
             for (FavoritesPlaylistStore.FavoriteTrack track : custom) {
                 mapped.add(new PlaylistTrack(track.videoId, track.title, track.artist, track.duration, track.imageUrl));
             }
             java.util.Map<String, PlaylistOverrideStore.Override> customOverrides =
-                    PlaylistOverrideStore.INSTANCE.getOverrides(requireContext(), playlistId);
+                    PlaylistOverrideStore.INSTANCE.getOverrides(ctx, playlistId);
             if (!customOverrides.isEmpty()) {
                 mapped = PlaylistOverrideStore.INSTANCE.applyOverridesTo(
                         mapped, customOverrides,
@@ -2755,9 +2805,9 @@ public class PlaylistDetailFragment extends Fragment
         }
 
         // For YouTube (non-local) playlists, apply persisted overrides
-        if (isAdded() && !playlistId.isEmpty()) {
+        if (!playlistId.isEmpty()) {
             java.util.Map<String, PlaylistOverrideStore.Override> overridesMap =
-                    PlaylistOverrideStore.INSTANCE.getOverrides(requireContext(), playlistId);
+                    PlaylistOverrideStore.INSTANCE.getOverrides(ctx, playlistId);
             
             List<PlaylistTrack> overridden = PlaylistOverrideStore.INSTANCE.applyOverridesTo(
                     new ArrayList<>(source),
@@ -2774,7 +2824,7 @@ public class PlaylistDetailFragment extends Fragment
 
             // Merge locally-mirrored tracks that were added via the save-to-playlist sheet
             List<FavoritesPlaylistStore.FavoriteTrack> mirrorTracks =
-                    CustomPlaylistsStore.INSTANCE.getYtMirrorTracks(requireContext(), playlistId);
+                    CustomPlaylistsStore.INSTANCE.getYtMirrorTracks(ctx, playlistId);
             if (!mirrorTracks.isEmpty()) {
                 Set<String> existingIds = new java.util.HashSet<>();
                 for (PlaylistTrack t : overridden) {
@@ -3129,13 +3179,13 @@ public class PlaylistDetailFragment extends Fragment
             return;
         }
 
-        // Safety timeout: reveal after 3s even if preloads haven't all completed
+        // Safety timeout: reveal after 1.5s even if preloads haven't all completed
         Handler uiHandler = new Handler(Looper.getMainLooper());
         uiHandler.postDelayed(() -> {
             if (isAdded() && awaitingInitialPlaylistRender) {
                 revealPlaylistContentIfNeeded(true);
             }
-        }, 3000L);
+        }, 1500L);
 
         Context ctx = requireContext();
         final java.util.concurrent.atomic.AtomicInteger remaining =
@@ -3398,12 +3448,23 @@ public class PlaylistDetailFragment extends Fragment
 
     @NonNull
     private List<PlaylistTrack> loadCachedTracksInternal(@NonNull String playlistId, boolean allowStale) {
+        Context ctx = getContext();
+        if (ctx == null || playlistId.isEmpty()) {
+            return new ArrayList<>();
+        }
+        return loadCachedTracksInternal(ctx, playlistId, allowStale);
+    }
+
+    /** Thread-safe overload that accepts an explicit Context for use off the UI thread. */
+    @NonNull
+    private List<PlaylistTrack> loadCachedTracksInternal(@NonNull Context ctx, @NonNull String playlistId, boolean allowStale) {
         List<PlaylistTrack> result = new ArrayList<>();
-        if (!isAdded() || playlistId.isEmpty()) {
+        if (playlistId.isEmpty()) {
             return result;
         }
 
-        long updatedAt = getCachePrefs().getLong(PREF_TRACKS_UPDATED_AT_PREFIX + playlistId, 0L);
+        SharedPreferences prefs = ctx.getSharedPreferences(PREFS_STREAMING_CACHE, Activity.MODE_PRIVATE);
+        long updatedAt = prefs.getLong(PREF_TRACKS_UPDATED_AT_PREFIX + playlistId, 0L);
         if (updatedAt <= 0L && !allowStale) {
             return result;
         }
@@ -3411,7 +3472,7 @@ public class PlaylistDetailFragment extends Fragment
             return result;
         }
 
-        String raw = getCachePrefs().getString(PREF_TRACKS_DATA_PREFIX + playlistId, "");
+        String raw = prefs.getString(PREF_TRACKS_DATA_PREFIX + playlistId, "");
         if (TextUtils.isEmpty(raw)) {
             return result;
         }
@@ -6738,7 +6799,10 @@ public class PlaylistDetailFragment extends Fragment
                 float target = progressForTrack(track.videoId, downloadingTrackProgressById);
                 holder.vOfflineProgressFill.setPivotX(0f);
                 holder.vOfflineProgressFill.animate().cancel();
-                holder.vOfflineProgressFill.animate().scaleX(target).setDuration(180L).start();
+                if (holder.vOfflineProgressFill.getScaleX() < 0.01f) {
+                    holder.vOfflineProgressFill.setScaleX(0f);
+                }
+                holder.vOfflineProgressFill.animate().scaleX(target).setDuration(500L).setInterpolator(new android.view.animation.DecelerateInterpolator()).start();
             } else {
                 holder.vOfflineProgressFill.animate().cancel();
                 holder.vOfflineProgressFill.setScaleX(0f);

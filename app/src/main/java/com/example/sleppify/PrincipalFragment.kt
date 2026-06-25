@@ -51,6 +51,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         private const val PREFS_PLAYER_STATE = "player_state"
         private const val PREF_LAST_YOUTUBE_WEB_COOKIE = "stream_last_youtube_web_cookie"
         private const val PREFS_STREAMING_CACHE = "streaming_cache"
+        private const val PREFS_RADIO_CACHE = "sleppify_radio_ui_cache"
         private const val SHORTCUTS_PER_PAGE = 9
         private const val SHORTCUTS_MAX_PAGES = 3
         // Partial-bind payload: refresh only the play/equalizer icon without reloading artwork or
@@ -191,6 +192,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
         llRadiosHeader = view.findViewById(R.id.llRadiosHeader)
         rvRadios = view.findViewById(R.id.rvRadios)
+        preloadRadioCaches()
         setupRadios()
 
         llPlaylistsHeader = view.findViewById(R.id.llPlaylistsHeader)
@@ -713,10 +715,10 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             val radioPlaylistId = "RDAMVM${track.videoId}"
             val selectedVideoId = track.videoId
             youTubeMusicService.fetchMixTracks(cookie, radioPlaylistId, object : YouTubeMusicService.MixTracksCallback {
-                override fun onSuccess(tracksList: List<YouTubeMusicService.TrackResult>) {
-                    if (!isAdded || tracksList.isEmpty()) return
+                override fun onSuccess(tracks: List<YouTubeMusicService.TrackResult>) {
+                    if (!isAdded || tracks.isEmpty()) return
                     val radioList = mutableListOf(track)
-                    for (t in tracksList) { if (t.videoId != selectedVideoId) radioList.add(t) }
+                    for (t in tracks) { if (t.videoId != selectedVideoId) radioList.add(t) }
 
                     findSongPlayerFragment()?.let { sp ->
                         if (sp.isAdded) {
@@ -734,7 +736,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                         track.subtitle ?: "",
                         track.thumbnailUrl ?: ""
                     ))
-                    for (t in tracksList) {
+                    for (t in tracks) {
                         if (t.videoId.isNullOrEmpty() || t.videoId == selectedVideoId) continue
                         radioStoreTracks.add(RadioHistoryStore.RadioTrack(t.videoId, t.title ?: "", t.subtitle ?: "", t.thumbnailUrl ?: ""))
                     }
@@ -1016,13 +1018,40 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
     private fun refreshRadios() {
         if (!isAdded) return
-        val radios = RadioHistoryStore.getRadios(requireContext()).take(10)
-        radioEntries.clear()
-        radioEntries.addAll(radios)
-        val hasRadios = radioEntries.isNotEmpty()
-        llRadiosHeader?.visibility = if (hasRadios) View.VISIBLE else View.GONE
-        rvRadios?.visibility = if (hasRadios) View.VISIBLE else View.GONE
-        (rvRadios?.adapter as? RadioCarouselAdapter)?.notifyDataSetChanged()
+        val appContext = requireContext().applicationContext
+        bgExecutor.execute {
+            val radios = RadioHistoryStore.getRadios(appContext).take(10)
+            handler.post {
+                if (!isAdded) return@post
+                radioEntries.clear()
+                radioEntries.addAll(radios)
+                val hasRadios = radioEntries.isNotEmpty()
+                llRadiosHeader?.visibility = if (hasRadios) View.VISIBLE else View.GONE
+                rvRadios?.visibility = if (hasRadios) View.VISIBLE else View.GONE
+                (rvRadios?.adapter as? RadioCarouselAdapter)?.notifyDataSetChanged()
+                // Pre-fetch side images so they're in Glide disk cache before scroll
+                preloadRadioImages(radios)
+            }
+        }
+    }
+
+    private fun preloadRadioImages(radios: List<RadioHistoryStore.RadioEntry>) {
+        if (!isAdded || radios.isEmpty()) return
+        try {
+            val glide = Glide.with(this)
+            for (radio in radios) {
+                if (radio.songThumbnail.isNotEmpty()) {
+                    glide.load(radio.songThumbnail).diskCacheStrategy(DiskCacheStrategy.ALL).centerCrop().preload()
+                }
+                val sides = radioSideUrlsCache[radio.radioPlaylistId] ?: continue
+                if (sides.first.isNotEmpty()) {
+                    glide.load(sides.first).diskCacheStrategy(DiskCacheStrategy.ALL).centerCrop().preload()
+                }
+                if (sides.second.isNotEmpty()) {
+                    glide.load(sides.second).diskCacheStrategy(DiskCacheStrategy.ALL).centerCrop().preload()
+                }
+            }
+        } catch (_: Exception) {}
     }
 
     private fun onRadioClicked(radio: RadioHistoryStore.RadioEntry) {
@@ -1061,17 +1090,20 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             private val tvTitle: TextView = itemView.findViewById(R.id.tvRadioTitle)
 
             fun bind(radio: RadioHistoryStore.RadioEntry) {
-                val text = radioArtistTextCache.getOrPut(radio.radioPlaylistId) {
+                val cachedText = radioArtistTextCache[radio.radioPlaylistId]
+                val text = if (cachedText != null) cachedText else {
                     val uniqueArtists = radio.tracks.map { it.artist }.filter { it.isNotEmpty() }.distinct()
                     val random = java.util.Random(radio.radioPlaylistId.hashCode().toLong())
                     val shuffledArtists = uniqueArtists.shuffled(random)
                     val top3 = shuffledArtists.take(3)
-                    when (top3.size) {
+                    val computed = when (top3.size) {
                         0 -> "Con varios artistas"
                         1 -> "Con ${top3[0]} y más"
                         2 -> "Con ${top3[0]}, ${top3[1]} y más"
                         else -> "Con ${top3[0]}, ${top3[1]}, ${top3[2]} y más"
                     }
+                    persistArtistText(radio.radioPlaylistId, computed)
+                    computed
                 }
                 tvName.text = text
                 tvTitle.text = radio.songTitle
@@ -1085,6 +1117,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                     try {
                         Glide.with(this@PrincipalFragment)
                             .load(centerUrl)
+                            .diskCacheStrategy(DiskCacheStrategy.ALL)
                             .centerCrop()
                             .placeholder(R.color.surface_high)
                             .into(ivCenter)
@@ -1100,6 +1133,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                             Glide.with(this@PrincipalFragment)
                                 .asBitmap()
                                 .load(centerUrl)
+                                .diskCacheStrategy(DiskCacheStrategy.ALL)
                                 .override(64, 64)
                                 .centerCrop()
                                 .into(object : com.bumptech.glide.request.target.CustomTarget<android.graphics.Bitmap>() {
@@ -1108,7 +1142,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                                             val dominant = palette?.getDarkMutedColor(
                                                 palette.getMutedColor(0xFF333333.toInt())
                                             ) ?: 0xFF333333.toInt()
-                                            radioDominantColorCache[centerUrl] = dominant
+                                            persistDominantColor(radio.radioPlaylistId, centerUrl, dominant)
                                             vBg.background = GradientDrawable(
                                                 GradientDrawable.Orientation.TOP_BOTTOM,
                                                 intArrayOf(dominant, darkenColor(dominant, 0.6f))
@@ -1122,23 +1156,113 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 }
 
                 // Left and Right = 2 deterministic tracks from the radio (excluding seed)
-                val (leftUrl, rightUrl) = radioSideUrlsCache.getOrPut(radio.radioPlaylistId) {
+                val cachedSides = radioSideUrlsCache[radio.radioPlaylistId]?.takeIf { it.first.isNotEmpty() }
+                val sides: Pair<String, String> = if (cachedSides != null) {
+                    cachedSides
+                } else {
                     val otherTracks = radio.tracks.filter { it.thumbnailUrl.isNotEmpty() && it.thumbnailUrl != centerUrl }
-                    val seed = radio.radioPlaylistId.hashCode().toLong()
-                    val seeded = otherTracks.sortedBy { it.videoId.hashCode().toLong() xor seed }
-                    Pair(seeded.getOrNull(0)?.thumbnailUrl ?: "", seeded.getOrNull(1)?.thumbnailUrl ?: "")
+                    if (otherTracks.size >= 2) {
+                        val seed = radio.radioPlaylistId.hashCode().toLong()
+                        val seeded = otherTracks.sortedBy { it.videoId.hashCode().toLong() xor seed }
+                        Pair(seeded[0].thumbnailUrl, seeded.getOrNull(1)?.thumbnailUrl ?: "")
+                    } else if (isAdded) {
+                        val gridUrls = resolvePlaylistGridUrls(radio.radioPlaylistId).filter { it != centerUrl }
+                        if (gridUrls.size >= 2) Pair(gridUrls[0], gridUrls[1])
+                        else if (gridUrls.size == 1) Pair(gridUrls[0], "")
+                        else Pair("", "")
+                    } else Pair("", "")
                 }
+                if (sides.first.isNotEmpty() && cachedSides == null) {
+                    persistSideUrls(radio.radioPlaylistId, sides.first, sides.second)
+                }
+                val (leftUrl, rightUrl) = sides
 
                 if (leftUrl.isNotEmpty() && isAdded) {
-                    try { Glide.with(this@PrincipalFragment).load(leftUrl).centerCrop().placeholder(R.color.surface_high).into(ivLeft) } catch (_: Exception) {}
+                    try { Glide.with(this@PrincipalFragment).load(leftUrl).diskCacheStrategy(DiskCacheStrategy.ALL).centerCrop().placeholder(R.color.surface_high).into(ivLeft) } catch (_: Exception) {}
                 } else {
                     ivLeft.setImageResource(R.color.surface_high)
                 }
                 if (rightUrl.isNotEmpty() && isAdded) {
-                    try { Glide.with(this@PrincipalFragment).load(rightUrl).centerCrop().placeholder(R.color.surface_high).into(ivRight) } catch (_: Exception) {}
+                    try { Glide.with(this@PrincipalFragment).load(rightUrl).diskCacheStrategy(DiskCacheStrategy.ALL).centerCrop().placeholder(R.color.surface_high).into(ivRight) } catch (_: Exception) {}
                 } else {
                     ivRight.setImageResource(R.color.surface_high)
                 }
+            }
+        }
+    }
+
+    // ========== Radio UI Cache Persistence ==========
+
+    private fun persistDominantColor(radioPlaylistId: String, url: String, color: Int) {
+        radioDominantColorCache[url] = color
+        val ctx = context?.applicationContext ?: return
+        bgExecutor.execute {
+            ctx.getSharedPreferences(PREFS_RADIO_CACHE, Context.MODE_PRIVATE)
+                .edit()
+                .putInt("color_$radioPlaylistId", color)
+                .putString("colorurl_$radioPlaylistId", url)
+                .apply()
+        }
+    }
+
+    private fun persistSideUrls(radioPlaylistId: String, left: String, right: String) {
+        radioSideUrlsCache[radioPlaylistId] = Pair(left, right)
+        val ctx = context?.applicationContext ?: return
+        bgExecutor.execute {
+            ctx.getSharedPreferences(PREFS_RADIO_CACHE, Context.MODE_PRIVATE)
+                .edit()
+                .putString("sides_$radioPlaylistId", "$left\n$right")
+                .apply()
+        }
+    }
+
+    private fun persistArtistText(radioPlaylistId: String, text: String) {
+        radioArtistTextCache[radioPlaylistId] = text
+        val ctx = context?.applicationContext ?: return
+        bgExecutor.execute {
+            ctx.getSharedPreferences(PREFS_RADIO_CACHE, Context.MODE_PRIVATE)
+                .edit()
+                .putString("artists_$radioPlaylistId", text)
+                .apply()
+        }
+    }
+
+    private fun preloadRadioCaches() {
+        val ctx = context?.applicationContext ?: return
+        bgExecutor.execute {
+            try {
+                val prefs = ctx.getSharedPreferences(PREFS_RADIO_CACHE, Context.MODE_PRIVATE)
+                val all = prefs.all
+                val colors = HashMap<String, Int>()
+                val sides = HashMap<String, Pair<String, String>>()
+                val artists = HashMap<String, String>()
+                for ((key, value) in all) {
+                    when {
+                        key.startsWith("color_") && !key.startsWith("colorurl_") && value is Int -> {
+                            val id = key.removePrefix("color_")
+                            val url = all["colorurl_$id"] as? String
+                            if (!url.isNullOrEmpty()) colors[url] = value
+                        }
+                        key.startsWith("sides_") && value is String -> {
+                            val id = key.removePrefix("sides_")
+                            val parts = value.split("\n", limit = 2)
+                            if (parts.size == 2) sides[id] = Pair(parts[0], parts[1])
+                        }
+                        key.startsWith("artists_") && value is String -> {
+                            val id = key.removePrefix("artists_")
+                            artists[id] = value
+                        }
+                    }
+                }
+
+                handler.post {
+                    if (!isAdded) return@post
+                    radioDominantColorCache.putAll(colors)
+                    radioSideUrlsCache.putAll(sides)
+                    radioArtistTextCache.putAll(artists)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "preloadRadioCaches failed", e)
             }
         }
     }
@@ -1167,6 +1291,12 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         llPlaylistsHeader?.visibility = if (hasPlaylists) View.VISIBLE else View.GONE
         rvPlaylists?.visibility = if (hasPlaylists) View.VISIBLE else View.GONE
         (rvPlaylists?.adapter as? PlaylistCarouselAdapter)?.notifyDataSetChanged()
+    }
+
+    private fun isLikedPlaylistId(playlistId: String): Boolean {
+        val id = playlistId.trim()
+        return id == YouTubeMusicService.SPECIAL_LIKED_VIDEOS_ID
+                || id == "LL" || id == "LM" || id.startsWith("VLLL")
     }
 
     private fun onPlaylistClicked(entry: PlayCountStore.PlayCountEntry) {
@@ -1214,12 +1344,36 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             private val cardPlaylist: View = itemView.findViewById(R.id.cardPlaylist)
             private val ivCover: ShapeableImageView = itemView.findViewById(R.id.ivPlaylistCover)
             private val tvName: TextView = itemView.findViewById(R.id.tvPlaylistName)
+            private val vLikedBg: View = itemView.findViewById(R.id.vPlaylistLikedBg)
+            private val ivLikedIcon: ImageView = itemView.findViewById(R.id.ivPlaylistLikedIcon)
 
             fun bind(entry: PlayCountStore.PlayCountEntry) {
-                tvName.text = entry.playlistName
+                val isLiked = isLikedPlaylistId(entry.playlistId)
+                tvName.text = if (isLiked) "Música que te gustó" else entry.playlistName
                 val clickListener = View.OnClickListener { onPlaylistClicked(entry) }
                 itemView.setOnClickListener(clickListener)
                 cardPlaylist.setOnClickListener(clickListener)
+
+                if (isLiked) {
+                    ivCover.setImageDrawable(null)
+                    ivCover.visibility = View.INVISIBLE
+                    vLikedBg.visibility = View.VISIBLE
+                    ivLikedIcon.visibility = View.VISIBLE
+                    // Scale icon to ~40% of cover (30% padding each side)
+                    ivLikedIcon.post {
+                        val w = ivLikedIcon.width
+                        if (w > 0) {
+                            val pad = (w * 0.30f).toInt()
+                            ivLikedIcon.setPadding(pad, pad, pad, pad)
+                        }
+                    }
+                    return
+                }
+
+                // Reset liked views for recycled ViewHolder
+                ivCover.visibility = View.VISIBLE
+                vLikedBg.visibility = View.GONE
+                ivLikedIcon.visibility = View.GONE
 
                 if (isAdded) {
                     val gridUrls = resolvePlaylistGridUrls(entry.playlistId)
@@ -1233,6 +1387,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                             try {
                                 Glide.with(this@PrincipalFragment)
                                     .load(fallbackUrl)
+                                    .diskCacheStrategy(DiskCacheStrategy.ALL)
                                     .centerCrop()
                                     .placeholder(R.color.surface_high)
                                     .into(ivCover)
@@ -1261,22 +1416,39 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 itemView.setOnClickListener(clickListener)
                 cardRadio.setOnClickListener(clickListener)
 
-                // Try to find matching radio history to get real side track thumbnails
-                val radio = if (isAdded) {
-                    RadioHistoryStore.getRadios(requireContext()).find { it.radioPlaylistId == entry.playlistId }
-                } else null
+                // Use already-loaded radioEntries instead of reading from disk per bind
+                val radio = radioEntries.find { it.radioPlaylistId == entry.playlistId }
                 val centerUrl = radio?.songThumbnail?.takeIf { it.isNotEmpty() } ?: entry.imageUrl
-                val (leftUrl, rightUrl) = radioSideUrlsCache.getOrPut(entry.playlistId) {
-                    val otherTracks = radio?.tracks?.filter { it.thumbnailUrl.isNotEmpty() && it.thumbnailUrl != centerUrl } ?: emptyList()
-                    val seed = entry.playlistId.hashCode().toLong()
-                    val seeded = otherTracks.sortedBy { it.videoId.hashCode().toLong() xor seed }
-                    Pair(seeded.getOrNull(0)?.thumbnailUrl ?: "", seeded.getOrNull(1)?.thumbnailUrl ?: "")
+                val cachedSides = radioSideUrlsCache[entry.playlistId]?.takeIf { it.first.isNotEmpty() }
+                val sides: Pair<String, String> = if (cachedSides != null) {
+                    cachedSides
+                } else {
+                    // 1. Try from in-memory radio tracks
+                    val radioTracks = radio?.tracks?.filter { it.thumbnailUrl.isNotEmpty() && it.thumbnailUrl != centerUrl } ?: emptyList()
+                    if (radioTracks.size >= 2) {
+                        val seed = entry.playlistId.hashCode().toLong()
+                        val seeded = radioTracks.sortedBy { it.videoId.hashCode().toLong() xor seed }
+                        Pair(seeded[0].thumbnailUrl, seeded.getOrNull(1)?.thumbnailUrl ?: "")
+                    } else if (isAdded) {
+                        // 2. Fallback: streaming cache (playlist_tracks_data / grid_urls)
+                        val gridUrls = resolvePlaylistGridUrls(entry.playlistId).filter { it != centerUrl }
+                        if (gridUrls.size >= 2) Pair(gridUrls[0], gridUrls[1])
+                        else if (gridUrls.size == 1) Pair(gridUrls[0], "")
+                        else Pair("", "")
+                    } else {
+                        Pair("", "")
+                    }
                 }
+                if (sides.first.isNotEmpty() && cachedSides == null) {
+                    persistSideUrls(entry.playlistId, sides.first, sides.second)
+                }
+                val (leftUrl, rightUrl) = sides
 
                 if (centerUrl.isNotEmpty() && isAdded) {
                     try {
                         Glide.with(this@PrincipalFragment)
                             .load(centerUrl)
+                            .diskCacheStrategy(DiskCacheStrategy.ALL)
                             .centerCrop()
                             .placeholder(R.color.surface_high)
                             .into(ivCenter)
@@ -1291,6 +1463,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                             Glide.with(this@PrincipalFragment)
                                 .asBitmap()
                                 .load(centerUrl)
+                                .diskCacheStrategy(DiskCacheStrategy.ALL)
                                 .override(64, 64)
                                 .centerCrop()
                                 .into(object : com.bumptech.glide.request.target.CustomTarget<android.graphics.Bitmap>() {
@@ -1299,7 +1472,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                                             val dominant = palette?.getDarkMutedColor(
                                                 palette.getMutedColor(0xFF333333.toInt())
                                             ) ?: 0xFF333333.toInt()
-                                            radioDominantColorCache[centerUrl] = dominant
+                                            persistDominantColor(entry.playlistId, centerUrl, dominant)
                                             vBg.background = GradientDrawable(
                                                 GradientDrawable.Orientation.TOP_BOTTOM,
                                                 intArrayOf(dominant, darkenColor(dominant, 0.6f))
@@ -1311,12 +1484,12 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                         }
 
                         if (leftUrl.isNotEmpty()) {
-                            Glide.with(this@PrincipalFragment).load(leftUrl).centerCrop().placeholder(R.color.surface_high).into(ivLeft)
+                            Glide.with(this@PrincipalFragment).load(leftUrl).diskCacheStrategy(DiskCacheStrategy.ALL).centerCrop().placeholder(R.color.surface_high).into(ivLeft)
                         } else {
                             ivLeft.setImageResource(R.color.surface_high)
                         }
                         if (rightUrl.isNotEmpty()) {
-                            Glide.with(this@PrincipalFragment).load(rightUrl).centerCrop().placeholder(R.color.surface_high).into(ivRight)
+                            Glide.with(this@PrincipalFragment).load(rightUrl).diskCacheStrategy(DiskCacheStrategy.ALL).centerCrop().placeholder(R.color.surface_high).into(ivRight)
                         } else {
                             ivRight.setImageResource(R.color.surface_high)
                         }
@@ -1383,32 +1556,46 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
         override fun onBindViewHolder(holder: CellVH, position: Int) {
             val entry = items[position]
-            holder.tvTitle.text = entry.title
 
             val isPlaylist = !entry.playlistId.isNullOrEmpty() && entry.videoId == entry.playlistId
-            val currentTag = (holder.ivThumb.getTag(R.id.tag_artwork_signature) as? String) ?: ""
+            val isLiked = isPlaylist && isLikedPlaylistId(entry.playlistId)
 
-            if (isPlaylist && isAdded) {
-                val gridUrls = resolvePlaylistGridUrls(entry.playlistId)
-                if (gridUrls.size >= 4) {
-                    val signature = "${entry.playlistId}_${gridUrls[0]}"
-                    if (signature != currentTag) {
-                        holder.ivThumb.setTag(R.id.tag_artwork_signature, signature)
-                        val density = holder.itemView.context.resources.displayMetrics.density
-                        val sizePx = (120 * density).toInt()
-                        PlaylistGridArtLoader.load(holder.ivThumb, gridUrls, sizePx)
+            holder.tvTitle.text = if (isLiked) "Música que te gustó" else entry.title
+
+            // Liked playlist: gradient + icon, no artwork
+            if (isLiked) {
+                holder.ivThumb.setImageDrawable(null)
+                holder.vLikedBg.visibility = View.VISIBLE
+                holder.ivLikedIcon.visibility = View.VISIBLE
+                holder.ivThumb.setTag(R.id.tag_artwork_signature, "__liked__")
+            } else {
+                holder.vLikedBg.visibility = View.GONE
+                holder.ivLikedIcon.visibility = View.GONE
+
+                val currentTag = (holder.ivThumb.getTag(R.id.tag_artwork_signature) as? String) ?: ""
+
+                if (isPlaylist && isAdded) {
+                    val gridUrls = resolvePlaylistGridUrls(entry.playlistId)
+                    if (gridUrls.size >= 4) {
+                        val signature = "${entry.playlistId}_${gridUrls[0]}"
+                        if (signature != currentTag) {
+                            holder.ivThumb.setTag(R.id.tag_artwork_signature, signature)
+                            val density = holder.itemView.context.resources.displayMetrics.density
+                            val sizePx = (120 * density).toInt()
+                            PlaylistGridArtLoader.load(holder.ivThumb, gridUrls, sizePx)
+                        }
+                    } else {
+                        val fallbackUrl = gridUrls.firstOrNull() ?: entry.imageUrl
+                        if (!fallbackUrl.isNullOrEmpty() && fallbackUrl != currentTag) {
+                            holder.ivThumb.setTag(R.id.tag_artwork_signature, fallbackUrl)
+                            try { Glide.with(this@PrincipalFragment).load(fallbackUrl).placeholder(R.color.surface_high).transform(SHARED_YT_CROP, SHARED_CENTER_CROP).into(holder.ivThumb) } catch (_: Exception) {}
+                        }
                     }
-                } else {
-                    val fallbackUrl = gridUrls.firstOrNull() ?: entry.imageUrl
-                    if (!fallbackUrl.isNullOrEmpty() && fallbackUrl != currentTag) {
-                        holder.ivThumb.setTag(R.id.tag_artwork_signature, fallbackUrl)
-                        try { Glide.with(this@PrincipalFragment).load(fallbackUrl).placeholder(R.color.surface_high).transform(SHARED_YT_CROP, SHARED_CENTER_CROP).into(holder.ivThumb) } catch (_: Exception) {}
+                } else if (!entry.imageUrl.isNullOrEmpty() && isAdded) {
+                    if (entry.imageUrl != currentTag) {
+                        holder.ivThumb.setTag(R.id.tag_artwork_signature, entry.imageUrl)
+                        try { Glide.with(this@PrincipalFragment).load(entry.imageUrl).placeholder(R.color.surface_high).transform(SHARED_YT_CROP, SHARED_CENTER_CROP).into(holder.ivThumb) } catch (_: Exception) {}
                     }
-                }
-            } else if (!entry.imageUrl.isNullOrEmpty() && isAdded) {
-                if (entry.imageUrl != currentTag) {
-                    holder.ivThumb.setTag(R.id.tag_artwork_signature, entry.imageUrl)
-                    try { Glide.with(this@PrincipalFragment).load(entry.imageUrl).placeholder(R.color.surface_high).transform(SHARED_YT_CROP, SHARED_CENTER_CROP).into(holder.ivThumb) } catch (_: Exception) {}
                 }
             }
 
@@ -1455,6 +1642,8 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             val tvTitle: TextView = itemView.findViewById(R.id.tvShortcutTitle)
             val ivPlay: ImageView = itemView.findViewById(R.id.ivShortcutPlay)
             val eqView: AnimatedEqualizerView = itemView.findViewById(R.id.eqShortcut)
+            val vLikedBg: View = itemView.findViewById(R.id.vShortcutLikedBg)
+            val ivLikedIcon: ImageView = itemView.findViewById(R.id.ivShortcutLikedIcon)
         }
     }
 

@@ -31,7 +31,7 @@ public class CircularProgressView extends View {
     private ValueAnimator animator;
 
     private static final float STROKE_WIDTH_DP = 2f;
-    private static final long ANIM_DURATION_MS = 320L;
+    private static final long ANIM_DURATION_MS = 600L;
     private static final float START_ANGLE = -90f; // 12 o'clock
 
     public CircularProgressView(@NonNull Context context) {
@@ -97,6 +97,25 @@ public class CircularProgressView extends View {
 
     public float getProgress() {
         return progress;
+    }
+
+    /**
+     * Resets display to 0 immediately, then animates up to target.
+     * Use this when a download starts fresh so it always visually begins from zero.
+     */
+    public void setProgressFromZero(float target) {
+        target = Math.max(0f, Math.min(1f, target));
+        if (animator != null) {
+            animator.cancel();
+            animator = null;
+        }
+        this.displayProgress = 0f;
+        this.progress = 0f;
+        invalidate();
+        if (target > 0.001f) {
+            this.progress = target;
+            animateTo(target);
+        }
     }
 
     private void animateTo(float target) {

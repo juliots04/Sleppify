@@ -238,7 +238,7 @@ class EqualizerFragment : Fragment() {
             tvBassGainValue.text = formatDb(value)
             if (restoringUi) return@addOnChangeListener
             preferences.edit().putFloat(AudioEffectsService.KEY_BASS_DB, value).apply()
-            markPresetAsCustom()
+            markOrSaveBassToUserPreset()
             applyIfEnabled()
         }
         sliderBassGain.setOnFocusChangeListener { _, hasFocus ->
@@ -248,7 +248,7 @@ class EqualizerFragment : Fragment() {
             tvBassFrequencyValue.text = formatHz(value)
             if (restoringUi) return@addOnChangeListener
             preferences.edit().putFloat(AudioEffectsService.KEY_BASS_FREQUENCY_HZ, value).apply()
-            markPresetAsCustom()
+            markOrSaveBassToUserPreset()
             applyIfEnabled()
         }
         sliderBassFrequency.setOnFocusChangeListener { _, hasFocus ->
@@ -543,7 +543,7 @@ class EqualizerFragment : Fragment() {
     ): TextView = createPopupRow(option.label, isSelected) {
         preferences.edit().putInt(AudioEffectsService.KEY_BASS_TYPE, option.value).apply()
         tvSelectedBassType?.text = option.label
-        markPresetAsCustom()
+        markOrSaveBassToUserPreset()
         applyIfEnabled()
         popupWindow.dismiss()
     }
@@ -607,14 +607,38 @@ class EqualizerFragment : Fragment() {
         eqCurveView.setBandValues(preset.bands)
         eqCurveView.setHandlesVisible(false)
         tvSelectedPreset.text = preset.name
-        restoringUi = false
 
         val editor = preferences.edit()
         for (i in preset.bands.indices) {
             editor.putFloat(AudioEffectsService.bandDbKey(i), preset.bands[i])
         }
         editor.putString(KEY_SELECTED_PRESET, preset.id)
+
+        // Restore bass values stored for this user preset
+        val profileId = preset.profileId
+        val bassDbKey = KEY_USER_PRESET_BASS_DB_PREFIX + profileId
+        val bassFreqKey = KEY_USER_PRESET_BASS_FREQ_PREFIX + profileId
+        val bassTypeKey = KEY_USER_PRESET_BASS_TYPE_PREFIX + profileId
+        if (preferences.contains(bassDbKey)) {
+            val bassDb = quantizeBassGainToggle(preferences.getFloat(bassDbKey, 0f))
+            editor.putFloat(AudioEffectsService.KEY_BASS_DB, bassDb)
+            sliderBassGain.value = bassDb
+            tvBassGainValue.text = formatDb(bassDb)
+        }
+        if (preferences.contains(bassFreqKey)) {
+            val bassFreq = normalizeBassFrequencySlider(preferences.getFloat(bassFreqKey, BASS_DEFAULT_FREQUENCY_HZ))
+            editor.putFloat(AudioEffectsService.KEY_BASS_FREQUENCY_HZ, bassFreq)
+            sliderBassFrequency.value = bassFreq
+            tvBassFrequencyValue.text = formatHz(bassFreq)
+        }
+        if (preferences.contains(bassTypeKey)) {
+            val bassType = normalizeBassType(preferences.getInt(bassTypeKey, BASS_TYPE_DEFAULT))
+            editor.putInt(AudioEffectsService.KEY_BASS_TYPE, bassType)
+            tvSelectedBassType?.text = bassTypeLabelFromValue(bassType)
+        }
+
         editor.apply()
+        restoringUi = false
 
         applyIfEnabled()
     }
@@ -891,7 +915,10 @@ class EqualizerFragment : Fragment() {
         }
     }
 
-    private fun formatGraphicEqDialogGain(value: Float): String = String.format(Locale.US, "%.1f", value)
+    private fun formatGraphicEqDialogGain(value: Float): String {
+        val formatted = String.format(Locale.US, "%.1f", value)
+        return if (formatted == "-0.0") "0.0" else formatted
+    }
 
     private fun formatGraphicEqDialogFrequency(frequencyHz: Float): String {
         if (frequencyHz >= 1000f) {
@@ -1155,6 +1182,20 @@ class EqualizerFragment : Fragment() {
         tvSelectedPreset.text = presetLabelFromId(targetPresetId)
     }
 
+    private fun markOrSaveBassToUserPreset() {
+        val currentPreset = preferences.getString(KEY_SELECTED_PRESET, PRESET_DEFAULT)
+        if (isUserPresetId(currentPreset)) {
+            val profileId = profileIdFromUserPresetId(currentPreset) ?: return
+            preferences.edit()
+                .putFloat(KEY_USER_PRESET_BASS_DB_PREFIX + profileId, preferences.getFloat(AudioEffectsService.KEY_BASS_DB, 0f))
+                .putFloat(KEY_USER_PRESET_BASS_FREQ_PREFIX + profileId, preferences.getFloat(AudioEffectsService.KEY_BASS_FREQUENCY_HZ, BASS_DEFAULT_FREQUENCY_HZ))
+                .putInt(KEY_USER_PRESET_BASS_TYPE_PREFIX + profileId, preferences.getInt(AudioEffectsService.KEY_BASS_TYPE, BASS_TYPE_DEFAULT))
+                .apply()
+        } else {
+            markPresetAsCustom()
+        }
+    }
+
     private fun findPresetById(presetId: String?): PresetConfig? {
         for (presetConfig in PRESET_CONFIGS) {
             if (presetConfig.id == presetId) return presetConfig
@@ -1305,6 +1346,9 @@ class EqualizerFragment : Fragment() {
         private const val KEY_SELECTED_PRESET = "selected_preset"
         private const val KEY_PROFILE_CUSTOM_PRESET_NAME_PREFIX = "profile_custom_preset_name_"
         private const val KEY_USER_PRESET_BAND_PREFIX = "user_preset_band_"
+        private const val KEY_USER_PRESET_BASS_DB_PREFIX = "user_preset_bass_db_"
+        private const val KEY_USER_PRESET_BASS_FREQ_PREFIX = "user_preset_bass_freq_"
+        private const val KEY_USER_PRESET_BASS_TYPE_PREFIX = "user_preset_bass_type_"
         private const val KEY_DEVICE_PROFILE_PREFIX = "device_profile_"
         private const val PRESET_DEFAULT = "default"
         private const val PRESET_CUSTOM = "custom"

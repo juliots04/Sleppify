@@ -16,13 +16,46 @@
         android:clickable="false"
         android:focusable="false">
 
-        <com.google.android.material.imageview.ShapeableImageView
-            android:id="@+id/ivPlaylistCover"
+        <androidx.constraintlayout.widget.ConstraintLayout
             android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:adjustViewBounds="true"
-            android:scaleType="centerCrop"
-            android:background="@color/surface_high" />
+            android:layout_height="wrap_content">
+
+            <com.google.android.material.imageview.ShapeableImageView
+                android:id="@+id/ivPlaylistCover"
+                android:layout_width="0dp"
+                android:layout_height="0dp"
+                android:scaleType="centerCrop"
+                android:background="@color/surface_high"
+                app:layout_constraintDimensionRatio="1:1"
+                app:layout_constraintTop_toTopOf="parent"
+                app:layout_constraintStart_toStartOf="parent"
+                app:layout_constraintEnd_toEndOf="parent" />
+
+            <View
+                android:id="@+id/vPlaylistLikedBg"
+                android:layout_width="0dp"
+                android:layout_height="0dp"
+                android:background="@drawable/bg_music_liked_gradient"
+                android:visibility="gone"
+                app:layout_constraintDimensionRatio="1:1"
+                app:layout_constraintTop_toTopOf="parent"
+                app:layout_constraintStart_toStartOf="parent"
+                app:layout_constraintEnd_toEndOf="parent" />
+
+            <ImageView
+                android:id="@+id/ivPlaylistLikedIcon"
+                android:layout_width="0dp"
+                android:layout_height="0dp"
+                android:src="@drawable/ic_thumb_up_liked"
+                android:scaleType="fitCenter"
+                app:tint="@android:color/white"
+                android:visibility="gone"
+                app:layout_constraintDimensionRatio="1:1"
+                app:layout_constraintTop_toTopOf="parent"
+                app:layout_constraintStart_toStartOf="parent"
+                app:layout_constraintEnd_toEndOf="parent" />
+
+        </androidx.constraintlayout.widget.ConstraintLayout>
 
     </com.google.android.material.card.MaterialCardView>
 

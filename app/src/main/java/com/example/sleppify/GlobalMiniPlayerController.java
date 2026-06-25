@@ -354,6 +354,17 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
 
     // ── Snapshot helpers ──────────────────────────────────────────
 
+    /**
+     * Public entry point for notification/media-button resume when no player is attached.
+     * Restores the last playback snapshot and starts playing if requested.
+     */
+    public void resumePlaybackFromSnapshot(boolean startPlaying) {
+        PlaybackHistoryStore.Snapshot snapshot = PlaybackHistoryStore.load(activity);
+        if (snapshot.isValid()) {
+            startHiddenPlayerFromSnapshot(snapshot, startPlaying);
+        }
+    }
+
     private void startHiddenPlayerFromSnapshot(
             @NonNull PlaybackHistoryStore.Snapshot snapshot,
             boolean startPlaying

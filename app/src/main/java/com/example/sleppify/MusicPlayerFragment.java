@@ -107,6 +107,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     private static final String PREFS_STREAMING_CACHE = AppConstants.PREFS_STREAMING_CACHE;
     private static final String PREF_LIBRARY_UPDATED_AT_PREFIX = "library_updated_at_";
     private static final String PREF_LIBRARY_DATA_PREFIX = "library_data_";
+    private static final String PREF_ARTISTS_DATA_PREFIX = "library_artists_data_";
     private static final String PREF_TRACKS_UPDATED_AT_PREFIX = "playlist_tracks_updated_at_";
     private static final String PREF_TRACKS_DATA_PREFIX = "playlist_tracks_data_";
     private static final String PREF_TRACKS_FULL_CACHE_PREFIX = "playlist_tracks_cache_full_";
@@ -469,6 +470,15 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                         ""
                 ));
             }
+
+            // Artists section
+            if (!libraryArtists.isEmpty()) {
+                for (YouTubeMusicService.ArtistResult artist : libraryArtists) {
+                    display.add(new YouTubeMusicService.TrackResult(
+                            "artist", artist.channelId, artist.name, artist.subtitle, artist.thumbnailUrl
+                    ));
+                }
+            }
         }
         cachedDisplayLibrary = new ArrayList<>(display);
         displayLibraryDirty = false;
@@ -596,6 +606,8 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     private final ExecutorService offlineStateExecutor = Executors.newSingleThreadExecutor();
     private final List<YouTubeMusicService.TrackResult> tracks = new ArrayList<>();
     private final List<YouTubeMusicService.TrackResult> libraryTracks = new ArrayList<>();
+    private final List<YouTubeMusicService.ArtistResult> libraryArtists = new ArrayList<>();
+    private boolean libraryArtistsFetchInFlight;
     private final android.util.LruCache<String, String> normalizedFilterCache = new android.util.LruCache<>(512);
     private final Set<String> offlinePrefetchInFlight = new HashSet<>();
     private final Object cachedPlaylistTracksLock = new Object();
@@ -805,6 +817,11 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         });
         rebuildGoogleSignInClient();
         restoreCachedStreamingSessionState();
+        // Fetch artists after session restore (cached or not)
+        view.postDelayed(() -> {
+            if (!isAdded() || isRemoving() || isDetached()) return;
+            fetchLibraryArtistsIfNeeded();
+        }, 1200L);
         refreshCurrentPlayingPlaylistState();
         setupLibraryPullToRefresh();
         llFeaturedResult.setVisibility(View.GONE);
@@ -968,6 +985,16 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
 
         // Brand title — "Biblioteca" text (no app icon, same style as old tvLibraryTitle)
         // No custom styling needed; XML handles textSize=22sp, bold, text_primary
+
+        // History button → opens Settings at History section
+        ImageView btnFragHeaderHistory = root.findViewById(R.id.btnFragHeaderHistory);
+        if (btnFragHeaderHistory != null) {
+            btnFragHeaderHistory.setOnClickListener(v -> {
+                if (getActivity() instanceof MainActivity) {
+                    ((MainActivity) getActivity()).enterSettingsAtHistory();
+                }
+            });
+        }
 
         // Search button → opens SearchFragment via MainActivity
         if (btnFragHeaderSearch != null) {
@@ -1153,6 +1180,15 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 .hide(playerFragment)
                 .runOnCommit(() -> {
                     restoringHiddenMiniPlayerFromSnapshot = false;
+                    // Notify mini-player after player is attached and ready (delayed to
+                    // allow stream resolution + onPrepared to complete).
+                    View root = getView();
+                    if (root != null) {
+                        root.postDelayed(() -> {
+                            if (!isAdded()) return;
+                            PlaybackEventBus.notifyPlaybackSnapshotUpdated();
+                        }, 4000L);
+                    }
                 })
                 .commit();
     }
@@ -1779,6 +1815,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 if (activeScreen == ScreenMode.LIBRARY) {
                     renderLibraryResults();
                 }
+                fetchLibraryArtistsIfNeeded();
             }
             @Override
             public void onError(@NonNull String error) {
@@ -1839,6 +1876,41 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             cachedPlaylistTracksUpdatedAtById.remove(FavoritesPlaylistStore.PLAYLIST_ID);
         }
         renderLibraryResults();
+    }
+    private void fetchLibraryArtistsIfNeeded() {
+        if (libraryArtistsFetchInFlight || !isAdded()) {
+            Log.d(TAG_STREAMING, "artists_fetch skip inFlight=" + libraryArtistsFetchInFlight + " added=" + isAdded());
+            return;
+        }
+        SharedPreferences prefs = requireContext().getSharedPreferences(PREFS_PLAYER_STATE, Activity.MODE_PRIVATE);
+        String raw = prefs.getString(PREF_LAST_YOUTUBE_WEB_COOKIE, "");
+        String webCookie = raw != null ? raw.trim() : "";
+        if (TextUtils.isEmpty(webCookie)) {
+            Log.d(TAG_STREAMING, "artists_fetch skip no_cookie");
+            return;
+        }
+        Log.i(TAG_STREAMING, "artists_fetch start cookieLen=" + webCookie.length());
+        libraryArtistsFetchInFlight = true;
+        youTubeMusicService.fetchLibraryArtists(webCookie, new YouTubeMusicService.LibraryArtistsCallback() {
+            @Override
+            public void onSuccess(@NonNull List<YouTubeMusicService.ArtistResult> artists) {
+                libraryArtistsFetchInFlight = false;
+                if (!isAdded()) return;
+                Log.i(TAG_STREAMING, "artists_fetch success count=" + artists.size());
+                libraryArtists.clear();
+                libraryArtists.addAll(artists);
+                persistArtists(artists);
+                displayLibraryDirty = true;
+                if (activeScreen == ScreenMode.LIBRARY) {
+                    renderLibraryResults();
+                }
+            }
+            @Override
+            public void onError(@NonNull String error) {
+                libraryArtistsFetchInFlight = false;
+                Log.w(TAG_STREAMING, "artists_fetch error: " + error);
+            }
+        });
     }
     private void renderLibraryResults() {
         displayLibraryDirty = true;
@@ -2354,6 +2426,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             libraryTracks.clear();
             libraryTracks.addAll(new ArrayList<>(LIBRARY_CACHE));
             displayLibraryDirty = true;
+            restoreCachedArtists(accountKey);
             return;
         }
         List<YouTubeMusicService.TrackResult> persisted = loadPersistedLibrary(accountKey);
@@ -2365,6 +2438,16 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             LIBRARY_CACHE.addAll(libraryTracks);
             libraryCacheAccountKey = accountKey;
             libraryCacheUpdatedAtMs = getPersistedLibraryUpdatedAt(accountKey);
+        }
+        restoreCachedArtists(accountKey);
+    }
+    private void restoreCachedArtists(@NonNull String accountKey) {
+        if (!libraryArtists.isEmpty()) return;
+        List<YouTubeMusicService.ArtistResult> cached = loadPersistedArtists(accountKey);
+        if (!cached.isEmpty()) {
+            libraryArtists.clear();
+            libraryArtists.addAll(cached);
+            displayLibraryDirty = true;
         }
     }
     private boolean restoreLibraryFromPersistentCache() {
@@ -2649,6 +2732,49 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         } catch (Exception e) {
             Log.w(TAG, "Unexpected error", e);
             return new ArrayList<>();
+        }
+        return result;
+    }
+    private void persistArtists(@NonNull List<YouTubeMusicService.ArtistResult> artists) {
+        if (!isAdded()) return;
+        try {
+            JSONArray array = new JSONArray();
+            for (YouTubeMusicService.ArtistResult a : artists) {
+                JSONObject obj = new JSONObject();
+                obj.put("channelId", a.channelId);
+                obj.put("name", a.name);
+                obj.put("subtitle", a.subtitle);
+                obj.put("thumbnailUrl", a.thumbnailUrl);
+                array.put(obj);
+            }
+            String accountKey = resolveAccountKey();
+            getCachePrefs().edit()
+                    .putString(PREF_ARTISTS_DATA_PREFIX + accountKey, array.toString())
+                    .apply();
+        } catch (Exception e) {
+            Log.w(TAG, "persistArtists failed", e);
+        }
+    }
+    @NonNull
+    private List<YouTubeMusicService.ArtistResult> loadPersistedArtists(@NonNull String accountKey) {
+        List<YouTubeMusicService.ArtistResult> result = new ArrayList<>();
+        if (TextUtils.isEmpty(accountKey) || !isAdded()) return result;
+        String raw = getCachePrefs().getString(PREF_ARTISTS_DATA_PREFIX + accountKey, "");
+        if (TextUtils.isEmpty(raw)) return result;
+        try {
+            JSONArray array = new JSONArray(raw);
+            for (int i = 0; i < array.length(); i++) {
+                JSONObject obj = array.optJSONObject(i);
+                if (obj == null) continue;
+                String channelId = obj.optString("channelId", "").trim();
+                String name = obj.optString("name", "").trim();
+                String subtitle = obj.optString("subtitle", "").trim();
+                String thumbnailUrl = obj.optString("thumbnailUrl", "").trim();
+                if (name.isEmpty()) continue;
+                result.add(new YouTubeMusicService.ArtistResult(channelId, name, subtitle, thumbnailUrl));
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "loadPersistedArtists failed", e);
         }
         return result;
     }
@@ -3304,7 +3430,14 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         String playlistTitle = prefs.getString(PREF_LAST_PLAYLIST_TITLE, "Lista");
         String playlistSubtitle = prefs.getString(PREF_LAST_PLAYLIST_SUBTITLE, "Playlist");
         String playlistThumbnail = prefs.getString(PREF_LAST_PLAYLIST_THUMBNAIL, "");
-        // ID-only normalization â€” consistent with mapPlaylistsToLibraryTracks
+
+        // Show loading overlay immediately for snappier perceived transition
+        if (getActivity() instanceof MainActivity) {
+            ((MainActivity) getActivity()).showModuleLoadingOverlay();
+            ((MainActivity) getActivity()).hideTopAppBarForPlaylistDetail();
+        }
+
+        // ID-only normalization — consistent with mapPlaylistsToLibraryTracks
         String rawId = playlistId == null ? "" : playlistId.trim();
         String normalizedPlaylistId;
         if (YouTubeMusicService.SPECIAL_LIKED_VIDEOS_ID.equals(rawId)
@@ -5540,6 +5673,13 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         if (getParentFragmentManager().isStateSaved()) {
             return;
         }
+
+        // Show loading overlay and hide top bar immediately for snappier perceived transition
+        if (getActivity() instanceof MainActivity) {
+            ((MainActivity) getActivity()).showModuleLoadingOverlay();
+            ((MainActivity) getActivity()).hideTopAppBarForPlaylistDetail();
+        }
+
         String accessTokenForDetail = resolveAccessTokenForPlaylistDetail();
         PlaylistDetailFragment detailFragment = PlaylistDetailFragment.newInstance(
                 track.contentId,
@@ -5817,6 +5957,8 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         private static final int VIEW_TYPE_LIST = 0;
         private static final int VIEW_TYPE_SEARCH = 2;
         private static final int VIEW_TYPE_CREATE_PLAYLIST = 3;
+        private static final int VIEW_TYPE_SECTION_HEADER = 4;
+        private static final int VIEW_TYPE_ARTIST = 5;
         private static final String PAYLOAD_PLAYBACK_STATE = "playback_state";
         private static final String PAYLOAD_OFFLINE_STATE = "offline_state";
         private static final String PAYLOAD_DOWNLOAD_PROGRESS = "download_progress";
@@ -6175,6 +6317,21 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 View view = LayoutInflater.from(parent.getContext()).inflate(R.layout.item_create_playlist_row, parent, false);
                 return new CreatePlaylistViewHolder(view);
             }
+            if (viewType == VIEW_TYPE_SECTION_HEADER) {
+                TextView tv = new TextView(parent.getContext());
+                tv.setLayoutParams(new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+                tv.setTextColor(ContextCompat.getColor(parent.getContext(), R.color.text_primary));
+                tv.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 18);
+                tv.setTypeface(tv.getTypeface(), Typeface.BOLD);
+                int dp16 = (int) (16 * parent.getContext().getResources().getDisplayMetrics().density);
+                int dp8 = (int) (8 * parent.getContext().getResources().getDisplayMetrics().density);
+                tv.setPadding(dp16, dp16, dp16, dp8);
+                return new SectionHeaderViewHolder(tv);
+            }
+            if (viewType == VIEW_TYPE_ARTIST) {
+                View view = LayoutInflater.from(parent.getContext()).inflate(R.layout.item_music_result, parent, false);
+                return new TrackViewHolder(view);
+            }
             int layoutRes;
             if (viewType == VIEW_TYPE_SEARCH) {
                 layoutRes = R.layout.item_music_search_result;
@@ -6191,6 +6348,13 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             }
             if (position == data.size()) {
                 return VIEW_TYPE_CREATE_PLAYLIST;
+            }
+            YouTubeMusicService.TrackResult item = data.get(position);
+            if ("section_header".equals(item.resultType)) {
+                return VIEW_TYPE_SECTION_HEADER;
+            }
+            if ("artist".equals(item.resultType)) {
+                return VIEW_TYPE_ARTIST;
             }
             return VIEW_TYPE_LIST;
         }
@@ -6222,8 +6386,18 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 genericHolder.itemView.setOnClickListener(v -> showCreatePlaylistDialog());
                 return;
             }
+            if (viewType == VIEW_TYPE_SECTION_HEADER) {
+                SectionHeaderViewHolder headerHolder = (SectionHeaderViewHolder) genericHolder;
+                YouTubeMusicService.TrackResult item = data.get(position);
+                headerHolder.tvSectionTitle.setText(item.title);
+                return;
+            }
             TrackViewHolder holder = (TrackViewHolder) genericHolder;
             YouTubeMusicService.TrackResult item = data.get(position);
+            if (viewType == VIEW_TYPE_ARTIST) {
+                bindArtistRow(holder, item);
+                return;
+            }
                 if (searchMode) {
                 bindSearchRow(holder, item, position);
                 return;
@@ -6373,7 +6547,11 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 // State: downloading — circular arc + download icon (no background circle)
                 holder.flPlaylistOfflineContainer.setVisibility(View.VISIBLE);
                 holder.circularProgress.setVisibility(View.VISIBLE);
-                holder.circularProgress.setProgress(downloadFraction);
+                if (holder.circularProgress.getProgress() < 0.001f) {
+                    holder.circularProgress.setProgressFromZero(downloadFraction);
+                } else {
+                    holder.circularProgress.setProgress(downloadFraction);
+                }
                 holder.ivPlaylistOfflineAll.setImageResource(R.drawable.ic_download_bold);
                 holder.ivPlaylistOfflineAll.setBackground(null);
                 holder.ivPlaylistOfflineAll.setColorFilter(ContextCompat.getColor(ctx, R.color.stitch_blue));
@@ -6449,6 +6627,45 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                     }
                 }
             }
+        }
+
+        private void bindArtistRow(
+                @NonNull TrackViewHolder holder,
+                @NonNull YouTubeMusicService.TrackResult item
+        ) {
+            holder.vLikedBackground.setVisibility(View.GONE);
+            holder.ivLikedIcon.setVisibility(View.GONE);
+            holder.ivTrackThumb.setVisibility(View.VISIBLE);
+            holder.flPlaylistOfflineContainer.setVisibility(View.GONE);
+            holder.ivTrackMore.setVisibility(View.GONE);
+            if (holder.ivPlaylistPin != null) holder.ivPlaylistPin.setVisibility(View.GONE);
+            if (holder.llNowPlayingOverlay != null) holder.llNowPlayingOverlay.setVisibility(View.GONE);
+
+            holder.tvTrackTitle.setText(TextUtils.isEmpty(item.title) ? "Artista" : item.title);
+            holder.tvTrackSubtitle.setText(TextUtils.isEmpty(item.subtitle) ? "Artista" : item.subtitle);
+            int defaultTitleColor = ContextCompat.getColor(holder.itemView.getContext(), R.color.text_primary);
+            int defaultSubtitleColor = ContextCompat.getColor(holder.itemView.getContext(), R.color.text_secondary);
+            holder.tvTrackTitle.setTextColor(defaultTitleColor);
+            holder.tvTrackSubtitle.setTextColor(defaultSubtitleColor);
+
+            // Circular crop for artist photo
+            holder.ivTrackThumb.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            holder.ivTrackThumb.setBackgroundColor(android.graphics.Color.TRANSPARENT);
+            if (!TextUtils.isEmpty(item.thumbnailUrl)) {
+                Glide.with(holder.ivTrackThumb)
+                    .load(item.thumbnailUrl.trim())
+                    .transform(new com.bumptech.glide.load.resource.bitmap.CircleCrop())
+                    .format(com.bumptech.glide.load.DecodeFormat.PREFER_RGB_565)
+                    .diskCacheStrategy(DiskCacheStrategy.ALL)
+                    .transition(com.bumptech.glide.load.resource.drawable.DrawableTransitionOptions.withCrossFade())
+                    .into(holder.ivTrackThumb);
+            } else {
+                holder.ivTrackThumb.setImageDrawable(new android.graphics.drawable.ColorDrawable(
+                        ContextCompat.getColor(holder.itemView.getContext(), R.color.surface_high)));
+            }
+
+            holder.itemView.setOnClickListener(null);
+            holder.itemView.setOnLongClickListener(null);
         }
 
         private void bindSearchRow(
@@ -6621,6 +6838,13 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         private final class CreatePlaylistViewHolder extends RecyclerView.ViewHolder {
             CreatePlaylistViewHolder(@NonNull View itemView) {
                 super(itemView);
+            }
+        }
+        private final class SectionHeaderViewHolder extends RecyclerView.ViewHolder {
+            final TextView tvSectionTitle;
+            SectionHeaderViewHolder(@NonNull View itemView) {
+                super(itemView);
+                tvSectionTitle = (TextView) itemView;
             }
         }
         final class TrackViewHolder extends RecyclerView.ViewHolder {

@@ -92,6 +92,19 @@
                     android:layout_weight="1" />
 
                 <ImageView
+                    android:id="@+id/btnFragHeaderHistory"
+                    android:layout_width="41.5dp"
+                    android:layout_height="41.5dp"
+                    android:background="?attr/selectableItemBackgroundBorderless"
+                    android:clickable="true"
+                    android:contentDescription="Historial"
+                    android:focusable="true"
+                    android:layout_marginEnd="4dp"
+                    android:padding="8dp"
+                    android:src="@drawable/ic_time_24"
+                    app:tint="@android:color/white" />
+
+                <ImageView
                     android:id="@+id/btnFragHeaderSearch"
                     android:layout_width="41.5dp"
                     android:layout_height="41.5dp"

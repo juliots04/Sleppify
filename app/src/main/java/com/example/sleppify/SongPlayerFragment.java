@@ -1107,6 +1107,11 @@ public class SongPlayerFragment extends Fragment {
         });
         // Advertise the loaded shuffle state so controllers start in sync.
         publishShuffleModeToSession(shuffleEnabled);
+        // Initialize the playback state immediately so the system controller (notification,
+        // lock screen, Android Auto) knows whether we are playing or paused before the user
+        // taps any button; otherwise a stale/undefined state can make the system log/send
+        // the opposite action (e.g., MediaSessionRecord:pause) when the user pressed play.
+        updateMediaSessionState();
         ensureMediaNotificationChannel();
     }
 
@@ -2647,6 +2652,9 @@ public class SongPlayerFragment extends Fragment {
         int progress = Math.round((Math.max(0, currentSeconds) / (float) Math.max(1, totalSeconds)) * 1000f);
         sbPlaybackProgress.setProgress(Math.max(0, Math.min(1000, progress)));
         notifyPlaybackStateChanged();
+        // Fire event bus directly on main thread so GlobalMiniPlayerController picks up
+        // the prepared state immediately (bypasses persistPlaybackSnapshot debounce).
+        PlaybackEventBus.notifyPlaybackSnapshotUpdated();
     }
 
     private void resetPlaybackStateForNewTrack() {
@@ -5198,9 +5206,10 @@ public class SongPlayerFragment extends Fragment {
             return;
         }
 
-        int state = isPlaying ? PlaybackStateCompat.STATE_PLAYING : PlaybackStateCompat.STATE_PAUSED;
-        float speed = isPlaying ? 1f : 0f;
-        
+        boolean effectivelyPlaying = isEffectivePlaying();
+        int state = effectivelyPlaying ? PlaybackStateCompat.STATE_PLAYING : PlaybackStateCompat.STATE_PAUSED;
+        float speed = effectivelyPlaying ? 1f : 0f;
+
         playbackStateBuilder.setState(state, Math.max(0, currentSeconds) * 1000L, speed);
         mediaSession.setPlaybackState(playbackStateBuilder.build());
         mediaSession.setActive(true);
@@ -5226,13 +5235,30 @@ public class SongPlayerFragment extends Fragment {
         }
         PendingIntent contentIntent = PendingIntent.getActivity(persistentAppContext, 8701, openAppIntent, pendingFlags);
 
-        PendingIntent prevIntent = androidx.media.session.MediaButtonReceiver.buildMediaButtonPendingIntent(
-                persistentAppContext, PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS);
-        PendingIntent playPauseIntent = androidx.media.session.MediaButtonReceiver.buildMediaButtonPendingIntent(
-                persistentAppContext, isPlaying ? PlaybackStateCompat.ACTION_PAUSE : PlaybackStateCompat.ACTION_PLAY);
-        PendingIntent nextIntent = androidx.media.session.MediaButtonReceiver.buildMediaButtonPendingIntent(
-                persistentAppContext, PlaybackStateCompat.ACTION_SKIP_TO_NEXT);
+        int mediaPendingFlags = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            mediaPendingFlags |= PendingIntent.FLAG_IMMUTABLE;
+        }
 
+        Intent prevIntent = new Intent(persistentAppContext, MainActivity.class)
+                .setAction(MainActivity.ACTION_MEDIA_PREV)
+                .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        PendingIntent prevPendingIntent = PendingIntent.getActivity(
+                persistentAppContext, 8702, prevIntent, mediaPendingFlags);
+
+        Intent playPauseIntent = new Intent(persistentAppContext, MainActivity.class)
+                .setAction(MainActivity.ACTION_MEDIA_PLAY_PAUSE)
+                .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        PendingIntent playPausePendingIntent = PendingIntent.getActivity(
+                persistentAppContext, 8703, playPauseIntent, mediaPendingFlags);
+
+        Intent nextIntent = new Intent(persistentAppContext, MainActivity.class)
+                .setAction(MainActivity.ACTION_MEDIA_NEXT)
+                .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        PendingIntent nextPendingIntent = PendingIntent.getActivity(
+                persistentAppContext, 8704, nextIntent, mediaPendingFlags);
+
+        boolean effectivelyPlaying = isEffectivePlaying();
         NotificationCompat.Builder builder = new NotificationCompat.Builder(persistentAppContext, MEDIA_NOTIFICATION_CHANNEL_ID)
                 .setSmallIcon(R.drawable.ic_notification_cat)
                 .setContentTitle(track.title)
@@ -5242,14 +5268,14 @@ public class SongPlayerFragment extends Fragment {
                 .setContentIntent(contentIntent)
                 .setSilent(true)
                 .setOnlyAlertOnce(true)
-                .setOngoing(isPlaying)
-                .addAction(android.R.drawable.ic_media_previous, "Anterior", prevIntent)
+                .setOngoing(effectivelyPlaying)
+                .addAction(android.R.drawable.ic_media_previous, "Anterior", prevPendingIntent)
                 .addAction(
-                        isPlaying ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play,
-                        isPlaying ? "Pausar" : "Reproducir",
-                        playPauseIntent
+                        effectivelyPlaying ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play,
+                        effectivelyPlaying ? "Pausar" : "Reproducir",
+                        playPausePendingIntent
                 )
-                .addAction(android.R.drawable.ic_media_next, "Siguiente", nextIntent)
+                .addAction(android.R.drawable.ic_media_next, "Siguiente", nextPendingIntent)
                 .setStyle(new androidx.media.app.NotificationCompat.MediaStyle()
                         .setMediaSession(mediaSession.getSessionToken())
                         .setShowActionsInCompactView(0, 1, 2));
@@ -5266,7 +5292,7 @@ public class SongPlayerFragment extends Fragment {
 
         // Keep process alive while playing so the MediaSession binder stays valid in background.
         // When paused, downgrade from foreground but keep notification visible (dismissable).
-        if (isPlaying) {
+        if (effectivelyPlaying) {
             PlaybackKeepAliveService.start(persistentAppContext, notification);
         } else {
             PlaybackKeepAliveService.stopForegroundKeepNotification(persistentAppContext);

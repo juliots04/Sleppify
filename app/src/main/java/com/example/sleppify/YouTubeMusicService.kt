@@ -86,6 +86,11 @@ class YouTubeMusicService @JvmOverloads constructor(
         fun onError(error: String)
     }
 
+    interface LibraryArtistsCallback {
+        fun onSuccess(artists: List<ArtistResult>)
+        fun onError(error: String)
+    }
+
     // ----- Public data classes (field-accessible from Java via @JvmField) -----
 
     class TrackResult(
@@ -160,6 +165,13 @@ class YouTubeMusicService @JvmOverloads constructor(
     class HomeSection(
         @JvmField val title: String,
         @JvmField val items: List<MixResult>
+    )
+
+    class ArtistResult(
+        @JvmField val channelId: String,
+        @JvmField val name: String,
+        @JvmField val subtitle: String,
+        @JvmField val thumbnailUrl: String
     )
 
     class ReplacementCandidate(
@@ -707,6 +719,21 @@ class YouTubeMusicService @JvmOverloads constructor(
                 mainHandler.post { callback.onSuccess(result) }
             } catch (e: Exception) {
                 mainHandler.post { callback.onError(e.message ?: "Error cargando home.") }
+            }
+        }
+    }
+
+    fun fetchLibraryArtists(cookieHeader: String, callback: LibraryArtistsCallback) {
+        if (cookieHeader.isEmpty()) {
+            callback.onError("No hay sesión web para cargar artistas.")
+            return
+        }
+        executor.execute {
+            try {
+                val artists = performLibraryArtistsBrowseRequest(cookieHeader)
+                mainHandler.post { callback.onSuccess(artists) }
+            } catch (e: Exception) {
+                mainHandler.post { callback.onError(e.message ?: "Error cargando artistas.") }
             }
         }
     }
@@ -2074,6 +2101,187 @@ class YouTubeMusicService @JvmOverloads constructor(
         return Pair(channelName, photoUrl)
     }
 
+    // ----- Library artists browse -----
+
+    @Throws(Exception::class)
+    private fun performLibraryArtistsBrowseRequest(cookieHeader: String): List<ArtistResult> {
+        val endpoint = "https://music.youtube.com/youtubei/v1/browse?prettyPrint=false"
+        val body = JSONObject().apply {
+            put("context", JSONObject().apply {
+                put("client", JSONObject().apply {
+                    put("clientName", "WEB_REMIX")
+                    put("clientVersion", buildClientVersion())
+                    put("hl", "es")
+                })
+            })
+            put("browseId", "FEmusic_library_corpus_artists")
+        }.toString().toByteArray(StandardCharsets.UTF_8)
+
+        val responseBody = postInnerTubeBrowse(endpoint, body, cookieHeader)
+        Log.d(TAG, "artists_browse responseLen=${responseBody.length} firstChars=${responseBody.take(500)}")
+        val root = JSONObject(responseBody)
+        val result = parseLibraryArtists(root)
+        Log.d(TAG, "artists_browse parsed=${result.size}")
+        return result
+    }
+
+    private fun parseLibraryArtists(root: JSONObject): List<ArtistResult> {
+        val artists = mutableListOf<ArtistResult>()
+        val seenIds = HashSet<String>()
+
+        val tabs = root.optJSONObject("contents")
+            ?.optJSONObject("singleColumnBrowseResultsRenderer")
+            ?.optJSONArray("tabs")
+
+        if (tabs == null) {
+            Log.d(TAG, "artists_parse no tabs found, keys=${root.optJSONObject("contents")?.keys()?.asSequence()?.toList()}")
+            return artists
+        }
+
+        val tabContent = tabs.optJSONObject(0)
+            ?.optJSONObject("tabRenderer")
+            ?.optJSONObject("content")
+            ?.optJSONObject("sectionListRenderer")
+            ?.optJSONArray("contents")
+
+        if (tabContent == null) {
+            Log.d(TAG, "artists_parse no tabContent found")
+            return artists
+        }
+
+        Log.d(TAG, "artists_parse sections=${tabContent.length()}")
+
+        for (s in 0 until tabContent.length()) {
+            val section = tabContent.optJSONObject(s) ?: continue
+            val shelf = section.optJSONObject("musicShelfRenderer")
+                ?: section.optJSONObject("gridRenderer")
+                ?: section.optJSONObject("itemSectionRenderer")
+                ?: continue
+
+            val items = shelf.optJSONArray("contents") ?: continue
+            Log.d(TAG, "artists_parse section=$s items=${items.length()}")
+            for (i in 0 until items.length()) {
+                val item = items.optJSONObject(i) ?: continue
+                val renderer = item.optJSONObject("musicResponsiveListItemRenderer")
+                    ?: item.optJSONObject("musicTwoRowItemRenderer")
+                    ?: continue
+
+                val artist = parseArtistFromRenderer(renderer) ?: continue
+                if (artist.channelId.isNotEmpty()) {
+                    if (seenIds.add(artist.channelId)) {
+                        artists.add(artist)
+                    }
+                } else if (artist.name.isNotEmpty()) {
+                    artists.add(artist)
+                }
+            }
+        }
+        return artists
+    }
+
+    private fun parseArtistFromRenderer(renderer: JSONObject): ArtistResult? {
+        // Extract channelId from navigation endpoint
+        var channelId = ""
+        val navEndpoint = renderer.optJSONObject("navigationEndpoint")
+            ?: renderer.optJSONObject("overlay")
+                ?.optJSONObject("musicItemThumbnailOverlayRenderer")
+                ?.optJSONObject("content")
+                ?.optJSONObject("musicPlayButtonRenderer")
+                ?.optJSONObject("playNavigationEndpoint")
+
+        val browseEp = navEndpoint?.optJSONObject("browseEndpoint")
+        if (browseEp != null) {
+            channelId = browseEp.optString("browseId", "").trim()
+        }
+
+        // musicResponsiveListItemRenderer path
+        val flexColumns = renderer.optJSONArray("flexColumns")
+        if (flexColumns != null) {
+            val name = extractFlexColumnText(flexColumns, 0)
+            val subtitle = extractFlexColumnText(flexColumns, 1)
+            val thumbnailUrl = extractRendererThumbnail(renderer)
+
+            if (channelId.isEmpty()) {
+                // Try to extract from first flex column navigation
+                val firstCol = flexColumns.optJSONObject(0)
+                    ?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")
+                    ?.optJSONObject("text")
+                    ?.optJSONArray("runs")
+                    ?.optJSONObject(0)
+                val colNav = firstCol?.optJSONObject("navigationEndpoint")
+                    ?.optJSONObject("browseEndpoint")
+                if (colNav != null) {
+                    channelId = colNav.optString("browseId", "").trim()
+                }
+            }
+
+            if (name.isNotEmpty()) {
+                return ArtistResult(channelId, name, subtitle, thumbnailUrl)
+            }
+        }
+
+        // musicTwoRowItemRenderer path
+        val title = renderer.optJSONObject("title")
+            ?.optJSONArray("runs")
+            ?.optJSONObject(0)
+            ?.optString("text", "")?.trim() ?: ""
+
+        val subtitleRuns = renderer.optJSONObject("subtitle")?.optJSONArray("runs")
+        val subtitle = buildString {
+            if (subtitleRuns != null) {
+                for (r in 0 until subtitleRuns.length()) {
+                    append(subtitleRuns.optJSONObject(r)?.optString("text", "") ?: "")
+                }
+            }
+        }.trim()
+
+        val thumbnailUrl = renderer.optJSONObject("thumbnailRenderer")
+            ?.optJSONObject("musicThumbnailRenderer")
+            ?.optJSONObject("thumbnail")
+            ?.optJSONArray("thumbnails")
+            ?.let { thumbs ->
+                if (thumbs.length() > 0) thumbs.optJSONObject(thumbs.length() - 1)?.optString("url", "") ?: ""
+                else ""
+            } ?: ""
+
+        if (title.isEmpty()) return null
+
+        if (channelId.isEmpty()) {
+            val titleNav = renderer.optJSONObject("title")
+                ?.optJSONArray("runs")?.optJSONObject(0)
+                ?.optJSONObject("navigationEndpoint")
+                ?.optJSONObject("browseEndpoint")
+            if (titleNav != null) {
+                channelId = titleNav.optString("browseId", "").trim()
+            }
+        }
+
+        return ArtistResult(channelId, title, subtitle, thumbnailUrl)
+    }
+
+    private fun extractFlexColumnText(flexColumns: JSONArray, index: Int): String {
+        val col = flexColumns.optJSONObject(index) ?: return ""
+        val runs = col.optJSONObject("musicResponsiveListItemFlexColumnRenderer")
+            ?.optJSONObject("text")
+            ?.optJSONArray("runs")
+            ?: return ""
+        return buildString {
+            for (r in 0 until runs.length()) {
+                append(runs.optJSONObject(r)?.optString("text", "") ?: "")
+            }
+        }.trim()
+    }
+
+    private fun extractRendererThumbnail(renderer: JSONObject): String {
+        val thumbs = renderer.optJSONObject("thumbnail")
+            ?.optJSONObject("musicThumbnailRenderer")
+            ?.optJSONObject("thumbnail")
+            ?.optJSONArray("thumbnails")
+            ?: return ""
+        if (thumbs.length() == 0) return ""
+        return thumbs.optJSONObject(thumbs.length() - 1)?.optString("url", "") ?: ""
+    }
+
     // ----- Full home browse (split generic + personal mixes) -----
 
     private val MAX_HOME_CONTINUATIONS = 4
@@ -2134,6 +2342,10 @@ class YouTubeMusicService @JvmOverloads constructor(
         connection.setRequestProperty("Referer", "https://music.youtube.com/")
         if (cookieHeader.isNotEmpty()) {
             connection.setRequestProperty("Cookie", cookieHeader)
+            val sapisidAuth = StreamResolver.buildSapisidHash("https://music.youtube.com")
+            if (sapisidAuth.isNotEmpty()) {
+                connection.setRequestProperty("Authorization", sapisidAuth)
+            }
         }
         try {
             connection.outputStream.use { it.write(body) }

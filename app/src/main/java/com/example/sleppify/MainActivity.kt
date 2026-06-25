@@ -373,12 +373,30 @@ class MainActivity : AppCompatActivity() {
 
     private fun dispatchMediaNotificationAction(action: String?) {
         val fm = supportFragmentManager
-        val player = fm.findFragmentByTag(TAG_SONG_PLAYER)
-        if (player is SongPlayerFragment) {
+        val player = fm.findFragmentByTag(TAG_SONG_PLAYER) as? SongPlayerFragment
+        if (player != null && player.isAdded) {
             when (action) {
                 ACTION_MEDIA_PLAY_PAUSE -> player.externalTogglePlayback()
                 ACTION_MEDIA_NEXT -> player.externalSkipNext()
                 ACTION_MEDIA_PREV -> player.externalSkipPrevious()
+            }
+            return
+        }
+
+        // No player attached — restore from snapshot so notification buttons work when the app is closed
+        val snapshot = PlaybackHistoryStore.load(this)
+        if (!snapshot.isValid()) return
+
+        globalMiniPlayer?.resumePlaybackFromSnapshot(true)
+        if (action == ACTION_MEDIA_NEXT || action == ACTION_MEDIA_PREV) {
+            fragmentContainer.post {
+                val restored = supportFragmentManager.findFragmentByTag(TAG_SONG_PLAYER) as? SongPlayerFragment
+                if (restored != null && restored.isAdded) {
+                    when (action) {
+                        ACTION_MEDIA_NEXT -> restored.externalSkipNext()
+                        ACTION_MEDIA_PREV -> restored.externalSkipPrevious()
+                    }
+                }
             }
         }
     }
@@ -1020,6 +1038,18 @@ class MainActivity : AppCompatActivity() {
             bottomNav.visibility = View.GONE
             fragmentContainer.post { fragmentContainer.post { revealModuleContent() } }
         }
+    }
+
+    fun enterSettingsAtHistory() {
+        val sf = (settingsFragment as? SettingsFragment)
+            ?: SettingsFragment().also { settingsFragment = it }
+        if (inSettings) {
+            sf.navigateToHistory()
+            return
+        }
+        // Set pending section BEFORE enterSettings so onHiddenChanged picks it up
+        sf.navigateToHistory()
+        enterSettings()
     }
 
     fun returnFromSettings() {

@@ -1,5 +1,7 @@
 import os
 import time as _time
+import logging
+import logging.handlers
 import yt_dlp
 from flask import Flask, request, jsonify, Response, render_template
 
@@ -10,57 +12,60 @@ app.secret_key = 'downloadmp3'
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _COOKIES_PATH = os.path.join(_SCRIPT_DIR, 'cookies.txt')
 
+# ─── File logger → logs/sleppify-YYYY-MM-DD.log (daily rotation, keep 7 days) ───
+_LOG_DIR = os.path.join(_SCRIPT_DIR, 'logs')
+os.makedirs(_LOG_DIR, exist_ok=True)
+_log_handler = logging.handlers.TimedRotatingFileHandler(
+    filename=os.path.join(_LOG_DIR, 'sleppify.log'),
+    when='midnight', interval=1, backupCount=7, encoding='utf-8',
+)
+_log_handler.suffix = '%Y-%m-%d'
+_log_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+logger = logging.getLogger('sleppify')
+logger.setLevel(logging.DEBUG)
+logger.addHandler(_log_handler)
+# Also mirror to stdout so uWSGI process log still shows everything
+logger.addHandler(logging.StreamHandler())
+
 import contextlib
 import tempfile
 
 @contextlib.contextmanager
 def get_ydl_opts(request_headers=None):
-    """
-    Context manager that yields yt-dlp options.
-    If the client sends an 'X-Youtube-Cookie' header, it securely creates a temporary 
-    Netscape-format cookie file for the lifetime of the block, avoiding bot detection.
-    """
+    player_clients = ['tv_embedded', 'web_embedded']
+    logger.info(f"[YDL_OPTS] player_clients={player_clients} cookies=none getpot=disabled")
     opts = {
-        'extractor_args': {'youtube': {'player_client': ['android', 'ios']}},
-        'quiet': True,
-        'no_warnings': True,
+        'extractor_args': {
+            'youtube': {
+                'player_client': player_clients,
+                'po_token': [],
+            },
+            'youtubetab': {'skip': ['webpage']},
+        },
+        'quiet': False,
+        'no_warnings': False,
         'no_playlist': True,
+        'verbose': True,
+        'compat_opts': {'no-youtube-unavailable-videos'},
     }
-    
-    tmp_cookie_file = None
-    raw_cookie = request_headers.get('X-Youtube-Cookie') if request_headers else None
-
-    if raw_cookie:
-        tmp_cookie_file = tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.txt', encoding='utf-8')
-        tmp_cookie_file.write("# Netscape HTTP Cookie File\n")
-        parts = [p.strip() for p in raw_cookie.split(';') if p.strip()]
-        for p in parts:
-            if '=' in p:
-                k, v = p.split('=', 1)
-                tmp_cookie_file.write(f".youtube.com\tTRUE\t/\tTRUE\t2147483647\t{k}\t{v}\n")
-        tmp_cookie_file.flush()
-        opts['cookiefile'] = tmp_cookie_file.name
-        tmp_cookie_file.close()
-    elif os.path.isfile(_COOKIES_PATH):
-        opts['cookiefile'] = _COOKIES_PATH
 
     try:
         yield opts
     finally:
-        if tmp_cookie_file and os.path.isfile(tmp_cookie_file.name):
-            try: os.unlink(tmp_cookie_file.name)
-            except: pass
+        pass
 
 
 @app.errorhandler(500)
 def handle_500(e):
-    import traceback
-    return jsonify({"status": "error", "error_type": type(e).__name__, "error_message": str(e), "traceback": traceback.format_exc()}), 500
+    import traceback; tb = traceback.format_exc()
+    logger.error(f"[FLASK500] {type(e).__name__}: {e}\n{tb}")
+    return jsonify({"status": "error", "error_type": type(e).__name__, "error_message": str(e), "traceback": tb}), 500
 
 @app.errorhandler(Exception)
 def handle_exception(e):
-    import traceback
-    return jsonify({"status": "error", "error_type": type(e).__name__, "error_message": str(e), "traceback": traceback.format_exc()}), 500
+    import traceback; tb = traceback.format_exc()
+    logger.error(f"[FLASK_EXC] {type(e).__name__}: {e}\n{tb}")
+    return jsonify({"status": "error", "error_type": type(e).__name__, "error_message": str(e), "traceback": tb}), 500
 
 @app.errorhandler(404)
 def handle_404(e):
@@ -110,10 +115,10 @@ def _stream_and_cleanup_dir(file_path, tmpdir, chunk_size=65536):
 # NOTE: We intentionally avoid 'best' alone because on modern YouTube
 # (DASH-only videos) it raises "Requested format is not available".
 # bestaudio ALWAYS resolves to a single URL on YouTube.
-VIDEO_FORMAT = '22/18/best[ext=mp4]/bestaudio[ext=m4a]/bestaudio'
+VIDEO_FORMAT = 'best[ext=mp4]/bestaudio[ext=m4a]/bestaudio'
 
 # Streaming uses the same selector — always returns a single URL.
-STREAM_FORMAT = '22/18/best[ext=mp4]/bestaudio[ext=m4a]/bestaudio'
+STREAM_FORMAT = 'best[ext=mp4]/bestaudio[ext=m4a]/bestaudio'
 
 # In-memory stream URL cache (avoids re-resolving on each Range/seek request)
 _stream_url_cache = {}  # {video_id: {'url': str, 'content_length': int, 'ts': float}}
@@ -130,9 +135,9 @@ _DOWNLOAD_SEMAPHORE = threading.Semaphore(_MAX_CONCURRENT_DOWNLOADS)
 # Audio-only download: a single pre-muxed m4a file — NO ffmpeg merge — which is exactly what the
 # app stores and plays (it is audio-first: the offline .mp4 holds music, never video). This is far
 # lighter/faster than downloading 720p video and is the main reliability win for playlist offline.
-AUDIO_DOWNLOAD_FORMAT = 'bestaudio[ext=m4a]/140/bestaudio'
+AUDIO_DOWNLOAD_FORMAT = 'bestaudio[ext=m4a]/bestaudio/best'
 # Optional full video download (pre-muxed 22/18 first to avoid a merge).
-VIDEO_DOWNLOAD_FORMAT = '22/18/best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best'
+VIDEO_DOWNLOAD_FORMAT = 'best[ext=mp4]/bestaudio[ext=m4a]/bestaudio/best'
 
 
 @app.route('/api/info', methods=['GET'])
@@ -213,7 +218,11 @@ def api_video():
             if os.path.isfile(_ffmpeg):
                 dl_opts['ffmpeg_location'] = _ffmpeg
 
-            print(f"[VIDEO] {want} downloading: {youtube_url}")
+            try:
+                ydl_version = yt_dlp.version.__version__
+            except Exception:
+                ydl_version = 'unknown'
+            logger.info(f"[VIDEO] start want={want} fmt={fmt} url={youtube_url} yt_dlp={ydl_version} clients={dl_opts.get('extractor_args',{}).get('youtube',{}).get('player_client')}")
             with yt_dlp.YoutubeDL(dl_opts) as ydl:
                 ydl.download([youtube_url])
 
@@ -223,11 +232,12 @@ def api_video():
             raise RuntimeError("Download produced no file")
         out_file = max(candidates, key=os.path.getsize)
         file_size = os.path.getsize(out_file)
-        print(f"[VIDEO] {want} success: {youtube_url} size={file_size}")
+        logger.info(f"[VIDEO] success want={want} url={youtube_url} size={file_size}")
     except Exception as e:
+        import traceback
         if tmpdir:
             shutil.rmtree(tmpdir, ignore_errors=True)
-        print(f"[VIDEO] error: {youtube_url} — {e}")
+        logger.error(f"[VIDEO] error url={youtube_url} err={e}\n{traceback.format_exc()}")
         return jsonify({"error": str(e)}), 502
     finally:
         # Free the slot as soon as the heavy server-side download is done — streaming the finished
@@ -296,7 +306,7 @@ def api_stream_cached(video_id):
                 }
                 cached = _stream_url_cache[video_id]
             except Exception as e:
-                print(f"[STREAM] resolve error: {video_id} — {e}")
+                logger.error(f"[STREAM] resolve_error video_id={video_id} err={e}")
                 return jsonify({"error": str(e)}), 500
 
     # Now proxy from cached URL
@@ -328,7 +338,7 @@ def api_stream_cached(video_id):
         if he.code == 403:
             # URL expired, invalidate cache and retry once
             _stream_url_cache.pop(video_id, None)
-            print(f"[STREAM] 403 from CDN for {video_id}, cache invalidated. Client should retry.")
+            logger.warning(f"[STREAM] 403 cdn_expired video_id={video_id}")
             return jsonify({"error": "Stream URL expired, retry"}), 410
         elif he.code == 416:
             # The client requested a range beyond the file size (file fully downloaded)
@@ -353,7 +363,7 @@ def api_stream_cached(video_id):
     if content_length:
         resp_headers['Content-Length'] = str(resp_length)
 
-    if range_header and content_length and range_start > 0:
+    if range_header and content_length:
         resp_headers['Content-Range'] = f'bytes {range_start}-{range_end}/{content_length}'
         return Response(generate(), status=206, headers=resp_headers)
     else:
