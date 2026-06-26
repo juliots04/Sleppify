@@ -102,14 +102,19 @@ class TrackReplacementSheet : BottomSheetDialogFragment() {
         tvOriginalTrackInfo?.text = infoText
 
         ivOriginalTrackThumbnail?.let { iv ->
-            val finalImageUrl = if (imageUrl.isNotEmpty()) imageUrl else "https://img.youtube.com/vi/$originalVideoId/hqdefault.jpg"
-            try {
-                Glide.with(iv)
-                    .load(finalImageUrl)
-                    .centerCrop()
-                    .into(iv)
-            } catch (e: Exception) {
-                android.util.Log.w("TrackReplaceSheet", "Failed to load thumbnail", e)
+            if (LocalFilesStore.isLocalVideoId(originalVideoId)) {
+                // Local file: its own embedded cover; never synthesize a YouTube URL (404s for local_ ids).
+                LocalArtworkResolver.loadInto(iv, originalVideoId)
+            } else {
+                val finalImageUrl = if (imageUrl.isNotEmpty()) imageUrl else "https://img.youtube.com/vi/$originalVideoId/hqdefault.jpg"
+                try {
+                    Glide.with(iv)
+                        .load(finalImageUrl)
+                        .centerCrop()
+                        .into(iv)
+                } catch (e: Exception) {
+                    android.util.Log.w("TrackReplaceSheet", "Failed to load thumbnail", e)
+                }
             }
         }
 

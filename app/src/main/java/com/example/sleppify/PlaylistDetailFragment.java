@@ -57,6 +57,8 @@ import androidx.work.WorkInfo;
 import androidx.work.WorkManager;
 
 import com.bumptech.glide.Glide;
+import com.bumptech.glide.RequestBuilder;
+import com.bumptech.glide.RequestManager;
 import com.bumptech.glide.load.engine.DiskCacheStrategy;
 import com.bumptech.glide.load.DecodeFormat;
 import com.bumptech.glide.load.resource.drawable.DrawableTransitionOptions;
@@ -265,9 +267,10 @@ public class PlaylistDetailFragment extends Fragment
     /** Cached surface_high color for the track art placeholder. Resolved once to avoid a
      *  Resources lookup on every list bind. */
     private int cachedTrackArtPlaceholderColor = 0;
-    /** How many rows past the viewport to warm in the scroll direction. ~1.5 screens of
-     *  60dp rows — enough that thumbnails are cached before their row binds. */
-    private static final int ART_PREFETCH_AHEAD = 12;
+    /** How many rows past the viewport to warm in the scroll direction. Kept small so off-screen
+     *  decodes never steal CPU/decode-thread slots from the rows actually on screen during a fling
+     *  — the visible rows must win the cores so the scroll stays fluid. ~half a screen of buffer. */
+    private static final int ART_PREFETCH_AHEAD = 6;
     /** Last (anchor, direction) pair the artwork prefetcher ran for; prevents re-issuing
      *  the same prefetch batch on every onScrolled frame while the anchor row is unchanged. */
     private int lastArtPrefetchKey = Integer.MIN_VALUE;
@@ -329,6 +332,10 @@ public class PlaylistDetailFragment extends Fragment
             ((MainActivity) getActivity()).setContainerOverlayMode(false);
             ((MainActivity) getActivity()).revealModuleContent();
         }
+        // Resolve the fragment-scoped Glide manager once here so list binds reuse it
+        // instead of paying the Glide.with(Fragment) lookup per row.
+        glideManager = Glide.with(this);
+        artRequestBase = null;
         rvPlaylistContent = view.findViewById(R.id.rvPlaylistContent);
         playlistLoadingOverlay = view.findViewById(R.id.flPlaylistLoadingOverlay);
         pbPlaylistLoading = view.findViewById(R.id.pbPlaylistLoading);
@@ -536,7 +543,7 @@ public class PlaylistDetailFragment extends Fragment
         }
         // Ensure Glide is not paused if the fragment resumes after a fling was interrupted
         if (isAdded()) {
-            try { Glide.with(this).resumeRequests(); } catch (Exception e) {
+            try { glideManager().resumeRequests(); } catch (Exception e) {
                 Log.w(TAG, "Unexpected error", e);
             }
         }
@@ -669,6 +676,9 @@ public class PlaylistDetailFragment extends Fragment
         playlistLoadingOverlay = null;
         pbPlaylistLoading = null;
         rvPlaylistContent = null;
+        // Drop the view-scoped Glide references so a destroyed-view manager is never reused.
+        artRequestBase = null;
+        glideManager = null;
         // Cleanup toolbar views
         llPlaylistToolbar = null;
         btnPlaylistBack = null;
@@ -1193,6 +1203,40 @@ public class PlaylistDetailFragment extends Fragment
         return cachedTrackArtPlaceholder;
     }
 
+    /** Fragment-scoped Glide manager resolved ONCE in onViewCreated. Reusing it avoids the
+     *  expensive Glide.with(Fragment) FragmentManager traversal on every list bind — the
+     *  dominant per-bind main-thread cost behind the scroll jank. */
+    @Nullable
+    private RequestManager glideManager;
+    /** Base artwork request holding the static request shape (transform, decode format, disk
+     *  cache, override size, placeholder). Cloned per bind so the request graph isn't rebuilt
+     *  from scratch for every row; only the model/priority/transition vary per call. */
+    @Nullable
+    private RequestBuilder<android.graphics.drawable.Drawable> artRequestBase;
+
+    @NonNull
+    private RequestManager glideManager() {
+        if (glideManager == null) {
+            glideManager = Glide.with(this);
+        }
+        return glideManager;
+    }
+
+    @NonNull
+    private RequestBuilder<android.graphics.drawable.Drawable> artRequestBase(@NonNull Context ctx) {
+        if (artRequestBase == null) {
+            int px = trackArtSizePx(ctx);
+            artRequestBase = glideManager()
+                    .asDrawable()
+                    .transform(SHARED_YT_CROP)
+                    .format(DecodeFormat.PREFER_RGB_565)
+                    .diskCacheStrategy(DiskCacheStrategy.ALL)
+                    .override(px, px)
+                    .placeholder(trackArtPlaceholder(ctx));
+        }
+        return artRequestBase;
+    }
+
     private void loadTrackArt(
             @NonNull ImageView target,
             @Nullable String imageUrl,
@@ -1201,7 +1245,7 @@ public class PlaylistDetailFragment extends Fragment
         Context ctx = target.getContext();
         if (TextUtils.isEmpty(imageUrl)) {
             target.setTag(R.id.tag_artwork_signature, null);
-            Glide.with(ctx).clear(target);
+            glideManager().clear(target);
             target.setImageDrawable(null);
             return;
         }
@@ -1219,16 +1263,13 @@ public class PlaylistDetailFragment extends Fragment
         // request start, so a row can never briefly show the previous track's image.
         // Memory-cache hits complete synchronously inside into() and never show it.
         boolean offlineOnly = !cachedHasValidatedInternet(ctx);
-        int px = trackArtSizePx(ctx);
-        Glide.with(this)
+        // Clone the prebuilt base request (transform/format/diskCache/override/placeholder are
+        // already baked in) so the request graph isn't reassembled per row — only the dynamic
+        // bits (model, cache policy, priority, transition) are applied here.
+        artRequestBase(ctx).clone()
                 .load(url)
-                .transform(SHARED_YT_CROP)
-                .format(DecodeFormat.PREFER_RGB_565)
-                .diskCacheStrategy(DiskCacheStrategy.ALL)
                 .onlyRetrieveFromCache(offlineOnly)
                 .priority(priority)
-                .override(px, px)
-                .placeholder(trackArtPlaceholder(ctx))
                 .transition(SHARED_CROSSFADE)
                 .into(target);
     }
@@ -1243,7 +1284,6 @@ public class PlaylistDetailFragment extends Fragment
         if (!isAdded() || anchorIndex < 0 || anchorIndex >= tracks.size()) return;
         Context ctx = requireContext();
         boolean offlineOnly = !cachedHasValidatedInternet(ctx);
-        int px = trackArtSizePx(ctx);
         for (int i = 1; i <= count; i++) {
             int idx = anchorIndex + direction * i;
             if (idx < 0 || idx >= tracks.size()) break;
@@ -1252,15 +1292,11 @@ public class PlaylistDetailFragment extends Fragment
                     || LocalFilesStore.isLocalVideoId(track.videoId)) {
                 continue;
             }
-            Glide.with(this)
+            artRequestBase(ctx).clone()
                     .load(track.imageUrl.trim())
-                    .transform(SHARED_YT_CROP)
-                    .format(DecodeFormat.PREFER_RGB_565)
-                    .diskCacheStrategy(DiskCacheStrategy.ALL)
                     .onlyRetrieveFromCache(offlineOnly)
                     .priority(com.bumptech.glide.Priority.LOW)
-                    .override(px, px)
-                    .preload(px, px);
+                    .preload();
         }
     }
 
@@ -1595,7 +1631,7 @@ public class PlaylistDetailFragment extends Fragment
             if (!isAdded()) return;
             List<LocalFilesStore.LocalTrack> localTracks = LocalFilesStore.getCachedFiles(requireContext());
             boolean needsRescan = localTracks.isEmpty()
-                    || (!localTracks.isEmpty() && TextUtils.isEmpty(localTracks.get(0).getAlbumArtUri()));
+                    || LocalFilesStore.isCacheStale(requireContext());
             if (needsRescan) {
                 localTracks = LocalFilesStore.scanLocalFiles(requireContext());
                 LocalFilesStore.cacheFiles(requireContext(), localTracks);
@@ -3741,10 +3777,9 @@ public class PlaylistDetailFragment extends Fragment
         
         tvTitle.setText(TextUtils.isEmpty(selectedTrack.title) ? "Tema" : selectedTrack.title);
         tvSubtitle.setText(TextUtils.isEmpty(selectedTrack.artist) ? "Artista" : selectedTrack.artist);
-        if (isLocalFilesPlaylist && LocalFilesStore.isLocalVideoId(selectedTrack.videoId)) {
-            ivArt.setScaleType(ImageView.ScaleType.CENTER);
-            ivArt.setBackgroundColor(ContextCompat.getColor(context, R.color.surface_high));
-            ivArt.setImageResource(R.drawable.ic_music);
+        if (LocalFilesStore.isLocalVideoId(selectedTrack.videoId)) {
+            // Show the file's own embedded cover (falls back to the music icon when absent).
+            LocalArtworkResolver.loadInto(ivArt, selectedTrack.videoId);
         } else {
             loadArtworkInto(ivArt, selectedTrack.imageUrl);
         }
@@ -5366,15 +5401,7 @@ public class PlaylistDetailFragment extends Fragment
                 .beginTransaction()
                 .setReorderingAllowed(true)
                 .show(player)
-                .runOnCommit(() -> {
-                    mainHandler.post(() -> {
-                        if (!isAdded()) return;
-                        View view = player.getView();
-                        if (view != null) {
-                            view.post(player::externalAnimateEnterSlide);
-                        }
-                    });
-                })
+                .runOnCommit(() -> startPlayerEnterAnimation(player))
                 .commit();
     }
 
@@ -5383,16 +5410,30 @@ public class PlaylistDetailFragment extends Fragment
                 .beginTransaction()
                 .setReorderingAllowed(true)
                 .add(R.id.playerContainer, player, "song_player")
-                .runOnCommit(() -> {
-                    mainHandler.post(() -> {
-                        if (!isAdded()) return;
-                        View view = player.getView();
-                        if (view != null) {
-                            view.post(player::externalAnimateEnterSlide);
-                        }
-                    });
-                })
+                .runOnCommit(() -> startPlayerEnterAnimation(player))
                 .commit();
+    }
+
+    /**
+     * Kicks off the player's slide-in at commit time. Previously this was double-deferred
+     * (mainHandler.post → view.post), which let the player draw at its resting position for a
+     * couple of frames before the animation snapped it off-screen — so the slide was either
+     * invisible or looked like a jump. runOnCommit already runs before the view's first draw, so
+     * starting synchronously here lets externalAnimateEnterSlide() place the view off-screen first;
+     * it then self-defers the actual slide to the first pre-draw (after the heavy layout pass).
+     */
+    private void startPlayerEnterAnimation(@NonNull SongPlayerFragment player) {
+        if (!isAdded()) return;
+        if (player.getView() != null) {
+            player.externalAnimateEnterSlide();
+        } else {
+            // View not created yet (rare with reordering enabled) — fall back to a single post.
+            mainHandler.post(() -> {
+                if (isAdded() && player.getView() != null) {
+                    player.externalAnimateEnterSlide();
+                }
+            });
+        }
     }
 
     private boolean startHiddenPlayerFromSnapshot(
@@ -6316,6 +6357,11 @@ public class PlaylistDetailFragment extends Fragment
 
     private static final int TRACK_STATE_CACHE_MAX_SIZE = 200;
 
+    /** Offline indicator visual states tracked per ViewHolder to skip redundant per-bind work. */
+    private static final int OFFLINE_STATE_NONE = 0;
+    private static final int OFFLINE_STATE_AVAILABLE = 1;
+    private static final int OFFLINE_STATE_DOWNLOADING = 2;
+
     private final class PlaylistTrackAdapter extends RecyclerView.Adapter<PlaylistTrackAdapter.TrackViewHolder> {
         private final List<PlaylistTrack> items;
         private final OnTrackTap onTrackTap;
@@ -6814,22 +6860,37 @@ public class PlaylistDetailFragment extends Fragment
 
             holder.tvTrackSubtitle.setText(track.normalizedSubtitle);
 
-            boolean showOfflineState = isOfflineAvailable || isCurrentlyDownloading;
-            holder.ivOfflineState.setVisibility(showOfflineState ? View.VISIBLE : View.INVISIBLE);
-
-            if (isOfflineAvailable) {
-                holder.ivOfflineState.setImageResource(R.drawable.ic_check_small);
-                holder.ivOfflineState.setBackgroundResource(R.drawable.bg_offline_state_filled_primary);
-                holder.ivOfflineState.setColorFilter(colorSurface);
-            } else if (isCurrentlyDownloading) {
-                holder.ivOfflineState.setImageResource(R.drawable.ic_check_small);
-                holder.ivOfflineState.setBackgroundResource(R.drawable.bg_offline_state_outline_primary);
-                holder.ivOfflineState.setColorFilter(colorPrimary);
+            // Offline indicator state is collapsed to a single int so the icon/background/
+            // progress-bar mutations only run when this holder's visual state actually
+            // changes — most binds (especially during scroll) are no-ops here.
+            int offlineState = isOfflineAvailable ? OFFLINE_STATE_AVAILABLE
+                    : (isCurrentlyDownloading ? OFFLINE_STATE_DOWNLOADING : OFFLINE_STATE_NONE);
+            if (holder.appliedOfflineState != offlineState) {
+                holder.appliedOfflineState = offlineState;
+                holder.ivOfflineState.setVisibility(
+                        offlineState == OFFLINE_STATE_NONE ? View.INVISIBLE : View.VISIBLE);
+                if (offlineState == OFFLINE_STATE_AVAILABLE) {
+                    holder.ivOfflineState.setImageResource(R.drawable.ic_check_small);
+                    holder.ivOfflineState.setBackgroundResource(R.drawable.bg_offline_state_filled_primary);
+                    holder.ivOfflineState.setColorFilter(colorSurface);
+                } else if (offlineState == OFFLINE_STATE_DOWNLOADING) {
+                    holder.ivOfflineState.setImageResource(R.drawable.ic_check_small);
+                    holder.ivOfflineState.setBackgroundResource(R.drawable.bg_offline_state_outline_primary);
+                    holder.ivOfflineState.setColorFilter(colorPrimary);
+                }
+                if (offlineState == OFFLINE_STATE_DOWNLOADING) {
+                    holder.flOfflineProgress.setVisibility(View.VISIBLE);
+                    holder.vOfflineProgressFill.setVisibility(View.VISIBLE);
+                } else {
+                    holder.vOfflineProgressFill.animate().cancel();
+                    holder.vOfflineProgressFill.setScaleX(0f);
+                    holder.flOfflineProgress.setVisibility(View.GONE);
+                }
             }
 
-            if (isCurrentlyDownloading) {
-                holder.flOfflineProgress.setVisibility(View.VISIBLE);
-                holder.vOfflineProgressFill.setVisibility(View.VISIBLE);
+            // Progress value must refresh on every bind while downloading (the state guard
+            // above only handles the show/hide transition, not the live progress fraction).
+            if (offlineState == OFFLINE_STATE_DOWNLOADING) {
                 float target = progressForTrack(track.videoId, downloadingTrackProgressById);
                 holder.vOfflineProgressFill.setPivotX(0f);
                 holder.vOfflineProgressFill.animate().cancel();
@@ -6837,10 +6898,6 @@ public class PlaylistDetailFragment extends Fragment
                     holder.vOfflineProgressFill.setScaleX(0f);
                 }
                 holder.vOfflineProgressFill.animate().scaleX(target).setDuration(500L).setInterpolator(DECELERATE_EASE).start();
-            } else {
-                holder.vOfflineProgressFill.animate().cancel();
-                holder.vOfflineProgressFill.setScaleX(0f);
-                holder.flOfflineProgress.setVisibility(View.GONE);
             }
 
             boolean isActive = position == activeIndex;
@@ -6904,24 +6961,12 @@ public class PlaylistDetailFragment extends Fragment
                 // Local tracks don't go through loadTrackArt, so clear the artwork signature
                 // to prevent a stale URL match if this holder is later reused for a remote track.
                 holder.ivTrackArt.setTag(R.id.tag_artwork_signature, null);
-                if (!TextUtils.isEmpty(track.imageUrl)) {
-                    holder.ivTrackArt.setScaleType(ImageView.ScaleType.CENTER_CROP);
-                    holder.ivTrackArt.setBackgroundColor(android.graphics.Color.TRANSPARENT);
-                    Glide.with(context)
-                        .load(android.net.Uri.parse(track.imageUrl))
-                        .diskCacheStrategy(com.bumptech.glide.load.engine.DiskCacheStrategy.ALL)
-                        .placeholder(R.drawable.ic_music)
-                        .error(R.drawable.ic_music)
-                        .override(160, 160)
-                        .centerCrop()
-                        .into(holder.ivTrackArt);
-                } else {
-                    Glide.with(context).clear(holder.ivTrackArt);
-                    holder.ivTrackArt.setScaleType(ImageView.ScaleType.FIT_CENTER);
-                    holder.ivTrackArt.setBackgroundColor(ContextCompat.getColor(context, R.color.surface_high));
-                    holder.ivTrackArt.setImageResource(R.drawable.ic_music);
-                }
+                // Resolve the file's OWN embedded picture (per-track), not the unreliable
+                // album-level art that bled wrong/missing covers across tracks.
+                LocalArtworkResolver.loadInto(holder.ivTrackArt, track.videoId, 160);
             } else {
+                // Reused row may have shown local art — invalidate its pending resolve.
+                LocalArtworkResolver.detach(holder.ivTrackArt);
                 holder.ivTrackArt.setScaleType(ImageView.ScaleType.CENTER_CROP);
                 holder.ivTrackArt.setBackgroundColor(android.graphics.Color.TRANSPARENT);
                 loadTrackArt(holder.ivTrackArt, track.imageUrl, com.bumptech.glide.Priority.HIGH);
@@ -6950,6 +6995,9 @@ public class PlaylistDetailFragment extends Fragment
             final View vOfflineProgressFill;
             /** Background drawable currently applied to the row; starts as the XML default. */
             int appliedRowBackgroundRes = R.drawable.bg_playlist_track_default;
+            /** Offline indicator visual state currently applied to this holder (-1 = unset).
+             *  Lets bindTrackState skip the icon/background/progress mutations on no-op binds. */
+            int appliedOfflineState = -1;
 
             TrackViewHolder(@NonNull View itemView) {
                 super(itemView);

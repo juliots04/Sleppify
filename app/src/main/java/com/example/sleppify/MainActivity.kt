@@ -120,6 +120,10 @@ class MainActivity : AppCompatActivity() {
     private var inEqualizerFromSettings = false
     private var inScannerFromSettings = false
     private var isNavigating = false
+    // Latest module requested while a navigation is already in flight. We never drop a
+    // request (that is what let the footer and the visible fragment drift apart); we
+    // remember the most recent one and reconcile to it once the current switch settles.
+    private var pendingNavItemId = View.NO_ID
     private var suppressNavListener = false
 
 
@@ -418,7 +422,8 @@ class MainActivity : AppCompatActivity() {
     fun handlePlayFromSearchIntent(intent: Intent) {
 
         if (currentMainNavItemId != R.id.nav_music) {
-            bottomNav.selectedItemId = R.id.nav_music
+            // switchToMainModule reconciles the footer itself; setting selectedItemId here
+            // (unsuppressed) would fire the listener and start a second, racing navigation.
             switchToMainModule(R.id.nav_music)
         }
 
@@ -1008,15 +1013,26 @@ class MainActivity : AppCompatActivity() {
 
     private fun resolveHeaderSettingsTypeface() = headerSettingsTypeface ?: ResourcesCompat.getFont(this, R.font.inter_variable).also { headerSettingsTypeface = it } ?: Typeface.DEFAULT_BOLD
 
-    fun enterSettings() {
+    fun enterSettings() = enterSettingsForSection(atHistory = false)
+
+    fun enterSettingsAtHistory() = enterSettingsForSection(atHistory = true)
+
+    private fun enterSettingsForSection(atHistory: Boolean) {
+        val target = (settingsFragment as? SettingsFragment)
+            ?: SettingsFragment().also { settingsFragment = it }
+        // Declare the entry section up front. requestSection() applies it immediately
+        // when Settings is already on screen, otherwise records it as the pending section
+        // that the fragment applies as soon as it appears. Doing this before the
+        // transaction means the section is fixed regardless of which lifecycle callback
+        // (onViewCreated or onHiddenChanged) ends up driving the first render.
+        if (atHistory) target.navigateToHistory() else target.navigateToRoot()
         if (inSettings) return
+
         dismissSavedBar()
         if (bottomNav.selectedItemId == R.id.nav_music) markStreamingEntryAsLibrary()
 
         inSettings = true
         globalMiniPlayer?.hide()
-        val target = settingsFragment ?: SettingsFragment().also { settingsFragment = it }
-        val isNew = !target.isAdded
         setOverlayFullscreen(true)
         showModuleLoadingOverlay()
         fragmentContainer.post {
@@ -1038,18 +1054,6 @@ class MainActivity : AppCompatActivity() {
             bottomNav.visibility = View.GONE
             fragmentContainer.post { fragmentContainer.post { revealModuleContent() } }
         }
-    }
-
-    fun enterSettingsAtHistory() {
-        val sf = (settingsFragment as? SettingsFragment)
-            ?: SettingsFragment().also { settingsFragment = it }
-        if (inSettings) {
-            sf.navigateToHistory()
-            return
-        }
-        // Set pending section BEFORE enterSettings so onHiddenChanged picks it up
-        sf.navigateToHistory()
-        enterSettings()
     }
 
     fun returnFromSettings() {
@@ -1440,8 +1444,42 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** Keep the footer highlight locked onto the module actually shown — the footer is a
+     *  pure reflection of [currentMainNavItemId], never an independent source of truth. */
+    private fun syncBottomNavSelection(itemId: Int) {
+        if (itemId == View.NO_ID || itemId == R.id.nav_search) return
+        if (bottomNav.selectedItemId != itemId) {
+            suppressNavListener = true
+            bottomNav.selectedItemId = itemId
+            suppressNavListener = false
+        }
+    }
+
+    /**
+     * Ends the in-flight navigation and reconciles state. If another module was requested
+     * while we were busy, honor that latest request now; otherwise lock the footer onto the
+     * module we actually showed. Either way the footer, [currentMainNavItemId] and the single
+     * visible main-module fragment converge on the same value — they can no longer disagree.
+     */
+    private fun finishMainModuleNavigation(shownItemId: Int) {
+        isNavigating = false
+        val pending = pendingNavItemId
+        pendingNavItemId = View.NO_ID
+        if (pending != View.NO_ID && pending != shownItemId && moduleTagForItem(pending) != null) {
+            switchToMainModule(pending)
+        } else {
+            syncBottomNavSelection(shownItemId)
+        }
+    }
+
     private fun switchToMainModule(itemId: Int): Boolean {
-        if (isNavigating) return true
+        if (isNavigating) {
+            // Coalesce instead of dropping: record the most recent request and run it when the
+            // current switch finishes. Dropping it here while still returning success is exactly
+            // what let the footer say "Principal" while Biblioteca was on screen.
+            pendingNavItemId = itemId
+            return true
+        }
         isNavigating = true
 
         // Reset stale sub-navigation flags — but only if the EQ overlay is no longer shown,
@@ -1454,18 +1492,14 @@ class MainActivity : AppCompatActivity() {
 
         supportFragmentManager.executePendingTransactions()
         setContainerOverlayMode(false)
-        val tag = moduleTagForItem(itemId) ?: run { isNavigating = false; return false }
+        val tag = moduleTagForItem(itemId) ?: run { finishMainModuleNavigation(currentMainNavItemId); return false }
         val target = supportFragmentManager.findFragmentByTag(tag)
             ?: getOrCreateMainModuleFragment(itemId)
-            ?: run { isNavigating = false; return false }
+            ?: run { finishMainModuleNavigation(currentMainNavItemId); return false }
 
         if (currentMainNavItemId == R.id.nav_music && itemId != R.id.nav_music) markStreamingEntryAsLibrary()
 
-        if (bottomNav.selectedItemId != itemId) {
-            suppressNavListener = true
-            bottomNav.selectedItemId = itemId
-            suppressNavListener = false
-        }
+        syncBottomNavSelection(itemId)
 
         val isTrulySwitching = currentMainNavItemId != itemId || !target.isAdded || target.isHidden
         if (!isTrulySwitching && !inSettings) {
@@ -1473,7 +1507,7 @@ class MainActivity : AppCompatActivity() {
             if (itemId == R.id.nav_music) {
                 (target as? MusicPlayerFragment)?.scrollToTop()
             }
-            isNavigating = false
+            finishMainModuleNavigation(itemId)
             return true
         }
 
@@ -1493,7 +1527,6 @@ class MainActivity : AppCompatActivity() {
                 setMaxLifecycle(target, Lifecycle.State.RESUMED)
                 commitAllowingStateLoss()
             }
-            isNavigating = false
             getSharedPreferences(PREFS_BOOTSTRAP, Context.MODE_PRIVATE)
                 .edit().putInt(PREF_LAST_MAIN_MODULE, itemId).apply()
             if (!isSearchFragmentVisible()) {
@@ -1502,6 +1535,7 @@ class MainActivity : AppCompatActivity() {
             }
             configureHeaderActionForMainModules()
             updateHeaderTitleForModule(itemId)
+            finishMainModuleNavigation(itemId)
             return true
         }
 
@@ -1534,8 +1568,6 @@ class MainActivity : AppCompatActivity() {
                 commitAllowingStateLoss()
             }
 
-            isNavigating = false
-
             getSharedPreferences(PREFS_BOOTSTRAP, Context.MODE_PRIVATE)
                 .edit()
                 .putInt(PREF_LAST_MAIN_MODULE, itemId)
@@ -1554,6 +1586,10 @@ class MainActivity : AppCompatActivity() {
             }
 
             fragmentContainer.post { revealModuleContent() }
+
+            // Navigation settled — clear the busy flag and reconcile the footer with the
+            // module actually shown (or honor a newer request that arrived meanwhile).
+            finishMainModuleNavigation(itemId)
         }
         return true
     }

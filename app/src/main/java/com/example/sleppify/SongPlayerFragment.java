@@ -34,6 +34,7 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.ViewGroup;
+import android.view.ViewTreeObserver;
 import android.widget.HorizontalScrollView;
 import android.widget.ImageButton;
 import android.widget.ImageView;
@@ -3268,15 +3269,48 @@ public class SongPlayerFragment extends Fragment {
             return;
         }
 
-        // Primary URL: track's own imageUrl. Fallback: YouTube hqdefault thumbnail.
-        final String primaryUrl = !TextUtils.isEmpty(imageUrl) ? imageUrl
-                : "https://i.ytimg.com/vi/" + Uri.encode(videoId) + "/hqdefault.jpg";
-        final String fallbackUrl = "https://i.ytimg.com/vi/" + Uri.encode(videoId) + "/hqdefault.jpg";
         final String notifVideoId = videoId;
 
         // Use applicationContext so this request outlives fragment hide/show.
         Context appCtx = getContext() != null ? getContext().getApplicationContext() : null;
         if (appCtx == null) return;
+
+        // Local files: resolve the file's OWN embedded picture. Never fall back to a YouTube
+        // thumbnail (a "local_<id>" videoId would build a URL that always 404s).
+        if (LocalFilesStore.isLocalVideoId(videoId)) {
+            LocalArtworkResolver.loadBytes(appCtx, videoId, bytes -> {
+                if (!isAdded() || bytes == null) return; // no embedded art -> launcher-icon fallback
+                Glide.with(appCtx).asBitmap()
+                    .load(bytes)
+                    .transform(SHARED_YT_CROP)
+                    .format(DecodeFormat.PREFER_RGB_565)
+                    .signature(new com.bumptech.glide.signature.ObjectKey("localart:" + notifVideoId))
+                    .diskCacheStrategy(DiskCacheStrategy.NONE)
+                    .override(256, 256)
+                    .into(new com.bumptech.glide.request.target.CustomTarget<Bitmap>() {
+                        @Override
+                        public void onResourceReady(@NonNull Bitmap resource,
+                                @Nullable Transition<? super Bitmap> transition) {
+                            if (!isAdded()) return;
+                            cacheMediaNotificationArtwork(notifVideoId, resource);
+                            updateMediaSessionMetadata();
+                            updateMediaNotification();
+                        }
+                        @Override
+                        public void onLoadCleared(@Nullable android.graphics.drawable.Drawable placeholder) {}
+                        @Override
+                        public void onLoadFailed(@Nullable android.graphics.drawable.Drawable errorDrawable) {
+                            Log.w(TAG, "loadNotificationArtworkOnly: local decode failed for " + notifVideoId);
+                        }
+                    });
+            });
+            return;
+        }
+
+        // Primary URL: track's own imageUrl. Fallback: YouTube hqdefault thumbnail.
+        final String primaryUrl = !TextUtils.isEmpty(imageUrl) ? imageUrl
+                : "https://i.ytimg.com/vi/" + Uri.encode(videoId) + "/hqdefault.jpg";
+        final String fallbackUrl = "https://i.ytimg.com/vi/" + Uri.encode(videoId) + "/hqdefault.jpg";
 
         com.bumptech.glide.RequestManager rm = Glide.with(appCtx);
         rm.asBitmap()
@@ -3517,19 +3551,40 @@ public class SongPlayerFragment extends Fragment {
                         public void onLoadCleared(@Nullable Drawable placeholder) {}
                     };
 
-                Glide.with(this)
-                    .asBitmap()
-                    .load(hdUrl)
-                    .transform(SHARED_YT_CROP)
-                    .diskCacheStrategy(DiskCacheStrategy.ALL)
-                    .error(
+                if (LocalFilesStore.isLocalVideoId(track.videoId)) {
+                    // Local track: resolve the file's own embedded picture off the main thread,
+                    // then feed the bytes into the same cover target (Palette + hero shaping).
+                    final CustomTarget<Bitmap> coverTarget = playerCoverTarget;
+                    final String localVideoId = track.videoId;
+                    LocalArtworkResolver.loadBytes(requireContext(), localVideoId, bytes -> {
+                        if (!isAdded() || artworkGen != playerArtworkGeneration || coverTarget == null) return;
+                        if (bytes == null) {
+                            coverTarget.onLoadFailed(null);
+                            return;
+                        }
                         Glide.with(this)
                             .asBitmap()
-                            .load(track.imageUrl)
+                            .load(bytes)
                             .transform(SHARED_YT_CROP)
-                            .diskCacheStrategy(DiskCacheStrategy.ALL)
-                    )
-                    .into(playerCoverTarget);
+                            .signature(new com.bumptech.glide.signature.ObjectKey("localart:" + localVideoId))
+                            .diskCacheStrategy(DiskCacheStrategy.NONE)
+                            .into(coverTarget);
+                    });
+                } else {
+                    Glide.with(this)
+                        .asBitmap()
+                        .load(hdUrl)
+                        .transform(SHARED_YT_CROP)
+                        .diskCacheStrategy(DiskCacheStrategy.ALL)
+                        .error(
+                            Glide.with(this)
+                                .asBitmap()
+                                .load(track.imageUrl)
+                                .transform(SHARED_YT_CROP)
+                                .diskCacheStrategy(DiskCacheStrategy.ALL)
+                        )
+                        .into(playerCoverTarget);
+                }
             }
         }
 
@@ -3555,6 +3610,11 @@ public class SongPlayerFragment extends Fragment {
     }
 
     private String getHdImageUrl(String url, String videoId) {
+        // Local files have no remote thumbnail — art is resolved per-file from the embedded
+        // picture by LocalArtworkResolver. Never synthesize a (bogus) YouTube URL for them.
+        if (LocalFilesStore.isLocalVideoId(videoId)) {
+            return "";
+        }
         if (TextUtils.isEmpty(url)) {
             if (!TextUtils.isEmpty(videoId)) {
                 return "https://i.ytimg.com/vi/" + videoId + "/hq720.jpg";
@@ -4366,18 +4426,43 @@ public class SongPlayerFragment extends Fragment {
 
         playerEnterAnimationRunning = true;
 
-        // Use cached height or resources fallback for first frame
-        int distance = root.getHeight();
-        if (distance <= 0) {
-            distance = root.getResources().getDisplayMetrics().heightPixels;
-        }
+        final int fallbackDistance = root.getResources().getDisplayMetrics().heightPixels;
 
+        // Put the player off-screen synchronously, BEFORE its first draw, so it never flashes at
+        // rest. Then defer the actual slide to the first pre-draw: the heavy initial measure/layout
+        // of this large layout runs first, so it can't drop the animation's opening frames — which
+        // is exactly what made the player look like it appeared instantly with no animation.
         root.animate().cancel();
         root.setVisibility(View.VISIBLE);
         root.setAlpha(1f);
-        root.setTranslationY(distance);
+        root.setTranslationY(root.getHeight() > 0 ? root.getHeight() : fallbackDistance);
 
-        // Perform animation immediately
+        final View slideRoot = root;
+        ViewTreeObserver vto = root.getViewTreeObserver();
+        if (vto.isAlive()) {
+            vto.addOnPreDrawListener(new ViewTreeObserver.OnPreDrawListener() {
+                @Override
+                public boolean onPreDraw() {
+                    slideRoot.getViewTreeObserver().removeOnPreDrawListener(this);
+                    startEnterSlide(slideRoot, fallbackDistance);
+                    return true; // allow this (off-screen) frame to draw; slide starts next frame
+                }
+            });
+        } else {
+            // View not ready for a pre-draw hook — start on the next loop instead.
+            root.post(() -> startEnterSlide(slideRoot, fallbackDistance));
+        }
+    }
+
+    /** Runs the actual slide-to-rest. Split out so it can start either from the first pre-draw
+     *  (after layout, so the opening frames aren't dropped) or from a posted fallback. */
+    private void startEnterSlide(@NonNull View root, int fallbackDistance) {
+        if (!isAdded() || getView() != root) {
+            playerEnterAnimationRunning = false;
+            return;
+        }
+        int distance = root.getHeight() > 0 ? root.getHeight() : fallbackDistance;
+        root.setTranslationY(distance);
         root.animate()
                 .translationY(0f)
                 .setDuration(280L)
@@ -5191,7 +5276,9 @@ public class SongPlayerFragment extends Fragment {
             }
         }
 
-        if (!TextUtils.isEmpty(track.imageUrl)) {
+        // For local tracks the art comes from the embedded picture (set as the ART bitmaps
+        // above); never publish an art URI for them (the legacy album URI was unreliable).
+        if (!TextUtils.isEmpty(track.imageUrl) && !LocalFilesStore.isLocalVideoId(track.videoId)) {
             metadataBuilder.putString(MediaMetadataCompat.METADATA_KEY_ALBUM_ART_URI, track.imageUrl);
         }
         if (!TextUtils.isEmpty(track.videoId)) {
@@ -5790,7 +5877,11 @@ public class SongPlayerFragment extends Fragment {
                 holder.tvNextUpArtist.setTextColor(Color.parseColor("#A0A0A0")); // Default gray
             }
 
-            if (!TextUtils.isEmpty(item.imageUrl)) {
+            if (LocalFilesStore.isLocalVideoId(item.videoId)) {
+                // Local queued track: resolve the file's own embedded cover.
+                LocalArtworkResolver.loadInto(holder.ivNextUpArt, item.videoId, 160);
+            } else if (!TextUtils.isEmpty(item.imageUrl)) {
+                LocalArtworkResolver.detach(holder.ivNextUpArt);
                 String imageUrl = item.imageUrl.trim();
                 // Do NOT null the drawable before loading — the placeholder replaces any
                 // recycled art the instant the request starts, and memory-cache hits bind
@@ -5806,6 +5897,7 @@ public class SongPlayerFragment extends Fragment {
                     .transition(com.bumptech.glide.load.resource.drawable.DrawableTransitionOptions.withCrossFade())
                     .into(holder.ivNextUpArt);
             } else {
+                LocalArtworkResolver.detach(holder.ivNextUpArt);
                 Glide.with(holder.itemView).clear(holder.ivNextUpArt);
                 holder.ivNextUpArt.setImageDrawable(null);
             }
@@ -6528,6 +6620,13 @@ public class SongPlayerFragment extends Fragment {
             case MotionEvent.ACTION_DOWN:
                 playerEnterAnimationRunning = false;
                 root.animate().cancel();
+                // CRITICAL: clear the dismiss-animation lock on every new touch. The dismiss/settle
+                // animations reset this flag in withEndAction(), but withEndAction does NOT run when
+                // the animation is cancelled — and the line above cancels it. Without this reset the
+                // flag stayed true forever, so onSwipeTouch() returned early on every later gesture:
+                // the sheet only nudged down a few px and froze on release, needing an app restart.
+                // Clearing it here makes every touch self-heal that state.
+                swipeDismissAnimationRunning = false;
                 initialTouchY[0] = event.getRawY();
                 dragStartY[0] = initialTouchY[0];
                 lastTouchY[0] = initialTouchY[0];
@@ -6600,6 +6699,13 @@ public class SongPlayerFragment extends Fragment {
                                 .start();
                     }
                     return true;
+                }
+                // Not dragging. If a cancelled enter/dismiss animation left the view offset (e.g. the
+                // user tapped mid-animation), settle it back to rest so it can never sit visually stuck
+                // partway down. A no-op when already at rest (guard below).
+                if (root.getTranslationY() > 0.5f) {
+                    root.animate().cancel();
+                    root.animate().translationY(0f).setDuration(180L).start();
                 }
                 return false;
         }

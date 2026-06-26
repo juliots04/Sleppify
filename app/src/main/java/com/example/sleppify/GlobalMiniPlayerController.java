@@ -229,7 +229,7 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
         if (!videoAttached && !videoOverlayActive) {
             if (!TextUtils.equals(lastArtVideoId, videoId)
                     || !TextUtils.equals(lastArtUrl, imageUrl)) {
-                loadArtwork(imageUrl);
+                loadArtwork(imageUrl, videoId);
                 lastArtVideoId = videoId;
                 lastArtUrl = imageUrl;
             }
@@ -523,8 +523,28 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
 
     // ── Artwork ─────────────────────────────────────────────────────────
 
-    private void loadArtwork(@Nullable String imageUrl) {
-        if (TextUtils.isEmpty(imageUrl) || activity.isFinishing() || activity.isDestroyed()) {
+    private void loadArtwork(@Nullable String imageUrl, @Nullable String videoId) {
+        if (activity.isFinishing() || activity.isDestroyed()) {
+            if (ivArt != null) {
+                ivArt.setImageDrawable(null);
+            }
+            artworkLoading = false;
+            updateMiniLoadingVisibility();
+            return;
+        }
+        // Local track: resolve the file's own embedded picture (music icon when absent).
+        if (LocalFilesStore.isLocalVideoId(videoId)) {
+            if (ivArt != null) {
+                LocalArtworkResolver.loadInto(ivArt, videoId, 320);
+            }
+            artworkLoading = false;
+            updateMiniLoadingVisibility();
+            return;
+        }
+        if (ivArt != null) {
+            LocalArtworkResolver.detach(ivArt);
+        }
+        if (TextUtils.isEmpty(imageUrl)) {
             if (ivArt != null) {
                 ivArt.setImageDrawable(null);
             }

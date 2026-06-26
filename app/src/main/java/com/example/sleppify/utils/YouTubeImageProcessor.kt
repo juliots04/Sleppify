@@ -2,10 +2,8 @@ package com.example.sleppify.utils
 
 import android.graphics.Bitmap
 import android.graphics.Color
-import android.text.TextUtils
 import android.util.Log
 import kotlin.math.max
-import kotlin.math.min
 
 object YouTubeImageProcessor {
     private const val TAG = "YouTubeImageProcessor"
@@ -15,6 +13,16 @@ object YouTubeImageProcessor {
      * thumbs) make margin detection unreliable so the row art no longer matches the full player.
      */
     private const val MIN_DECODE_PX_FOR_SMART_CROP = 320
+
+    /** Reduced threshold for tighter "uniformity" (better margin detection). */
+    private const val COLOR_SIMILARITY_THRESHOLD = 18
+
+    /**
+     * Safety cap on the pixel buffer. A decoded bitmap larger than this (4M px ≈ a 2000² image,
+     * 16 MB int[]) is never produced by our Glide overrides, so if one shows up we skip the crop
+     * rather than allocate a huge transient array. Keeps [smartCrop] memory bounded.
+     */
+    private const val MAX_SCAN_PIXELS = 4_000_000
 
     /**
      * Glide [.override] width/height for a view that will display at [displayPx] on one axis,
@@ -35,6 +43,23 @@ object YouTubeImageProcessor {
         val width = source.width
         val height = source.height
         if (width < 50 || height < 50) return source
+        if (width.toLong() * height > MAX_SCAN_PIXELS) return source
+
+        // Read every pixel we'll inspect in ONE native call. The previous implementation probed
+        // margins with thousands of individual Bitmap.getPixel() calls — each a JNI hop that
+        // locks the pixel buffer — which was the dominant CPU cost while scrolling and starved
+        // the UI thread. A single getPixels() (a bulk memcpy) plus a pure-Kotlin scan is 10–50x
+        // cheaper and produces byte-identical crops.
+        val pixels: IntArray = try {
+            IntArray(width * height).also { source.getPixels(it, 0, width, 0, 0, width, height) }
+        } catch (e: Exception) {
+            Log.e(TAG, "smartCrop: getPixels failed", e)
+            return source
+        }
+
+        // Sample offsets are identical to the original 7-point probes (10/20/40/50/60/80/90%).
+        val xPoints = samplePoints(width)
+        val yPoints = samplePoints(height)
 
         var cropTop = 0
         var cropBottom = height
@@ -42,35 +67,43 @@ object YouTubeImageProcessor {
         var cropRight = width
 
         // 1. Detect Top Margin (checking more of the image and using 7 points)
-        for (y in 2 until height / 2 step 2) {
-            if (!isRowUniform(source, y)) {
-                cropTop = maxOf(0, y - 2)
+        var yTop = 2
+        while (yTop < height / 2) {
+            if (!isRowUniform(pixels, width, yTop, xPoints)) {
+                cropTop = max(0, yTop - 2)
                 break
             }
+            yTop += 2
         }
 
         // 2. Detect Bottom Margin
-        for (y in height - 3 downTo height / 2 step 2) {
-            if (!isRowUniform(source, y)) {
-                cropBottom = minOf(height, y + 2)
+        var yBottom = height - 3
+        while (yBottom >= height / 2) {
+            if (!isRowUniform(pixels, width, yBottom, xPoints)) {
+                cropBottom = minOf(height, yBottom + 2)
                 break
             }
+            yBottom -= 2
         }
 
         // 3. Detect Left Margin
-        for (x in 2 until width / 2 step 2) {
-            if (!isColumnUniform(source, x)) {
-                cropLeft = maxOf(0, x - 2)
+        var xLeft = 2
+        while (xLeft < width / 2) {
+            if (!isColumnUniform(pixels, width, xLeft, yPoints)) {
+                cropLeft = max(0, xLeft - 2)
                 break
             }
+            xLeft += 2
         }
 
         // 4. Detect Right Margin
-        for (x in width - 3 downTo width / 2 step 2) {
-            if (!isColumnUniform(source, x)) {
-                cropRight = minOf(width, x + 2)
+        var xRight = width - 3
+        while (xRight >= width / 2) {
+            if (!isColumnUniform(pixels, width, xRight, yPoints)) {
+                cropRight = minOf(width, xRight + 2)
                 break
             }
+            xRight -= 2
         }
 
         // Ensure we don't crop into oblivion
@@ -103,32 +136,32 @@ object YouTubeImageProcessor {
         }
     }
 
-    private fun isRowUniform(bmp: Bitmap, y: Int): Boolean {
-        val w = bmp.width
-        // Use 7 points for better coverage
-        val points = intArrayOf(w/10, 2*w/10, 4*w/10, 5*w/10, 6*w/10, 8*w/10, 9*w/10)
-        val firstColor = bmp.getPixel(points[0], y)
-        
-        for (i in 1 until points.size) {
-            if (!isColorSimilar(firstColor, bmp.getPixel(points[i], y))) return false
+    /** The 7 probe offsets along an axis of length [size] (10/20/40/50/60/80/90%). */
+    private fun samplePoints(size: Int): IntArray = intArrayOf(
+        size / 10, 2 * size / 10, 4 * size / 10, 5 * size / 10, 6 * size / 10, 8 * size / 10, 9 * size / 10
+    )
+
+    /** Reads row [y] at the precomputed x-probes straight from the [pixels] buffer (no JNI). */
+    private fun isRowUniform(pixels: IntArray, width: Int, y: Int, xPoints: IntArray): Boolean {
+        val rowBase = y * width
+        val firstColor = pixels[rowBase + xPoints[0]]
+        for (i in 1 until xPoints.size) {
+            if (!isColorSimilar(firstColor, pixels[rowBase + xPoints[i]])) return false
         }
         return true
     }
 
-    private fun isColumnUniform(bmp: Bitmap, x: Int): Boolean {
-        val h = bmp.height
-        val points = intArrayOf(h/10, 2*h/10, 4*h/10, 5*h/10, 6*h/10, 8*h/10, 9*h/10)
-        val firstColor = bmp.getPixel(x, points[0])
-        
-        for (i in 1 until points.size) {
-            if (!isColorSimilar(firstColor, bmp.getPixel(x, points[i]))) return false
+    /** Reads column [x] at the precomputed y-probes straight from the [pixels] buffer (no JNI). */
+    private fun isColumnUniform(pixels: IntArray, width: Int, x: Int, yPoints: IntArray): Boolean {
+        val firstColor = pixels[yPoints[0] * width + x]
+        for (i in 1 until yPoints.size) {
+            if (!isColorSimilar(firstColor, pixels[yPoints[i] * width + x])) return false
         }
         return true
     }
 
     private fun isColorSimilar(c1: Int, c2: Int): Boolean {
-        // Reduced threshold for tighter "uniformity" (better margin detection)
-        val threshold = 18 
+        val threshold = COLOR_SIMILARITY_THRESHOLD
         return Math.abs(Color.red(c1) - Color.red(c2)) <= threshold &&
                Math.abs(Color.green(c1) - Color.green(c2)) <= threshold &&
                Math.abs(Color.blue(c1) - Color.blue(c2)) <= threshold
@@ -138,8 +171,8 @@ object YouTubeImageProcessor {
     fun shouldProcess(url: String?): Boolean {
         if (url.isNullOrEmpty()) return false
         val lower = url.lowercase()
-        return lower.contains("ytimg.com") || 
-               lower.contains("googleusercontent.com") || 
+        return lower.contains("ytimg.com") ||
+               lower.contains("googleusercontent.com") ||
                lower.contains("youtube.com/vi/")
     }
 }

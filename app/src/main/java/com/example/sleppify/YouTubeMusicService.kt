@@ -2129,54 +2129,99 @@ class YouTubeMusicService @JvmOverloads constructor(
         val artists = mutableListOf<ArtistResult>()
         val seenIds = HashSet<String>()
 
-        val tabs = root.optJSONObject("contents")
-            ?.optJSONObject("singleColumnBrowseResultsRenderer")
-            ?.optJSONArray("tabs")
-
-        if (tabs == null) {
-            Log.d(TAG, "artists_parse no tabs found, keys=${root.optJSONObject("contents")?.keys()?.asSequence()?.toList()}")
-            return artists
+        fun consider(artist: ArtistResult?) {
+            if (artist == null || artist.name.isEmpty()) return
+            val dedupKey = if (artist.channelId.isNotEmpty()) artist.channelId
+                           else "name:" + artist.name.lowercase(Locale.US)
+            if (seenIds.add(dedupKey)) artists.add(artist)
         }
 
-        val tabContent = tabs.optJSONObject(0)
-            ?.optJSONObject("tabRenderer")
-            ?.optJSONObject("content")
-            ?.optJSONObject("sectionListRenderer")
-            ?.optJSONArray("contents")
+        // Collect the section-content arrays from every browse layout YouTube has used for
+        // the library. The page used to be a singleColumnBrowseResultsRenderer; YouTube
+        // migrated library pages to twoColumnBrowseResultsRenderer, which is what made the
+        // artists "stop showing from one day to another". Handle both so it survives either.
+        val contentRoot = root.optJSONObject("contents")
+        val sectionArrays = mutableListOf<JSONArray>()
 
-        if (tabContent == null) {
-            Log.d(TAG, "artists_parse no tabContent found")
-            return artists
+        contentRoot?.optJSONObject("singleColumnBrowseResultsRenderer")
+            ?.optJSONArray("tabs")?.optJSONObject(0)
+            ?.optJSONObject("tabRenderer")?.optJSONObject("content")
+            ?.optJSONObject("sectionListRenderer")?.optJSONArray("contents")
+            ?.let { sectionArrays.add(it) }
+
+        contentRoot?.optJSONObject("twoColumnBrowseResultsRenderer")?.let { two ->
+            two.optJSONObject("secondaryContents")
+                ?.optJSONObject("sectionListRenderer")?.optJSONArray("contents")
+                ?.let { sectionArrays.add(it) }
+            two.optJSONArray("tabs")?.optJSONObject(0)
+                ?.optJSONObject("tabRenderer")?.optJSONObject("content")
+                ?.optJSONObject("sectionListRenderer")?.optJSONArray("contents")
+                ?.let { sectionArrays.add(it) }
         }
 
-        Log.d(TAG, "artists_parse sections=${tabContent.length()}")
+        Log.d(TAG, "artists_parse sectionArrays=${sectionArrays.size} contentKeys=${contentRoot?.keys()?.asSequence()?.toList()}")
 
-        for (s in 0 until tabContent.length()) {
-            val section = tabContent.optJSONObject(s) ?: continue
-            val shelf = section.optJSONObject("musicShelfRenderer")
-                ?: section.optJSONObject("gridRenderer")
-                ?: section.optJSONObject("itemSectionRenderer")
-                ?: continue
-
-            val items = shelf.optJSONArray("contents") ?: continue
-            Log.d(TAG, "artists_parse section=$s items=${items.length()}")
-            for (i in 0 until items.length()) {
-                val item = items.optJSONObject(i) ?: continue
-                val renderer = item.optJSONObject("musicResponsiveListItemRenderer")
-                    ?: item.optJSONObject("musicTwoRowItemRenderer")
+        for (sections in sectionArrays) {
+            for (s in 0 until sections.length()) {
+                val section = sections.optJSONObject(s) ?: continue
+                // musicShelfRenderer/itemSectionRenderer use "contents"; gridRenderer uses "items".
+                val items = section.optJSONObject("musicShelfRenderer")?.optJSONArray("contents")
+                    ?: section.optJSONObject("itemSectionRenderer")?.optJSONArray("contents")
+                    ?: section.optJSONObject("gridRenderer")?.optJSONArray("items")
                     ?: continue
-
-                val artist = parseArtistFromRenderer(renderer) ?: continue
-                if (artist.channelId.isNotEmpty()) {
-                    if (seenIds.add(artist.channelId)) {
-                        artists.add(artist)
-                    }
-                } else if (artist.name.isNotEmpty()) {
-                    artists.add(artist)
+                for (i in 0 until items.length()) {
+                    val item = items.optJSONObject(i) ?: continue
+                    val renderer = item.optJSONObject("musicResponsiveListItemRenderer")
+                        ?: item.optJSONObject("musicTwoRowItemRenderer")
+                        ?: continue
+                    consider(parseArtistFromRenderer(renderer))
                 }
             }
         }
+
+        // Fallback: the response didn't match any known layout. Rather than returning empty
+        // (which previously wiped the cache), deep-scan the whole tree for artist item
+        // renderers. Restrict to entries that navigate to a real channel (UC…) so we don't
+        // pick up songs/playlists that share the same renderer type.
+        if (artists.isEmpty()) {
+            Log.w(TAG, "artists_parse known layouts empty — deep scanning response")
+            for (renderer in deepCollectItemRenderers(root)) {
+                val artist = parseArtistFromRenderer(renderer) ?: continue
+                if (artist.channelId.startsWith("UC")) consider(artist)
+            }
+        }
+
+        Log.d(TAG, "artists_parse parsed=${artists.size}")
         return artists
+    }
+
+    /** Walk the entire JSON tree collecting every artist-capable item renderer. */
+    private fun deepCollectItemRenderers(root: JSONObject): List<JSONObject> {
+        val out = ArrayList<JSONObject>()
+        val stack = ArrayList<Any>()
+        stack.add(root)
+        var guard = 0
+        while (stack.isNotEmpty() && guard < 200_000) {
+            guard++
+            when (val node = stack.removeAt(stack.size - 1)) {
+                is JSONObject -> {
+                    node.optJSONObject("musicResponsiveListItemRenderer")?.let { out.add(it) }
+                    node.optJSONObject("musicTwoRowItemRenderer")?.let { out.add(it) }
+                    val keys = node.keys()
+                    while (keys.hasNext()) {
+                        val v = node.opt(keys.next())
+                        if (v is JSONObject || v is JSONArray) stack.add(v)
+                    }
+                }
+                is JSONArray -> {
+                    for (i in 0 until node.length()) {
+                        val v = node.opt(i)
+                        if (v is JSONObject || v is JSONArray) stack.add(v)
+                    }
+                }
+            }
+        }
+        return out
     }
 
     private fun parseArtistFromRenderer(renderer: JSONObject): ArtistResult? {

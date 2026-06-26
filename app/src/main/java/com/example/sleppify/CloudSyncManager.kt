@@ -1068,7 +1068,12 @@ class CloudSyncManager private constructor(context: Context) {
                 key == FAVORITES_TRACKS_DATA_KEY ||
                 key == FAVORITES_TRACKS_FULL_CACHE_KEY ||
                 key == FAVORITES_OFFLINE_COMPLETE_KEY ||
-                key == "stream_recent_search_queries"
+                key == "stream_recent_search_queries" ||
+                // Library artists cache (MusicPlayerFragment "library_artists_data_<account>").
+                // Whitelisting the prefix makes the artists sync to Firebase through the same
+                // streaming bucket as favorites: change-listener upload, payload inclusion and
+                // download-apply all key off this predicate.
+                key.startsWith(STREAMING_ARTISTS_KEY_PREFIX)
     }
 
     private fun isDeprecatedEqSyncKey(key: String?): Boolean {
@@ -1660,6 +1665,9 @@ class CloudSyncManager private constructor(context: Context) {
             "playlist_tracks_cache_full_" + FavoritesPlaylistStore.PLAYLIST_ID
         private val FAVORITES_OFFLINE_COMPLETE_KEY =
             "playlist_offline_complete_" + FavoritesPlaylistStore.PLAYLIST_ID
+
+        // Matches MusicPlayerFragment.PREF_ARTISTS_DATA_PREFIX ("library_artists_data_<account>").
+        private const val STREAMING_ARTISTS_KEY_PREFIX = "library_artists_data_"
 
         private const val DEBOUNCE_MS = 650L
         private const val SYNC_STUCK_TIMEOUT_MS = 16000L

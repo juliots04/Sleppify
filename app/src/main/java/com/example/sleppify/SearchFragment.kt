@@ -2347,8 +2347,15 @@ class SearchFragment : Fragment() {
     }
 
     private fun loadArtworkInto(target: ImageView, url: String?, videoId: String? = null) {
+        if (LocalFilesStore.isLocalVideoId(videoId)) {
+            // Local file: render its own embedded cover (music icon when absent).
+            LocalArtworkResolver.loadInto(target, videoId)
+            return
+        }
+        // Reused view may have shown local art — invalidate its pending resolve.
+        LocalArtworkResolver.detach(target)
         var finalUrl = url?.trim()
-        
+
         if (finalUrl.isNullOrEmpty() && !videoId.isNullOrEmpty() && OfflineAudioStore.hasOfflineAudio(requireContext(), videoId)) {
             finalUrl = OfflineAudioStore.getThumbnailUri(requireContext(), videoId)?.toString()
         }
@@ -2764,7 +2771,11 @@ class SearchFragment : Fragment() {
                     (h as TrackViewHolder).apply {
                         title.text = item.track.title
                         artist.text = item.track.artist
-                        if (item.track.imageUrl.isNotEmpty()) {
+                        if (LocalFilesStore.isLocalVideoId(item.track.videoId)) {
+                            LocalArtworkResolver.loadInto(thumb, item.track.videoId)
+                            thumb.visibility = View.VISIBLE
+                        } else if (item.track.imageUrl.isNotEmpty()) {
+                            LocalArtworkResolver.detach(thumb)
                             Glide.with(this@SearchFragment)
                                 .load(item.track.imageUrl)
                                 .transform(SHARED_YT_CROP)
@@ -2773,6 +2784,7 @@ class SearchFragment : Fragment() {
                                 .into(thumb)
                             thumb.visibility = View.VISIBLE
                         } else {
+                            LocalArtworkResolver.detach(thumb)
                             thumb.visibility = View.GONE
                         }
                         val trackResult = YouTubeMusicService.TrackResult(

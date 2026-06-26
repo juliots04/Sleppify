@@ -842,6 +842,26 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         val backdrop = ivHomeBackdrop ?: return
         if (!isAdded || shortcutEntries.isEmpty()) return
         val firstEntry = shortcutEntries[0]
+        if (LocalFilesStore.isLocalVideoId(firstEntry.videoId)) {
+            val key = "localart:${firstEntry.videoId}"
+            if (key == lastBackdropUrl) return
+            lastBackdropUrl = key
+            LocalArtworkResolver.loadBytes(requireContext(), firstEntry.videoId) { bytes ->
+                if (!isAdded || bytes == null) return@loadBytes
+                try {
+                    Glide.with(this)
+                        .load(bytes)
+                        .diskCacheStrategy(DiskCacheStrategy.NONE)
+                        .signature(com.bumptech.glide.signature.ObjectKey(key))
+                        .override(320, 320)
+                        .transform(SHARED_CENTER_CROP)
+                        .into(backdrop)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Backdrop load error", e)
+                }
+            }
+            return
+        }
         val url = firstEntry.imageUrl
         if (url.isNullOrEmpty() || url == lastBackdropUrl) return
         lastBackdropUrl = url
@@ -1564,6 +1584,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
             // Liked playlist: gradient + icon, no artwork
             if (isLiked) {
+                LocalArtworkResolver.detach(holder.ivThumb)
                 holder.ivThumb.setImageDrawable(null)
                 holder.vLikedBg.visibility = View.VISIBLE
                 holder.ivLikedIcon.visibility = View.VISIBLE
@@ -1575,6 +1596,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 val currentTag = (holder.ivThumb.getTag(R.id.tag_artwork_signature) as? String) ?: ""
 
                 if (isPlaylist && isAdded) {
+                    LocalArtworkResolver.detach(holder.ivThumb)
                     val gridUrls = resolvePlaylistGridUrls(entry.playlistId)
                     if (gridUrls.size >= 4) {
                         val signature = "${entry.playlistId}_${gridUrls[0]}"
@@ -1591,7 +1613,16 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                             try { Glide.with(this@PrincipalFragment).load(fallbackUrl).placeholder(R.color.surface_high).transform(SHARED_YT_CROP, SHARED_CENTER_CROP).into(holder.ivThumb) } catch (_: Exception) {}
                         }
                     }
+                } else if (LocalFilesStore.isLocalVideoId(entry.videoId) && isAdded) {
+                    // Local track shortcut: render the file's own embedded cover.
+                    val signature = "localart:${entry.videoId}"
+                    if (signature != currentTag) {
+                        holder.ivThumb.setTag(R.id.tag_artwork_signature, signature)
+                        val density = holder.itemView.context.resources.displayMetrics.density
+                        LocalArtworkResolver.loadInto(holder.ivThumb, entry.videoId, (120 * density).toInt())
+                    }
                 } else if (!entry.imageUrl.isNullOrEmpty() && isAdded) {
+                    LocalArtworkResolver.detach(holder.ivThumb)
                     if (entry.imageUrl != currentTag) {
                         holder.ivThumb.setTag(R.id.tag_artwork_signature, entry.imageUrl)
                         try { Glide.with(this@PrincipalFragment).load(entry.imageUrl).placeholder(R.color.surface_high).transform(SHARED_YT_CROP, SHARED_CENTER_CROP).into(holder.ivThumb) } catch (_: Exception) {}

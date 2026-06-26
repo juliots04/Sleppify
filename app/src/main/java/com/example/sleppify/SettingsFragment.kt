@@ -180,7 +180,12 @@ class SettingsFragment : Fragment() {
     override fun onHiddenChanged(hidden: Boolean) {
         super.onHiddenChanged(hidden)
         if (!hidden) {
-            val target = pendingSection ?: SECTION_ROOT
+            // Fall back to the section already shown — NOT SECTION_ROOT. With
+            // setReorderingAllowed(true) a freshly added fragment can receive this
+            // dispatch right after onViewCreated already consumed pendingSection; if we
+            // defaulted to root here we'd clobber the requested section (e.g. History)
+            // back to the configuration tree.
+            val target = pendingSection ?: currentSection
             pendingSection = null
             showSection(target)
         }
@@ -206,11 +211,21 @@ class SettingsFragment : Fragment() {
         }
     }
 
-    fun navigateToHistory() {
+    fun navigateToHistory() = requestSection(SECTION_HISTORY)
+
+    fun navigateToRoot() = requestSection(SECTION_ROOT)
+
+    /**
+     * Declares which section to show the next time the fragment becomes visible.
+     * If it is already added and visible the switch happens immediately; otherwise the
+     * section is recorded and applied by onViewCreated/onHiddenChanged when it appears.
+     */
+    private fun requestSection(section: Int) {
         if (isAdded && !isHidden) {
-            showSection(SECTION_HISTORY)
+            pendingSection = null
+            showSection(section)
         } else {
-            pendingSection = SECTION_HISTORY
+            pendingSection = section
         }
     }
 
@@ -663,7 +678,9 @@ class SettingsFragment : Fragment() {
         val ivArt = view.findViewById<ImageView>(R.id.ivBsTrackArt)
         tvTitle.text = entry.title.ifEmpty { "Tema" }
         tvSubtitle.text = entry.artist.ifEmpty { "Artista" }
-        if (entry.imageUrl.isNotEmpty()) {
+        if (LocalFilesStore.isLocalVideoId(entry.videoId)) {
+            LocalArtworkResolver.loadInto(ivArt, entry.videoId)
+        } else if (entry.imageUrl.isNotEmpty()) {
             Glide.with(ivArt).load(entry.imageUrl).centerCrop().placeholder(R.color.surface_high).into(ivArt)
         }
         view.findViewById<View>(R.id.ivBsOfflineState)?.visibility = View.GONE
@@ -1182,9 +1199,13 @@ class SettingsFragment : Fragment() {
                 tvTitle.text = entry.title
                 tvArtist.text = entry.artist
                 tvTime.text = timeFormat.format(Date(entry.timestampMs))
-                if (entry.imageUrl.isNotEmpty()) {
+                if (LocalFilesStore.isLocalVideoId(entry.videoId)) {
+                    LocalArtworkResolver.loadInto(ivThumb, entry.videoId)
+                } else if (entry.imageUrl.isNotEmpty()) {
+                    LocalArtworkResolver.detach(ivThumb)
                     Glide.with(ivThumb).load(entry.imageUrl).centerCrop().placeholder(R.color.surface_high).into(ivThumb)
                 } else {
+                    LocalArtworkResolver.detach(ivThumb)
                     ivThumb.setImageDrawable(ColorDrawable(ContextCompat.getColor(ivThumb.context, R.color.surface_high)))
                 }
                 itemView.setOnClickListener { onClick(entry) }
@@ -1214,9 +1235,13 @@ class SettingsFragment : Fragment() {
             private val tvTitle = v.findViewById<TextView>(R.id.tvTopPlayedTitle)
             fun bind(entry: PlayCountStore.PlayCountEntry) {
                 tvTitle.text = entry.title
-                if (entry.imageUrl.isNotEmpty()) {
+                if (LocalFilesStore.isLocalVideoId(entry.videoId)) {
+                    LocalArtworkResolver.loadInto(ivThumb, entry.videoId)
+                } else if (entry.imageUrl.isNotEmpty()) {
+                    LocalArtworkResolver.detach(ivThumb)
                     Glide.with(ivThumb).load(entry.imageUrl).centerCrop().placeholder(R.color.surface_high).into(ivThumb)
                 } else {
+                    LocalArtworkResolver.detach(ivThumb)
                     ivThumb.setImageDrawable(ColorDrawable(ContextCompat.getColor(ivThumb.context, R.color.surface_high)))
                 }
                 itemView.setOnClickListener { onClick(entry) }

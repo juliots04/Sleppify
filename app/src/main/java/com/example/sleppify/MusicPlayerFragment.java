@@ -1897,6 +1897,15 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 libraryArtistsFetchInFlight = false;
                 if (!isAdded()) return;
                 Log.i(TAG_STREAMING, "artists_fetch success count=" + artists.size());
+                if (artists.isEmpty()) {
+                    // Empty result — usually a transient error or a YouTube layout change the
+                    // parser didn't recognize. NEVER overwrite a good cache with an empty list:
+                    // that is what made the artists vanish "de un día a otro" and disappear from
+                    // cache too. Keep whatever we already have shown/persisted.
+                    Log.w(TAG_STREAMING, "artists_fetch empty — keeping cached artists (cached="
+                            + libraryArtists.size() + ")");
+                    return;
+                }
                 libraryArtists.clear();
                 libraryArtists.addAll(artists);
                 persistArtists(artists);
@@ -6541,9 +6550,15 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 // Use max, because worker fraction may be 0 if it's just ENQUEUED.
                 downloadFraction = Math.max(workerFraction, realFraction);
             }
+            // The progress arc has reached 100%. Treat this as "done" visually even if the worker
+            // hasn't flipped to SUCCEEDED yet / the disk-validation refresh hasn't run — otherwise the
+            // ring sits full showing the download icon and never swaps to the filled check. That gap
+            // (worker reports 100% while still RUNNING) was the reported bug. 100% downloaded == done,
+            // and the async disk refresh still runs on completion to confirm/correct the state.
+            boolean reachedFull = isDownloading && downloadFraction >= 0.999f;
             Context ctx = holder.itemView.getContext();
 
-            if (isDownloading) {
+            if (isDownloading && !reachedFull) {
                 // State: downloading — circular arc + download icon (no background circle)
                 holder.flPlaylistOfflineContainer.setVisibility(View.VISIBLE);
                 holder.circularProgress.setVisibility(View.VISIBLE);
@@ -6556,12 +6571,19 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 holder.ivPlaylistOfflineAll.setBackground(null);
                 holder.ivPlaylistOfflineAll.setColorFilter(ContextCompat.getColor(ctx, R.color.stitch_blue));
                 holder.ivPlaylistOfflineAll.setAlpha(1f);
-            } else if (completeOffline) {
+            } else if (completeOffline || reachedFull) {
                 // State: fully downloaded — filled circle + check.
                 // Show the check whenever the playlist is fully on disk, regardless of the
                 // auto-offline toggle (e.g. completed via per-track taps, or shared tracks
                 // already downloaded by another playlist). Disk-completeness is the source of
                 // truth; the auto flag only gates the "queued/in-progress" ring below.
+                if (reachedFull) {
+                    // Seed the cache so when the worker flips out of the downloading set, the very
+                    // next bind still resolves to "complete" and the check doesn't flicker away while
+                    // the async disk refresh is in flight. The forced recompute on worker completion
+                    // overwrites this with the validated value.
+                    playlistOfflineCompleteCache.put(playlistId, true);
+                }
                 holder.flPlaylistOfflineContainer.setVisibility(View.VISIBLE);
                 holder.circularProgress.setVisibility(View.GONE);
                 holder.circularProgress.setProgressImmediate(0f);
