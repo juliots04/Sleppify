@@ -30,7 +30,9 @@ import com.example.sleppify.utils.YouTubeCropTransformation;
 @androidx.annotation.OptIn(markerClass = androidx.media3.common.util.UnstableApi.class)
 public final class GlobalMiniPlayerController implements PlaybackEventBus.Listener, PlaybackLoadingBus.Listener {
 
-    private static final long PROGRESS_TICK_MS = 200L;
+    // Drives only the small mini-bar progress (when the full player isn't visible). 2 Hz is smooth
+    // for a thin bar and cuts main-thread wakeups ~60% vs the old 200ms while playing in background.
+    private static final long PROGRESS_TICK_MS = 500L;
     private static final PathInterpolator MATERIAL_EASE =
             new PathInterpolator(0.2f, 0f, 0f, 1f);
     private static final YouTubeCropTransformation SHARED_YT_CROP =
@@ -408,7 +410,7 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
         activity.getSupportFragmentManager()
                 .beginTransaction()
                 .setReorderingAllowed(true)
-                .add(R.id.playerContainer, playerFragment, "song_player")
+                .add(R.id.playerContainer, playerFragment, AppConstants.TAG_SONG_PLAYER)
                 .hide(playerFragment)
                 .runOnCommit(this::updateUi)
                 .commit();
@@ -456,7 +458,7 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
         activity.getSupportFragmentManager()
                 .beginTransaction()
                 .setReorderingAllowed(true)
-                .add(R.id.playerContainer, playerFragment, "song_player")
+                .add(R.id.playerContainer, playerFragment, AppConstants.TAG_SONG_PLAYER)
                 .runOnCommit(playerFragment::externalAnimateEnterSlide)
                 .commit();
     }

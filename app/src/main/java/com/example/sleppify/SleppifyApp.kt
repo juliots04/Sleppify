@@ -26,6 +26,20 @@ class SleppifyApp : Application() {
         // On first install (no session), defer until after successful web login.
         if (hasExistingSession()) {
             performHeavyInit()
+        } else {
+            // performHeavyInit (which pre-warms the data caches) is deferred until after web login,
+            // but PlaybackHistoryStore is still read on the cold-start UI path (the mini-player's
+            // first updateUi). Pre-warm it off the main thread now so that first read is O(1)
+            // instead of a synchronous prefs-XML disk hit on the first frame.
+            val warmExec = Executors.newSingleThreadExecutor()
+            warmExec.execute {
+                try { PlaybackHistoryStore.load(this) } catch (e: Exception) {
+                    Log.w("SleppifyApp", "PlaybackHistoryStore pre-warm (no session) failed", e)
+                }
+            }
+            // Let the one-shot warm-up run, then terminate the worker thread instead of leaking an
+            // idle non-daemon core thread for the whole process lifetime.
+            warmExec.shutdown()
         }
     }
 
@@ -57,7 +71,8 @@ class SleppifyApp : Application() {
         // — no need to block the main thread here.
 
         // Background: pre-warm data caches + ProviderInstaller for TLS security
-        Executors.newSingleThreadExecutor().execute {
+        val initExec = Executors.newSingleThreadExecutor()
+        initExec.execute {
             // Pre-load caches so MainActivity.onCreate finds them warm (O(1) read)
             try { PlaybackHistoryStore.load(this) } catch (e: Exception) {
                 Log.w("SleppifyApp", "PlaybackHistoryStore pre-warm failed", e)
@@ -71,11 +86,13 @@ class SleppifyApp : Application() {
                 Log.w("SleppifyApp", "ProviderInstaller failed", e)
             }
         }
+        // Terminate the worker thread after the one-shot init completes (no leaked idle thread).
+        initExec.shutdown()
     }
 
     private fun hasExistingSession(): Boolean {
         val prefs = getSharedPreferences(AppConstants.PREFS_PLAYER_STATE, MODE_PRIVATE)
-        val cookie = prefs.getString("stream_last_youtube_web_cookie", "") ?: ""
+        val cookie = prefs.getString(AppConstants.PREF_LAST_YOUTUBE_WEB_COOKIE, "") ?: ""
         return cookie.trim().isNotEmpty()
     }
 

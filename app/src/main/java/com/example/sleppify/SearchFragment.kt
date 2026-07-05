@@ -81,6 +81,14 @@ class SearchFragment : Fragment() {
         private val SHARED_YT_CROP = YouTubeCropTransformation()
         val WHITESPACE_REGEX = Regex("\\s+")
 
+        // Compiled once and reused. These were previously re-compiled on every call while sorting
+        // search results (once per track), which is pure allocation/CPU churn.
+        private val DURATION_REGEX = Regex("\\d{1,2}:\\d{2}(:\\d{2})?")
+        private val PLAY_COUNT_MIL_M_REGEX = Regex("([\\d,.]+)\\s*mil\\s+m", RegexOption.IGNORE_CASE)
+        private val PLAY_COUNT_REPRO_REGEX = Regex("([\\d,.]+)\\s*(m|k|b|mil)?\\s*reproducciones", RegexOption.IGNORE_CASE)
+        private val PLAY_COUNT_PLAYS_REGEX = Regex("([\\d,.]+)\\s*(m|k|b|mil)?\\s*(plays|views)", RegexOption.IGNORE_CASE)
+        private val PLAY_COUNT_NUM_REGEX = Regex("([\\d,.]+)\\s*(m|k|b|mil)?", RegexOption.IGNORE_CASE)
+
         fun newInstance() = SearchFragment()
     }
 
@@ -753,7 +761,7 @@ class SearchFragment : Fragment() {
         if (subtitle.isNullOrEmpty()) return ""
         val parts = subtitle.split(" \u2022 ").map { it.trim() }
         for (part in parts.asReversed()) {
-            if (part.matches(Regex("\\d{1,2}:\\d{2}(:\\d{2})?")))
+            if (part.matches(DURATION_REGEX))
                 return part
         }
         return ""
@@ -778,15 +786,15 @@ class SearchFragment : Fragment() {
             val trimmed = part.trim().lowercase(Locale.ROOT)
             if (trimmed.contains("reproducciones") || trimmed.contains("plays") || trimmed.contains("views")) {
                 // Handle "10 mil M reproducciones" = 10,000 M = 10 billion
-                val milMMatch = Regex("([\\d,.]+)\\s*mil\\s+m", RegexOption.IGNORE_CASE).find(trimmed)
+                val milMMatch = PLAY_COUNT_MIL_M_REGEX.find(trimmed)
                 if (milMMatch != null) {
                     val num = milMMatch.groupValues[1].replace(",", ".").toDoubleOrNull() ?: 0.0
                     return (num * 1_000_000_000L).toLong()
                 }
                 // Handle "3570 M reproducciones", "459 k reproducciones", "28 reproducciones"
-                val numMatch = Regex("([\\d,.]+)\\s*(m|k|b|mil)?\\s*reproducciones", RegexOption.IGNORE_CASE).find(trimmed)
-                    ?: Regex("([\\d,.]+)\\s*(m|k|b|mil)?\\s*(plays|views)", RegexOption.IGNORE_CASE).find(trimmed)
-                    ?: Regex("([\\d,.]+)\\s*(m|k|b|mil)?", RegexOption.IGNORE_CASE).find(trimmed)
+                val numMatch = PLAY_COUNT_REPRO_REGEX.find(trimmed)
+                    ?: PLAY_COUNT_PLAYS_REGEX.find(trimmed)
+                    ?: PLAY_COUNT_NUM_REGEX.find(trimmed)
                 if (numMatch != null) {
                     val numStr = numMatch.groupValues[1].replace(",", ".")
                     val multiplier = when (numMatch.groupValues[2].lowercase(Locale.ROOT)) {
@@ -2416,7 +2424,7 @@ class SearchFragment : Fragment() {
     private fun getCookieHeader(): String {
         if (!isAdded) return ""
         val prefs = requireContext().getSharedPreferences(AppConstants.PREFS_PLAYER_STATE, android.app.Activity.MODE_PRIVATE)
-        return (prefs.getString("stream_last_youtube_web_cookie", "") ?: "").trim()
+        return (prefs.getString(AppConstants.PREF_LAST_YOUTUBE_WEB_COOKIE, "") ?: "").trim()
     }
 
     private fun hideKeyboard() {
@@ -2779,6 +2787,8 @@ class SearchFragment : Fragment() {
                             Glide.with(this@SearchFragment)
                                 .load(item.track.imageUrl)
                                 .transform(SHARED_YT_CROP)
+                                .format(com.bumptech.glide.load.DecodeFormat.PREFER_RGB_565)
+                                .override(160, 160)
                                 .diskCacheStrategy(DiskCacheStrategy.ALL)
                                 .placeholder(android.R.color.darker_gray)
                                 .into(thumb)
@@ -2915,7 +2925,9 @@ class SearchFragment : Fragment() {
             if (item.thumbnail.isNotEmpty()) {
                 Glide.with(this@SearchFragment)
                     .load(item.thumbnail)
-                    .transform(YouTubeCropTransformation())
+                    .transform(SHARED_YT_CROP)
+                    .format(com.bumptech.glide.load.DecodeFormat.PREFER_RGB_565)
+                    .override(360, 360)
                     .diskCacheStrategy(DiskCacheStrategy.ALL)
                     .listener(object : RequestListener<Drawable> {
                         override fun onLoadFailed(
@@ -2988,7 +3000,7 @@ class SearchFragment : Fragment() {
     }
 
     private fun findSongPlayerFragment(): SongPlayerFragment? {
-        return parentFragmentManager.findFragmentByTag("song_player") as? SongPlayerFragment
+        return parentFragmentManager.findFragmentByTag(AppConstants.TAG_SONG_PLAYER) as? SongPlayerFragment
     }
 
     private fun showSongPlayerWithEnterAnimation(player: SongPlayerFragment) {
@@ -3002,9 +3014,25 @@ class SearchFragment : Fragment() {
     private fun addSongPlayerWithEnterAnimation(player: SongPlayerFragment) {
         parentFragmentManager.beginTransaction()
             .setReorderingAllowed(true)
-            .add(R.id.playerContainer, player, "song_player")
+            .add(R.id.playerContainer, player, AppConstants.TAG_SONG_PLAYER)
             .runOnCommit { player.externalAnimateEnterSlide() }
             .commit()
+    }
+
+    /** Adds the player attached but HIDDEN so playback starts in the mini-player, not the full
+     *  screen player. The global mini-player then appears via the snapshot event; refresh it now
+     *  so it never lags a frame behind. */
+    private fun addSongPlayerHidden(player: SongPlayerFragment) {
+        parentFragmentManager.beginTransaction()
+            .setReorderingAllowed(true)
+            .add(R.id.playerContainer, player, AppConstants.TAG_SONG_PLAYER)
+            .hide(player)
+            .runOnCommit { ensureMiniPlayerShown() }
+            .commit()
+    }
+
+    private fun ensureMiniPlayerShown() {
+        (activity as? MainActivity)?.getGlobalMiniPlayer()?.updateUi()
     }
 
     private fun searchPlayTrackList(tracksList: List<YouTubeMusicService.TrackResult>, startIndex: Int) {
@@ -3013,19 +3041,18 @@ class SearchFragment : Fragment() {
         if (data.ids.isEmpty()) return
         val safeIndex = startIndex.coerceIn(0, data.ids.size - 1)
 
-        (activity as? MainActivity)?.getGlobalMiniPlayer()?.animateOut()
-
+        // Play in the mini-player — do NOT auto-open the full-screen player.
         val existingPlayer = findSongPlayerFragment()
         if (existingPlayer != null && existingPlayer.isAdded) {
             existingPlayer.externalSetReturnTargetTag("module_search")
             existingPlayer.externalReplaceQueue(data.ids, data.titles, data.artists, data.durations, data.images, safeIndex, true)
-            showSongPlayerWithEnterAnimation(existingPlayer)
+            ensureMiniPlayerShown()
             return
         }
 
         val playerFragment = SongPlayerFragment.newInstance(data.ids, data.titles, data.artists, data.durations, data.images, safeIndex, true)
         playerFragment.externalSetReturnTargetTag("module_search")
-        addSongPlayerWithEnterAnimation(playerFragment)
+        addSongPlayerHidden(playerFragment)
     }
 
     private fun searchPlayTrackWithRadio(track: YouTubeMusicService.TrackResult) {

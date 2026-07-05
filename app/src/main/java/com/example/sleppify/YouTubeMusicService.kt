@@ -91,6 +91,11 @@ class YouTubeMusicService @JvmOverloads constructor(
         fun onError(error: String)
     }
 
+    interface ArtistPageCallback {
+        fun onSuccess(page: ArtistPage)
+        fun onError(error: String)
+    }
+
     // ----- Public data classes (field-accessible from Java via @JvmField) -----
 
     class TrackResult(
@@ -137,6 +142,15 @@ class YouTubeMusicService @JvmOverloads constructor(
         fun getOpenUrl(): String =
             "https://music.youtube.com/playlist?list=" + safeUrlEncode(playlistId)
     }
+
+    /** A real YouTube Music artist page (from browse(channelId)). Fields are @JvmField for Java. */
+    class ArtistPage(
+        @JvmField val name: String,
+        @JvmField val subtitle: String,
+        @JvmField val thumbnailUrl: String,
+        @JvmField val topSongs: List<TrackResult>,
+        @JvmField val albums: List<PlaylistResult>
+    )
 
     class PlaylistTrackResult(
         @JvmField val videoId: String,
@@ -2371,6 +2385,154 @@ class YouTubeMusicService @JvmOverloads constructor(
         }
 
         return result
+    }
+
+    // ----- Artist page browse (real Spotify-style artist page) -----
+
+    /**
+     * Fetches a real artist page by browsing the artist's channelId. Returns the header
+     * (name + monthly listeners), top songs and albums/singles. Parsing is fully defensive: if the
+     * Innertube response shape doesn't match, it returns an empty page and the caller falls back to
+     * a plain search.
+     */
+    fun fetchArtistPage(channelId: String, cookieHeader: String, callback: ArtistPageCallback) {
+        val id = channelId.trim()
+        if (id.isEmpty()) {
+            callback.onError("Artista sin identificador.")
+            return
+        }
+        executor.execute {
+            try {
+                val page = performArtistPageBrowseRequest(id, cookieHeader)
+                mainHandler.post { callback.onSuccess(page) }
+            } catch (e: Exception) {
+                mainHandler.post { callback.onError(e.message ?: "Error cargando artista.") }
+            }
+        }
+    }
+
+    @Throws(Exception::class)
+    private fun performArtistPageBrowseRequest(channelId: String, cookieHeader: String): ArtistPage {
+        val endpoint = "https://music.youtube.com/youtubei/v1/browse?prettyPrint=false"
+        val body = JSONObject().apply {
+            put("context", JSONObject().apply {
+                put("client", JSONObject().apply {
+                    put("clientName", "WEB_REMIX")
+                    put("clientVersion", buildClientVersion())
+                    put("hl", "es")
+                })
+            })
+            put("browseId", channelId)
+        }.toString().toByteArray(StandardCharsets.UTF_8)
+        val responseBody = postInnerTubeBrowse(endpoint, body, cookieHeader)
+        val root = JSONObject(responseBody)
+        return parseArtistPage(root)
+    }
+
+    private fun parseArtistPage(root: JSONObject): ArtistPage {
+        var name = ""
+        var subtitle = ""
+        var thumb = ""
+        val songs = mutableListOf<TrackResult>()
+        val albums = mutableListOf<PlaylistResult>()
+        try {
+            val header = root.optJSONObject("header")
+            val hr = header?.optJSONObject("musicImmersiveHeaderRenderer")
+                ?: header?.optJSONObject("musicVisualHeaderRenderer")
+                ?: header?.optJSONObject("musicDetailHeaderRenderer")
+            if (hr != null) {
+                name = artistRunsToText(hr.optJSONObject("title"))
+                subtitle = artistRunsToText(hr.optJSONObject("subtitle"))
+                if (subtitle.isEmpty()) subtitle = artistRunsToText(hr.optJSONObject("secondSubtitle"))
+                thumb = artistThumbUrl(
+                    hr.optJSONObject("thumbnail")?.optJSONObject("musicThumbnailRenderer")
+                        ?: hr.optJSONObject("foregroundThumbnail")?.optJSONObject("musicThumbnailRenderer")
+                )
+            }
+            val sections = root.optJSONObject("contents")
+                ?.optJSONObject("singleColumnBrowseResultsRenderer")
+                ?.optJSONArray("tabs")?.optJSONObject(0)
+                ?.optJSONObject("tabRenderer")?.optJSONObject("content")
+                ?.optJSONObject("sectionListRenderer")?.optJSONArray("contents")
+            sections?.forEachObject { section ->
+                section.optJSONObject("musicShelfRenderer")?.let { shelf ->
+                    if (songs.isEmpty()) {
+                        shelf.optJSONArray("contents")?.let { songs.addAll(parseArtistTopSongs(it, 30)) }
+                    }
+                }
+                section.optJSONObject("musicCarouselShelfRenderer")?.let { carousel ->
+                    carousel.optJSONArray("contents")?.let { albums.addAll(parseArtistAlbums(it)) }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "parseArtistPage failed", e)
+        }
+        return ArtistPage(name, subtitle, thumb, songs, albums)
+    }
+
+    private fun parseArtistTopSongs(items: JSONArray, limit: Int): List<TrackResult> {
+        val out = mutableListOf<TrackResult>()
+        items.forEachObject { item ->
+            if (out.size >= limit) return@forEachObject
+            val r = item.optJSONObject("musicResponsiveListItemRenderer") ?: return@forEachObject
+            var videoId = r.optJSONObject("playlistItemData")?.optString("videoId", "")?.trim() ?: ""
+            if (videoId.isEmpty()) {
+                videoId = r.optJSONObject("overlay")
+                    ?.optJSONObject("musicItemThumbnailOverlayRenderer")
+                    ?.optJSONObject("content")
+                    ?.optJSONObject("musicPlayButtonRenderer")
+                    ?.optJSONObject("playNavigationEndpoint")
+                    ?.optJSONObject("watchEndpoint")
+                    ?.optString("videoId", "")?.trim() ?: ""
+            }
+            if (videoId.isEmpty()) return@forEachObject
+            val flex = r.optJSONArray("flexColumns")
+            val title = artistRunsToText(
+                flex?.optJSONObject(0)
+                    ?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")?.optJSONObject("text")
+            )
+            if (title.isEmpty()) return@forEachObject
+            val artist = artistRunsToText(
+                flex?.optJSONObject(1)
+                    ?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")?.optJSONObject("text")
+            )
+            val thumb = artistThumbUrl(r.optJSONObject("thumbnail")?.optJSONObject("musicThumbnailRenderer"))
+            out.add(TrackResult("video", videoId, title, artist, thumb))
+        }
+        return out
+    }
+
+    private fun parseArtistAlbums(items: JSONArray): List<PlaylistResult> {
+        val out = mutableListOf<PlaylistResult>()
+        items.forEachObject { item ->
+            val r = item.optJSONObject("musicTwoRowItemRenderer") ?: return@forEachObject
+            val nav = r.optJSONObject("navigationEndpoint")
+            val playlistId = nav?.optJSONObject("watchPlaylistEndpoint")?.optString("playlistId", "")?.trim() ?: ""
+            val browseId = nav?.optJSONObject("browseEndpoint")?.optString("browseId", "")?.trim() ?: ""
+            val id = if (playlistId.isNotEmpty()) playlistId else browseId
+            if (id.isEmpty()) return@forEachObject
+            val title = artistRunsToText(r.optJSONObject("title"))
+            if (title.isEmpty()) return@forEachObject
+            val sub = artistRunsToText(r.optJSONObject("subtitle"))
+            val thumb = artistThumbUrl(r.optJSONObject("thumbnailRenderer")?.optJSONObject("musicThumbnailRenderer"))
+            out.add(PlaylistResult(id, title, sub, 0, thumb, "", ""))
+        }
+        return out
+    }
+
+    private fun artistRunsToText(obj: JSONObject?): String {
+        val runs = obj?.optJSONArray("runs") ?: return ""
+        val sb = StringBuilder()
+        for (i in 0 until runs.length()) {
+            sb.append(runs.optJSONObject(i)?.optString("text", "") ?: "")
+        }
+        return sb.toString().trim()
+    }
+
+    private fun artistThumbUrl(musicThumbnailRenderer: JSONObject?): String {
+        val thumbs = musicThumbnailRenderer?.optJSONObject("thumbnail")?.optJSONArray("thumbnails") ?: return ""
+        if (thumbs.length() == 0) return ""
+        return thumbs.optJSONObject(thumbs.length() - 1)?.optString("url", "") ?: ""
     }
 
     private fun postInnerTubeBrowse(endpoint: String, body: ByteArray, cookieHeader: String): String {

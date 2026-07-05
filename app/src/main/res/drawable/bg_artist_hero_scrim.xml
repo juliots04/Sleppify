@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Hero scrim: darker at the very top (keeps the back button legible), clear through the
+     middle (so the artist photo shows), fading into surface_dark at the bottom so the big name
+     stays readable and the hero blends seamlessly into the list below. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <gradient
+        android:angle="270"
+        android:startColor="#59000000"
+        android:centerColor="#00111319"
+        android:endColor="#FF111319"
+        android:type="linear" />
+</shape>

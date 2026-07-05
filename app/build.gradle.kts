@@ -94,6 +94,10 @@ dependencies {
     implementation("androidx.camera:camera-view:$cameraXVersion")
     implementation("com.google.mlkit:barcode-scanning:17.3.0")
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs_nio:2.0.3")
+    // Debug-only automatic leak detection. Self-installs (no code needed) and reports retained
+    // Activity/Fragment/View/ViewModel leaks with the full reference trace via a notification.
+    // Stripped from release builds, so it never ships to users.
+    debugImplementation("com.squareup.leakcanary:leakcanary-android:2.14")
     testImplementation(libs.junit)
     androidTestImplementation(libs.ext.junit)
     androidTestImplementation(libs.espresso.core)

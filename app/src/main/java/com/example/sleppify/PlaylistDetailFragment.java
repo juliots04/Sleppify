@@ -98,7 +98,7 @@ public class PlaylistDetailFragment extends Fragment
                    TrackReplacementSheet.OnReplacementUndoneListener {
 
     private static final String TAG = "PlaylistDetailFragment";
-    private static final String PREFS_STREAMING_CACHE = "streaming_cache";
+    private static final String PREFS_STREAMING_CACHE = AppConstants.PREFS_STREAMING_CACHE;
     private static final long TRACKS_CACHE_TTL_MS = 24 * 60 * 60 * 1000L;
     private static final String PREF_TRACKS_UPDATED_AT_PREFIX = "playlist_tracks_updated_at_";
     private static final String PREF_TRACKS_DATA_PREFIX = "playlist_tracks_data_";
@@ -107,7 +107,7 @@ public class PlaylistDetailFragment extends Fragment
     private static final String PREF_CACHED_GOOGLE_PROFILE_PHOTO_URL = "cached_google_profile_photo_url";
     private static final String PREF_PLAYLIST_OFFLINE_AUTO_PREFIX = "playlist_offline_auto_";
     private static final String PREF_PLAYLIST_GRID_URLS_PREFIX = "playlist_grid_urls_";
-    private static final String PREFS_PLAYER_STATE = "player_state";
+    private static final String PREFS_PLAYER_STATE = AppConstants.PREFS_PLAYER_STATE;
     private static final String PREF_LAST_PLAYLIST_ID = "stream_last_playlist_id";
     private static final String PREF_LAST_PLAYLIST_TITLE = "stream_last_playlist_title";
     private static final String PREF_LAST_PLAYLIST_SUBTITLE = "stream_last_playlist_subtitle";
@@ -485,7 +485,7 @@ public class PlaylistDetailFragment extends Fragment
                 // Warm artwork for the rows about to enter the viewport. Keyed on the
                 // (anchor row, direction) pair so it fires once per new edge row, not on
                 // every scroll frame.
-                if (trackAdapter != null && dy != 0) {
+                if (trackAdapter != null && dy != 0 && !isFlinging) {
                     int anchor = (dy > 0 ? layoutManager.findLastVisibleItemPosition()
                                          : layoutManager.findFirstVisibleItemPosition()) - 1;
                     int prefetchKey = anchor * 2 + (dy > 0 ? 1 : 0);
@@ -1275,6 +1275,35 @@ public class PlaylistDetailFragment extends Fragment
     }
 
     /**
+     * Mid-fling artwork bind. Paints the row only if the thumbnail is already resolvable from
+     * cache — a memory hit shows instantly and synchronously (no decode, no executor work, no
+     * crossfade), so it never costs a frame. On a miss it leaves the grey placeholder (the flying
+     * row stays grey) and never touches the network. The signature is set to the URL so that once
+     * the list settles, {@link PlaylistTrackAdapter#reloadImagesForRange} skips the rows that
+     * already resolved and issues the full load only for the ones still on the placeholder.
+     */
+    private void loadTrackArtCacheOnly(@NonNull ImageView target, @Nullable String imageUrl) {
+        if (TextUtils.isEmpty(imageUrl)) {
+            target.setTag(R.id.tag_artwork_signature, null);
+            glideManager().clear(target);
+            target.setImageDrawable(null);
+            return;
+        }
+        String url = imageUrl.trim();
+        if (url.equals(target.getTag(R.id.tag_artwork_signature))) {
+            return;
+        }
+        target.setTag(R.id.tag_artwork_signature, url);
+        // No .transition() is applied (the base request bakes none) so a cache hit paints with no
+        // crossfade — instant and frame-free, which is exactly what we want mid-fling.
+        artRequestBase(target.getContext()).clone()
+                .load(url)
+                .onlyRetrieveFromCache(true)
+                .priority(com.bumptech.glide.Priority.LOW)
+                .into(target);
+    }
+
+    /**
      * Warms Glide's memory/disk caches for rows just beyond the viewport in the scroll
      * direction, using the exact same request shape (size, transform, decode format) as
      * {@link #loadTrackArt} so the cache keys match and the bind is a synchronous hit.
@@ -1812,7 +1841,7 @@ public class PlaylistDetailFragment extends Fragment
                 return;
             }
             String cookie = requireContext().getSharedPreferences(PREFS_PLAYER_STATE, Activity.MODE_PRIVATE)
-                    .getString("stream_last_youtube_web_cookie", "");
+                    .getString(AppConstants.PREF_LAST_YOUTUBE_WEB_COOKIE, "");
             if (cookie == null) cookie = "";
             youTubeMusicService.fetchMixTracks(cookie.trim(), playlistId, new YouTubeMusicService.MixTracksCallback() {
                 @Override
@@ -3656,7 +3685,7 @@ public class PlaylistDetailFragment extends Fragment
         if (lastCachedSongPlayerTime > 0 && now - lastCachedSongPlayerTime < 500L) {
             return cachedSongPlayer;
         }
-        Fragment fragment = getParentFragmentManager().findFragmentByTag("song_player");
+        Fragment fragment = getParentFragmentManager().findFragmentByTag(AppConstants.TAG_SONG_PLAYER);
         cachedSongPlayer = fragment instanceof SongPlayerFragment ? (SongPlayerFragment) fragment : null;
         lastCachedSongPlayerTime = now;
         return cachedSongPlayer;
@@ -3718,21 +3747,19 @@ public class PlaylistDetailFragment extends Fragment
         if (existingPlayer != null && existingPlayer.isAdded()) {
             existingPlayer.externalSetReturnTargetTag(TAG_PLAYLIST_DETAIL);
             existingPlayer.externalSetPlaylistContext(currentPlaylistId, currentPlaylistTitle);
-            
-            // If the selected track is already playing, just open the player
-            if (TextUtils.equals(selectedVideoId, existingPlayer.getLoadedVideoId())) {
-                showSongPlayerWithEnterAnimation(existingPlayer);
-                return;
+
+            // Play in the mini-player — do NOT auto-open the full-screen player. If the tapped
+            // track is already the loaded one, leave it playing; otherwise switch to it in place.
+            if (!TextUtils.equals(selectedVideoId, existingPlayer.getLoadedVideoId())) {
+                if (existingPlayer.externalMatchesQueue(ids)) {
+                    existingPlayer.externalPlayTrackFromStart(queueIndex);
+                } else {
+                    existingPlayer.externalReplaceQueueFromStart(ids, titles, artists, durations, images, queueIndex, true);
+                    injectOriginalQueueOrderIfShuffled(existingPlayer);
+                }
             }
 
-            if (existingPlayer.externalMatchesQueue(ids)) {
-                existingPlayer.externalPlayTrackFromStart(queueIndex);
-            } else {
-                existingPlayer.externalReplaceQueueFromStart(ids, titles, artists, durations, images, queueIndex, true);
-                injectOriginalQueueOrderIfShuffled(existingPlayer);
-            }
-
-            showSongPlayerWithEnterAnimation(existingPlayer);
+            ensureMiniPlayerShown();
 
             currentTrackIndex = position;
             miniPlaying = true;
@@ -3743,7 +3770,7 @@ public class PlaylistDetailFragment extends Fragment
             return;
         }
 
-        openIntegratedPlayerAt(position, true);
+        startHiddenIntegratedPlayerAt(position, true);
     }
 
     private void onTrackMorePressed(int position, @NonNull View anchor) {
@@ -4618,7 +4645,7 @@ public class PlaylistDetailFragment extends Fragment
 
         // Fetch radio tracks and save to RadioHistoryStore for library display
         String cookie = requireContext().getSharedPreferences(PREFS_PLAYER_STATE, Activity.MODE_PRIVATE)
-                .getString("stream_last_youtube_web_cookie", "");
+                .getString(AppConstants.PREF_LAST_YOUTUBE_WEB_COOKIE, "");
         if (cookie == null) cookie = "";
         final String selectedVideoId = track.videoId;
         final String selectedTitle = TextUtils.isEmpty(track.title) ? "Tema" : track.title;
@@ -5085,10 +5112,8 @@ public class PlaylistDetailFragment extends Fragment
             return;
         }
 
-        if (getActivity() instanceof MainActivity) {
-            GlobalMiniPlayerController gmp = ((MainActivity) getActivity()).getGlobalMiniPlayer();
-            if (gmp != null) gmp.animateOut();
-        }
+        // Playback now starts in the mini-player (never auto-opens the full player), so we no
+        // longer animate the mini-player out here — it stays/appears instead.
 
         ensurePlaybackQueue();
         if (playbackQueueTracks.isEmpty()) {
@@ -5135,7 +5160,7 @@ public class PlaylistDetailFragment extends Fragment
                     injectOriginalQueueOrderIfShuffled(existingPlayer);
                 }
 
-                    showSongPlayerWithEnterAnimation(existingPlayer);
+                ensureMiniPlayerShown();
 
                 currentTrackIndex = position;
                 miniPlaying = true;
@@ -5143,7 +5168,6 @@ public class PlaylistDetailFragment extends Fragment
                     trackAdapter.setActiveIndex(position);
                 }
             }
-            // Don't update mini-player UI - keep it hidden while full player is visible
             return;
         }
 
@@ -5163,75 +5187,8 @@ public class PlaylistDetailFragment extends Fragment
         playerFragment.externalSetReturnTargetTag(TAG_PLAYLIST_DETAIL);
         playerFragment.externalSetPlaylistContext(currentPlaylistId, currentPlaylistTitle);
         injectOriginalQueueOrderIfShuffled(playerFragment);
-        addSongPlayerWithEnterAnimation(playerFragment);
-        // Don't update mini-player UI - keep it hidden while full player is visible
-    }
-
-    private boolean openPlayerFromSnapshot(
-            @NonNull PlaybackHistoryStore.Snapshot snapshot,
-            boolean startPlaying
-    ) {
-        if (!snapshot.isValid()) {
-            return false;
-        }
-
-        // Hide global mini-player immediately to prevent UI overlap
-        if (getActivity() instanceof MainActivity) {
-            GlobalMiniPlayerController gmp = ((MainActivity) getActivity()).getGlobalMiniPlayer();
-            if (gmp != null) gmp.hide();
-        }
-
-        ArrayList<String> ids = new ArrayList<>();
-        ArrayList<String> titles = new ArrayList<>();
-        ArrayList<String> artists = new ArrayList<>();
-        ArrayList<String> durations = new ArrayList<>();
-        ArrayList<String> images = new ArrayList<>();
-        for (PlaybackHistoryStore.QueueTrack item : snapshot.queue) {
-            ids.add(item.videoId);
-            titles.add(item.title);
-            artists.add(item.artist);
-            durations.add(item.duration);
-            images.add(item.imageUrl);
-        }
-        if (ids.isEmpty()) {
-            return false;
-        }
-
-        int snapshotIndex = Math.max(0, Math.min(snapshot.currentIndex, ids.size() - 1));
-
-        SongPlayerFragment existingPlayer = findSongPlayerFragment();
-        if (existingPlayer != null) {
-            if (existingPlayer.isAdded()) {
-                existingPlayer.externalSetReturnTargetTag(TAG_PLAYLIST_DETAIL);
-                existingPlayer.externalSetPlaylistContext(currentPlaylistId, currentPlaylistTitle);
-                existingPlayer.externalReplaceQueue(ids, titles, artists, durations, images, snapshotIndex, startPlaying);
-                injectOriginalQueueFromSnapshot(existingPlayer, snapshot);
-                showSongPlayerWithEnterAnimation(existingPlayer);
-            }
-        } else {
-            SongPlayerFragment playerFragment = SongPlayerFragment.newInstance(
-                    ids,
-                    titles,
-                    artists,
-                    durations,
-                    images,
-                    snapshotIndex,
-                    startPlaying
-            );
-            playerFragment.externalSetReturnTargetTag(TAG_PLAYLIST_DETAIL);
-            playerFragment.externalSetPlaylistContext(currentPlaylistId, currentPlaylistTitle);
-            injectOriginalQueueFromSnapshot(playerFragment, snapshot);
-                addSongPlayerWithEnterAnimation(playerFragment);
-        }
-
-        int displayIndex = findTrackIndexFromSnapshot(currentTracks, snapshot);
-        currentTrackIndex = displayIndex;
-        miniPlaying = startPlaying;
-        if (trackAdapter != null) {
-            trackAdapter.setActiveIndex(displayIndex);
-        }
-        syncTrackStateFromPlayer();
-        return true;
+        // Start hidden → plays in the mini-player instead of opening the full-screen player.
+        addSongPlayerHidden(playerFragment);
     }
 
     private void maybeRestoreHiddenPlayerFromSnapshot() {
@@ -5294,7 +5251,7 @@ public class PlaylistDetailFragment extends Fragment
         getParentFragmentManager()
                 .beginTransaction()
                 .setReorderingAllowed(true)
-                .add(R.id.playerContainer, playerFragment, "song_player")
+                .add(R.id.playerContainer, playerFragment, AppConstants.TAG_SONG_PLAYER)
                 .hide(playerFragment)
                 .runOnCommit(() -> {
                     restoringHiddenPlayerFromSnapshot = false;
@@ -5309,222 +5266,28 @@ public class PlaylistDetailFragment extends Fragment
         }
     }
 
-    private boolean launchPlayerFromLastTrackPrefs(boolean startPlaying, boolean showPlayer) {
-        if (!isAdded()) {
-            return false;
-        }
-
-        SharedPreferences prefs = getPlayerStatePrefs();
-        String persistedPlaylistId = prefs.getString(PREF_LAST_PLAYLIST_ID, "");
-        if (!TextUtils.isEmpty(currentPlaylistId)
-                && !TextUtils.equals(currentPlaylistId, persistedPlaylistId)) {
-            return false;
-        }
-
-        String videoId = prefs.getString(PREF_LAST_VIDEO_ID, "");
-        if (TextUtils.isEmpty(videoId)) {
-            return false;
-        }
-
-        String title = prefs.getString(PREF_LAST_TRACK_TITLE, "");
-        String artist = prefs.getString(PREF_LAST_TRACK_ARTIST, "");
-        String duration = prefs.getString(PREF_LAST_TRACK_DURATION, "");
-        String image = prefs.getString(PREF_LAST_TRACK_IMAGE, "");
-
-        ArrayList<String> ids = new ArrayList<>();
-        ArrayList<String> titles = new ArrayList<>();
-        ArrayList<String> artists = new ArrayList<>();
-        ArrayList<String> durations = new ArrayList<>();
-        ArrayList<String> images = new ArrayList<>();
-        ids.add(videoId);
-        titles.add(TextUtils.isEmpty(title) ? "Ultima reproduccion" : title);
-        artists.add(artist == null ? "" : artist);
-        durations.add(duration == null ? "" : duration);
-        images.add(image == null ? "" : image);
-
-        SongPlayerFragment existingPlayer = findSongPlayerFragment();
-        if (existingPlayer != null) {
-            if (existingPlayer.isAdded()) {
-                existingPlayer.externalSetReturnTargetTag(TAG_PLAYLIST_DETAIL);
-                existingPlayer.externalReplaceQueue(ids, titles, artists, durations, images, 0, startPlaying);
-
-                if (showPlayer) {
-                    showSongPlayerWithEnterAnimation(existingPlayer);
-                }
-
-                currentTrackIndex = findTrackIndexByVideoId(currentTracks, videoId);
-                miniPlaying = startPlaying;
-                if (trackAdapter != null) {
-                    trackAdapter.setActiveIndex(currentTrackIndex);
-                }
-                syncTrackStateFromPlayer();
-            }
-            return true;
-        }
-
-        if (getParentFragmentManager().isStateSaved()) {
-            return false;
-        }
-
-        SongPlayerFragment playerFragment = SongPlayerFragment.newInstance(
-                ids,
-                titles,
-                artists,
-                durations,
-                images,
-                0,
-                startPlaying
-        );
-        playerFragment.externalSetReturnTargetTag(TAG_PLAYLIST_DETAIL);
-            if (showPlayer) {
-                addSongPlayerWithEnterAnimation(playerFragment);
-            } else {
-                getParentFragmentManager()
-                    .beginTransaction()
-                    .setReorderingAllowed(true)
-                    .add(R.id.playerContainer, playerFragment, "song_player")
-                    .hide(playerFragment)
-                    .commit();
-            }
-
-        currentTrackIndex = findTrackIndexByVideoId(currentTracks, videoId);
-        miniPlaying = startPlaying;
-        if (trackAdapter != null) {
-            trackAdapter.setActiveIndex(currentTrackIndex);
-        }
-        syncTrackStateFromPlayer();
-        return true;
-    }
-
-    private void showSongPlayerWithEnterAnimation(@NonNull SongPlayerFragment player) {
-        getParentFragmentManager()
-                .beginTransaction()
-                .setReorderingAllowed(true)
-                .show(player)
-                .runOnCommit(() -> startPlayerEnterAnimation(player))
-                .commit();
-    }
-
-    private void addSongPlayerWithEnterAnimation(@NonNull SongPlayerFragment player) {
-        getParentFragmentManager()
-                .beginTransaction()
-                .setReorderingAllowed(true)
-                .add(R.id.playerContainer, player, "song_player")
-                .runOnCommit(() -> startPlayerEnterAnimation(player))
-                .commit();
-    }
-
     /**
-     * Kicks off the player's slide-in at commit time. Previously this was double-deferred
-     * (mainHandler.post → view.post), which let the player draw at its resting position for a
-     * couple of frames before the animation snapped it off-screen — so the slide was either
-     * invisible or looked like a jump. runOnCommit already runs before the view's first draw, so
-     * starting synchronously here lets externalAnimateEnterSlide() place the view off-screen first;
-     * it then self-defers the actual slide to the first pre-draw (after the heavy layout pass).
+     * Adds the player attached but HIDDEN so playback starts in the mini-player instead of the
+     * full-screen player (the pre-change behavior: playing a song from a list never auto-opened
+     * the player). The global mini-player then appears on its own via the snapshot event; we also
+     * refresh it immediately so it never lags a frame behind.
      */
-    private void startPlayerEnterAnimation(@NonNull SongPlayerFragment player) {
-        if (!isAdded()) return;
-        if (player.getView() != null) {
-            player.externalAnimateEnterSlide();
-        } else {
-            // View not created yet (rare with reordering enabled) — fall back to a single post.
-            mainHandler.post(() -> {
-                if (isAdded() && player.getView() != null) {
-                    player.externalAnimateEnterSlide();
-                }
-            });
-        }
-    }
-
-    private boolean startHiddenPlayerFromSnapshot(
-            @NonNull PlaybackHistoryStore.Snapshot snapshot,
-            boolean startPlaying
-    ) {
-        if (!snapshot.isValid() || !isAdded()) {
-            return false;
-        }
-
-        SongPlayerFragment existingPlayer = findSongPlayerFragment();
-        if (existingPlayer != null) {
-            if (existingPlayer.isAdded()) {
-                existingPlayer.externalSetReturnTargetTag(TAG_PLAYLIST_DETAIL);
-                if (startPlaying && !existingPlayer.externalIsPlaying()) {
-                    existingPlayer.externalTogglePlayback();
-                }
-                syncTrackStateFromPlayer();
-            }
-            return true;
-        }
-
-        if (getParentFragmentManager().isStateSaved()) {
-            return false;
-        }
-
-        ArrayList<String> ids = new ArrayList<>();
-        ArrayList<String> titles = new ArrayList<>();
-        ArrayList<String> artists = new ArrayList<>();
-        ArrayList<String> durations = new ArrayList<>();
-        ArrayList<String> images = new ArrayList<>();
-        for (PlaybackHistoryStore.QueueTrack item : snapshot.queue) {
-            ids.add(item.videoId);
-            titles.add(item.title);
-            artists.add(item.artist);
-            durations.add(item.duration);
-            images.add(item.imageUrl);
-        }
-        if (ids.isEmpty()) {
-            return false;
-        }
-
-        int snapshotIndex = Math.max(0, Math.min(snapshot.currentIndex, ids.size() - 1));
-
-        SongPlayerFragment playerFragment = SongPlayerFragment.newInstance(
-                ids,
-                titles,
-                artists,
-                durations,
-                images,
-                snapshotIndex,
-            false
-        );
-        playerFragment.externalSetReturnTargetTag(TAG_PLAYLIST_DETAIL);
-        injectOriginalQueueFromSnapshot(playerFragment, snapshot);
-
-        final ArrayList<String> replayIds = ids;
-        final ArrayList<String> replayTitles = titles;
-        final ArrayList<String> replayArtists = artists;
-        final ArrayList<String> replayDurations = durations;
-        final ArrayList<String> replayImages = images;
-        final int replaySnapshotIndex = snapshotIndex;
-        final boolean replayStartPlaying = startPlaying;
+    private void addSongPlayerHidden(@NonNull SongPlayerFragment player) {
         getParentFragmentManager()
                 .beginTransaction()
                 .setReorderingAllowed(true)
-                .add(R.id.playerContainer, playerFragment, "song_player")
-                .hide(playerFragment)
-                .runOnCommit(() -> {
-                    playerFragment.externalReplaceQueue(
-                            replayIds,
-                            replayTitles,
-                            replayArtists,
-                            replayDurations,
-                            replayImages,
-                            replaySnapshotIndex,
-                            replayStartPlaying
-                    );
-                    injectOriginalQueueFromSnapshot(playerFragment, snapshot);
-                    syncTrackStateFromPlayer();
-                })
+                .add(R.id.playerContainer, player, AppConstants.TAG_SONG_PLAYER)
+                .hide(player)
+                .runOnCommit(this::ensureMiniPlayerShown)
                 .commit();
+    }
 
-        int displayIndex = findTrackIndexFromSnapshot(currentTracks, snapshot);
-        currentTrackIndex = displayIndex;
-        miniPlaying = startPlaying;
-        if (trackAdapter != null) {
-            trackAdapter.setActiveIndex(displayIndex);
+    /** Refresh the global mini-player so it appears/updates when playback starts hidden. */
+    private void ensureMiniPlayerShown() {
+        if (getActivity() instanceof MainActivity) {
+            GlobalMiniPlayerController gmp = ((MainActivity) getActivity()).getGlobalMiniPlayer();
+            if (gmp != null) gmp.updateUi();
         }
-        syncTrackStateFromPlayer();
-        return true;
     }
 
     private void injectOriginalQueueOrderIfShuffled(@NonNull SongPlayerFragment player) {
@@ -5617,8 +5380,9 @@ public class PlaylistDetailFragment extends Fragment
         getParentFragmentManager()
                 .beginTransaction()
                 .setReorderingAllowed(true)
-                .add(R.id.playerContainer, playerFragment, "song_player")
+                .add(R.id.playerContainer, playerFragment, AppConstants.TAG_SONG_PLAYER)
                 .hide(playerFragment)
+                .runOnCommit(this::ensureMiniPlayerShown)
                 .commit();
 
         currentTrackIndex = position;
@@ -5665,7 +5429,11 @@ public class PlaylistDetailFragment extends Fragment
             snapshot = loadPlaybackSnapshot();
             snapshotTrack = snapshot.currentTrack();
             if (snapshotTrack != null) {
-                miniPlaying = snapshot.isPlaying;
+                // No live player attached → nothing is actually playing right now. Do NOT read
+                // the (stale) persisted snapshot.isPlaying, which made this row render/persist as
+                // "playing" while the mini-bar (which forces false with no player) showed paused —
+                // the two surfaces disagreed for the identical state. Mirror the mini-bar.
+                miniPlaying = false;
                 int mappedIndex = currentTracks.isEmpty()
                         ? -1
                         : findTrackIndexByVideoId(currentTracks, snapshotTrack.videoId);
@@ -6782,11 +6550,24 @@ public class PlaylistDetailFragment extends Fragment
                     PlaylistTrack track = items.get(i);
                     if (track != null && !TextUtils.isEmpty(track.imageUrl)
                             && !LocalFilesStore.isLocalVideoId(track.videoId)) {
-                        // Clear the signature so the anti-rebind guard doesn't skip the retry of
-                        // a load that previously failed (e.g. fired while offline). This runs only
-                        // on idle, so re-issuing for the ~10 visible rows is cheap (cache hits).
-                        ((TrackViewHolder) vh).ivTrackArt.setTag(R.id.tag_artwork_signature, null);
-                        loadTrackArt(((TrackViewHolder) vh).ivTrackArt, track.imageUrl, com.bumptech.glide.Priority.HIGH);
+                        ImageView iv = ((TrackViewHolder) vh).ivTrackArt;
+                        Object sig = iv.getTag(R.id.tag_artwork_signature);
+                        android.graphics.drawable.Drawable current = iv.getDrawable();
+                        // A row is "resolved" when it shows a real drawable, not the shared grey
+                        // placeholder (identity compare against the cached placeholder instance).
+                        boolean placeholderShowing =
+                                current == null || current == cachedTrackArtPlaceholder;
+                        // If this row already shows the correct, successfully-loaded art, leave it.
+                        // Re-issuing into() here rebuilds the whole Glide request graph (request
+                        // teardown + new SingleRequest + EngineKey hashing + memory probe) for every
+                        // visible row on EVERY scroll-settle — the confirmed source of the per-
+                        // re-scroll main-thread burst. Only rows still on the placeholder (a load
+                        // that never landed — fired while offline, or was skipped mid-fling) retry.
+                        if (track.imageUrl.trim().equals(sig) && !placeholderShowing) {
+                            continue;
+                        }
+                        iv.setTag(R.id.tag_artwork_signature, null);
+                        loadTrackArt(iv, track.imageUrl, com.bumptech.glide.Priority.HIGH);
                     }
                 }
             }
@@ -6969,7 +6750,18 @@ public class PlaylistDetailFragment extends Fragment
                 LocalArtworkResolver.detach(holder.ivTrackArt);
                 holder.ivTrackArt.setScaleType(ImageView.ScaleType.CENTER_CROP);
                 holder.ivTrackArt.setBackgroundColor(android.graphics.Color.TRANSPARENT);
-                loadTrackArt(holder.ivTrackArt, track.imageUrl, com.bumptech.glide.Priority.HIGH);
+                if (isFlinging) {
+                    // Mid fast-fling, dozens of rows bind per second. Firing a full HIGH-priority
+                    // Glide request for each (request-graph build + executor submit + crossfade
+                    // wiring) is the churn that makes fast scroll stutter. Instead paint only rows
+                    // already in the memory cache (synchronous, no decode); rows not yet cached keep
+                    // the grey placeholder and fly past. reloadImagesForRange() issues their real
+                    // loads once the list settles (IDLE), so images stream in exactly as scrolling
+                    // stops — the YT-Music feel: rows fly smoothly, artwork fills in on settle.
+                    loadTrackArtCacheOnly(holder.ivTrackArt, track.imageUrl);
+                } else {
+                    loadTrackArt(holder.ivTrackArt, track.imageUrl, com.bumptech.glide.Priority.HIGH);
+                }
             }
 
             // Trigger the disk-based offline state lookup on bind, but never during a fling —

@@ -12,6 +12,15 @@ object PlayCountStore {
     private const val KEY_ENTRIES_JSON = "entries_json"
     private val IO = Executors.newSingleThreadExecutor()
 
+    // In-memory snapshot of the parsed entries. Every read path (shortcuts, covers, playlists,
+    // grid art) used to re-read SharedPreferences and re-parse the full JSON — 3-4 full parses
+    // per Principal re-entry — which is the main reason navigating back to a module "loads from
+    // scratch". Reads now hit this cache (O(1)); it is refreshed on every save and is an
+    // immutable snapshot, so callers get a private mutable copy they can sort/mutate freely.
+    // Safe across threads: the reference is @Volatile and only ever points at a finished list.
+    @Volatile
+    private var cachedEntries: List<PlayCountEntry>? = null
+
     data class PlayCountEntry(
         @JvmField val videoId: String,
         @JvmField val title: String,
@@ -171,9 +180,15 @@ object PlayCountStore {
     // --- internals ---
 
     private fun loadEntriesMutable(appCtx: Context): MutableList<PlayCountEntry> {
+        // Serve from the in-memory snapshot when warm — a private copy so the caller may sort or
+        // mutate it without corrupting the shared cache.
+        cachedEntries?.let { return ArrayList(it) }
         val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val raw = prefs.getString(KEY_ENTRIES_JSON, "") ?: ""
-        if (raw.isEmpty()) return mutableListOf()
+        if (raw.isEmpty()) {
+            cachedEntries = emptyList()
+            return mutableListOf()
+        }
         return try {
             val arr = JSONArray(raw)
             val list = mutableListOf<PlayCountEntry>()
@@ -181,6 +196,7 @@ object PlayCountStore {
                 val obj = arr.optJSONObject(i) ?: continue
                 jsonToEntry(obj)?.let { list.add(it) }
             }
+            cachedEntries = ArrayList(list)
             list
         } catch (_: Exception) {
             mutableListOf()
@@ -188,6 +204,9 @@ object PlayCountStore {
     }
 
     private fun saveEntries(appCtx: Context, entries: List<PlayCountEntry>) {
+        // Refresh the snapshot first so the very next read (often on another thread) sees the
+        // new data without waiting for a disk round-trip.
+        cachedEntries = ArrayList(entries)
         val arr = JSONArray()
         for (e in entries) arr.put(entryToJson(e))
         appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)

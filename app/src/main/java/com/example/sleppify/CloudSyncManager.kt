@@ -1069,6 +1069,9 @@ class CloudSyncManager private constructor(context: Context) {
                 key == FAVORITES_TRACKS_FULL_CACHE_KEY ||
                 key == FAVORITES_OFFLINE_COMPLETE_KEY ||
                 key == "stream_recent_search_queries" ||
+                // Followed artists from the artist detail page. Riding the same streaming bucket
+                // makes "Seguir" sync to Firebase (upload on change + restore on sign-in) for free.
+                key == "followed_artists_channel_ids" ||
                 // Library artists cache (MusicPlayerFragment "library_artists_data_<account>").
                 // Whitelisting the prefix makes the artists sync to Firebase through the same
                 // streaming bucket as favorites: change-listener upload, payload inclusion and

@@ -97,7 +97,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     private static final String PREF_LAST_STREAM_SCREEN = "stream_last_screen";
     private static final String PREF_LAST_YOUTUBE_ACCESS_TOKEN = "stream_last_youtube_access_token";
     private static final String PREF_LAST_YOUTUBE_ACCESS_TOKEN_UPDATED_AT = "stream_last_youtube_access_token_updated_at";
-    private static final String PREF_LAST_YOUTUBE_WEB_COOKIE = "stream_last_youtube_web_cookie";
+    private static final String PREF_LAST_YOUTUBE_WEB_COOKIE = AppConstants.PREF_LAST_YOUTUBE_WEB_COOKIE;
     private static final String PREF_LAST_STREAMING_OAUTH_ACCOUNT_EMAIL = "stream_last_oauth_account_email";
     private static final String STREAM_SCREEN_LIBRARY = "library";
     private static final String STREAM_SCREEN_PLAYLIST_DETAIL = "playlist_detail";
@@ -689,6 +689,10 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     private ScreenMode activeScreen = ScreenMode.LIBRARY;
     private static final Object fragmentLock = new Object();
     private static final YouTubeCropTransformation SHARED_YT_CROP = new YouTubeCropTransformation();
+    // Shared CircleCrop for artist photos — one cached instance instead of allocating a new
+    // CircleCrop on every bind, so it matches the disciplined sizing/caching of loadArtworkInto.
+    private static final com.bumptech.glide.load.resource.bitmap.CircleCrop SHARED_CIRCLE_CROP =
+            new com.bumptech.glide.load.resource.bitmap.CircleCrop();
     private interface OnLibraryTrackClick {
         void onTrackClick(@NonNull YouTubeMusicService.TrackResult track);
     }
@@ -754,7 +758,10 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         PlaybackEventBus.addListener(this);
         setupFragBrandHeader(view);
         ivLibraryBackdrop = view.findViewById(R.id.ivLibraryBackdrop);
-        applyLibraryBackdropBlur();
+        // Defer blur setup off the cold-start path. This fragment starts HIDDEN, so setting the
+        // RenderEffect synchronously here is wasted work competing with Principal's first frame;
+        // deferring is visually identical (the backdrop has no image yet).
+        view.post(() -> applyLibraryBackdropBlur());
         tvLibraryTitle = tvFragBrandTitle;
         llMusicState = view.findViewById(R.id.llMusicState);
         btnYoutubeLogin = view.findViewById(R.id.btnYoutubeLogin);
@@ -1176,7 +1183,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         getParentFragmentManager()
                 .beginTransaction()
                 .setReorderingAllowed(true)
-                .add(R.id.playerContainer, playerFragment, "song_player")
+                .add(R.id.playerContainer, playerFragment, AppConstants.TAG_SONG_PLAYER)
                 .hide(playerFragment)
                 .runOnCommit(() -> {
                     restoringHiddenMiniPlayerFromSnapshot = false;
@@ -1459,6 +1466,12 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             requireView().post(() -> {
                 if (isAdded()) ExoPlayerManager.INSTANCE.initialize(requireContext());
             });
+        }
+        // Now that the web session cookie is live, ask MainActivity to repopulate the Principal
+        // home carousels if it's the visible module — otherwise it stays black after first-install
+        // login until the user navigates away and back.
+        if (isAdded() && getActivity() instanceof MainActivity) {
+            ((MainActivity) getActivity()).refreshPrincipalContentIfVisible();
         }
         // Activar inmediatamente la cookie en StreamResolver para que las
         // siguientes peticiones de resolución y playback estén autenticadas.
@@ -1816,6 +1829,14 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                     renderLibraryResults();
                 }
                 fetchLibraryArtistsIfNeeded();
+                // The library's cached playlist track titles are exactly what seeds Principal's
+                // "covers" carousel. On first-install (right after the web login) Principal has no
+                // local history to seed from, so it renders empty; now that the session's library
+                // just landed, nudge Principal to repopulate instead of waiting for the user to
+                // navigate there or for a TTL to expire.
+                if (isAdded() && getActivity() instanceof MainActivity) {
+                    ((MainActivity) getActivity()).refreshPrincipalContentIfVisible();
+                }
             }
             @Override
             public void onError(@NonNull String error) {
@@ -3079,6 +3100,51 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             .transition(com.bumptech.glide.load.resource.drawable.DrawableTransitionOptions.withCrossFade())
             .into(target);
     }
+    /**
+     * Circular-photo sibling of {@link #loadArtworkInto} for artist rows. Same normalized
+     * pipeline as the rest of the library (bucketed override size, RGB_565, disk cache,
+     * signature dedup) so artists load as fast as playlists instead of decoding full-res and
+     * reloading on every rebind. Differs only in the transform: CircleCrop, not the YT crop.
+     */
+    private void loadCircularArtworkInto(@NonNull ImageView target, @Nullable String imageUrl) {
+        if (TextUtils.isEmpty(imageUrl)) {
+            target.setTag(R.id.tag_artwork_signature, null);
+            target.setImageDrawable(new android.graphics.drawable.ColorDrawable(
+                    ContextCompat.getColor(target.getContext(), R.color.surface_high)));
+            return;
+        }
+        String safeUrl = imageUrl.trim();
+        Context context = target.getContext();
+        float density = context.getResources().getDisplayMetrics().density;
+        int targetWidth;
+        int targetHeight;
+        ViewGroup.LayoutParams params = target.getLayoutParams();
+        int rawWidth = resolveArtworkTargetSize(target.getWidth(), params == null ? 0 : params.width);
+        int rawHeight = resolveArtworkTargetSize(target.getHeight(), params == null ? 0 : params.height);
+        if (rawWidth > 0 && rawHeight > 0) {
+            targetWidth = bucketArtworkDimension(rawWidth);
+            targetHeight = bucketArtworkDimension(rawHeight);
+        } else {
+            targetWidth = Math.round(160 * density);
+            targetHeight = targetWidth;
+        }
+        String signature = safeUrl + "|circle|" + targetWidth + "x" + targetHeight;
+        Object previousSignature = target.getTag(R.id.tag_artwork_signature);
+        if (previousSignature instanceof String && signature.equals(previousSignature)) {
+            return;
+        }
+        target.setTag(R.id.tag_artwork_signature, signature);
+        boolean offlineOnly = !isNetworkAvailable();
+        Glide.with(target)
+            .load(safeUrl)
+            .transform(SHARED_CIRCLE_CROP)
+            .format(com.bumptech.glide.load.DecodeFormat.PREFER_RGB_565)
+            .diskCacheStrategy(DiskCacheStrategy.ALL)
+            .onlyRetrieveFromCache(offlineOnly)
+            .override(Math.max(targetWidth, 320), Math.max(targetHeight, 320))
+            .transition(com.bumptech.glide.load.resource.drawable.DrawableTransitionOptions.withCrossFade())
+            .into(target);
+    }
     private void bindFeaturedTrack(@NonNull YouTubeMusicService.TrackResult track) {
         tvFeaturedTitle.setText(track.title);
         String typeLabel = searchTypeLabel(track);
@@ -3326,7 +3392,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     }
     @Nullable
     private SongPlayerFragment findSongPlayerFragment() {
-        androidx.fragment.app.Fragment fragment = getParentFragmentManager().findFragmentByTag("song_player");
+        androidx.fragment.app.Fragment fragment = getParentFragmentManager().findFragmentByTag(AppConstants.TAG_SONG_PLAYER);
         if (fragment instanceof SongPlayerFragment) {
             return (SongPlayerFragment) fragment;
         }
@@ -3390,7 +3456,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         getParentFragmentManager()
                 .beginTransaction()
                 .setReorderingAllowed(true)
-                .add(R.id.playerContainer, playerFragment, "song_player")
+                .add(R.id.playerContainer, playerFragment, AppConstants.TAG_SONG_PLAYER)
                 .hide(playerFragment)
                 .commit();
         return true;
@@ -3528,7 +3594,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             getParentFragmentManager()
                     .beginTransaction()
                     .setReorderingAllowed(true)
-                    .add(R.id.playerContainer, playerFragment, "song_player")
+                    .add(R.id.playerContainer, playerFragment, AppConstants.TAG_SONG_PLAYER)
                     .runOnCommit(newPlayerForAnim::externalAnimateEnterSlide)
                     .commit();
         }
@@ -4008,6 +4074,26 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             }
         });
     }
+    /** Refresh the global mini-player so it appears/updates when playback starts hidden. */
+    private void ensureMiniPlayerShown() {
+        if (getActivity() instanceof MainActivity) {
+            GlobalMiniPlayerController gmp = ((MainActivity) getActivity()).getGlobalMiniPlayer();
+            if (gmp != null) gmp.updateUi();
+        }
+    }
+
+    /** Adds the player attached but HIDDEN so playback starts in the mini-player, not the
+     *  full-screen player. The mini-player then appears via the snapshot event; refresh it now. */
+    private void addSongPlayerHidden(@NonNull SongPlayerFragment player) {
+        getParentFragmentManager()
+                .beginTransaction()
+                .setReorderingAllowed(true)
+                .add(R.id.playerContainer, player, AppConstants.TAG_SONG_PLAYER)
+                .hide(player)
+                .runOnCommit(this::ensureMiniPlayerShown)
+                .commit();
+    }
+
     private void startPlaybackQueue(
             @NonNull ArrayList<String> ids,
             @NonNull ArrayList<String> titles,
@@ -4018,22 +4104,13 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     ) {
         if (!isAdded() || ids.isEmpty()) return;
         int index = Math.max(0, Math.min(selectedIndex, ids.size() - 1));
-        // Hide global mini-player when opening full player
-        if (getActivity() instanceof MainActivity) {
-            GlobalMiniPlayerController ctrl = ((MainActivity) getActivity()).getGlobalMiniPlayerController();
-            if (ctrl != null) ctrl.hide();
-        }
+        // Play in the mini-player — do NOT auto-open the full-screen player.
         SongPlayerFragment existingPlayer = findSongPlayerFragment();
         if (existingPlayer != null) {
             if (existingPlayer.isAdded()) {
                 existingPlayer.externalSetReturnTargetTag(TAG_MODULE_MUSIC);
                 existingPlayer.externalReplaceQueueFromStart(ids, titles, artists, durations, images, index, true);
-                getParentFragmentManager()
-                        .beginTransaction()
-                        .setReorderingAllowed(true)
-                        .show(existingPlayer)
-                        .runOnCommit(existingPlayer::externalAnimateEnterSlide)
-                        .commit();
+                ensureMiniPlayerShown();
             }
         } else {
             SongPlayerFragment playerFragment = SongPlayerFragment.newInstance(
@@ -4046,13 +4123,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                     true
             );
             playerFragment.externalSetReturnTargetTag(TAG_MODULE_MUSIC);
-            final SongPlayerFragment newPlayerForAnim = playerFragment;
-            getParentFragmentManager()
-                    .beginTransaction()
-                    .setReorderingAllowed(true)
-                    .add(R.id.playerContainer, playerFragment, "song_player")
-                    .runOnCommit(newPlayerForAnim::externalAnimateEnterSlide)
-                    .commit();
+            addSongPlayerHidden(playerFragment);
         }
     }
     private void enqueuePlaylistTracksNext(@NonNull YouTubeMusicService.TrackResult playlistTrack) {
@@ -5618,7 +5689,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         }
         // Hide global mini-player when opening full player
         if (!startInMiniMode && getActivity() instanceof MainActivity) {
-            GlobalMiniPlayerController ctrl = ((MainActivity) getActivity()).getGlobalMiniPlayerController();
+            GlobalMiniPlayerController ctrl = ((MainActivity) getActivity()).getGlobalMiniPlayer();
             if (ctrl != null) ctrl.hide();
         }
         SongPlayerFragment existingPlayer = findSongPlayerFragment();
@@ -5666,7 +5737,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             androidx.fragment.app.FragmentTransaction transaction = getParentFragmentManager()
                     .beginTransaction()
                     .setReorderingAllowed(true)
-                    .add(R.id.playerContainer, playerFragment, "song_player");
+                    .add(R.id.playerContainer, playerFragment, AppConstants.TAG_SONG_PLAYER);
             if (startInMiniMode) {
                 transaction.hide(playerFragment);
                 transaction.commit();
@@ -5709,6 +5780,33 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             .add(R.id.fragmentContainer, detailFragment, "playlist_detail")
             .addToBackStack("playlist_detail")
             .commit();
+    }
+
+    /** Open the Spotify-style artist page for a tapped artist row (mirrors openPlaylistDetail). */
+    private void openArtistDetail(@NonNull YouTubeMusicService.TrackResult artist) {
+        if (!isAdded() || artist == null || TextUtils.isEmpty(artist.contentId)) {
+            return;
+        }
+        if (getParentFragmentManager().isStateSaved()) {
+            return;
+        }
+        if (getActivity() instanceof MainActivity) {
+            ((MainActivity) getActivity()).showModuleLoadingOverlay();
+            ((MainActivity) getActivity()).hideTopAppBarForPlaylistDetail();
+        }
+        ArtistDetailFragment detailFragment = ArtistDetailFragment.newInstance(
+                artist.contentId, artist.title, artist.subtitle, artist.thumbnailUrl);
+        androidx.fragment.app.Fragment existingDetail = getParentFragmentManager().findFragmentByTag("artist_detail");
+        androidx.fragment.app.FragmentTransaction transaction = getParentFragmentManager()
+                .beginTransaction()
+                .setReorderingAllowed(true);
+        if (existingDetail != null && existingDetail.isAdded() && existingDetail != this) {
+            transaction.remove(existingDetail);
+        }
+        transaction
+                .add(R.id.fragmentContainer, detailFragment, "artist_detail")
+                .addToBackStack("artist_detail")
+                .commit();
     }
     @NonNull
     private String resolveAccessTokenForPlaylistDetail() {
@@ -6670,23 +6768,13 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             holder.tvTrackTitle.setTextColor(defaultTitleColor);
             holder.tvTrackSubtitle.setTextColor(defaultSubtitleColor);
 
-            // Circular crop for artist photo
+            // Circular crop for artist photo — uses the same normalized loader as the rest of
+            // the library (bucketed override + signature dedup) so it loads as fast as playlists.
             holder.ivTrackThumb.setScaleType(ImageView.ScaleType.CENTER_CROP);
             holder.ivTrackThumb.setBackgroundColor(android.graphics.Color.TRANSPARENT);
-            if (!TextUtils.isEmpty(item.thumbnailUrl)) {
-                Glide.with(holder.ivTrackThumb)
-                    .load(item.thumbnailUrl.trim())
-                    .transform(new com.bumptech.glide.load.resource.bitmap.CircleCrop())
-                    .format(com.bumptech.glide.load.DecodeFormat.PREFER_RGB_565)
-                    .diskCacheStrategy(DiskCacheStrategy.ALL)
-                    .transition(com.bumptech.glide.load.resource.drawable.DrawableTransitionOptions.withCrossFade())
-                    .into(holder.ivTrackThumb);
-            } else {
-                holder.ivTrackThumb.setImageDrawable(new android.graphics.drawable.ColorDrawable(
-                        ContextCompat.getColor(holder.itemView.getContext(), R.color.surface_high)));
-            }
+            loadCircularArtworkInto(holder.ivTrackThumb, item.thumbnailUrl);
 
-            holder.itemView.setOnClickListener(null);
+            holder.itemView.setOnClickListener(v -> openArtistDetail(item));
             holder.itemView.setOnLongClickListener(null);
         }
 

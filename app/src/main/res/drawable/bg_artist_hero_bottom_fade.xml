@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Default bottom fade (used until the Palette dominant color is applied): the artist photo
+     stays clear through the top, then fades into surface_dark so the name/list blend in. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <gradient
+        android:angle="270"
+        android:startColor="#00111319"
+        android:centerColor="#00111319"
+        android:endColor="#FF111319"
+        android:type="linear" />
+</shape>

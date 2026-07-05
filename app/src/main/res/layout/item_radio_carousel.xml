@@ -31,45 +31,20 @@
                 app:layout_constraintStart_toStartOf="parent"
                 app:layout_constraintEnd_toEndOf="parent" />
 
-            <!-- 3 circular images with overlap effect -->
-            <FrameLayout
+            <!-- The 3 overlapping circular thumbnails, pre-composed into a SINGLE cached image
+                 (see RadioArtComposer) so the carousel never streams them in one by one. Drawn on a
+                 transparent canvas so the vRadioBg gradient shows through the gaps. -->
+            <ImageView
+                android:id="@+id/ivRadioComposite"
                 android:layout_width="0dp"
                 android:layout_height="0dp"
-                android:layout_marginVertical="12dp"
+                android:scaleType="fitXY"
+                android:contentDescription="@null"
+                app:layout_constraintDimensionRatio="1:1"
                 app:layout_constraintTop_toTopOf="@id/vRadioBg"
                 app:layout_constraintBottom_toBottomOf="@id/vRadioBg"
                 app:layout_constraintStart_toStartOf="@id/vRadioBg"
-                app:layout_constraintEnd_toEndOf="@id/vRadioBg">
-
-                <com.google.android.material.imageview.ShapeableImageView
-                    android:id="@+id/ivRadioLeft"
-                    android:layout_width="68dp"
-                    android:layout_height="68dp"
-                    android:scaleType="centerCrop"
-                    android:layout_gravity="center_vertical|start"
-                    android:layout_marginStart="-12dp"
-                    android:elevation="1dp"
-                    app:shapeAppearanceOverlay="@style/ShapeAppearance.Material3.Corner.Full" />
-
-                <com.google.android.material.imageview.ShapeableImageView
-                    android:id="@+id/ivRadioCenter"
-                    android:layout_width="95dp"
-                    android:layout_height="95dp"
-                    android:scaleType="centerCrop"
-                    android:layout_gravity="center"
-                    android:elevation="4dp"
-                    app:shapeAppearanceOverlay="@style/ShapeAppearance.Material3.Corner.Full" />
-
-                <com.google.android.material.imageview.ShapeableImageView
-                    android:id="@+id/ivRadioRight"
-                    android:layout_width="68dp"
-                    android:layout_height="68dp"
-                    android:scaleType="centerCrop"
-                    android:layout_gravity="center_vertical|end"
-                    android:layout_marginEnd="-12dp"
-                    android:elevation="1dp"
-                    app:shapeAppearanceOverlay="@style/ShapeAppearance.Material3.Corner.Full" />
-            </FrameLayout>
+                app:layout_constraintEnd_toEndOf="@id/vRadioBg" />
 
             <!-- "RADIO" badge top-right -->
             <TextView

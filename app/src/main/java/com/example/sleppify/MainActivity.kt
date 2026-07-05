@@ -61,9 +61,9 @@ class MainActivity : AppCompatActivity() {
         const val TAG_MODULE_SETTINGS = "module_settings"
         const val TAG_MODULE_SEARCH = "module_search"
         private const val TAG_PLAYLIST_DETAIL = "playlist_detail"
-        private const val TAG_SONG_PLAYER = "song_player"
+        private const val TAG_SONG_PLAYER = AppConstants.TAG_SONG_PLAYER
 
-        private const val PREFS_PLAYER_STATE = "player_state"
+        private const val PREFS_PLAYER_STATE = AppConstants.PREFS_PLAYER_STATE
         private const val PREFS_BOOTSTRAP = "sleppify_bootstrap"
         private const val PREF_LAST_STREAM_SCREEN = "stream_last_screen"
         private const val PREF_LAST_MAIN_MODULE = "last_main_module"
@@ -117,6 +117,9 @@ class MainActivity : AppCompatActivity() {
     private var btnSignInHeader: MaterialButton? = null
 
     private var inSettings = false
+    // The main-module tab Settings was opened from. Back out of Settings returns HERE instead of to
+    // bottomNav.selectedItemId, which onCreate force-resets to Principal on every Activity recreation.
+    private var settingsReturnNavItemId: Int = R.id.nav_music
     private var inEqualizerFromSettings = false
     private var inScannerFromSettings = false
     private var isNavigating = false
@@ -235,11 +238,17 @@ class MainActivity : AppCompatActivity() {
         // By now they are likely ready (O(1) read from in-memory cache).
 
         // Always open directly on Principal — no login gate.
-        suppressNavListener = true
-        bottomNav.selectedItemId = R.id.nav_principal
-        suppressNavListener = false
-        currentMainNavItemId = R.id.nav_principal
-        switchToMainModule(R.id.nav_principal)
+        // Don't clobber a restored Settings shell: when recreated INTO Settings (inSettings set
+        // from the restored fragment just above), the FragmentManager already restored Settings
+        // visible, and showMainShell() early-returns for overlays — so forcing Principal here would
+        // only corrupt the footer/module state that Back-out-of-Settings relies on.
+        if (!inSettings) {
+            suppressNavListener = true
+            bottomNav.selectedItemId = R.id.nav_principal
+            suppressNavListener = false
+            currentMainNavItemId = R.id.nav_principal
+            switchToMainModule(R.id.nav_principal)
+        }
         showMainShell()
 
         // Pre-create MusicPlayerFragment hidden so its onViewCreated triggers the
@@ -409,6 +418,7 @@ class MainActivity : AppCompatActivity() {
         super.onSaveInstanceState(outState)
         outState.putInt("current_main_nav_item_id", currentMainNavItemId)
         outState.putBoolean("in_settings", inSettings)
+        outState.putInt("settings_return_nav_item_id", settingsReturnNavItemId)
     }
 
     override fun onRestoreInstanceState(savedInstanceState: Bundle) {
@@ -417,6 +427,7 @@ class MainActivity : AppCompatActivity() {
         // (See matching policy in onCreate.)
         currentMainNavItemId = R.id.nav_music
         inSettings = savedInstanceState.getBoolean("in_settings", false)
+        settingsReturnNavItemId = savedInstanceState.getInt("settings_return_nav_item_id", R.id.nav_music)
     }
 
     fun handlePlayFromSearchIntent(intent: Intent) {
@@ -520,7 +531,8 @@ class MainActivity : AppCompatActivity() {
         if (music is MusicPlayerFragment && music.isAdded) {
             music.refreshLibraryUi()
         } else {
-            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            mainHandler.postDelayed({
+                if (isFinishing || isDestroyed) return@postDelayed
                 val m = supportFragmentManager.findFragmentByTag(TAG_MODULE_MUSIC)
                 if (m is MusicPlayerFragment && m.isAdded) m.refreshLibraryUi()
             }, 800)
@@ -898,6 +910,9 @@ class MainActivity : AppCompatActivity() {
                 if (music is MusicPlayerFragment && music.isAdded) {
                     runOnUiThread { music.refreshLibraryUi() }
                 }
+                // Repopulate Principal too: its carousels were rendered once from empty caches on
+                // cold start and would otherwise stay black until the user navigated away and back.
+                refreshPrincipalContentIfVisible()
                 onSuccess?.run()
             }
         }
@@ -907,6 +922,19 @@ class MainActivity : AppCompatActivity() {
 
     private fun notifyHydrationCompleted() {
         (getMainModuleFragment(R.id.nav_equalizer) as? EqualizerFragment)?.onCloudEqHydrationCompleted()
+    }
+
+    /**
+     * Repopulate the Principal home carousels if it is the currently-visible module. Called when
+     * session/cloud data arrives after Principal was already rendered on cold start (post web
+     * login, post cloud hydration). Thread-safe: hops to the UI thread itself, so callers may
+     * invoke it from any thread.
+     */
+    fun refreshPrincipalContentIfVisible() {
+        val principal = supportFragmentManager.findFragmentByTag(TAG_MODULE_PRINCIPAL)
+        if (principal is PrincipalFragment && principal.isAdded && !principal.isHidden) {
+            runOnUiThread { principal.refreshAllContent() }
+        }
     }
 
     private fun setSyncOverlayVisible(visible: Boolean) { /* Signals visual sync in header */ }
@@ -929,7 +957,9 @@ class MainActivity : AppCompatActivity() {
         btnProfilePhoto.visibility = View.VISIBLE
         btnProfilePhoto.contentDescription = getString(R.string.header_action_settings)
         btnProfilePhoto.setOnClickListener { enterSettings() }
-        loadProfilePhoto()
+        // Defer the profile-photo load off the first-frame path (it does a synchronous streaming_cache
+        // prefs read + Glide build). showMainShell()/returnFromSettings()/handleSignedInUser re-trigger it.
+        btnProfilePhoto.post { loadProfilePhoto() }
 
         tvModuleTitle.apply {
             text = getString(R.string.header_brand_title)
@@ -1027,6 +1057,9 @@ class MainActivity : AppCompatActivity() {
         // (onViewCreated or onHiddenChanged) ends up driving the first render.
         if (atHistory) target.navigateToHistory() else target.navigateToRoot()
         if (inSettings) return
+        // Capture the origin module AFTER the re-entrancy guard, so a second enter-Settings call
+        // while already in Settings can't overwrite it. Back out of Settings returns here.
+        settingsReturnNavItemId = currentMainNavItemId
 
         dismissSavedBar()
         if (bottomNav.selectedItemId == R.id.nav_music) markStreamingEntryAsLibrary()
@@ -1059,7 +1092,10 @@ class MainActivity : AppCompatActivity() {
     fun returnFromSettings() {
         if (!inSettings) return
         inSettings = false
-        val selectedId = bottomNav.selectedItemId
+        // Return to the module Settings was opened from (persisted across recreation), not to the
+        // footer selection, and re-align the footer highlight to match.
+        val selectedId = settingsReturnNavItemId
+        syncBottomNavSelection(selectedId)
         val target = getMainModuleFragment(selectedId) ?: getOrCreateMainModuleFragment(selectedId)
         val isNew = target?.isAdded == false
         setOverlayFullscreen(false)
@@ -1232,7 +1268,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     fun getGlobalMiniPlayer(): GlobalMiniPlayerController? = globalMiniPlayer
-    fun getGlobalMiniPlayerController(): GlobalMiniPlayerController? = globalMiniPlayer
 
     fun isMiniPlayerAllowedForCurrentScreen(): Boolean {
         // Mini-player only in these 4 screens — block all overlay screens
@@ -1521,6 +1556,18 @@ class MainActivity : AppCompatActivity() {
         val isColdStartFirstModule = isNew && supportFragmentManager.fragments.none { it.isAdded && !it.isHidden }
 
         if (isColdStartFirstModule) {
+            // Cover the first frame with the loading overlay (dark bg + spinner) so the user never
+            // sees Principal's empty/black first frame while its carousels populate from disk/cloud.
+            // PrincipalFragment fades it out once a section actually has content
+            // (revealAfterFirstContentPass), and it owns its own ~2.5s "reveal anyway" safety-net.
+            // This postDelayed is only a last-resort backstop in case the fragment never calls back
+            // (e.g. it died) — so it must be LONGER than the fragment's net, otherwise it would be
+            // the thing that reveals an empty/black home early (the exact bug we're fixing).
+            val gateReveal = itemId == R.id.nav_principal
+            if (gateReveal) {
+                setOverlayFullscreen(false)
+                showModuleLoadingOverlay()
+            }
             supportFragmentManager.beginTransaction().apply {
                 setReorderingAllowed(true)
                 add(R.id.fragmentContainer, target, tag)
@@ -1533,18 +1580,34 @@ class MainActivity : AppCompatActivity() {
                 val isFragOwnedHeader = itemId == R.id.nav_music || itemId == R.id.nav_principal
                 topAppBar.visibility = if (isFragOwnedHeader) View.GONE else View.VISIBLE
             }
-            configureHeaderActionForMainModules()
+            // Header (search button, profile-photo prefs read + Glide build, title) was already
+            // configured synchronously by onCreate before this cold-start branch runs; showMainShell()
+            // re-loads the photo after the first frame. Skip the redundant pre-first-frame call.
             updateHeaderTitleForModule(itemId)
+            if (gateReveal) {
+                fragmentContainer.postDelayed({ revealModuleContent() }, 3500L)
+            }
             finishMainModuleNavigation(itemId)
             return true
         }
 
-        // Normal path: show overlay, then post fragment work
-        setOverlayFullscreen(false)
-        showModuleLoadingOverlay()
-        fragmentContainer.post {
-            if (isFinishing || isDestroyed) { isNavigating = false; return@post }
-            // Re-resolve all fragment references to avoid stale properties after deferred post
+        // A "warm" switch targets a module that is already added with its view still resident
+        // (main modules are hidden/shown, not replaced). Its content is laid out and appears
+        // instantly, so we skip the loading overlay and the extra reveal frame entirely — showing
+        // the dark spinner on every re-entry is what made navigation feel like a fresh load.
+        val isWarmSwitch = target.isAdded && target.view != null
+        // Normal path: show overlay (cold target only), then post fragment work
+        if (!isWarmSwitch) {
+            setOverlayFullscreen(false)
+            showModuleLoadingOverlay()
+        }
+        // Warm target: its view is already laid out so hide/show is instant. Run the transaction
+        // SYNCHRONOUSLY — the deferred post below added a frame of latency to every footer tap,
+        // which is what made warm navigation feel heavy. Cold targets still post so the overlay
+        // gets a frame to render before the heavy first layout.
+        val commitSwitch = Runnable {
+            if (isFinishing || isDestroyed) { isNavigating = false; return@Runnable }
+            // Re-resolve all fragment references to avoid stale properties after a deferred post
             restoreMainModuleReferences()
             val resolvedTarget = supportFragmentManager.findFragmentByTag(tag) ?: target
             supportFragmentManager.beginTransaction().apply {
@@ -1585,12 +1648,20 @@ class MainActivity : AppCompatActivity() {
                 globalMiniPlayer?.hide()
             }
 
-            fragmentContainer.post { revealModuleContent() }
+            // Only cold targets were covered by the overlay; warm ones were never hidden. Still
+            // clear any overlay that happened to be left visible so a warm switch can't get stuck
+            // behind it.
+            if (!isWarmSwitch) {
+                fragmentContainer.post { revealModuleContent() }
+            } else if (moduleLoadingOverlay.visibility == View.VISIBLE) {
+                revealModuleContent()
+            }
 
             // Navigation settled — clear the busy flag and reconcile the footer with the
             // module actually shown (or honor a newer request that arrived meanwhile).
             finishMainModuleNavigation(itemId)
         }
+        if (isWarmSwitch) commitSwitch.run() else fragmentContainer.post(commitSwitch)
         return true
     }
 

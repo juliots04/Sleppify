@@ -50,7 +50,11 @@ class AudioEffectsService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        ensureNotificationChannel()
+        // Intentionally NOT a foreground service and it owns NO notification channel. The DSP
+        // engine attaches to the global audio session; the process is already held foreground by
+        // PlaybackKeepAliveService (media notification id 11031) during playback. Posting its own
+        // (blank) notification id 11032 on the shared media channel was the spurious "extra media
+        // notification" that appeared whenever the EQ was enabled.
         audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
         audioManager?.registerAudioDeviceCallback(deviceCallback, mainHandler)
     }
@@ -61,7 +65,6 @@ class AudioEffectsService : Service() {
         when (action) {
             ACTION_APPLY -> {
                 val sessionId = intent?.getIntExtra(EXTRA_AUDIO_SESSION_ID, GLOBAL_SESSION_ID) ?: GLOBAL_SESSION_ID
-                enterForeground()
                 applyEffects(sessionId)
             }
             ACTION_STOP -> {
@@ -70,7 +73,6 @@ class AudioEffectsService : Service() {
                 stopSelf()
             }
             else -> {
-                enterForeground()
                 applyEffects(GLOBAL_SESSION_ID)
             }
         }

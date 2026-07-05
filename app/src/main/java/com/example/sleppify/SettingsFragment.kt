@@ -53,11 +53,23 @@ class SettingsFragment : Fragment() {
         private const val HISTORY_PAGE_SIZE = 20
         private const val HISTORY_DAY_VISIBLE_LIMIT = 20
         private const val KEY_USE_SD_CARD = "use_sd_card"
+        private const val STATE_CURRENT_SECTION = "settings_current_section"
+        private const val STATE_ENTRY_SECTION = "settings_entry_section"
+        private const val STATE_PENDING_ENTRY = "settings_pending_entry"
     }
 
     // --- Navigation state ---
     private var currentSection = SECTION_ROOT
     private var pendingSection: Int? = null
+    // The section the user landed on when Settings was opened. Back-press exits Settings
+    // (instead of dropping to the root tree) when the user is at this section — so History
+    // opened directly from the library returns to the library, while History reached by
+    // drilling into the settings tree still backs out to the root.
+    private var entrySection = SECTION_ROOT
+    // True while a navigateTo*() request is in flight. entrySection is committed only when the
+    // requested section is actually rendered (in showSection), so it can never point at a section
+    // that was never shown — the desync behind "Back from History drops to the settings root tree".
+    private var pendingEntry = false
 
     // --- Views ---
     private lateinit var tvToolbarTitle: TextView
@@ -172,9 +184,28 @@ class SettingsFragment : Fragment() {
         setupHistorySection(view)
         setupAccountSection(view)
 
+        // Restore across process death (e.g. the user switched apps and the system reclaimed
+        // us). MainActivity re-enters Settings by finding this fragment by tag without calling
+        // navigateTo*, so the entry/current section would otherwise reset to the root tree and
+        // break back-navigation. A pending section (a fresh navigateTo* request) takes priority.
+        if (savedInstanceState != null) {
+            entrySection = savedInstanceState.getInt(STATE_ENTRY_SECTION, entrySection)
+            pendingEntry = savedInstanceState.getBoolean(STATE_PENDING_ENTRY, pendingEntry)
+            if (pendingSection == null) {
+                currentSection = savedInstanceState.getInt(STATE_CURRENT_SECTION, currentSection)
+            }
+        }
+
         val initialSection = pendingSection ?: currentSection
         pendingSection = null
         showSection(initialSection)
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putInt(STATE_CURRENT_SECTION, currentSection)
+        outState.putInt(STATE_ENTRY_SECTION, entrySection)
+        outState.putBoolean(STATE_PENDING_ENTRY, pendingEntry)
     }
 
     override fun onHiddenChanged(hidden: Boolean) {
@@ -198,7 +229,10 @@ class SettingsFragment : Fragment() {
     }
 
     fun onBackPressed() {
-        if (currentSection != SECTION_ROOT) {
+        // Exit Settings when we're at the section the user entered on (e.g. History opened
+        // from the library → back returns to the library). Otherwise a deeper sub-section
+        // backs out to the settings root tree first.
+        if (currentSection != SECTION_ROOT && currentSection != entrySection) {
             showSection(SECTION_ROOT)
         } else {
             (activity as? MainActivity)?.returnFromSettings()
@@ -211,9 +245,15 @@ class SettingsFragment : Fragment() {
         }
     }
 
-    fun navigateToHistory() = requestSection(SECTION_HISTORY)
+    fun navigateToHistory() {
+        pendingEntry = true
+        requestSection(SECTION_HISTORY)
+    }
 
-    fun navigateToRoot() = requestSection(SECTION_ROOT)
+    fun navigateToRoot() {
+        pendingEntry = true
+        requestSection(SECTION_ROOT)
+    }
 
     /**
      * Declares which section to show the next time the fragment becomes visible.
@@ -233,6 +273,13 @@ class SettingsFragment : Fragment() {
 
     private fun showSection(section: Int) {
         currentSection = section
+        // Commit the entry section only when the requested section is actually rendered. A deferred
+        // navigateTo*() (fragment hidden when the request arrived, e.g. process-death restore) can
+        // therefore never leave entrySection pointing at a section that was never shown.
+        if (pendingEntry) {
+            entrySection = section
+            pendingEntry = false
+        }
         sectionRoot.visibility = if (section == SECTION_ROOT) View.VISIBLE else View.GONE
         sectionPlayback.visibility = if (section == SECTION_PLAYBACK) View.VISIBLE else View.GONE
         sectionDownloads.visibility = if (section == SECTION_DOWNLOADS) View.VISIBLE else View.GONE
@@ -647,7 +694,7 @@ class SettingsFragment : Fragment() {
         val durations = arrayListOf("")
         val images = arrayListOf(entry.imageUrl)
 
-        val existing = fm.findFragmentByTag("song_player") as? SongPlayerFragment
+        val existing = fm.findFragmentByTag(AppConstants.TAG_SONG_PLAYER) as? SongPlayerFragment
         if (existing != null && existing.isAdded) {
             existing.externalSetReturnTargetTag("module_settings")
             existing.externalReplaceQueueFromStart(ids, titles, artists, durations, images, 0, true)
@@ -656,7 +703,7 @@ class SettingsFragment : Fragment() {
             player.externalSetReturnTargetTag("module_settings")
             fm.beginTransaction()
                 .setReorderingAllowed(true)
-                .add(R.id.playerContainer, player, "song_player")
+                .add(R.id.playerContainer, player, AppConstants.TAG_SONG_PLAYER)
                 .hide(player)
                 .commit()
         }
@@ -756,7 +803,7 @@ class SettingsFragment : Fragment() {
         btnQueue.setOnClickListener {
             dialog.dismiss()
             val fm = parentFragmentManager
-            val player = fm.findFragmentByTag("song_player") as? SongPlayerFragment
+            val player = fm.findFragmentByTag(AppConstants.TAG_SONG_PLAYER) as? SongPlayerFragment
             if (player != null && player.isAdded) {
                 player.externalEnqueue(entry.videoId, entry.title, entry.artist, "", entry.imageUrl)
                 Toast.makeText(ctx, "Agregado a la fila", Toast.LENGTH_SHORT).show()
@@ -863,7 +910,7 @@ class SettingsFragment : Fragment() {
         val durations = arrayListOf("")
         val images = arrayListOf(entry.imageUrl)
 
-        val existing = fm.findFragmentByTag("song_player") as? SongPlayerFragment
+        val existing = fm.findFragmentByTag(AppConstants.TAG_SONG_PLAYER) as? SongPlayerFragment
         if (existing != null && existing.isAdded) {
             existing.externalSetReturnTargetTag("module_settings")
             existing.externalReplaceQueueFromStart(ids, titles, artists, durations, images, 0, true)
@@ -872,7 +919,7 @@ class SettingsFragment : Fragment() {
             player.externalSetReturnTargetTag("module_settings")
             fm.beginTransaction()
                 .setReorderingAllowed(true)
-                .add(R.id.playerContainer, player, "song_player")
+                .add(R.id.playerContainer, player, AppConstants.TAG_SONG_PLAYER)
                 .hide(player)
                 .commit()
         }
@@ -911,7 +958,7 @@ class SettingsFragment : Fragment() {
                     qImages.add(t.thumbnailUrl ?: "")
                 }
                 val fm = parentFragmentManager
-                val sp = fm.findFragmentByTag("song_player") as? SongPlayerFragment
+                val sp = fm.findFragmentByTag(AppConstants.TAG_SONG_PLAYER) as? SongPlayerFragment
                 if (sp != null && sp.isAdded) {
                     sp.externalReplaceQueue(qIds, qTitles, qArtists, qDurations, qImages, 0, true)
                 }

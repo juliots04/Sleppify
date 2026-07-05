@@ -142,11 +142,24 @@ object LocalFilesStore {
         return getPrefs(context).getInt(KEY_SCHEMA_VERSION, 1) != CACHE_SCHEMA_VERSION
     }
 
+    // The MediaStore id is embedded in the videoId (LOCAL_VIDEO_ID_PREFIX + rowId) and the content
+    // URI is deterministically ContentUris.withAppendedId(collection, id) — the exact value the scan
+    // persisted (see scan at ~88-89). Reconstruct it directly instead of parsing the whole cached-
+    // tracks JSON + allocating a LocalTrack per entry on every local track transition. Falls back to
+    // the cache only if the id can't be parsed.
     @JvmStatic
     fun getContentUriForVideoId(context: Context, videoId: String): String? {
         if (!videoId.startsWith(LOCAL_VIDEO_ID_PREFIX)) return null
-        val cached = getCachedFiles(context)
-        return cached.firstOrNull { it.videoId == videoId }?.contentUri
+        val id = videoId.substring(LOCAL_VIDEO_ID_PREFIX.length).toLongOrNull()
+        if (id != null) {
+            val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+            } else {
+                MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+            }
+            return ContentUris.withAppendedId(collection, id).toString()
+        }
+        return getCachedFiles(context).firstOrNull { it.videoId == videoId }?.contentUri
     }
 
     @JvmStatic

@@ -437,6 +437,14 @@ public class SongPlayerFragment extends Fragment {
                     | PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS
                     | PlaybackStateCompat.ACTION_SEEK_TO);
 
+    // Last values actually rendered into the time labels / seekbar, so the 2Hz ticker skips the
+    // String.format + setText + layout when the displayed value hasn't changed (the current-time
+    // label only changes once per second, the total-time label almost never). Reset to -1 on bind
+    // so a new track always re-renders. -1 = "nothing rendered yet".
+    private int lastRenderedCurrentSeconds = -1;
+    private int lastRenderedTotalSeconds = -1;
+    private int lastRenderedProgress = -1;
+
     private final Runnable localProgressTicker = new Runnable() {
         @Override
         public void run() {
@@ -497,13 +505,25 @@ public class SongPlayerFragment extends Fragment {
 
                 totalSeconds = Math.max(1, durationMs / 1000);
 
-                // Only update UI if player is visible - reduces GPU/CPU load when hidden
+                // Only update UI if player is visible - reduces GPU/CPU load when hidden.
+                // Skip the format+setText+layout when the rendered value is unchanged: the ticker
+                // fires 2x/second but the second value changes only 1x/second, and the total-time
+                // label is effectively constant per track.
                 if (!isHidden()) {
-                    tvCurrentTime.setText(formatSeconds(currentSeconds));
-                    tvTotalTime.setText(formatSeconds(totalSeconds));
-
+                    if (currentSeconds != lastRenderedCurrentSeconds) {
+                        lastRenderedCurrentSeconds = currentSeconds;
+                        tvCurrentTime.setText(formatSeconds(currentSeconds));
+                    }
+                    if (totalSeconds != lastRenderedTotalSeconds) {
+                        lastRenderedTotalSeconds = totalSeconds;
+                        tvTotalTime.setText(formatSeconds(totalSeconds));
+                    }
                     int progress = Math.round((Math.max(0, currentSeconds) / (float) Math.max(1, totalSeconds)) * 1000f);
-                    sbPlaybackProgress.setProgress(Math.max(0, Math.min(1000, progress)));
+                    progress = Math.max(0, Math.min(1000, progress));
+                    if (progress != lastRenderedProgress) {
+                        lastRenderedProgress = progress;
+                        sbPlaybackProgress.setProgress(progress);
+                    }
                 }
 
                 if (!playCountRecordedForCurrentTrack && totalSeconds > 0
@@ -702,6 +722,12 @@ public class SongPlayerFragment extends Fragment {
             llSimilarTrigger.setOnClickListener(v -> openRadioForCurrentTrack());
         }
 
+        // Wire the swipe-to-dismiss gesture SYNCHRONOUSLY (not deferred to phase1 below). It only
+        // reads ViewConfiguration + display metrics, so it's cheap. Deferring it via view.post()
+        // left a window — especially after a process-death restore triggered by backgrounding the
+        // app — where the SwipeInterceptLayout callback was still null and the swipe "no agarraba".
+        setupSwipeToDismiss(view);
+
         // When created hidden (mini-player background restore), skip the entry animation
         // delay and run both phases faster to start playback sooner.
         final boolean createdHidden = isHidden();
@@ -710,7 +736,6 @@ public class SongPlayerFragment extends Fragment {
         Runnable phase1 = () -> {
             if (!isAdded()) return;
 
-            setupSwipeToDismiss(view);
             setupBackPressToMiniMode();
             view.findViewById(R.id.btnPrev).setOnClickListener(v -> moveTrack(-1));
             view.findViewById(R.id.btnNext).setOnClickListener(v -> moveTrack(1));
@@ -872,10 +897,17 @@ public class SongPlayerFragment extends Fragment {
     @Override
     public void onResume() {
         super.onResume();
+        boolean returningFromBackground = appInBackground;
         swipeDismissGestureActive = false;
         swipeDismissAnimationRunning = false;
         if (getView() != null && !isHidden()) {
-            if (!playerEnterAnimationRunning) {
+            // A legitimate entry animation only runs on a fresh open, never on a background return.
+            // So when returning from background, force the player back to rest even if
+            // playerEnterAnimationRunning got stuck true (its withEndAction doesn't fire if the
+            // animation was cancelled by backgrounding) — otherwise the view could stay translated
+            // off-rest and the swipe-to-dismiss target lands in the wrong place ("no agarra").
+            if (returningFromBackground || !playerEnterAnimationRunning) {
+                playerEnterAnimationRunning = false;
                 getView().animate().cancel();
                 getView().setTranslationY(0f);
             }
@@ -1004,9 +1036,11 @@ public class SongPlayerFragment extends Fragment {
         if (seekThumbAnimator != null) { seekThumbAnimator.cancel(); seekThumbAnimator = null; }
         sbPlaybackProgress = null;
         pbSeekBarLoading = null;
-        streamResolverExecutor.shutdownNow();
-        backgroundExecutor.shutdownNow();
-        backgroundDownloadExecutor.shutdownNow();
+        // NOTE: the stream/background executors are final, instance-scoped fields shut down in
+        // onDestroy() — NOT here. This fragment is retained and its view is add/hide/show'd, so a
+        // config change (rotation, resize, font/locale change) runs onDestroyView then recreates
+        // the view on the SAME instance; shutting the executors down here left them permanently
+        // dead and the next skip/seek/resolve threw RejectedExecutionException.
         super.onDestroyView();
     }
 
@@ -2702,9 +2736,49 @@ public class SongPlayerFragment extends Fragment {
             File file = OfflineAudioStore.getExistingOfflineAudioFile(requireContext(), track.videoId);
             if (file.isFile() && file.length() > 0L) {
                 orderedSources.add(file.getAbsolutePath());
+                // Resolve "does this offline file contain video?" SYNCHRONOUSLY here, before playback
+                // attaches the surface. isVideoTrack() reads offlineVideoProbeCache, and the surface is
+                // attached exactly once at videoRouter.onTrackStarted(..., isVideoTrack). The old async
+                // probe returned false on that first call, so a downloaded music-video attached NO video
+                // surface and showed its cover photo forever (re-attaching later hits the router's
+                // sameUnderlying branch, which never re-adds the PlayerView). Caching it now fixes that.
+                ensureOfflineVideoProbeCached(track.videoId, file);
             }
         }
         return new ArrayList<>(orderedSources);
+    }
+
+    /** Synchronous, cached MediaExtractor probe for a real video track in an offline file. Runs once
+     *  per videoId (guarded by {@link #offlineVideoProbeCache}) on a local file we're about to open
+     *  anyway, so the cost is negligible and only paid on the first play of each downloaded track. */
+    private void ensureOfflineVideoProbeCached(@Nullable String videoId, @NonNull File file) {
+        if (TextUtils.isEmpty(videoId) || offlineVideoProbeCache.containsKey(videoId)) return;
+        boolean hasVideo = false;
+        android.media.MediaExtractor extractor = new android.media.MediaExtractor();
+        try {
+            extractor.setDataSource(file.getAbsolutePath());
+            for (int i = 0; i < extractor.getTrackCount(); i++) {
+                String mime = extractor.getTrackFormat(i).getString(android.media.MediaFormat.KEY_MIME);
+                if (mime != null && mime.startsWith("video/")) { hasVideo = true; break; }
+            }
+        } catch (Exception e) {
+            hasVideo = false;
+        } finally {
+            try { extractor.release(); } catch (Exception ignored) {}
+        }
+        putOfflineVideoProbe(videoId, hasVideo);
+    }
+
+    private static final int OFFLINE_PROBE_CACHE_MAX = 256;
+
+    /** Store a probe result, bounding the cache so a very long listening session can't grow it
+     *  without limit. Thread-safe: clear()/put() on the ConcurrentHashMap are atomic and a
+     *  double-clear race is harmless. */
+    private void putOfflineVideoProbe(@NonNull String videoId, boolean hasVideo) {
+        if (offlineVideoProbeCache.size() >= OFFLINE_PROBE_CACHE_MAX) {
+            offlineVideoProbeCache.clear();
+        }
+        offlineVideoProbeCache.put(videoId, hasVideo);
     }
 
     private void cancelPendingStreamResolver() {
@@ -3104,10 +3178,29 @@ public class SongPlayerFragment extends Fragment {
         return value.substring(0, tokenIndex) + "token=***" + value.substring(amp);
     }
 
+    private boolean cachedNetworkAvailable = false;
+    private long cachedNetworkCheckedAtMs = 0L;
+    private static final long NETWORK_CACHE_TTL_MS = 2000L;
+
+    /** Cached network reachability. The raw check does ConnectivityManager Binder calls
+     *  (getActiveNetwork + getNetworkCapabilities), and this is polled on every 500ms progress
+     *  tick plus many playback paths — querying the system service that often is needless IPC.
+     *  A ~2s TTL keeps it effectively real-time for playback decisions while cutting the churn. */
     private boolean isNetworkAvailable() {
         if (!isAdded()) {
             return false;
         }
+        long now = SystemClock.elapsedRealtime();
+        if (cachedNetworkCheckedAtMs != 0L && now - cachedNetworkCheckedAtMs < NETWORK_CACHE_TTL_MS) {
+            return cachedNetworkAvailable;
+        }
+        boolean available = queryNetworkAvailable();
+        cachedNetworkAvailable = available;
+        cachedNetworkCheckedAtMs = now;
+        return available;
+    }
+
+    private boolean queryNetworkAvailable() {
         ConnectivityManager cm = ContextCompat.getSystemService(requireContext(), ConnectivityManager.class);
         if (cm == null) {
             return false;
@@ -3417,6 +3510,11 @@ public class SongPlayerFragment extends Fragment {
         totalSeconds = Math.max(1, parseDurationSeconds(track.duration));
         currentSeconds = 0;
 
+        // New track: invalidate the ticker's render cache so the labels/seekbar re-sync even if
+        // the new second/duration numerically matches the previous track's last rendered value.
+        lastRenderedCurrentSeconds = -1;
+        lastRenderedTotalSeconds = -1;
+        lastRenderedProgress = -1;
         tvCurrentTime.setText(formatSeconds(currentSeconds));
         tvTotalTime.setText(TextUtils.isEmpty(track.duration) ? formatSeconds(totalSeconds) : track.duration);
 
@@ -3488,24 +3586,23 @@ public class SongPlayerFragment extends Fragment {
                             final int srcW = resource.getWidth();
                             final int srcH = resource.getHeight();
 
+                            // Apply the artwork SYNCHRONOUSLY here — never deferred into an
+                            // animation's withEndAction. That end-action only runs if the fade
+                            // completes naturally; a competing ivPlayerCover.animate().cancel()
+                            // from a rapid follow-up bind (or updatePlayerSurfaceForSource)
+                            // dropped it, leaving the cover stuck (blank / previous art) while
+                            // the Palette color below — applied directly — still landed. That is
+                            // the "dominant color changes but the next song's image never
+                            // appears" bug when songs auto-advance one after another. Hiding the
+                            // cover first (alpha 0) still prevents the hero reshape from
+                            // re-cropping the outgoing bitmap on screen.
                             boolean coverHasContent = ivPlayerCover.getDrawable() != null
                                     && ivPlayerCover.getAlpha() > 0.01f;
                             ivPlayerCover.animate().cancel();
-                            if (!coverHasContent) {
-                                // First paint — nothing to distort. Shape now and fade in.
-                                applyHeroShapeForAspect(aspect, srcW, srcH, artworkGen);
-                                ivPlayerCover.setImageBitmap(resource);
-                                ivPlayerCover.setAlpha(0f);
-                                ivPlayerCover.animate().alpha(1f).setDuration(260).start();
-                            } else {
-                                // Fade old cover out, reshape + swap while invisible, fade new in.
-                                ivPlayerCover.animate().alpha(0f).setDuration(150).withEndAction(() -> {
-                                    if (artworkGen != playerArtworkGeneration) return;
-                                    applyHeroShapeForAspect(aspect, srcW, srcH, artworkGen);
-                                    ivPlayerCover.setImageBitmap(resource);
-                                    ivPlayerCover.animate().alpha(1f).setDuration(240).start();
-                                }).start();
-                            }
+                            ivPlayerCover.setAlpha(0f);
+                            applyHeroShapeForAspect(aspect, srcW, srcH, artworkGen);
+                            ivPlayerCover.setImageBitmap(resource);
+                            ivPlayerCover.animate().alpha(1f).setDuration(coverHasContent ? 240 : 260).start();
                             if (pbVideoLoading != null) {
                                 pbVideoLoading.setVisibility(View.GONE);
                             }
@@ -3965,7 +4062,7 @@ public class SongPlayerFragment extends Fragment {
         }
 
         // Fetch radio tracks and save to RadioHistoryStore for library display
-        String cookie = safeValue(prefs.getString("stream_last_youtube_web_cookie", ""));
+        String cookie = safeValue(prefs.getString(AppConstants.PREF_LAST_YOUTUBE_WEB_COOKIE, ""));
         final String selectedVideoId = track.videoId;
         final String selectedTitle = TextUtils.isEmpty(track.title) ? "Tema" : track.title;
         final String selectedArtist = TextUtils.isEmpty(track.artist) ? "" : track.artist;
@@ -4121,18 +4218,33 @@ public class SongPlayerFragment extends Fragment {
 
         pendingSocialStatsVideoId = track.videoId;
         SocialStats cached = socialStatsCache.get(track.videoId);
-        if (cached == null) {
-            cached = readSocialStatsFromCache(track.videoId);
-            if (cached != null) {
-                socialStatsCache.put(track.videoId, cached);
-            }
-        }
         if (cached != null) {
             applySocialStatsToUi(cached);
-        } else {
-            applySocialStatsToUi(SocialStats.loading());
+            continueSocialStatsFetch(track.videoId, cached);
+            return;
         }
 
+        // In-memory miss: read the persisted stats (SharedPreferences + JSON parse) OFF the UI
+        // thread. This used to run on the main thread on every track change; the network fetch it
+        // feeds into is already async, so deferring the disk read is behaviour-preserving.
+        applySocialStatsToUi(SocialStats.loading());
+        final String requestVideoId = track.videoId;
+        backgroundExecutor.execute(() -> {
+            final SocialStats prefStats = readSocialStatsFromCache(requestVideoId);
+            localProgressHandler.post(() -> {
+                if (!isAdded() || !TextUtils.equals(pendingSocialStatsVideoId, requestVideoId)) {
+                    return;
+                }
+                if (prefStats != null) {
+                    socialStatsCache.put(requestVideoId, prefStats);
+                    applySocialStatsToUi(prefStats);
+                }
+                continueSocialStatsFetch(requestVideoId, prefStats);
+            });
+        });
+    }
+
+    private void continueSocialStatsFetch(@NonNull String requestVideoId, @Nullable SocialStats cached) {
         String apiKey = BuildConfig.YOUTUBE_DATA_API_KEY == null
                 ? ""
                 : BuildConfig.YOUTUBE_DATA_API_KEY.trim();
@@ -4143,11 +4255,8 @@ public class SongPlayerFragment extends Fragment {
             }
             return;
         }
-
-        String requestVideoId = track.videoId;
-        SocialStats cachedSnapshot = cached;
         boolean deferFetch = cached == null && isPlaying && !usingOfflineSource;
-        scheduleSocialStatsFetch(requestVideoId, apiKey, cachedSnapshot, deferFetch);
+        scheduleSocialStatsFetch(requestVideoId, apiKey, cached, deferFetch);
     }
 
     private void scheduleSocialStatsFetch(
@@ -4905,7 +5014,7 @@ public class SongPlayerFragment extends Fragment {
                 try { extractor.release(); } catch (Exception ignored) {}
             }
             final boolean result = hasVideo;
-            offlineVideoProbeCache.put(probeVideoId, result);
+            putOfflineVideoProbe(probeVideoId, result);
             localProgressHandler.post(() -> {
                 if (!isAdded()) return;
                 if (currentIndex >= 0 && currentIndex < tracks.size()
@@ -5822,9 +5931,24 @@ public class SongPlayerFragment extends Fragment {
         }
 
         void setItems(@NonNull List<PlayerTrack> newItems) {
+            // refreshNextUp() runs on every track change / shuffle / repeat toggle. When the queue
+            // is actually unchanged (same ids in the same order — e.g. a repeat-mode toggle), skip
+            // the full re-bind: notifyDataSetChanged() would otherwise re-bind every visible row
+            // and re-issue its Glide load for nothing.
+            if (sameQueue(newItems)) return;
             items.clear();
             items.addAll(newItems);
             notifyDataSetChanged();
+        }
+
+        private boolean sameQueue(@NonNull List<PlayerTrack> newItems) {
+            if (items.size() != newItems.size()) return false;
+            for (int i = 0; i < items.size(); i++) {
+                PlayerTrack a = items.get(i);
+                PlayerTrack b = newItems.get(i);
+                if (a == null || b == null || !TextUtils.equals(a.videoId, b.videoId)) return false;
+            }
+            return true;
         }
 
         @NonNull
@@ -5858,7 +5982,25 @@ public class SongPlayerFragment extends Fragment {
         @Override
         public NextUpViewHolder onCreateViewHolder(@NonNull ViewGroup parent, int viewType) {
             View view = LayoutInflater.from(parent.getContext()).inflate(R.layout.item_song_next_up, parent, false);
-            return new NextUpViewHolder(view);
+            NextUpViewHolder holder = new NextUpViewHolder(view);
+            // Set listeners ONCE per holder — position is resolved dynamically via
+            // getAdapterPosition(), so there's no need to reallocate two lambdas on every bind
+            // while scrolling the queue.
+            holder.itemView.setOnClickListener(v -> {
+                int adapterPosition = holder.getAdapterPosition();
+                if (adapterPosition == RecyclerView.NO_POSITION) {
+                    return;
+                }
+                onNextUpTap.onTap(adapterPosition);
+            });
+            holder.ivQueueDragHandle.setOnTouchListener((v, event) -> {
+                if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                    onDragStart.onStartDrag(holder);
+                    return true;
+                }
+                return false;
+            });
+            return holder;
         }
 
         @Override
@@ -5901,22 +6043,8 @@ public class SongPlayerFragment extends Fragment {
                 Glide.with(holder.itemView).clear(holder.ivNextUpArt);
                 holder.ivNextUpArt.setImageDrawable(null);
             }
-
-            holder.itemView.setOnClickListener(v -> {
-                int adapterPosition = holder.getAdapterPosition();
-                if (adapterPosition == RecyclerView.NO_POSITION) {
-                    return;
-                }
-                onNextUpTap.onTap(adapterPosition);
-            });
-
-            holder.ivQueueDragHandle.setOnTouchListener((v, event) -> {
-                if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
-                    onDragStart.onStartDrag(holder);
-                    return true;
-                }
-                return false;
-            });
+            // Click + drag listeners are set once in onCreateViewHolder (not here) to avoid
+            // reallocating them on every bind.
         }
 
         static final class NextUpViewHolder extends RecyclerView.ViewHolder {
@@ -6027,7 +6155,9 @@ public class SongPlayerFragment extends Fragment {
             if (favUrls.size() >= 4) {
                 PlaylistGridArtLoader.load(ivThumb, favUrls, thumbSizePx);
             } else if (!favUrls.isEmpty()) {
-                Glide.with(this).load(favUrls.get(0)).centerCrop().into(ivThumb);
+                Glide.with(this).load(favUrls.get(0))
+                        .format(com.bumptech.glide.load.DecodeFormat.PREFER_RGB_565)
+                        .override(200, 200).centerCrop().into(ivThumb);
             }
             boolean isIn = isTrackInPlaylist(ctx, track.videoId, FavoritesPlaylistStore.PLAYLIST_ID);
             if (ivCheck != null) ivCheck.setVisibility(isIn ? View.VISIBLE : View.GONE);
@@ -6124,7 +6254,9 @@ public class SongPlayerFragment extends Fragment {
             if (urls.size() >= 4) {
                 PlaylistGridArtLoader.load(ivThumb, urls, thumbSizePx);
             } else if (!urls.isEmpty()) {
-                Glide.with(this).load(urls.get(0)).centerCrop().into(ivThumb);
+                Glide.with(this).load(urls.get(0))
+                        .format(com.bumptech.glide.load.DecodeFormat.PREFER_RGB_565)
+                        .override(200, 200).centerCrop().into(ivThumb);
             }
             boolean isIn = isTrackInPlaylist(ctx, track.videoId, playlistKey);
             if (ivCheck != null) ivCheck.setVisibility(isIn ? View.VISIBLE : View.GONE);
@@ -6183,9 +6315,13 @@ public class SongPlayerFragment extends Fragment {
             if (ytUrls.size() >= 4) {
                 PlaylistGridArtLoader.load(ivThumb, ytUrls, thumbSizePx);
             } else if (!ytUrls.isEmpty()) {
-                Glide.with(this).load(ytUrls.get(0)).centerCrop().into(ivThumb);
+                Glide.with(this).load(ytUrls.get(0))
+                        .format(com.bumptech.glide.load.DecodeFormat.PREFER_RGB_565)
+                        .override(200, 200).centerCrop().into(ivThumb);
             } else if (!ytFallbackThumb.isEmpty()) {
-                Glide.with(this).load(ytFallbackThumb).centerCrop().into(ivThumb);
+                Glide.with(this).load(ytFallbackThumb)
+                        .format(com.bumptech.glide.load.DecodeFormat.PREFER_RGB_565)
+                        .override(200, 200).centerCrop().into(ivThumb);
             }
             boolean isIn = CustomPlaylistsStore.INSTANCE.isTrackInYtMirror(ctx, ytPlaylistId, track.videoId);
             if (ivCheck != null) ivCheck.setVisibility(isIn ? View.VISIBLE : View.GONE);

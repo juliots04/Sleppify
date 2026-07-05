@@ -200,7 +200,7 @@ class YouTubeMusicWebSessionActivity : AppCompatActivity() {
         // and won't launch the WebView again.
         getSharedPreferences(AppConstants.PREFS_PLAYER_STATE, MODE_PRIVATE)
             .edit()
-            .putString("stream_last_youtube_web_cookie", lastCookieHeader)
+            .putString(AppConstants.PREF_LAST_YOUTUBE_WEB_COOKIE, lastCookieHeader)
             .commit()
 
         // Trigger deferred heavy initialization now that login succeeded.

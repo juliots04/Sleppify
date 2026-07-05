@@ -129,29 +129,44 @@ object RadioHistoryStore {
         return context.getSharedPreferences(PREFS_PINNED_PLAYLISTS, Context.MODE_PRIVATE)
     }
 
+    // In-memory snapshot of the pinned-playlist id set. isPlaylistPinned() is called once per
+    // RecyclerView row bind on the UI thread; parsing the JSON every time caused scroll jank.
+    // The set is small and only mutated via pin/unpin, so cache it and refresh on every write.
+    @Volatile
+    private var pinnedPlaylistIdsCache: Set<String>? = null
+
+    // LinkedHashSet preserves pin order, which buildDisplayLibrary relies on ("Pinned in pin order").
+    private fun pinnedSet(context: Context): Set<String> {
+        pinnedPlaylistIdsCache?.let { return it }
+        val set = LinkedHashSet(loadPinnedPlaylistIds(getPinnedPrefs(context)))
+        pinnedPlaylistIdsCache = set
+        return set
+    }
+
     fun isPlaylistPinned(context: Context, contentId: String): Boolean {
-        return loadPinnedPlaylistIds(getPinnedPrefs(context)).contains(contentId)
+        return pinnedSet(context).contains(contentId)
     }
 
     fun pinPlaylist(context: Context, contentId: String) {
         val prefs = getPinnedPrefs(context)
-        val pinned = loadPinnedPlaylistIds(prefs).toMutableList()
-        if (!pinned.contains(contentId)) {
-            pinned.add(contentId)
-            prefs.edit().putString(KEY_PINNED_PLAYLISTS, JSONArray(pinned).toString()).apply()
+        val pinned = LinkedHashSet(pinnedSet(context))
+        if (pinned.add(contentId)) {
+            prefs.edit().putString(KEY_PINNED_PLAYLISTS, JSONArray(pinned.toList()).toString()).apply()
+            pinnedPlaylistIdsCache = pinned
         }
     }
 
     fun unpinPlaylist(context: Context, contentId: String) {
         val prefs = getPinnedPrefs(context)
-        val pinned = loadPinnedPlaylistIds(prefs).toMutableList()
+        val pinned = LinkedHashSet(pinnedSet(context))
         if (pinned.remove(contentId)) {
-            prefs.edit().putString(KEY_PINNED_PLAYLISTS, JSONArray(pinned).toString()).apply()
+            prefs.edit().putString(KEY_PINNED_PLAYLISTS, JSONArray(pinned.toList()).toString()).apply()
+            pinnedPlaylistIdsCache = pinned
         }
     }
 
     fun getPinnedPlaylistIds(context: Context): List<String> {
-        return loadPinnedPlaylistIds(getPinnedPrefs(context))
+        return pinnedSet(context).toList()
     }
 
     // --- Internal helpers ---

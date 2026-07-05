@@ -107,14 +107,19 @@ class PlaybackKeepAliveService : Service() {
     }
 
     private fun buildFallbackNotification(): Notification {
-        val channelId = "sleppify_playback"
+        // Reuse the EXACT channel + icon of the real media notification (SongPlayerFragment) so the
+        // in-place startForeground swap on id 11031 is seamless and never flashes a distinct-looking
+        // "Sleppify" entry. This exists only to satisfy the foreground contract in the brief window
+        // before onStartCommand replaces it with the real MediaStyle notification.
+        val channelId = "sleppify_media_playback"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val nm = getSystemService(android.app.NotificationManager::class.java)
             if (nm != null) {
                 if (nm.getNotificationChannel(channelId) == null) {
                     val channel = android.app.NotificationChannel(
-                        channelId, "Playback", android.app.NotificationManager.IMPORTANCE_LOW
+                        channelId, "Reproducción", android.app.NotificationManager.IMPORTANCE_LOW
                     )
+                    channel.setShowBadge(false)
                     nm.createNotificationChannel(channel)
                 }
             } else {
@@ -122,8 +127,9 @@ class PlaybackKeepAliveService : Service() {
             }
         }
         return Notification.Builder(this, channelId)
-            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setSmallIcon(R.drawable.ic_notification_cat)
             .setContentTitle("Sleppify")
+            .setOngoing(true)
             .build()
     }
 

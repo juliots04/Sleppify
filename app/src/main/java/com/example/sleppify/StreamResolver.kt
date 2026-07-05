@@ -161,7 +161,7 @@ object StreamResolver {
     fun loadAuthCookiesFromPrefs(context: Context) {
         try {
             val prefs = context.getSharedPreferences(AppConstants.PREFS_PLAYER_STATE, Context.MODE_PRIVATE)
-            val cookie = prefs.getString("stream_last_youtube_web_cookie", "") ?: ""
+            val cookie = prefs.getString(AppConstants.PREF_LAST_YOUTUBE_WEB_COOKIE, "") ?: ""
             if (cookie.isNotBlank()) {
                 authCookieHeader = cookie.trim()
             }
