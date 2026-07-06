@@ -447,7 +447,9 @@
             app:rippleColor="#33FFFFFF" />
     </LinearLayout>
 
-    <!-- Loading overlay for first-install grid loading -->
+    <!-- Library loading state: a skeleton (placeholder rows) instead of a bare spinner. Reuses the
+         existing show/dismiss/5s-timeout logic in MusicPlayerFragment (showLibraryGridOverlay /
+         dismissLibraryGridOverlay). The inner llLibrarySkeletonContent alpha is pulsed while shown. -->
     <FrameLayout
         android:id="@+id/flLibraryLoadingOverlay"
         android:layout_width="0dp"
@@ -461,12 +463,7 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent">
 
-        <ProgressBar
-            android:layout_width="62dp"
-            android:layout_height="62dp"
-            android:layout_gravity="center"
-            android:indeterminate="true"
-            android:indeterminateTint="@android:color/white" />
+        <include layout="@layout/view_library_skeleton" />
     </FrameLayout>
 
     <!-- Status bar overlay: fades to solid on scroll -->

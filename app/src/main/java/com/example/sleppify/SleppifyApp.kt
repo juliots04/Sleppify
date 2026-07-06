@@ -90,6 +90,51 @@ class SleppifyApp : Application() {
         initExec.shutdown()
     }
 
+    @Suppress("DEPRECATION") // TRIM_MEMORY_RUNNING_CRITICAL: still delivered on the API levels this app targets
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        // Glide scales its memory cache down according to the system's pressure signal.
+        // Guarded by heavyInitDone so a trim callback never force-initializes Glide.
+        if (heavyInitDone) {
+            try { com.bumptech.glide.Glide.get(this).trimMemory(level) } catch (e: Exception) {
+                Log.w("SleppifyApp", "Glide trimMemory failed", e)
+            }
+        }
+        // When the system genuinely needs memory (process backgrounded in the LRU list, or
+        // critical pressure while foreground), drop our own in-memory bitmap caches too.
+        // Disk caches (offline songs, art composites, embedded art) are untouched — everything
+        // repaints from disk instead of being re-fetched.
+        if (level >= TRIM_MEMORY_BACKGROUND || level == TRIM_MEMORY_RUNNING_CRITICAL) {
+            try { PlaylistGridArtLoader.trimMemory() } catch (e: Exception) {
+                Log.w("SleppifyApp", "PlaylistGridArtLoader trim failed", e)
+            }
+            try { RadioArtComposer.trimMemory() } catch (e: Exception) {
+                Log.w("SleppifyApp", "RadioArtComposer trim failed", e)
+            }
+            try { LocalArtworkResolver.trimMemory() } catch (e: Exception) {
+                Log.w("SleppifyApp", "LocalArtworkResolver trim failed", e)
+            }
+        }
+    }
+
+    override fun onLowMemory() {
+        super.onLowMemory()
+        if (heavyInitDone) {
+            try { com.bumptech.glide.Glide.get(this).clearMemory() } catch (e: Exception) {
+                Log.w("SleppifyApp", "Glide clearMemory failed", e)
+            }
+        }
+        try { PlaylistGridArtLoader.trimMemory() } catch (e: Exception) {
+            Log.w("SleppifyApp", "PlaylistGridArtLoader trim failed", e)
+        }
+        try { RadioArtComposer.trimMemory() } catch (e: Exception) {
+            Log.w("SleppifyApp", "RadioArtComposer trim failed", e)
+        }
+        try { LocalArtworkResolver.trimMemory() } catch (e: Exception) {
+            Log.w("SleppifyApp", "LocalArtworkResolver trim failed", e)
+        }
+    }
+
     private fun hasExistingSession(): Boolean {
         val prefs = getSharedPreferences(AppConstants.PREFS_PLAYER_STATE, MODE_PRIVATE)
         val cookie = prefs.getString(AppConstants.PREF_LAST_YOUTUBE_WEB_COOKIE, "") ?: ""

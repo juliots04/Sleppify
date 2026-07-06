@@ -2,3 +2,7 @@ Flask>=3.0
 yt-dlp>=2026.03.17
 gunicorn
 requests>=2.31.0
+# PO-token provider plugin — supplies GVS PO tokens so YouTube stops returning
+# "confirm you're not a bot" / "Requested format is not available" on datacenter IPs.
+# Needs a companion provider (Node server on :4416, or script mode). See SETUP_POTOKEN.md.
+bgutil-ytdlp-pot-provider>=1.3.1

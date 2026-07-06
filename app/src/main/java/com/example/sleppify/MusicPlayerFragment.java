@@ -593,6 +593,8 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     private MaterialButton btnFeaturedSave;
     private SwipeRefreshLayout swipeLibraryRefresh;
     private View flLibraryLoadingOverlay;
+    @Nullable private View llLibrarySkeletonContent;
+    @Nullable private android.animation.ObjectAnimator skeletonPulseAnimator;
     @Nullable private ImageView ivLibraryBackdrop;
     @Nullable private View vStatusBarOverlay;
     private boolean libraryGridOverlayActive;
@@ -777,6 +779,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         btnFeaturedSave = view.findViewById(R.id.btnFeaturedSave);
         swipeLibraryRefresh = view.findViewById(R.id.swipeLibraryRefresh);
         flLibraryLoadingOverlay = view.findViewById(R.id.flLibraryLoadingOverlay);
+        llLibrarySkeletonContent = view.findViewById(R.id.llLibrarySkeletonContent);
 
         // Status bar overlay: set height to status bar, fade to solid on scroll
         vStatusBarOverlay = view.findViewById(R.id.vStatusBarOverlay);
@@ -2327,8 +2330,31 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         libraryGridOverlayActive = true;
         flLibraryLoadingOverlay.setAlpha(1f);
         flLibraryLoadingOverlay.setVisibility(View.VISIBLE);
+        startSkeletonPulse();
         // Safety timeout: dismiss after 5 seconds even if prefetches haven't finished
         mainHandler.postDelayed(this::dismissLibraryGridOverlay, 5000L);
+    }
+    /** Gently pulses the skeleton placeholders' alpha while the library loads. */
+    private void startSkeletonPulse() {
+        if (llLibrarySkeletonContent == null) return;
+        stopSkeletonPulse();
+        android.animation.ObjectAnimator pulse = android.animation.ObjectAnimator.ofFloat(
+                llLibrarySkeletonContent, "alpha", 1f, 0.4f);
+        pulse.setDuration(650L);
+        pulse.setRepeatMode(android.animation.ValueAnimator.REVERSE);
+        pulse.setRepeatCount(android.animation.ValueAnimator.INFINITE);
+        pulse.setInterpolator(new android.view.animation.AccelerateDecelerateInterpolator());
+        skeletonPulseAnimator = pulse;
+        pulse.start();
+    }
+    private void stopSkeletonPulse() {
+        if (skeletonPulseAnimator != null) {
+            skeletonPulseAnimator.cancel();
+            skeletonPulseAnimator = null;
+        }
+        if (llLibrarySkeletonContent != null) {
+            llLibrarySkeletonContent.setAlpha(1f);
+        }
     }
     private void onLibraryGridPrefetchComplete() {
         if (!libraryGridOverlayActive) return;
@@ -2342,6 +2368,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         libraryGridOverlayActive = false;
         libraryGridPendingCount = 0;
         mainHandler.removeCallbacks(this::dismissLibraryGridOverlay);
+        stopSkeletonPulse();
         mainHandler.post(() -> {
             if (!isAdded()) return;
             // Refresh adapter so grids appear with fade
@@ -4103,28 +4130,11 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             int selectedIndex
     ) {
         if (!isAdded() || ids.isEmpty()) return;
-        int index = Math.max(0, Math.min(selectedIndex, ids.size() - 1));
         // Play in the mini-player — do NOT auto-open the full-screen player.
-        SongPlayerFragment existingPlayer = findSongPlayerFragment();
-        if (existingPlayer != null) {
-            if (existingPlayer.isAdded()) {
-                existingPlayer.externalSetReturnTargetTag(TAG_MODULE_MUSIC);
-                existingPlayer.externalReplaceQueueFromStart(ids, titles, artists, durations, images, index, true);
-                ensureMiniPlayerShown();
-            }
-        } else {
-            SongPlayerFragment playerFragment = SongPlayerFragment.newInstance(
-                    ids,
-                    titles,
-                    artists,
-                    durations,
-                    images,
-                    index,
-                    true
-            );
-            playerFragment.externalSetReturnTargetTag(TAG_MODULE_MUSIC);
-            addSongPlayerHidden(playerFragment);
-        }
+        SongPlayerLauncher.open(
+                getActivity(), ids, titles, artists, durations, images,
+                selectedIndex, /* startPlaying = */ true, TAG_MODULE_MUSIC,
+                /* openPlayerUi = */ false, /* fromStart = */ true);
     }
     private void enqueuePlaylistTracksNext(@NonNull YouTubeMusicService.TrackResult playlistTrack) {
         fetchPlaylistTracksForQueue(playlistTrack, true);
@@ -5927,6 +5937,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         cancelPendingLibraryInlineSearch();
         lastLibraryInlineDispatchedQuery = "";
         dismissPlaylistActionTooltip();
+        stopSkeletonPulse();
         stopObservingOfflineQueue();
         normalizedFilterCache.evictAll();
         // Cancel ALL pending mainHandler callbacks to prevent leaks and stale UI updates

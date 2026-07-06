@@ -66,6 +66,12 @@ public final class PlaylistGridArtLoader {
 
     private PlaylistGridArtLoader() {}
 
+    /** Drops the in-memory composite cache under system memory pressure. The disk cache is
+     *  untouched, so composites repaint from disk instead of being rebuilt from scratch. */
+    public static void trimMemory() {
+        MEM.evictAll();
+    }
+
     /**
      * Builds a cache key from the provided URLs + target size so we can skip re-compositing
      * if the same images are already loaded.

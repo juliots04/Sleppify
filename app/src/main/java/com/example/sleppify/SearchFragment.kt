@@ -3003,56 +3003,19 @@ class SearchFragment : Fragment() {
         return parentFragmentManager.findFragmentByTag(AppConstants.TAG_SONG_PLAYER) as? SongPlayerFragment
     }
 
-    private fun showSongPlayerWithEnterAnimation(player: SongPlayerFragment) {
-        parentFragmentManager.beginTransaction()
-            .setReorderingAllowed(true)
-            .show(player)
-            .runOnCommit { player.externalAnimateEnterSlide() }
-            .commit()
-    }
-
-    private fun addSongPlayerWithEnterAnimation(player: SongPlayerFragment) {
-        parentFragmentManager.beginTransaction()
-            .setReorderingAllowed(true)
-            .add(R.id.playerContainer, player, AppConstants.TAG_SONG_PLAYER)
-            .runOnCommit { player.externalAnimateEnterSlide() }
-            .commit()
-    }
-
-    /** Adds the player attached but HIDDEN so playback starts in the mini-player, not the full
-     *  screen player. The global mini-player then appears via the snapshot event; refresh it now
-     *  so it never lags a frame behind. */
-    private fun addSongPlayerHidden(player: SongPlayerFragment) {
-        parentFragmentManager.beginTransaction()
-            .setReorderingAllowed(true)
-            .add(R.id.playerContainer, player, AppConstants.TAG_SONG_PLAYER)
-            .hide(player)
-            .runOnCommit { ensureMiniPlayerShown() }
-            .commit()
-    }
-
-    private fun ensureMiniPlayerShown() {
-        (activity as? MainActivity)?.getGlobalMiniPlayer()?.updateUi()
-    }
-
     private fun searchPlayTrackList(tracksList: List<YouTubeMusicService.TrackResult>, startIndex: Int) {
         if (!isAdded || tracksList.isEmpty()) return
         val data = extractSearchQueueData(tracksList)
         if (data.ids.isEmpty()) return
-        val safeIndex = startIndex.coerceIn(0, data.ids.size - 1)
-
         // Play in the mini-player — do NOT auto-open the full-screen player.
-        val existingPlayer = findSongPlayerFragment()
-        if (existingPlayer != null && existingPlayer.isAdded) {
-            existingPlayer.externalSetReturnTargetTag("module_search")
-            existingPlayer.externalReplaceQueue(data.ids, data.titles, data.artists, data.durations, data.images, safeIndex, true)
-            ensureMiniPlayerShown()
-            return
-        }
-
-        val playerFragment = SongPlayerFragment.newInstance(data.ids, data.titles, data.artists, data.durations, data.images, safeIndex, true)
-        playerFragment.externalSetReturnTargetTag("module_search")
-        addSongPlayerHidden(playerFragment)
+        SongPlayerLauncher.open(
+            activity,
+            data.ids, data.titles, data.artists, data.durations, data.images,
+            startIndex,
+            /* startPlaying = */ true,
+            "module_search",
+            /* openPlayerUi = */ false
+        )
     }
 
     private fun searchPlayTrackWithRadio(track: YouTubeMusicService.TrackResult) {

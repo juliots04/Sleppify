@@ -56,6 +56,11 @@ object RadioArtComposer {
 
     private val crop = YouTubeCropTransformation()
 
+    /** Drops the in-memory composite cache under system memory pressure; disk cache is untouched. */
+    fun trimMemory() {
+        memCache.evictAll()
+    }
+
     /**
      * Loads the composed radio art into [target]. Paints instantly from the memory cache when warm;
      * otherwise builds it off the main thread (disk cache first) and sets it when ready — only if the

@@ -84,6 +84,7 @@ object RadioHistoryStore {
         }
 
         prefs.edit().putString(KEY_RADIOS, JSONArray(result).toString()).apply()
+        pushToCloud(context)
     }
 
     fun getRadios(context: Context): List<RadioEntry> {
@@ -99,6 +100,7 @@ object RadioHistoryStore {
         prefs.edit().putString(KEY_RADIOS, JSONArray(filtered).toString()).apply()
         // Also unpin if pinned
         unpinRadio(context, radioPlaylistId)
+        pushToCloud(context)
     }
 
     fun isPinned(context: Context, radioPlaylistId: String): Boolean {
@@ -110,6 +112,7 @@ object RadioHistoryStore {
         val pinned = loadPinnedIds(prefs).toMutableSet()
         pinned.add(radioPlaylistId)
         prefs.edit().putString(KEY_PINNED, JSONArray(pinned.toList()).toString()).apply()
+        pushToCloud(context)
     }
 
     fun unpinRadio(context: Context, radioPlaylistId: String) {
@@ -117,7 +120,89 @@ object RadioHistoryStore {
         val pinned = loadPinnedIds(prefs).toMutableSet()
         if (pinned.remove(radioPlaylistId)) {
             prefs.edit().putString(KEY_PINNED, JSONArray(pinned.toList()).toString()).apply()
+            pushToCloud(context)
         }
+    }
+
+    // --- Cloud sync (Firestore persistence so generated radios survive a reinstall) ---
+
+    /**
+     * Pushes the whole radio history + pinned set up to Firestore. No-op when signed out (the
+     * CloudSyncManager method guards on the active user). Called on every mutation, mirroring
+     * ListenHistoryStore.record()'s on-write upload style.
+     */
+    private fun pushToCloud(context: Context) {
+        try {
+            CloudSyncManager.getInstance(context.applicationContext)
+                .syncRadiosToCloud(context.applicationContext)
+        } catch (e: Exception) {
+            Log.w("RadioHistoryStore", "syncRadiosToCloud failed", e)
+        }
+    }
+
+    /** All radio entries as a JSONArray of the raw stored objects (id, title, thumbnail, tracks, createdAt). */
+    fun exportToJson(context: Context): JSONArray {
+        return JSONArray(loadRadiosInternal(getPrefs(context)))
+    }
+
+    /** The pinned radio ids as a JSONArray. */
+    fun exportPinnedToJson(context: Context): JSONArray {
+        return JSONArray(loadPinnedIds(getPrefs(context)).toList())
+    }
+
+    /**
+     * Download side of sync (called during sign-in hydration). Merges cloud radios/pins into local:
+     * union by radioPlaylistId keeping the newer createdAt, then re-applies the pinned-aware
+     * MAX_UNPINNED cap (mirrors saveRadio). Does NOT re-upload. Empty cloud data leaves local
+     * untouched, so a fresh/empty cloud doc can never wipe existing local radios.
+     */
+    fun importFromCloud(context: Context, radiosArr: JSONArray, pinnedArr: JSONArray) {
+        val prefs = getPrefs(context)
+
+        // 1. Merge pinned ids (union of local + cloud).
+        val mergedPinned = loadPinnedIds(prefs).toMutableSet()
+        for (i in 0 until pinnedArr.length()) {
+            val id = pinnedArr.optString(i, "")
+            if (id.isNotEmpty()) mergedPinned.add(id)
+        }
+
+        // 2. Merge radio entries by id, preferring the newer createdAt.
+        val byId = LinkedHashMap<String, JSONObject>()
+        for (obj in loadRadiosInternal(prefs)) {
+            val id = obj.optString("radioPlaylistId", "")
+            if (id.isNotEmpty()) byId[id] = obj
+        }
+        for (i in 0 until radiosArr.length()) {
+            val obj = radiosArr.optJSONObject(i) ?: continue
+            val id = obj.optString("radioPlaylistId", "")
+            if (id.isEmpty()) continue
+            val existing = byId[id]
+            if (existing == null || obj.optLong("createdAt", 0L) > existing.optLong("createdAt", 0L)) {
+                byId[id] = obj
+            }
+        }
+
+        // Nothing came down and nothing local to reshuffle → leave prefs alone.
+        if (byId.isEmpty() && mergedPinned.isEmpty()) return
+
+        // 3. Recency order (newest first), then re-apply the pinned-aware cap.
+        val ordered = byId.values.sortedByDescending { it.optLong("createdAt", 0L) }
+        val result = mutableListOf<JSONObject>()
+        var unpinnedCount = 0
+        for (obj in ordered) {
+            val id = obj.optString("radioPlaylistId", "")
+            if (mergedPinned.contains(id)) {
+                result.add(obj)
+            } else if (unpinnedCount < MAX_UNPINNED) {
+                result.add(obj)
+                unpinnedCount++
+            }
+        }
+
+        prefs.edit()
+            .putString(KEY_RADIOS, JSONArray(result).toString())
+            .putString(KEY_PINNED, JSONArray(mergedPinned.toList()).toString())
+            .apply()
     }
 
     // --- Pinned playlists (any type, not just radios) ---

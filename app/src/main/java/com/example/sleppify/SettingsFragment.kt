@@ -685,31 +685,16 @@ class SettingsFragment : Fragment() {
 
     private fun playHistoryEntry(entry: ListenHistoryStore.HistoryEntry) {
         if (!isAdded) return
-        val fm = parentFragmentManager
-        if (fm.isStateSaved) return
-
-        val ids = arrayListOf(entry.videoId)
-        val titles = arrayListOf(entry.title)
-        val artists = arrayListOf(entry.artist)
-        val durations = arrayListOf("")
-        val images = arrayListOf(entry.imageUrl)
-
-        val existing = fm.findFragmentByTag(AppConstants.TAG_SONG_PLAYER) as? SongPlayerFragment
-        if (existing != null && existing.isAdded) {
-            existing.externalSetReturnTargetTag("module_settings")
-            existing.externalReplaceQueueFromStart(ids, titles, artists, durations, images, 0, true)
-        } else {
-            val player = SongPlayerFragment.newInstance(ids, titles, artists, durations, images, 0, true)
-            player.externalSetReturnTargetTag("module_settings")
-            fm.beginTransaction()
-                .setReorderingAllowed(true)
-                .add(R.id.playerContainer, player, AppConstants.TAG_SONG_PLAYER)
-                .hide(player)
-                .commit()
-        }
-
-        // Update mini-player UI
-        (activity as? MainActivity)?.getGlobalMiniPlayer()?.updateUi()
+        SongPlayerLauncher.open(
+            activity,
+            arrayListOf(entry.videoId), arrayListOf(entry.title), arrayListOf(entry.artist),
+            arrayListOf(""), arrayListOf(entry.imageUrl),
+            0,
+            /* startPlaying = */ true,
+            "module_settings",
+            /* openPlayerUi = */ false,
+            /* fromStart = */ true
+        )
     }
 
     private fun showHistoryTrackOptions(entry: ListenHistoryStore.HistoryEntry) {
@@ -901,30 +886,16 @@ class SettingsFragment : Fragment() {
 
     private fun playTopEntry(entry: PlayCountStore.PlayCountEntry) {
         if (!isAdded) return
-        val fm = parentFragmentManager
-        if (fm.isStateSaved) return
-
-        val ids = arrayListOf(entry.videoId)
-        val titles = arrayListOf(entry.title)
-        val artists = arrayListOf(entry.artist)
-        val durations = arrayListOf("")
-        val images = arrayListOf(entry.imageUrl)
-
-        val existing = fm.findFragmentByTag(AppConstants.TAG_SONG_PLAYER) as? SongPlayerFragment
-        if (existing != null && existing.isAdded) {
-            existing.externalSetReturnTargetTag("module_settings")
-            existing.externalReplaceQueueFromStart(ids, titles, artists, durations, images, 0, true)
-        } else {
-            val player = SongPlayerFragment.newInstance(ids, titles, artists, durations, images, 0, true)
-            player.externalSetReturnTargetTag("module_settings")
-            fm.beginTransaction()
-                .setReorderingAllowed(true)
-                .add(R.id.playerContainer, player, AppConstants.TAG_SONG_PLAYER)
-                .hide(player)
-                .commit()
-        }
-
-        (activity as? MainActivity)?.getGlobalMiniPlayer()?.updateUi()
+        SongPlayerLauncher.open(
+            activity,
+            arrayListOf(entry.videoId), arrayListOf(entry.title), arrayListOf(entry.artist),
+            arrayListOf(""), arrayListOf(entry.imageUrl),
+            0,
+            /* startPlaying = */ true,
+            "module_settings",
+            /* openPlayerUi = */ false,
+            /* fromStart = */ true
+        )
 
         // Fetch radio for this song and append to queue
         fetchRadioForTopEntry(entry)

@@ -299,6 +299,9 @@ class CloudSyncManager private constructor(context: Context) {
 
         // Hydrate play counts (fire-and-forget, non-blocking)
         fetchCloudPlayCounts(appContext)
+
+        // Hydrate generated radios so they reappear after a reinstall (fire-and-forget, non-blocking)
+        fetchCloudRadios(appContext)
     }
 
     fun onUserSignedOut() {
@@ -1410,6 +1413,55 @@ class CloudSyncManager private constructor(context: Context) {
             .addOnFailureListener { e -> Log.e(TAG, "Error fetching cloud listen history", e) }
     }
 
+    /**
+     * Uploads the generated radios (entries + pinned set) so they survive a reinstall. Same
+     * entries-as-JSON-string layout as play counts / listen history. RadioHistoryStore calls this
+     * on every mutation; it no-ops when signed out.
+     */
+    fun syncRadiosToCloud(context: Context) {
+        val uid = activeUserId
+        // Skip while sign-in hydration is downloading (same guard as the other upload paths): a
+        // full-list upload here could clobber cloud radios before fetchCloudRadios merges them.
+        // The local save is preserved and re-uploaded on the next mutation after hydration.
+        if (uid.isNullOrEmpty() || initialHydrationInProgress) return
+        val data = hashMapOf<String, Any>(
+            "entries" to RadioHistoryStore.exportToJson(context).toString(),
+            "pinned" to RadioHistoryStore.exportPinnedToJson(context).toString(),
+            FIELD_UPDATED_AT to com.google.firebase.firestore.FieldValue.serverTimestamp()
+        )
+        firestore.collection(USERS_COLLECTION).document(uid)
+            .collection(APP_SCOPE_COLLECTION).document(DOC_RADIOS)
+            .set(data, SetOptions.merge())
+            .addOnFailureListener { e -> Log.e(TAG, "Error syncing radios", e) }
+    }
+
+    /**
+     * Downloads the radios doc on sign-in and merges it into local (RadioHistoryStore.importFromCloud).
+     * Fired fire-and-forget during hydration; when data lands it force-refreshes Principal so the
+     * "Estaciones más escuchadas" / "Playlist recientes" carousels repopulate without navigating away.
+     */
+    fun fetchCloudRadios(context: Context) {
+        val uid = activeUserId
+        if (uid.isNullOrEmpty()) return
+        firestore.collection(USERS_COLLECTION).document(uid)
+            .collection(APP_SCOPE_COLLECTION).document(DOC_RADIOS)
+            .get()
+            .addOnSuccessListener { doc ->
+                val radiosRaw = doc.getString("entries")
+                val pinnedRaw = doc.getString("pinned")
+                if (radiosRaw.isNullOrEmpty() && pinnedRaw.isNullOrEmpty()) return@addOnSuccessListener
+                try {
+                    val radiosArr = if (radiosRaw.isNullOrEmpty()) org.json.JSONArray() else org.json.JSONArray(radiosRaw)
+                    val pinnedArr = if (pinnedRaw.isNullOrEmpty()) org.json.JSONArray() else org.json.JSONArray(pinnedRaw)
+                    RadioHistoryStore.importFromCloud(context, radiosArr, pinnedArr)
+                    MainActivity.requestPrincipalRefresh()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error parsing cloud radios", e)
+                }
+            }
+            .addOnFailureListener { e -> Log.e(TAG, "Error fetching cloud radios", e) }
+    }
+
     fun syncShortcutsToCloud(entries: List<PlayCountStore.PlayCountEntry>) {
         val uid = activeUserId
         if (uid.isNullOrEmpty() || entries.isEmpty()) return
@@ -1640,6 +1692,7 @@ class CloudSyncManager private constructor(context: Context) {
         private const val DOC_STREAMING = "streaming"
         private const val DOC_PLAY_COUNTS = "play_counts"
         private const val DOC_LISTEN_HISTORY = "listen_history"
+        private const val DOC_RADIOS = "radios"
         private const val DOC_SHORTCUTS = "shortcuts"
         private const val DOC_HOME_COVERS = "home_covers"
         private const val COLLECTION_PLAYLISTS = "playlists"

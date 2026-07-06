@@ -88,6 +88,15 @@ class AnimatedEqualizerView @JvmOverloads constructor(
         animator.cancel()
     }
 
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        // onDetachedFromWindow cancels the animator but keeps `animating` true, so a
+        // recycled/re-attached row would otherwise stay frozen: setAnimating(true) no-ops.
+        if (animating && !animator.isStarted) {
+            animator.start()
+        }
+    }
+
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
 

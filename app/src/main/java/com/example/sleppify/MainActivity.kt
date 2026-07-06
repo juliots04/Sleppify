@@ -90,6 +90,31 @@ class MainActivity : AppCompatActivity() {
         @Volatile
         private var activeInstance: WeakReference<MainActivity>? = null
 
+        /**
+         * Routes a media notification action (prev / play-pause / next) to the live activity
+         * without launching it. Returns false when no usable activity exists so the caller
+         * (MediaActionReceiver) can decide on a fallback.
+         */
+        @JvmStatic
+        fun dispatchMediaAction(action: String): Boolean {
+            val activity = activeInstance?.get() ?: return false
+            if (activity.isDestroyed || activity.isFinishing) return false
+            activity.runOnUiThread { activity.dispatchMediaNotificationAction(action) }
+            return true
+        }
+
+        /**
+         * Re-renders the Principal home carousels if the app is live and Principal is visible. Called
+         * from CloudSyncManager once cloud radio hydration lands (it arrives async, after the initial
+         * hydration pass), so restored radios appear without the user navigating away and back.
+         */
+        @JvmStatic
+        fun requestPrincipalRefresh() {
+            val activity = activeInstance?.get() ?: return
+            if (activity.isDestroyed || activity.isFinishing) return
+            activity.refreshPrincipalContentIfVisible()
+        }
+
         @JvmStatic
         fun dispatchSearchPlayback(intent: Intent): Boolean {
             val activity = activeInstance?.get() ?: return false
@@ -188,9 +213,19 @@ class MainActivity : AppCompatActivity() {
                 returnFromEqualizer()
                 return
             }
-            if (inSettings) {
-                (settingsFragment as? SettingsFragment)?.onBackPressed()
+            // Settings back-handling keyed on the fragment's REAL visibility, not the inSettings
+            // flag: when they desync (observed in the wild) the old guard swallowed the event
+            // doing nothing — back looked completely dead while Settings was on screen.
+            val settingsFrag = supportFragmentManager.findFragmentByTag(TAG_MODULE_SETTINGS) as? SettingsFragment
+            if (settingsFrag != null && settingsFrag.isAdded && !settingsFrag.isHidden) {
+                settingsFragment = settingsFrag
+                inSettings = true // self-heal the flag so returnFromSettings() can run
+                settingsFrag.onBackPressed()
                 return
+            }
+            if (inSettings) {
+                // Flag says Settings but nothing is actually visible — heal and fall through.
+                inSettings = false
             }
 
             if (handleSongPlayerBackPressed()) return
@@ -553,6 +588,12 @@ class MainActivity : AppCompatActivity() {
         cloudSyncManager.setSyncStateListener(this::setSyncOverlayVisible)
         syncAudioEffectsServiceFromPreferences(false)
 
+        // Restore the mini player from the last playback snapshot on cold start. Previously only
+        // MusicPlayerFragment did this restore, so opening the app on any other module left the
+        // mini player invisible until the user visited the Music module. Idempotent: no-ops when
+        // the player fragment already exists.
+        globalMiniPlayer?.resumePlaybackFromSnapshot(false)
+
         showMainShell()
         // AI prefetch deliberately disabled here: the only allowed triggers are
         // pull-to-refresh in the agenda and task creation (see WeeklySchedulerFragment).
@@ -787,7 +828,9 @@ class MainActivity : AppCompatActivity() {
             syncAudioEffectsServiceFromPreferences(true)
         } else {
             AudioEffectsService.sendStop(applicationContext)
-            Toast.makeText(this, "Permiso denegado para el EQ system-wide.", Toast.LENGTH_LONG).show()
+            // applicationContext, not `this`: a LENGTH_LONG Toast built with the Activity keeps
+            // ToastPresenter.mContext pointing at a destroyed MainActivity (the ~3MB heap-dump leak).
+            Toast.makeText(applicationContext, "Permiso denegado para el EQ system-wide.", Toast.LENGTH_LONG).show()
         }
     }
 
@@ -803,7 +846,8 @@ class MainActivity : AppCompatActivity() {
             } else {
                 pendingAudioProcessingAuthorization = false
                 AudioEffectsService.sendStop(applicationContext)
-                Toast.makeText(this, "Se requiere permiso de micrófono.", Toast.LENGTH_LONG).show()
+                // applicationContext, not `this`, so the Toast never retains a destroyed MainActivity.
+                Toast.makeText(applicationContext, "Se requiere permiso de micrófono.", Toast.LENGTH_LONG).show()
             }
         }
     }
@@ -1096,6 +1140,17 @@ class MainActivity : AppCompatActivity() {
         // footer selection, and re-align the footer highlight to match.
         val selectedId = settingsReturnNavItemId
         syncBottomNavSelection(selectedId)
+        // Repoint a player that was opened from INSIDE Settings (return target == module_settings) to
+        // the module we're returning to. Otherwise the stale tag survives, and later closing that
+        // player (e.g. re-opened from the mini player in Biblioteca) re-shows the still-added, hidden
+        // Settings fragment instead of the current module. Guarded on the settings tag so players
+        // opened from Music/Principal/PlaylistDetail keep their own target, and so closing the player
+        // WHILE still in Settings (before this method runs) still correctly returns to Settings.
+        (supportFragmentManager.findFragmentByTag(TAG_SONG_PLAYER) as? SongPlayerFragment)?.let { p ->
+            if (p.isAdded && p.externalGetReturnTargetTag() == TAG_MODULE_SETTINGS) {
+                moduleTagForItem(selectedId)?.let { tag -> p.externalSetReturnTargetTag(tag) }
+            }
+        }
         val target = getMainModuleFragment(selectedId) ?: getOrCreateMainModuleFragment(selectedId)
         val isNew = target?.isAdded == false
         setOverlayFullscreen(false)
@@ -1124,7 +1179,10 @@ class MainActivity : AppCompatActivity() {
     fun returnFromEqualizer() {
         inEqualizerFromSettings = false
         supportFragmentManager.popBackStackImmediate(TAG_MODULE_EQUALIZER, androidx.fragment.app.FragmentManager.POP_BACK_STACK_INCLUSIVE)
-        
+        // popBackStackImmediate is synchronous: the EqualizerFragment is already destroyed here.
+        // Null the field so the destroyed fragment (~277kB) isn't retained via the live Activity.
+        equalizerFragment = null
+
         topAppBar.visibility = View.GONE
         setSolidNavigationBar(true)
         bottomNav.visibility = View.GONE
@@ -1272,9 +1330,12 @@ class MainActivity : AppCompatActivity() {
     fun isMiniPlayerAllowedForCurrentScreen(): Boolean {
         // Mini-player only in these 4 screens — block all overlay screens
         if (inEqualizerFromSettings || inScannerFromSettings) return false
-        if (inSettings) {
-            // Allow mini-player in History and Account sub-sections
-            return (settingsFragment as? SettingsFragment)?.isHistoryOrAccountActive() == true
+        // Keyed on the Settings fragment's REAL visibility (not the inSettings flag, which can
+        // desync): with a stale flag the mini player leaked into Settings sections where it
+        // must not appear (only History and Account may show it).
+        val settingsFrag = supportFragmentManager.findFragmentByTag(TAG_MODULE_SETTINGS)
+        if (settingsFrag != null && settingsFrag.isAdded && !settingsFrag.isHidden) {
+            return (settingsFrag as? SettingsFragment)?.isHistoryOrAccountActive() == true
         }
         if (isSearchFragmentVisible()) return true
         if (isPlaylistDetailVisible()) return true
@@ -1695,6 +1756,18 @@ class MainActivity : AppCompatActivity() {
             .start()
     }
 
+    /**
+     * Hides the activity-level module loading overlay INSTANTLY (no 200ms cross-fade). Used by
+     * PlaylistDetailFragment, which shows its own identical spinner and would otherwise render two
+     * overlapping spinners during revealModuleContent()'s fade. Everyone else keeps the fade.
+     */
+    fun hideModuleLoadingOverlayImmediate() {
+        if (isFinishing || isDestroyed) return
+        moduleLoadingOverlay.animate().cancel()
+        moduleLoadingOverlay.alpha = 0f
+        moduleLoadingOverlay.visibility = View.GONE
+    }
+
     private fun markStreamingEntryAsLibrary() {
         persistStreamingScreenState(STREAM_SCREEN_LIBRARY)
         val player = supportFragmentManager.findFragmentByTag(TAG_SONG_PLAYER) as? SongPlayerFragment ?: return
@@ -1766,10 +1839,19 @@ class MainActivity : AppCompatActivity() {
             }
             commitNowAllowingStateLoss()
         }
-        // Restore bottomNav when returning to a main module
-        val isFragOwnedHeader = currentMainNavItemId == R.id.nav_music || currentMainNavItemId == R.id.nav_principal
-        topAppBar.visibility = if (isFragOwnedHeader) View.GONE else View.VISIBLE
-        bottomNav.visibility = View.VISIBLE
+        // Restore bottomNav ONLY when returning to a main module. When the player was opened
+        // from Settings (return target = the settings fragment), forcing the nav visible here
+        // painted the bottom bar over the Settings screen.
+        val returnedToSettings = fallback != null && fallback.tag == TAG_MODULE_SETTINGS
+        if (returnedToSettings) {
+            topAppBar.visibility = View.GONE
+            bottomNav.visibility = View.GONE
+            setSolidNavigationBar(true)
+        } else {
+            val isFragOwnedHeader = currentMainNavItemId == R.id.nav_music || currentMainNavItemId == R.id.nav_principal
+            topAppBar.visibility = if (isFragOwnedHeader) View.GONE else View.VISIBLE
+            bottomNav.visibility = View.VISIBLE
+        }
         PlaybackEventBus.notifyPlaybackSnapshotUpdated()
     }
 
@@ -1832,6 +1914,8 @@ class MainActivity : AppCompatActivity() {
         if (!eq.isAdded || eq.isHidden || isFinishing || isDestroyed) return
         supportFragmentManager.popBackStackImmediate(TAG_MODULE_EQUALIZER, androidx.fragment.app.FragmentManager.POP_BACK_STACK_INCLUSIVE)
         inEqualizerFromSettings = false
+        // Release the just-destroyed EqualizerFragment (see returnFromEqualizer): both close paths pop.
+        equalizerFragment = null
     }
 
     private fun handlePlaylistDetailBackPressed(): Boolean {

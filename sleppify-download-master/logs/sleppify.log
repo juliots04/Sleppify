@@ -1,0 +1,83 @@
+2026-07-05 20:01:51,392 INFO [YDL_OPTS] player_clients=default pot=http:http://127.0.0.1:4416 cookies=none
+2026-07-05 20:01:53,303 INFO [YDL_OPTS] player_clients=default pot=http:http://127.0.0.1:4416 cookies=none
+2026-07-05 20:02:10,564 INFO [YDL_OPTS] player_clients=default pot=http:http://127.0.0.1:4416 cookies=none
+2026-07-05 20:02:12,108 INFO [YDL_OPTS] player_clients=default pot=http:http://127.0.0.1:4416 cookies=none
+2026-07-05 20:02:12,109 INFO [VIDEO] start want=audio fmt=bestaudio[ext=m4a]/bestaudio/best url=https://www.youtube.com/watch?v=dQw4w9WgXcQ yt_dlp=2026.06.09 clients=None
+2026-07-05 20:02:13,696 ERROR [VIDEO] error url=https://www.youtube.com/watch?v=dQw4w9WgXcQ err=ERROR: unable to download video data: HTTP Error 403: Forbidden
+Traceback (most recent call last):
+  File "C:\Users\julio\AppData\Local\Programs\Python\Python314\Lib\site-packages\yt_dlp\YoutubeDL.py", line 3574, in process_info
+    success, real_download = self.dl(temp_filename, info_dict)
+                             ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\julio\AppData\Local\Programs\Python\Python314\Lib\site-packages\yt_dlp\YoutubeDL.py", line 3313, in dl
+    return fd.download(name, new_info, subtitle)
+           ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\julio\AppData\Local\Programs\Python\Python314\Lib\site-packages\yt_dlp\downloader\common.py", line 480, in download
+    ret = self.real_download(filename, info_dict)
+  File "C:\Users\julio\AppData\Local\Programs\Python\Python314\Lib\site-packages\yt_dlp\downloader\http.py", line 362, in real_download
+    establish_connection()
+    ~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\julio\AppData\Local\Programs\Python\Python314\Lib\site-packages\yt_dlp\downloader\http.py", line 119, in establish_connection
+    ctx.data = self.ydl.urlopen(request)
+               ~~~~~~~~~~~~~~~~^^^^^^^^^
+  File "C:\Users\julio\AppData\Local\Programs\Python\Python314\Lib\site-packages\yt_dlp\YoutubeDL.py", line 4290, in urlopen
+    return self._request_director.send(req)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^
+  File "C:\Users\julio\AppData\Local\Programs\Python\Python314\Lib\site-packages\yt_dlp\networking\common.py", line 117, in send
+    response = handler.send(request)
+  File "C:\Users\julio\AppData\Local\Programs\Python\Python314\Lib\site-packages\yt_dlp\networking\_helper.py", line 194, in wrapper
+    return func(self, *args, **kwargs)
+  File "C:\Users\julio\AppData\Local\Programs\Python\Python314\Lib\site-packages\yt_dlp\networking\common.py", line 359, in send
+    return self._send(request)
+           ~~~~~~~~~~^^^^^^^^^
+  File "C:\Users\julio\AppData\Local\Programs\Python\Python314\Lib\site-packages\yt_dlp\networking\_requests.py", line 361, in _send
+    raise HTTPError(res, redirect_loop=max_redirects_exceeded)
+yt_dlp.networking.exceptions.HTTPError: HTTP Error 403: Forbidden
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "c:\Users\julio\Music\Sleppify\sleppify-download-master\app.py", line 271, in api_video
+    ydl.download([youtube_url])
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^
+  File "C:\Users\julio\AppData\Local\Programs\Python\Python314\Lib\site-packages\yt_dlp\YoutubeDL.py", line 3700, in download
+    self.__download_wrapper(self.extract_info)(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        url, force_generic_extractor=self.params.get('force_generic_extractor', False))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\julio\AppData\Local\Programs\Python\Python314\Lib\site-packages\yt_dlp\YoutubeDL.py", line 3673, in wrapper
+    res = func(*args, **kwargs)
+  File "C:\Users\julio\AppData\Local\Programs\Python\Python314\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1715, in extract_info
+    return self.__extract_info(url, self.get_info_extractor(key), download, extra_info, process)
+           ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\julio\AppData\Local\Programs\Python\Python314\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1726, in wrapper
+    return func(self, *args, **kwargs)
+  File "C:\Users\julio\AppData\Local\Programs\Python\Python314\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1882, in __extract_info
+    return self.process_ie_result(ie_result, download, extra_info)
+           ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\julio\AppData\Local\Programs\Python\Python314\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1941, in process_ie_result
+    ie_result = self.process_video_result(ie_result, download=download)
+  File "C:\Users\julio\AppData\Local\Programs\Python\Python314\Lib\site-packages\yt_dlp\YoutubeDL.py", line 3124, in process_video_result
+    self.process_info(new_info)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "C:\Users\julio\AppData\Local\Programs\Python\Python314\Lib\site-packages\yt_dlp\YoutubeDL.py", line 190, in wrapper
+    return func(self, *args, **kwargs)
+  File "C:\Users\julio\AppData\Local\Programs\Python\Python314\Lib\site-packages\yt_dlp\YoutubeDL.py", line 3583, in process_info
+    self.report_error(f'unable to download video data: {err}')
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\julio\AppData\Local\Programs\Python\Python314\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1160, in report_error
+    self.trouble(f'{self._format_err("ERROR:", self.Styles.ERROR)} {message}', *args, **kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\julio\AppData\Local\Programs\Python\Python314\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1099, in trouble
+    raise DownloadError(message, exc_info)
+yt_dlp.utils.DownloadError: ERROR: unable to download video data: HTTP Error 403: Forbidden
+
+2026-07-05 20:02:57,889 INFO [YDL_OPTS] player_clients=default pot=http:http://127.0.0.1:4416 cookies=none
+2026-07-05 20:02:57,889 INFO [VIDEO] start want=audio fmt=bestaudio[ext=m4a]/bestaudio/best url=https://www.youtube.com/watch?v=dQw4w9WgXcQ yt_dlp=2026.06.09 clients=None
+2026-07-05 20:02:59,882 INFO [VIDEO] success want=audio url=https://www.youtube.com/watch?v=dQw4w9WgXcQ size=3449447
+2026-07-05 20:02:59,963 INFO [YDL_OPTS] player_clients=default pot=http:http://127.0.0.1:4416 cookies=none
+2026-07-05 20:02:59,964 INFO [VIDEO] start want=audio fmt=bestaudio[ext=m4a]/bestaudio/best url=https://www.youtube.com/watch?v=dQw4w9WgXcQ yt_dlp=2026.06.09 clients=None
+2026-07-05 20:03:01,730 INFO [VIDEO] success want=audio url=https://www.youtube.com/watch?v=dQw4w9WgXcQ size=3449447
+2026-07-05 20:03:01,806 INFO [YDL_OPTS] player_clients=default pot=http:http://127.0.0.1:4416 cookies=none
+2026-07-05 20:03:01,806 INFO [VIDEO] start want=audio fmt=bestaudio[ext=m4a]/bestaudio/best url=https://www.youtube.com/watch?v=dQw4w9WgXcQ yt_dlp=2026.06.09 clients=None
+2026-07-05 20:03:03,509 INFO [VIDEO] success want=audio url=https://www.youtube.com/watch?v=dQw4w9WgXcQ size=3449447
+2026-07-05 20:07:07,664 INFO [YDL_OPTS] player_clients=default pot=script:C:/Program Files/Git/home/user/bgutil/server/build/generate_once.js cookies=none proxy=yes

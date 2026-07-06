@@ -101,6 +101,12 @@
             android:exported="false"
             android:foregroundServiceType="mediaPlayback" />
 
+        <!-- In-process target for the media notification buttons: handles prev/play-pause/next
+             without bringing the activity to the foreground (see MediaActionReceiver). -->
+        <receiver
+            android:name=".MediaActionReceiver"
+            android:exported="false" />
+
         <receiver android:name=".BootReceiver"
             android:exported="true">
             <intent-filter>

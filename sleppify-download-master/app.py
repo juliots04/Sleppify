@@ -30,24 +30,79 @@ logger.addHandler(logging.StreamHandler())
 import contextlib
 import tempfile
 
+# ─────────────────────────── PO token / anti-bot config ───────────────────────────
+# The old code hard-coded player_client=['tv_embedded','web_embedded'] AND po_token=[],
+# which DISABLES PO tokens. On a datacenter IP (alwaysdata) that yields the classic
+# "[youtube+GetPOT] Requested format is not available" / "confirm you're not a bot" errors.
+#
+# The fix: let the bgutil PO-token provider supply GVS PO tokens automatically.
+#  - HTTP mode:   a Node server on :4416  -> extractor_arg youtubepot-bgutilhttp:base_url
+#  - Script mode: a built generate_once.js -> extractor_arg youtubepot-bgutilscript:script_path
+# Install the plugin on the host with:  pip install bgutil-ytdlp-pot-provider
+# and stand up ONE of the two providers (see SETUP_POTOKEN.md).
+#
+# Everything below is env-tunable so the same code runs on every host without edits.
+
+# Player clients. "default" lets yt-dlp pick (best forward-compat, works once a PO
+# provider is reachable). Override per host, e.g. YT_PLAYER_CLIENTS="web,web_music,tv".
+_PLAYER_CLIENTS_ENV = os.environ.get('YT_PLAYER_CLIENTS', 'default').strip()
+
+# bgutil HTTP provider base URL (leave default to match the /api/health probe on :4416).
+_POT_BASE_URL = os.environ.get('BGUTIL_POT_BASE_URL', 'http://127.0.0.1:4416').strip()
+# bgutil script-mode path (set this INSTEAD of a server on hosts with no long-running
+# process, e.g. alwaysdata). Points at .../server/build/generate_once.js.
+_POT_SCRIPT_PATH = os.environ.get('BGUTIL_POT_SCRIPT', '').strip()
+
+# Egress proxy. THIS is the load-bearing fix for datacenter-IP bot blocks and for
+# region-locked videos: a PO token does NOT lift a datacenter-IP block on its own
+# (per yt-dlp maintainers) — you must egress through a residential/mobile IP or WARP,
+# and generate the PO token through that SAME egress. Set e.g.
+#   YTDLP_PROXY=http://user:pass@host:port   or   socks5://127.0.0.1:40000  (WARP)
+# For region unblock, the proxy exit must be in an allowed country.
+_YTDLP_PROXY = os.environ.get('YTDLP_PROXY', '').strip()
+
+
 @contextlib.contextmanager
 def get_ydl_opts(request_headers=None):
-    player_clients = ['tv_embedded', 'web_embedded']
-    logger.info(f"[YDL_OPTS] player_clients={player_clients} cookies=none getpot=disabled")
+    extractor_args = {
+        'youtubetab': {'skip': ['webpage']},
+    }
+
+    # Player client selection (omit entirely when "default" so yt-dlp chooses).
+    player_clients = None
+    if _PLAYER_CLIENTS_ENV and _PLAYER_CLIENTS_ENV.lower() != 'default':
+        player_clients = [c.strip() for c in _PLAYER_CLIENTS_ENV.split(',') if c.strip()]
+        extractor_args['youtube'] = {'player_client': player_clients}
+        # NOTE: intentionally NOT setting 'po_token': [] — that is what disabled PO tokens.
+
+    # Wire the bgutil PO-token provider. Script mode takes priority if a path is given,
+    # otherwise HTTP mode (both keys are harmless if the plugin isn't installed).
+    if _POT_SCRIPT_PATH:
+        extractor_args['youtubepot-bgutilscript'] = {'script_path': [_POT_SCRIPT_PATH]}
+        pot_mode = f'script:{_POT_SCRIPT_PATH}'
+    else:
+        extractor_args['youtubepot-bgutilhttp'] = {'base_url': [_POT_BASE_URL]}
+        pot_mode = f'http:{_POT_BASE_URL}'
+
+    cookies_on = os.path.isfile(_COOKIES_PATH)
+    logger.info(f"[YDL_OPTS] player_clients={player_clients or 'default'} pot={pot_mode} cookies={'yes' if cookies_on else 'none'} proxy={'yes' if _YTDLP_PROXY else 'no'}")
+
     opts = {
-        'extractor_args': {
-            'youtube': {
-                'player_client': player_clients,
-                'po_token': [],
-            },
-            'youtubetab': {'skip': ['webpage']},
-        },
+        'extractor_args': extractor_args,
         'quiet': False,
         'no_warnings': False,
         'no_playlist': True,
         'verbose': True,
         'compat_opts': {'no-youtube-unavailable-videos'},
     }
+
+    # Use cookies.txt when present (a logged-in account further reduces bot checks).
+    if cookies_on:
+        opts['cookiefile'] = _COOKIES_PATH
+
+    # Route all yt-dlp traffic through the egress proxy when configured.
+    if _YTDLP_PROXY:
+        opts['proxy'] = _YTDLP_PROXY
 
     try:
         yield opts
@@ -157,7 +212,9 @@ def api_info():
         "cookies_path": _COOKIES_PATH,
         "cookies_present": cookies_present,
         "cookies_size_bytes": cookies_size,
-        "player_clients": ["android", "ios"],
+        "player_clients": _PLAYER_CLIENTS_ENV,
+        "pot_mode": ("script:" + _POT_SCRIPT_PATH) if _POT_SCRIPT_PATH else ("http:" + _POT_BASE_URL),
+        "proxy_configured": bool(_YTDLP_PROXY),
         "video_format": VIDEO_FORMAT,
     })
 
@@ -380,28 +437,41 @@ def api_health():
     except Exception:
         version = "unknown"
 
-    # Check bgutil POT server (try IPv6 first, then IPv4)
-    bgutil_ok = False
-    for family, addr in [(_socket.AF_INET6, '::1'), (_socket.AF_INET, '127.0.0.1')]:
+    # PO-token provider status. Script mode needs no server, just the built script;
+    # HTTP mode needs the Node server reachable (default :4416 from BGUTIL_POT_BASE_URL).
+    if _POT_SCRIPT_PATH:
+        pot_ok = os.path.isfile(_POT_SCRIPT_PATH)
+        pot_status = f"script:{'ok' if pot_ok else 'missing'}"
+    else:
+        # Derive host/port from the configured base URL (default http://127.0.0.1:4416).
         try:
-            s = _socket.socket(family, _socket.SOCK_STREAM)
-            s.settimeout(1)
-            s.connect((addr, 4416))
-            s.close()
-            bgutil_ok = True
-            break
+            from urllib.parse import urlparse
+            _u = urlparse(_POT_BASE_URL)
+            _host, _port = (_u.hostname or '127.0.0.1'), (_u.port or 4416)
         except Exception:
-            pass
+            _host, _port = '127.0.0.1', 4416
+        pot_ok = False
+        for family, addr in [(_socket.AF_INET6, '::1'), (_socket.AF_INET, _host)]:
+            try:
+                s = _socket.socket(family, _socket.SOCK_STREAM)
+                s.settimeout(1)
+                s.connect((addr, _port))
+                s.close()
+                pot_ok = True
+                break
+            except Exception:
+                pass
+        pot_status = f"http:{'running' if pot_ok else 'not_running'}"
 
     cookies_present = os.path.isfile(_COOKIES_PATH)
 
     return jsonify({
-        "status": "ok" if bgutil_ok else "degraded",
+        "status": "ok" if pot_ok else "degraded",
         "yt_dlp_version": version,
-        "bgutil_pot_server": "running" if bgutil_ok else "not_running",
+        "bgutil_pot_provider": pot_status,
         "cookies_present": cookies_present,
         "cookies_path": _COOKIES_PATH,
-        "player_clients": ["android", "ios"],
+        "player_clients": _PLAYER_CLIENTS_ENV,
     })
 
 

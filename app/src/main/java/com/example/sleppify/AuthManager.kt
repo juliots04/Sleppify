@@ -106,7 +106,10 @@ class AuthManager private constructor(context: Context) {
             .addCredentialOption(googleIdOption)
             .build()
 
-        val cm = CredentialManager.create(activity)
+        // applicationContext: the Play Services controller caches the create() context
+        // (LeakCanary: CredentialProviderBeginSignInController.context -> destroyed MainActivity).
+        // Only getCredentialAsync's first argument needs the real Activity (for the UI launch).
+        val cm = CredentialManager.create(activity.applicationContext)
         cm.getCredentialAsync(
             activity,
             request,
@@ -312,7 +315,10 @@ class AuthManager private constructor(context: Context) {
             .addCredentialOption(googleIdOption)
             .build()
 
-        val cm = CredentialManager.create(activity)
+        // applicationContext: the Play Services controller caches the create() context
+        // (LeakCanary: CredentialProviderBeginSignInController.context -> destroyed MainActivity).
+        // Only getCredentialAsync's first argument needs the real Activity (for the UI launch).
+        val cm = CredentialManager.create(activity.applicationContext)
         cm.getCredentialAsync(
             activity,
             request,
@@ -361,7 +367,7 @@ class AuthManager private constructor(context: Context) {
 
     private fun clearCredentialState(context: Context, callback: SimpleCallback) {
         try {
-            val cm = CredentialManager.create(context)
+            val cm = CredentialManager.create(context.applicationContext)
             cm.clearCredentialStateAsync(
                 ClearCredentialStateRequest(),
                 null,

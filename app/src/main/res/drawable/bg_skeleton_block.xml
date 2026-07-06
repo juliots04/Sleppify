@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Placeholder block for library skeleton loading state. Uses surface_high so it reads as a
+     slightly-lighter block over the surface_dark skeleton background, matching the existing
+     vLoadingPlaceholder idiom (item_recent_search_image.xml). -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="@color/surface_high" />
+    <corners android:radius="8dp" />
+</shape>

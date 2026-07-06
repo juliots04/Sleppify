@@ -21,11 +21,14 @@ class PlaybackHistoryStore private constructor() {
 
     class Snapshot @JvmOverloads constructor(
         queue: List<QueueTrack>,
-        @JvmField val currentIndex: Int,
-        @JvmField val currentSeconds: Int,
-        @JvmField val totalSeconds: Int,
-        @JvmField val isPlaying: Boolean,
-        @JvmField val updatedAtMs: Long,
+        // Scalars are mutable so the cached parsed snapshot can be refreshed in place from the
+        // primitive prefs (persisted separately from the queue JSON) without re-parsing or
+        // re-copying the queue lists. Consumers use snapshots transiently on the main thread.
+        @JvmField var currentIndex: Int,
+        @JvmField var currentSeconds: Int,
+        @JvmField var totalSeconds: Int,
+        @JvmField var isPlaying: Boolean,
+        @JvmField var updatedAtMs: Long,
         originalQueue: List<QueueTrack>? = null
     ) {
         @JvmField
@@ -51,6 +54,16 @@ class PlaybackHistoryStore private constructor() {
     companion object {
         private const val PREFS_NAME = "playback_history_store"
         private const val KEY_SNAPSHOT_JSON = "snapshot_json"
+
+        // Scalars live OUTSIDE the queue JSON: they change every few seconds during playback,
+        // and embedding them in the JSON invalidated the parse cache on every persist — forcing
+        // the mini-player's periodic load() to re-parse the whole queue on the main thread.
+        private const val KEY_CURRENT_INDEX = "cur_index"
+        private const val KEY_CURRENT_SECONDS = "cur_seconds"
+        private const val KEY_TOTAL_SECONDS = "total_seconds"
+        private const val KEY_IS_PLAYING = "is_playing"
+        private const val KEY_UPDATED_AT = "updated_at_ms"
+
         private val IO_EXECUTOR: ExecutorService = Executors.newSingleThreadExecutor()
         private val CACHE_LOCK = Any()
 
@@ -59,6 +72,11 @@ class PlaybackHistoryStore private constructor() {
 
         @Volatile
         private var cachedSnapshot: Snapshot = emptySnapshot()
+
+        /** Identity of the persisted queue contents (ids + sizes). When unchanged, save() skips
+         *  re-serializing the queue JSON entirely and only writes the scalar prefs. */
+        @Volatile
+        private var cachedQueueSignature: Long = Long.MIN_VALUE
 
         @JvmStatic
         fun load(context: Context): Snapshot {
@@ -70,21 +88,27 @@ class PlaybackHistoryStore private constructor() {
                 synchronized(CACHE_LOCK) {
                     cachedRawSnapshot = ""
                     cachedSnapshot = empty
+                    cachedQueueSignature = Long.MIN_VALUE
                 }
                 return empty
             }
 
             synchronized(CACHE_LOCK) {
-                if (TextUtils.equals(raw, cachedRawSnapshot)) {
+                if (TextUtils.equals(raw, cachedRawSnapshot) && cachedSnapshot.queue.isNotEmpty()) {
+                    // Queue JSON unchanged — refresh only the scalars (persisted separately) and
+                    // reuse the already-parsed snapshot. No JSON parse, no list copies.
+                    applyScalarPrefs(prefs, cachedSnapshot)
                     return cachedSnapshot
                 }
             }
 
             return try {
                 val parsed = parseSnapshot(raw)
+                applyScalarPrefs(prefs, parsed)
                 synchronized(CACHE_LOCK) {
                     cachedRawSnapshot = raw
                     cachedSnapshot = parsed
+                    cachedQueueSignature = queueSignature(parsed.queue, parsed.originalQueue)
                 }
                 parsed
             } catch (e: Exception) {
@@ -92,9 +116,35 @@ class PlaybackHistoryStore private constructor() {
                 synchronized(CACHE_LOCK) {
                     cachedRawSnapshot = ""
                     cachedSnapshot = emptySnapshot()
+                    cachedQueueSignature = Long.MIN_VALUE
                 }
                 emptySnapshot()
             }
+        }
+
+        /** Overlays the separately-persisted scalar prefs onto [snapshot]. No-ops for legacy data
+         *  (scalars embedded in the JSON only) so old snapshots keep working untouched. */
+        private fun applyScalarPrefs(prefs: android.content.SharedPreferences, snapshot: Snapshot) {
+            if (snapshot.queue.isEmpty() || !prefs.contains(KEY_UPDATED_AT)) return
+            snapshot.currentIndex = prefs.getInt(KEY_CURRENT_INDEX, snapshot.currentIndex)
+                .coerceIn(0, snapshot.queue.size - 1)
+            snapshot.currentSeconds = prefs.getInt(KEY_CURRENT_SECONDS, snapshot.currentSeconds).coerceAtLeast(0)
+            snapshot.totalSeconds = prefs.getInt(KEY_TOTAL_SECONDS, snapshot.totalSeconds).coerceAtLeast(1)
+            snapshot.isPlaying = prefs.getBoolean(KEY_IS_PLAYING, snapshot.isPlaying)
+            snapshot.updatedAtMs = prefs.getLong(KEY_UPDATED_AT, snapshot.updatedAtMs)
+        }
+
+        /** Cheap identity of the queue contents: sizes + videoId hashes. Collisions are
+         *  astronomically unlikely (64-bit), and a false hit only skips a redundant JSON write. */
+        private fun queueSignature(queue: List<QueueTrack>, originalQueue: List<QueueTrack>?): Long {
+            var h = 1125899906842597L
+            h = h * 31 + queue.size
+            for (t in queue) h = h * 31 + t.videoId.hashCode()
+            if (originalQueue != null && originalQueue !== queue) {
+                h = h * 31 + originalQueue.size
+                for (t in originalQueue) h = h * 31 + t.videoId.hashCode()
+            }
+            return h
         }
 
         @JvmStatic
@@ -145,6 +195,39 @@ class PlaybackHistoryStore private constructor() {
 
             val task = Runnable {
                 try {
+                    val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    val signature = queueSignature(queue, originalQueue)
+
+                    val queueUnchanged: Boolean
+                    synchronized(CACHE_LOCK) {
+                        queueUnchanged = signature == cachedQueueSignature && cachedSnapshot.queue.isNotEmpty()
+                    }
+
+                    if (queueUnchanged) {
+                        // Queue identical to what is already persisted: write ONLY the scalars.
+                        // KEY_SNAPSHOT_JSON stays byte-identical, so load()'s parse cache keeps
+                        // hitting — no JSON serialization here, no JSON parse on the readers.
+                        // commit() (not apply()) for the same crash-safety reason as below.
+                        prefs.edit()
+                            .putInt(KEY_CURRENT_INDEX, safeIndex)
+                            .putInt(KEY_CURRENT_SECONDS, safeCurrentSeconds)
+                            .putInt(KEY_TOTAL_SECONDS, safeTotalSeconds)
+                            .putBoolean(KEY_IS_PLAYING, isPlaying)
+                            .putLong(KEY_UPDATED_AT, updatedAtMs)
+                            .commit()
+                        synchronized(CACHE_LOCK) {
+                            val cached = cachedSnapshot
+                            if (cached.queue.isNotEmpty()) {
+                                cached.currentIndex = safeIndex.coerceIn(0, cached.queue.size - 1)
+                                cached.currentSeconds = safeCurrentSeconds
+                                cached.totalSeconds = safeTotalSeconds
+                                cached.isPlaying = isPlaying
+                                cached.updatedAtMs = updatedAtMs
+                            }
+                        }
+                        return@Runnable
+                    }
+
                     val queueCopy = copyQueue(queue)
                     val origCopy = if (originalQueue != null) copyQueue(originalQueue) else null
                     val snapshot = Snapshot(
@@ -162,28 +245,27 @@ class PlaybackHistoryStore private constructor() {
                         return@Runnable
                     }
 
-                    synchronized(CACHE_LOCK) {
-                        if (TextUtils.equals(raw, cachedRawSnapshot)) {
-                            cachedSnapshot = snapshot
-                            return@Runnable
-                        }
-                    }
-
-                    val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                    val editor = prefs.edit().putString(KEY_SNAPSHOT_JSON, raw)
                     // Always use commit() — this task runs on IO_EXECUTOR (background thread),
                     // so commit() does NOT block the UI thread. Using apply() here is unsafe:
                     // apply() defers the disk write to the main thread's message queue, which
                     // means a crash or force-kill can discard the pending write before it ever
                     // reaches disk — resulting in the mini-player showing 0:00 on next launch.
-                    editor.commit()
+                    prefs.edit()
+                        .putString(KEY_SNAPSHOT_JSON, raw)
+                        .putInt(KEY_CURRENT_INDEX, safeIndex)
+                        .putInt(KEY_CURRENT_SECONDS, safeCurrentSeconds)
+                        .putInt(KEY_TOTAL_SECONDS, safeTotalSeconds)
+                        .putBoolean(KEY_IS_PLAYING, isPlaying)
+                        .putLong(KEY_UPDATED_AT, updatedAtMs)
+                        .commit()
 
                     synchronized(CACHE_LOCK) {
                         cachedRawSnapshot = raw
                         cachedSnapshot = snapshot
+                        cachedQueueSignature = signature
                     }
                 } catch (e: Exception) {
-                    Log.w("PlaybackHistStore", "Failed to parse playback snapshot", e)
+                    Log.w("PlaybackHistStore", "Failed to persist playback snapshot", e)
                 }
             }
 

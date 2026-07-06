@@ -241,11 +241,17 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         if (isHidden) return
         vpShortcuts?.setCurrentItem(0, false)
         vpCovers?.setCurrentItem(0, false)
-        refreshFragHeaderProfilePhoto()
-        refreshShortcuts()
-        refreshCovers()
-        refreshRadios()
-        refreshPlaylists()
+        // Defer the carousel rebuilds past the resume frame: the retained views already show
+        // the previous content, so the return feels instant and the refreshes trickle in.
+        handler.postDelayed({
+            if (isAdded && !isHidden) {
+                refreshFragHeaderProfilePhoto()
+                refreshShortcuts()
+                refreshCovers()
+                refreshRadios()
+                refreshPlaylists()
+            }
+        }, 150)
     }
 
     override fun onPause() {
@@ -292,13 +298,21 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             // Always reset to first page when re-entering
             vpShortcuts?.setCurrentItem(0, false)
             vpCovers?.setCurrentItem(0, false)
+            // Rebuilding all four carousels synchronously here is what made switching to
+            // Principal feel slow — the switch frame paid for every adapter rebuild + Glide
+            // bind at once. The kept-alive views still show the previous content, so defer
+            // the refreshes past the module-switch frame and let them trickle in.
             handler.postDelayed({
                 if (isAdded && !isHidden) refreshShortcuts()
             }, 200)
-            refreshFragHeaderProfilePhoto()
-            refreshCovers()
-            refreshRadios()
-            refreshPlaylists()
+            handler.postDelayed({
+                if (isAdded && !isHidden) {
+                    refreshFragHeaderProfilePhoto()
+                    refreshCovers()
+                    refreshRadios()
+                    refreshPlaylists()
+                }
+            }, 120)
         }
     }
 
@@ -743,21 +757,14 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         if (!isAdded || tracks.isEmpty()) return
         val data = extractQueueData(tracks)
         if (data.ids.isEmpty()) return
-        val safeIndex = startIndex.coerceIn(0, data.ids.size - 1)
-
-        (activity as? MainActivity)?.getGlobalMiniPlayer()?.animateOut()
-
-        val existingPlayer = findSongPlayerFragment()
-        if (existingPlayer != null && existingPlayer.isAdded) {
-            existingPlayer.externalSetReturnTargetTag("module_principal")
-            existingPlayer.externalReplaceQueue(data.ids, data.titles, data.artists, data.durations, data.images, safeIndex, true)
-            showSongPlayerWithEnterAnimation(existingPlayer)
-            return
-        }
-
-        val playerFragment = SongPlayerFragment.newInstance(data.ids, data.titles, data.artists, data.durations, data.images, safeIndex, true)
-        playerFragment.externalSetReturnTargetTag("module_principal")
-        addSongPlayerWithEnterAnimation(playerFragment)
+        SongPlayerLauncher.open(
+            activity,
+            data.ids, data.titles, data.artists, data.durations, data.images,
+            startIndex,
+            /* startPlaying = */ true,
+            "module_principal",
+            /* openPlayerUi = */ true
+        )
     }
 
     private fun onShortcutClicked(entry: PlayCountStore.PlayCountEntry) {
@@ -1009,21 +1016,8 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         return (prefs.getString(PREF_LAST_YOUTUBE_WEB_COOKIE, "") ?: "").trim()
     }
 
-    private fun showSongPlayerWithEnterAnimation(player: SongPlayerFragment) {
-        parentFragmentManager.beginTransaction()
-            .setReorderingAllowed(true)
-            .show(player)
-            .runOnCommit { player.externalAnimateEnterSlide() }
-            .commit()
-    }
-
-    private fun addSongPlayerWithEnterAnimation(player: SongPlayerFragment) {
-        parentFragmentManager.beginTransaction()
-            .setReorderingAllowed(true)
-            .add(R.id.playerContainer, player, TAG_SONG_PLAYER)
-            .runOnCommit { player.externalAnimateEnterSlide() }
-            .commit()
-    }
+    // "Open the player with a queue" now goes through SongPlayerLauncher — the transaction
+    // helpers that used to live here (and in SearchFragment) were per-fragment duplicates.
 
 
     // ========== Cache Covers ==========

@@ -9,6 +9,12 @@ object AppConstants {
 
     const val MEDIA_NOTIFICATION_ID = 11031
 
+    // Single Sleppify proxy/download host — the one place to change if the hosting moves.
+    // (Was a 3-server round-robin across alwaysdata copies; collapsed to a single host.)
+    // Streaming:  "$PROXY_BASE_URL/api/stream/<videoId>"
+    // Download:   "$PROXY_BASE_URL/api/descarga"
+    const val PROXY_BASE_URL = "https://sleppifydownload.alwaysdata.net"
+
     // Single source of truth for the full-screen player's fragment tag. It used to be a raw
     // "song_player" literal duplicated across ~15 sites plus three separate local constants — a
     // typo in any one silently made findFragmentByTag() miss and add a DUPLICATE player fragment.

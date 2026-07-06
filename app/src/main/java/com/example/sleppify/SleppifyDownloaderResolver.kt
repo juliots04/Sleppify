@@ -12,26 +12,21 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.locks.ReentrantLock
 
 /**
- * Downloads video via three parallel Sleppify proxy servers.
- *
- * Server 0: sleppifydownloader.alwaysdata.net
- * Server 1: sleppifydownload2.alwaysdata.net
- * Server 2: sleppifydownloader2.alwaysdata.net
- *
- * Supports resumable downloads via HTTP Range header — partial files
- * are continued from where they left off instead of restarting.
+ * Downloads a track for offline use from the single Sleppify proxy host
+ * ([AppConstants.PROXY_BASE_URL]) via its /api/descarga endpoint: the server fetches the track
+ * server-side (yt-dlp) and streams the finished mp4 back with a Content-Length.
  */
 object SleppifyDownloaderResolver {
 
     private const val TAG = "SleppifyDL"
 
-    private val VIDEO_ENDPOINTS = arrayOf(
-        "https://sleppifydownload.alwaysdata.net/api/video",
-        "https://sleppifydownload2.alwaysdata.net/api/video",
-        "https://sleppifydownloader2.alwaysdata.net/api/video"
-    )
+    // Single host now (was a 3-server round-robin). One endpoint, retried on transient errors.
+    private val DOWNLOAD_ENDPOINT = "${AppConstants.PROXY_BASE_URL}/api/descarga"
 
-    const val SERVER_COUNT = 3
+    // Kept so existing callers that do `index % SERVER_COUNT` collapse to 0 (single host).
+    const val SERVER_COUNT = 1
+
+    private const val MAX_ATTEMPTS = 2
 
     private const val CONNECT_TIMEOUT_MS = 10000
     private const val VIDEO_READ_TIMEOUT_MS = 120000
@@ -43,21 +38,18 @@ object SleppifyDownloaderResolver {
         downloadLocks.computeIfAbsent(videoId) { ReentrantLock() }
 
     /**
-     * Downloads [videoId] for offline use into [targetFile] by asking the Sleppify proxy servers to
-     * fetch it server-side (yt-dlp) and stream it back. The track's assigned server is [serverIndex]
-     * (round-robin across a playlist so the 3 servers share the load); if it fails we fall back to
-     * the other two before giving up, so one slow/busy/down proxy never fails a track.
+     * Downloads [videoId] for offline use into [targetFile] by asking the single Sleppify proxy host
+     * to fetch it server-side (yt-dlp) and stream it back. Retried up to [MAX_ATTEMPTS] times on a
+     * transient error / busy (503). [serverIndex] is kept for source compatibility and ignored.
      *
-     * Downloads VIDEO mp4 (the server falls back to audio-only for tracks that have no real video,
-     * e.g. plain songs, so those stay light). The player decides per file whether to present it as
-     * video (offline file with a video track → black, full-bleed) or as music (cover + backdrop).
-     * Returns true on success, false if all servers failed.
+     * Downloads VIDEO mp4 (the server falls back to audio-only for tracks with no real video, so
+     * plain songs stay light). Returns true on success, false if every attempt failed.
      */
     fun downloadVideoViaProxy(
         context: Context,
         videoId: String,
         targetFile: File,
-        serverIndex: Int = 0,
+        @Suppress("UNUSED_PARAMETER") serverIndex: Int = 0,
         onProgress: ((Float) -> Unit)? = null
     ): Boolean {
         if (videoId.isBlank()) return false
@@ -82,19 +74,18 @@ object SleppifyDownloaderResolver {
                 .toByteArray(StandardCharsets.UTF_8)
 
             val startMs = System.currentTimeMillis()
-            // Preferred server first, then the other two as fallbacks (wrap-around round robin).
-            for (attempt in 0 until SERVER_COUNT) {
-                val server = ((serverIndex % SERVER_COUNT) + SERVER_COUNT + attempt) % SERVER_COUNT
+            // Single host, retried on transient busy/error (503 "Server busy, retry").
+            for (attempt in 0 until MAX_ATTEMPTS) {
                 val downloaded = downloadFromServer(
-                    VIDEO_ENDPOINTS[server], server, videoId, payload, cookie, tempFile, onProgress
+                    DOWNLOAD_ENDPOINT, attempt, videoId, payload, cookie, tempFile, onProgress
                 )
-                if (downloaded && finalizeDownload(tempFile, targetFile, videoId, server, startMs)) {
+                if (downloaded && finalizeDownload(tempFile, targetFile, videoId, attempt, startMs)) {
                     return true
                 }
                 if (tempFile.isFile) tempFile.delete()
             }
 
-            Log.w(TAG, "video_proxy_fail id=$videoId all_servers_failed elapsed=${System.currentTimeMillis() - startMs}ms")
+            Log.w(TAG, "video_proxy_fail id=$videoId all_attempts_failed elapsed=${System.currentTimeMillis() - startMs}ms")
             return false
         } finally {
             // Keep the lock instance in the map (do NOT remove): computeIfAbsent + remove cannot
@@ -103,7 +94,7 @@ object SleppifyDownloaderResolver {
         }
     }
 
-    /** POSTs to a single proxy's /api/video and streams the result into [tempFile]. Returns true if
+    /** POSTs to the proxy's /api/descarga and streams the result into [tempFile]. Returns true if
      *  a complete, large-enough file was written; false on any HTTP/IO error (caller tries next server). */
     private fun downloadFromServer(
         endpoint: String,

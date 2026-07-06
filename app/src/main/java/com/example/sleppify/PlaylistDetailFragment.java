@@ -325,12 +325,13 @@ public class PlaylistDetailFragment extends Fragment
     @Override
     public void onViewCreated(@NonNull View view, @Nullable Bundle savedInstanceState) {
         super.onViewCreated(view, savedInstanceState);
-        // Hide global header and dismiss global loading overlay immediately —
-        // the fragment's own internal overlay (flPlaylistLoadingOverlay) takes over from here.
+        // Hide the global header. Do NOT dismiss the activity loading overlay here: it stays up until
+        // showInitialLoadingOverlay() (called a few lines below) shows the fragment's own overlay and
+        // then hides the activity one INSTANTLY. Cross-fading it here instead showed two overlapping
+        // spinners (the activity overlay + flPlaylistLoadingOverlay) during the 200ms fade window.
         if (getActivity() instanceof MainActivity) {
             ((MainActivity) getActivity()).hideTopAppBarForPlaylistDetail();
             ((MainActivity) getActivity()).setContainerOverlayMode(false);
-            ((MainActivity) getActivity()).revealModuleContent();
         }
         // Resolve the fragment-scoped Glide manager once here so list binds reuse it
         // instead of paying the Glide.with(Fragment) lookup per row.
@@ -440,7 +441,9 @@ public class PlaylistDetailFragment extends Fragment
         rvPlaylistContent.setLayoutManager(layoutManager);
         rvPlaylistContent.setHasFixedSize(true);
         rvPlaylistContent.setItemAnimator(null);
-        rvPlaylistContent.setItemViewCacheSize(8);
+        // 20 off-screen rows kept bound (rows are light: ~56dp, listeners set once in the
+        // holder) so short back-and-forth scrolls re-attach cached views instead of rebinding.
+        rvPlaylistContent.setItemViewCacheSize(20);
 
         // Single unified scroll listener — reduces per-frame dispatch overhead vs. 3 separate listeners
         rvPlaylistContent.addOnScrollListener(new RecyclerView.OnScrollListener() {
@@ -739,10 +742,7 @@ public class PlaylistDetailFragment extends Fragment
             rvPlaylistContent.animate().cancel();
             rvPlaylistContent.setAlpha(0f);
         }
-        // Hide the activity-level loading overlay — PlaylistDetail has its own
-        if (getActivity() instanceof MainActivity) {
-            ((MainActivity) getActivity()).revealModuleContent();
-        }
+        // Show the fragment's OWN overlay first, so there is always exactly one spinner on screen.
         // No afectar el minireproductor durante el loading state
         if (playlistLoadingOverlay != null) {
             playlistLoadingOverlay.animate().cancel();
@@ -752,6 +752,11 @@ public class PlaylistDetailFragment extends Fragment
         }
         if (pbPlaylistLoading != null) {
             pbPlaylistLoading.setVisibility(View.VISIBLE);
+        }
+        // Now dismiss the activity-level overlay INSTANTLY (not a 200ms cross-fade): the fragment's
+        // identical spinner is already up, so the hand-off shows no second spinner and no content flash.
+        if (getActivity() instanceof MainActivity) {
+            ((MainActivity) getActivity()).hideModuleLoadingOverlayImmediate();
         }
     }
 

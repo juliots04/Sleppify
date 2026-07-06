@@ -59,6 +59,11 @@ object LocalArtworkResolver {
         }
     }
 
+    /** Drops the in-memory embedded-art cache under system memory pressure; files re-probe on demand. */
+    fun trimMemory() {
+        cache.evictAll()
+    }
+
     private val mainHandler = Handler(Looper.getMainLooper())
 
     @JvmStatic

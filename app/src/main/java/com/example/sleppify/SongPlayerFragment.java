@@ -509,7 +509,10 @@ public class SongPlayerFragment extends Fragment {
                 // Skip the format+setText+layout when the rendered value is unchanged: the ticker
                 // fires 2x/second but the second value changes only 1x/second, and the total-time
                 // label is effectively constant per track.
-                if (!isHidden()) {
+                // appInBackground: isHidden() only covers mini-player mode — when the app is
+                // backgrounded with the full player on screen, these writes hit views nobody
+                // can see, twice a second, for hours.
+                if (!isHidden() && !appInBackground) {
                     if (currentSeconds != lastRenderedCurrentSeconds) {
                         lastRenderedCurrentSeconds = currentSeconds;
                         tvCurrentTime.setText(formatSeconds(currentSeconds));
@@ -541,10 +544,12 @@ public class SongPlayerFragment extends Fragment {
                         ListenHistoryStore.record(requireContext(), _t.videoId, _t.title, _t.artist, _t.imageUrl);
                     }
                 }
-                // The ticker fires 5x per second, so "% 5 == 0" alone re-persisted the whole
-                // queue snapshot and rebuilt the media session state five times in a burst
-                // during every fifth second. Track the last persisted second to fire once.
-                if (currentSeconds % 5 == 0 && currentSeconds != lastSnapshotPersistSecond) {
+                // Track the last persisted second so the snapshot fires once per matching second
+                // (the ticker runs 2x/second). In background stretch the cadence: the MediaSession
+                // extrapolates position from speed on its own, and persisting every 5s all night
+                // is pure churn.
+                int persistEverySeconds = appInBackground ? 30 : 5;
+                if (currentSeconds % persistEverySeconds == 0 && currentSeconds != lastSnapshotPersistSecond) {
                     lastSnapshotPersistSecond = currentSeconds;
                     persistPlaybackSnapshot(false);
                     updateMediaSessionState();
@@ -3470,7 +3475,11 @@ public class SongPlayerFragment extends Fragment {
         
         android.graphics.drawable.Drawable[] layers = new android.graphics.drawable.Drawable[]{oldDrawable, newDrawable};
         android.graphics.drawable.TransitionDrawable transition = new android.graphics.drawable.TransitionDrawable(layers);
-        transition.setCrossFadeEnabled(true);
+        // crossFade(true) fades the OLD layer out while the new fades in, so at mid-transition
+        // both are translucent and the black window background bleeds through — every track
+        // change flashed dark instead of fading color→color. With crossFade off the old color
+        // stays fully opaque underneath while the new one fades in over it.
+        transition.setCrossFadeEnabled(false);
         playerBackgroundContainer.setBackground(transition);
         transition.startTransition(400); // 400ms fade transition
     }
@@ -5436,22 +5445,22 @@ public class SongPlayerFragment extends Fragment {
             mediaPendingFlags |= PendingIntent.FLAG_IMMUTABLE;
         }
 
-        Intent prevIntent = new Intent(persistentAppContext, MainActivity.class)
-                .setAction(MainActivity.ACTION_MEDIA_PREV)
-                .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-        PendingIntent prevPendingIntent = PendingIntent.getActivity(
+        // Broadcast to the in-process MediaActionReceiver instead of PendingIntent.getActivity:
+        // launching the activity per tap yanked the whole app to the foreground on Android <= 12.
+        // The receiver dispatches to the live activity invisibly (or relaunches it as a fallback).
+        Intent prevIntent = new Intent(persistentAppContext, MediaActionReceiver.class)
+                .setAction(MainActivity.ACTION_MEDIA_PREV);
+        PendingIntent prevPendingIntent = PendingIntent.getBroadcast(
                 persistentAppContext, 8702, prevIntent, mediaPendingFlags);
 
-        Intent playPauseIntent = new Intent(persistentAppContext, MainActivity.class)
-                .setAction(MainActivity.ACTION_MEDIA_PLAY_PAUSE)
-                .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-        PendingIntent playPausePendingIntent = PendingIntent.getActivity(
+        Intent playPauseIntent = new Intent(persistentAppContext, MediaActionReceiver.class)
+                .setAction(MainActivity.ACTION_MEDIA_PLAY_PAUSE);
+        PendingIntent playPausePendingIntent = PendingIntent.getBroadcast(
                 persistentAppContext, 8703, playPauseIntent, mediaPendingFlags);
 
-        Intent nextIntent = new Intent(persistentAppContext, MainActivity.class)
-                .setAction(MainActivity.ACTION_MEDIA_NEXT)
-                .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-        PendingIntent nextPendingIntent = PendingIntent.getActivity(
+        Intent nextIntent = new Intent(persistentAppContext, MediaActionReceiver.class)
+                .setAction(MainActivity.ACTION_MEDIA_NEXT);
+        PendingIntent nextPendingIntent = PendingIntent.getBroadcast(
                 persistentAppContext, 8704, nextIntent, mediaPendingFlags);
 
         boolean effectivelyPlaying = isEffectivePlaying();
@@ -5490,9 +5499,13 @@ public class SongPlayerFragment extends Fragment {
         // When paused, downgrade from foreground but keep notification visible (dismissable).
         if (effectivelyPlaying) {
             PlaybackKeepAliveService.start(persistentAppContext, notification);
-        } else {
+        } else if (!isPlaying && !localSourcePreparing) {
+            // Downgrade ONLY on a real user pause. During a track switch the player briefly
+            // reports not-playing (preparing) — downgrading + stopSelf here raced the restart
+            // and made the media notification vanish until the next track change.
             PlaybackKeepAliveService.stopForegroundKeepNotification(persistentAppContext);
         }
+        // else: transient preparing state with playback intent — keep the service as is.
     }
 
     private void ensureMediaNotificationChannel() {

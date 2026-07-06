@@ -303,29 +303,9 @@ public class ArtistDetailFragment extends Fragment {
             images.add(t.thumbnailUrl == null ? "" : t.thumbnailUrl);
         }
         if (ids.isEmpty()) return;
-        int safe = Math.max(0, Math.min(index, ids.size() - 1));
-
-        if (getActivity() instanceof MainActivity) {
-            GlobalMiniPlayerController mini = ((MainActivity) getActivity()).getGlobalMiniPlayer();
-            if (mini != null) mini.animateOut();
-        }
-
-        FragmentManager fm = getParentFragmentManager();
-        Fragment existing = fm.findFragmentByTag(TAG_SONG_PLAYER);
-        if (existing instanceof SongPlayerFragment && existing.isAdded()) {
-            SongPlayerFragment p = (SongPlayerFragment) existing;
-            p.externalSetReturnTargetTag(TAG_MODULE_MUSIC);
-            p.externalReplaceQueue(ids, titles, artists, durations, images, safe, true);
-            fm.beginTransaction().setReorderingAllowed(true).show(p)
-                    .runOnCommit(p::externalAnimateEnterSlide).commit();
-            return;
-        }
-        SongPlayerFragment player = SongPlayerFragment.newInstance(
-                ids, titles, artists, durations, images, safe, true);
-        player.externalSetReturnTargetTag(TAG_MODULE_MUSIC);
-        fm.beginTransaction().setReorderingAllowed(true)
-                .add(R.id.playerContainer, player, TAG_SONG_PLAYER)
-                .runOnCommit(player::externalAnimateEnterSlide).commit();
+        SongPlayerLauncher.open(
+                getActivity(), ids, titles, artists, durations, images,
+                index, /* startPlaying = */ true, TAG_MODULE_MUSIC, /* openPlayerUi = */ true);
     }
 
     private void playShuffled() {
