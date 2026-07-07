@@ -15,6 +15,11 @@ object AppConstants {
     // Download:   "$PROXY_BASE_URL/api/descarga"
     const val PROXY_BASE_URL = "https://sleppifydownload.alwaysdata.net"
 
+    // Unique WorkManager queue for single-track (manual) offline downloads. Enqueue single-track
+    // work with this exact name + ExistingWorkPolicy.APPEND_OR_REPLACE so its progress/counter is
+    // picked up by the manual-queue observers (a plain enqueue() escapes them and shows no progress).
+    const val OFFLINE_MANUAL_TRACK_QUEUE = "offline_manual_track_queue"
+
     // Single source of truth for the full-screen player's fragment tag. It used to be a raw
     // "song_player" literal duplicated across ~15 sites plus three separate local constants — a
     // typo in any one silently made findFragmentByTag() miss and add a DUPLICATE player fragment.

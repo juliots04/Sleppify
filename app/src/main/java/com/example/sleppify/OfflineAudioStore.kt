@@ -25,6 +25,22 @@ object OfflineAudioStore {
         }
     }
 
+    // Fingerprints (path:size:mtime) of files that PASSED full validation this process. Full
+    // validation opens a MediaMetadataRetriever per file (10-100ms of disk+parse); the UI calls
+    // hasValidatedOfflineAudio for every visible row on every scroll-settle and for EVERY track
+    // of a playlist on each ready-state recompute — re-parsing unchanged files over and over was
+    // the main source of jank until caches "warmed". A file that changes on disk (re-download,
+    // truncation) changes its size/mtime, so the fingerprint self-invalidates.
+    private val VALIDATED_FINGERPRINTS = object : LinkedHashMap<String, String>(128, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>): Boolean {
+            return size > OFFLINE_STATE_CACHE_MAX_ENTRIES
+        }
+    }
+
+    private fun fingerprintOf(file: File): String {
+        return file.absolutePath + ":" + file.length() + ":" + file.lastModified()
+    }
+
     @JvmStatic
     fun getOfflineAudioDir(context: Context): File {
         return File(context.filesDir, OFFLINE_AUDIO_DIR)
@@ -116,12 +132,24 @@ object OfflineAudioStore {
     fun hasValidatedOfflineAudio(context: Context, trackId: String, expectedDurationLabel: String?): Boolean {
         val normalized = normalizeTrackId(trackId)
 
-        // Always check disk — do NOT short-circuit on cache. This method is the
+        // Always check disk — do NOT short-circuit on the boolean cache. This method is the
         // "source of truth" that callers rely on to detect failed downloads.
         val existing = getExistingOfflineAudioFile(context, normalized)
         if (!existing.isFile || existing.length() <= 0L) {
             putCachedOfflineState(normalized, false)
+            synchronized(OFFLINE_STATE_CACHE_LOCK) { VALIDATED_FINGERPRINTS.remove(normalized) }
             return false
+        }
+
+        // Fingerprint fast-path: if this exact file (path+size+mtime) already passed FULL
+        // validation this process, it is still valid — skip the expensive MediaMetadataRetriever
+        // parse. The disk stat above still guarantees a deleted/replaced file is re-checked.
+        val fingerprint = fingerprintOf(existing)
+        synchronized(OFFLINE_STATE_CACHE_LOCK) {
+            if (VALIDATED_FINGERPRINTS[normalized] == fingerprint) {
+                OFFLINE_STATE_CACHE[normalized] = true
+                return true
+            }
         }
 
         val actualDurationSeconds = readAudioDurationSeconds(existing)
@@ -148,6 +176,11 @@ object OfflineAudioStore {
 
         val expectedDurationSeconds = parseDurationSeconds(expectedDurationLabel)
         if (expectedDurationSeconds <= 0) {
+            // Deliberately NOT fingerprinting this pass: without an expected duration the
+            // ratio check was skipped, so this is a WEAKER validation. Fingerprinting it would
+            // let a later call WITH a real duration label short-circuit to true on a partial
+            // file that the ratio check exists to catch (and the worker would never repair it).
+            // Only the full-strictness PASS below stores the fingerprint.
             putCachedOfflineState(normalized, true)
             return true
         }
@@ -169,6 +202,7 @@ object OfflineAudioStore {
         }
 
         putCachedOfflineState(normalized, true)
+        synchronized(OFFLINE_STATE_CACHE_LOCK) { VALIDATED_FINGERPRINTS[normalized] = fingerprint }
         return true
     }
 
@@ -199,6 +233,7 @@ object OfflineAudioStore {
             removedAny = legacyBin.delete() || removedAny
         }
         putCachedOfflineState(normalized, false)
+        synchronized(OFFLINE_STATE_CACHE_LOCK) { VALIDATED_FINGERPRINTS.remove(normalized) }
         return removedAny
     }
 
@@ -268,6 +303,7 @@ object OfflineAudioStore {
     fun clearOfflineAudioStateCache() {
         synchronized(OFFLINE_STATE_CACHE_LOCK) {
             OFFLINE_STATE_CACHE.clear()
+            VALIDATED_FINGERPRINTS.clear()
         }
     }
 

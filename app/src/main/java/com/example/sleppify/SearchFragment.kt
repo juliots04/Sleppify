@@ -1416,9 +1416,16 @@ class SearchFragment : Fragment() {
         val request = OneTimeWorkRequest.Builder(OfflinePlaylistDownloadWorker::class.java)
             .setInputData(input)
             .setConstraints(constraints)
+            // Short linear backoff: this request APPENDs into the shared manual chain, so a
+            // retrying head must resolve fast or it blocks everything appended after it.
+            .setBackoffCriteria(androidx.work.BackoffPolicy.LINEAR, 10, java.util.concurrent.TimeUnit.SECONDS)
             .addTag("offline_search_dl_$videoId")
             .build()
-        WorkManager.getInstance(ctx).enqueue(request)
+        WorkManager.getInstance(ctx).enqueueUniqueWork(
+            AppConstants.OFFLINE_MANUAL_TRACK_QUEUE,
+            androidx.work.ExistingWorkPolicy.APPEND_OR_REPLACE,
+            request
+        )
     }
 
     private fun showSaveToPlaylistSheet(track: YouTubeMusicService.TrackResult) {
@@ -1922,9 +1929,15 @@ class SearchFragment : Fragment() {
             val request = androidx.work.OneTimeWorkRequest.Builder(OfflinePlaylistDownloadWorker::class.java)
                 .setInputData(inputData)
                 .setConstraints(constraints)
+                // Short linear backoff — see downloadSingleTrack: shared manual chain, no stuck heads.
+                .setBackoffCriteria(androidx.work.BackoffPolicy.LINEAR, 10, java.util.concurrent.TimeUnit.SECONDS)
                 .addTag("offline_add_track_$videoId")
                 .build()
-            androidx.work.WorkManager.getInstance(ctx).enqueue(request)
+            androidx.work.WorkManager.getInstance(ctx).enqueueUniqueWork(
+                AppConstants.OFFLINE_MANUAL_TRACK_QUEUE,
+                androidx.work.ExistingWorkPolicy.APPEND_OR_REPLACE,
+                request
+            )
         } catch (e: Exception) {
             Log.w(TAG, "Unexpected error", e)
         }

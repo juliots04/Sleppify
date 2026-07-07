@@ -1190,6 +1190,17 @@ public class PlaylistDetailFragment extends Fragment
         return cachedTrackArtPx;
     }
 
+    /**
+     * Rewrites a googleusercontent/ggpht thumbnail URL to request the row-thumbnail size from
+     * the CDN (the YT Music approach: tiny transfer + tiny disk cache entry for a 50dp cell,
+     * instead of shipping the full-size cover and downsampling locally). MUST be used by every
+     * row-art path (bind, fling, prefetch) so Glide cache keys stay consistent.
+     */
+    @Nullable
+    private String sizedTrackArtUrl(@NonNull Context ctx, @Nullable String url) {
+        return ThumbnailUrls.atSize(url, trackArtSizePx(ctx));
+    }
+
     private int trackArtPlaceholderColor(@NonNull Context ctx) {
         if (cachedTrackArtPlaceholderColor == 0) {
             cachedTrackArtPlaceholderColor = ContextCompat.getColor(ctx, R.color.surface_high);
@@ -1258,7 +1269,7 @@ public class PlaylistDetailFragment extends Fragment
         // ImageView already shows the same artwork. Prevents redundant work on re-binds
         // to the same track (notifyItemChanged, recycled holders) without affecting fresh
         // scroll (each new row has a different URL, so the signature differs).
-        String url = imageUrl.trim();
+        String url = sizedTrackArtUrl(ctx, imageUrl.trim());
         Object previousSignature = target.getTag(R.id.tag_artwork_signature);
         if (url.equals(previousSignature)) {
             return;
@@ -1271,12 +1282,23 @@ public class PlaylistDetailFragment extends Fragment
         // Clone the prebuilt base request (transform/format/diskCache/override/placeholder are
         // already baked in) so the request graph isn't reassembled per row — only the dynamic
         // bits (model, cache policy, priority, transition) are applied here.
-        artRequestBase(ctx).clone()
-                .load(url)
-                .onlyRetrieveFromCache(offlineOnly)
-                .priority(priority)
-                .transition(SHARED_CROSSFADE)
-                .into(target);
+        // The .error() fallback retries the ORIGINAL (unsized) URL from cache only: entries
+        // cached before the URL-sizing update are keyed by the raw URL, so without this an
+        // offline session right after updating would show placeholders for art that IS on disk.
+        String rawUrl = imageUrl.trim();
+        com.bumptech.glide.RequestBuilder<android.graphics.drawable.Drawable> request =
+                artRequestBase(ctx).clone()
+                        .load(url)
+                        .onlyRetrieveFromCache(offlineOnly)
+                        .priority(priority)
+                        .transition(SHARED_CROSSFADE);
+        if (url != null && !url.equals(rawUrl)) {
+            request = request.error(
+                    artRequestBase(ctx).clone()
+                            .load(rawUrl)
+                            .onlyRetrieveFromCache(true));
+        }
+        request.into(target);
     }
 
     /**
@@ -1294,8 +1316,8 @@ public class PlaylistDetailFragment extends Fragment
             target.setImageDrawable(null);
             return;
         }
-        String url = imageUrl.trim();
-        if (url.equals(target.getTag(R.id.tag_artwork_signature))) {
+        String url = sizedTrackArtUrl(target.getContext(), imageUrl.trim());
+        if (url != null && url.equals(target.getTag(R.id.tag_artwork_signature))) {
             return;
         }
         target.setTag(R.id.tag_artwork_signature, url);
@@ -1327,7 +1349,7 @@ public class PlaylistDetailFragment extends Fragment
                 continue;
             }
             artRequestBase(ctx).clone()
-                    .load(track.imageUrl.trim())
+                    .load(sizedTrackArtUrl(ctx, track.imageUrl.trim()))
                     .onlyRetrieveFromCache(offlineOnly)
                     .priority(com.bumptech.glide.Priority.LOW)
                     .preload();
@@ -1515,16 +1537,17 @@ public class PlaylistDetailFragment extends Fragment
                 .transition(com.bumptech.glide.load.resource.drawable.DrawableTransitionOptions.withCrossFade(100))
                 .into(target);
         } else {
+            int decodeW = highQuality ? targetWidth : Math.max(targetWidth, 320);
+            int decodeH = highQuality ? targetHeight : Math.max(targetHeight, 320);
             Glide.with(target)
-                .load(safeUrl)
+                .load(ThumbnailUrls.atSize(safeUrl, Math.max(decodeW, decodeH)))
                 .transform(SHARED_YT_CROP)
                 .format(highQuality ? DecodeFormat.PREFER_ARGB_8888 : DecodeFormat.PREFER_RGB_565)
                 .diskCacheStrategy(DiskCacheStrategy.ALL)
                 .skipMemoryCache(false)
                 .priority(priority)
                 .onlyRetrieveFromCache(offlineOnly)
-                .override(highQuality ? targetWidth : Math.max(targetWidth, 320), 
-                         highQuality ? targetHeight : Math.max(targetHeight, 320))
+                .override(decodeW, decodeH)
                 .transition(com.bumptech.glide.load.resource.drawable.DrawableTransitionOptions.withCrossFade())
                 .into(target);
         }
@@ -2425,56 +2448,14 @@ public class PlaylistDetailFragment extends Fragment
             }
 
             if (!runningInfos.isEmpty()) {
-                int done = 0;
-                int total = 0;
-                int downloaded = 0;
-                String currentId = "";
-                String dlPlaylistTitle = "";
-                Map<String, Float> progressByTrackId = new HashMap<>();
-
-                for (WorkInfo runningInfo : runningInfos) {
-                    Data progress = runningInfo.getProgress();
-                    done = Math.max(done, progress.getInt(OfflinePlaylistDownloadWorker.PROGRESS_DONE, 0));
-                    total = Math.max(total, progress.getInt(OfflinePlaylistDownloadWorker.PROGRESS_TOTAL, 0));
-                    downloaded = Math.max(downloaded, progress.getInt(OfflinePlaylistDownloadWorker.PROGRESS_DOWNLOADED, 0));
-
-                    String candidateCurrentId = progress.getString(OfflinePlaylistDownloadWorker.PROGRESS_CURRENT_ID);
-                    if (TextUtils.isEmpty(currentId) && !TextUtils.isEmpty(candidateCurrentId)) {
-                        currentId = candidateCurrentId.trim();
-                    }
-
-                    String candidatePlaylistTitle = progress.getString(OfflinePlaylistDownloadWorker.PROGRESS_PLAYLIST_TITLE);
-                    if (TextUtils.isEmpty(dlPlaylistTitle) && !TextUtils.isEmpty(candidatePlaylistTitle)) {
-                        dlPlaylistTitle = candidatePlaylistTitle.trim();
-                    }
-
-                    String[] activeIds = progress.getStringArray(OfflinePlaylistDownloadWorker.PROGRESS_ACTIVE_IDS);
-                    float[] activeFractions = progress.getFloatArray(OfflinePlaylistDownloadWorker.PROGRESS_ACTIVE_FRACTIONS);
-                    if (activeIds == null || activeIds.length == 0) {
-                        continue;
-                    }
-
-                    for (int idx = 0; idx < activeIds.length; idx++) {
-                        String activeId = activeIds[idx];
-                        if (TextUtils.isEmpty(activeId)) {
-                            continue;
-                        }
-                        String normalizedId = activeId.trim();
-                        float value = (activeFractions != null && idx < activeFractions.length)
-                                ? activeFractions[idx]
-                                : 0f;
-                        float normalizedValue = Math.max(0f, Math.min(1f, value));
-                        Float previous = progressByTrackId.get(normalizedId);
-                        if (previous == null || normalizedValue > previous) {
-                            progressByTrackId.put(normalizedId, normalizedValue);
-                        }
-                    }
-                }
-
-                String[] activeIds = progressByTrackId.keySet().toArray(new String[0]);
-                if (TextUtils.isEmpty(currentId) && activeIds.length > 0) {
-                    currentId = activeIds[0];
-                }
+                DownloadProgress dp = DownloadProgress.mergeRunning(runningInfos);
+                int done = dp.done;
+                int total = dp.total;
+                int downloaded = dp.downloaded;
+                String currentId = dp.currentId;
+                String dlPlaylistTitle = dp.playlistTitle;
+                Map<String, Float> progressByTrackId = new HashMap<>(dp.perTrackFraction);
+                String[] activeIds = dp.getActiveIds();
 
                 String effectivePlaylistTitle = dlPlaylistTitle == null ? "" : dlPlaylistTitle.trim();
                 if (TextUtils.isEmpty(effectivePlaylistTitle)) {
@@ -3328,12 +3309,13 @@ public class PlaylistDetailFragment extends Fragment
                     .preload();
         }
 
-        // Preload track thumbnails with SHARED_YT_CROP + same size as loadTrackArt
-        // so the cache key matches and the first scroll doesn't re-decode
+        // Preload track thumbnails with SHARED_YT_CROP + the SAME sized URL + size as
+        // loadTrackArt so the Glide cache key matches and the row bind is a pure cache hit
+        // (an unsized preload would warm entries the sized binds can never hit = double fetch).
         int trackPx = trackArtSizePx(ctx);
         for (String url : trackUrls) {
             Glide.with(ctx)
-                    .load(url)
+                    .load(sizedTrackArtUrl(ctx, url))
                     .transform(SHARED_YT_CROP)
                     .format(DecodeFormat.PREFER_RGB_565)
                     .diskCacheStrategy(DiskCacheStrategy.ALL)
@@ -6347,14 +6329,24 @@ public class PlaylistDetailFragment extends Fragment
                 downloadingTrackProgressById.putAll(normalizedProgressById);
             }
 
-            // Invalidate cache for all tracks that changed state so the next bind
-            // triggers a real disk lookup via triggerOfflineStateLookup, avoiding
-            // false positives when a download failed internally.
+            // Real-time row updates: a track that just LEFT the active set finished (or failed)
+            // RIGHT NOW. Resolve its state immediately with the cheap cached check — the worker
+            // already marked OfflineAudioStore's state cache on success — so the row's checkmark
+            // appears in THIS tick's rebind instead of waiting for an async disk scan. Only a
+            // failed download falls back to cache invalidation + verified disk lookup.
+            // Tracks STILL downloading are deliberately NOT invalidated: their cached "false" is
+            // still correct, and re-nulling them every 650ms progress tick just forced repeated
+            // MediaMetadataRetriever probes (scroll jank while any download ran).
+            Context stateCtx = getContext();
             for (String previousTrackId : previousIds) {
-                invalidateTrackStateCache(previousTrackId);
-            }
-            for (String currentTrackId : downloadingTrackIds) {
-                invalidateTrackStateCache(currentTrackId);
+                if (downloadingTrackIds.contains(previousTrackId)) {
+                    continue; // still active — cached state remains valid
+                }
+                if (stateCtx != null && OfflineAudioStore.hasOfflineAudio(stateCtx, previousTrackId)) {
+                    offlineAvailabilityCache.put(previousTrackId, Boolean.TRUE);
+                } else {
+                    invalidateTrackStateCache(previousTrackId);
+                }
             }
 
             Set<String> changedIds = new HashSet<>(previousIds);
@@ -6383,9 +6375,13 @@ public class PlaylistDetailFragment extends Fragment
                     if (rvPlaylistContent == null) return;
                     RecyclerView.LayoutManager lm = rvPlaylistContent.getLayoutManager();
                     if (lm instanceof LinearLayoutManager) {
-                        int first = ((LinearLayoutManager) lm).findFirstVisibleItemPosition() - 1;
+                        // Clamp to 0 like the other visible-range callers (the -1 compensates the
+                        // ConcatAdapter header). The old `if (first >= 0)` guard skipped this
+                        // recovery pass entirely whenever the header was visible — i.e. exactly
+                        // when the user sits at the top watching the download — leaving rows stale.
+                        int first = Math.max(0, ((LinearLayoutManager) lm).findFirstVisibleItemPosition() - 1);
                         int last = ((LinearLayoutManager) lm).findLastVisibleItemPosition() - 1;
-                        if (first >= 0) {
+                        if (last >= first) {
                             loadStateForVisibleRange(first, last);
                         }
                     }
@@ -6568,7 +6564,11 @@ public class PlaylistDetailFragment extends Fragment
                         // visible row on EVERY scroll-settle — the confirmed source of the per-
                         // re-scroll main-thread burst. Only rows still on the placeholder (a load
                         // that never landed — fired while offline, or was skipped mid-fling) retry.
-                        if (track.imageUrl.trim().equals(sig) && !placeholderShowing) {
+                        // Compare against the SIZED url — loadTrackArt stores the CDN-sized URL
+                        // as the signature now, so comparing the raw imageUrl would never match
+                        // and this guard would silently die (re-issuing every row per settle).
+                        String expectedSig = sizedTrackArtUrl(iv.getContext(), track.imageUrl.trim());
+                        if (expectedSig != null && expectedSig.equals(sig) && !placeholderShowing) {
                             continue;
                         }
                         iv.setTag(R.id.tag_artwork_signature, null);

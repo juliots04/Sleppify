@@ -159,6 +159,21 @@ class OfflinePlaylistDownloadWorker(
         }
 
         if (OUTPUT_REASON_NO_NETWORK == reason) {
+            // Manual single-track jobs share ONE unique APPEND chain (so the counter observers see
+            // them). An endlessly-retrying head job would block every download appended behind it
+            // (head-of-line blocking), so manual jobs get a bounded number of attempts and then
+            // let the chain advance; the user can re-tap download. Playlist (auto) jobs keep
+            // unbounded retry — resuming a big batch after connectivity returns is the priority there.
+            if (manualQueue && runAttemptCount >= MANUAL_QUEUE_MAX_RUN_ATTEMPTS - 1) {
+                Log.w(TAG, "doWork:network_unavailable manual_give_up attempt=$runAttemptCount")
+                return Result.success(
+                    Data.Builder()
+                        .putInt(OUTPUT_TOTAL, total)
+                        .putInt(OUTPUT_DOWNLOADED, downloaded)
+                        .putString(OUTPUT_REASON, reason)
+                        .build()
+                )
+            }
             Log.w(TAG, "doWork:network_unavailable retrying")
             return Result.retry()
         }
@@ -631,6 +646,9 @@ class OfflinePlaylistDownloadWorker(
         private const val CONSECUTIVE_FAIL_ABORT_THRESHOLD = 8
         private const val MAX_PARALLEL_DOWNLOADS_AUTO = 3
         private const val MAX_PARALLEL_DOWNLOADS_MANUAL = 3
+        // Manual (single-track) jobs share one unique APPEND chain; bound their retries so a
+        // stuck head job can't block every appended download behind it (head-of-line blocking).
+        private const val MANUAL_QUEUE_MAX_RUN_ATTEMPTS = 2
         private const val MIN_VALID_AUDIO_FILE_BYTES = 24L * 1024L
         private const val DOWNLOAD_DURATION_MIN_SAFE_SECONDS = 6
         private const val DOWNLOAD_DURATION_MATCH_RATIO = 0.88f

@@ -1980,8 +1980,9 @@ public class SongPlayerFragment extends Fragment {
     }
 
     /**
-     * After a network track starts playing, download it in the background to the offline directory.
-     * The proxy server already has the CDN URL cached, so this download is fast.
+     * After a network track starts playing, download it in the background to the offline directory
+     * via the single proxy download path (/api/descarga → .mp4), so a streamed track becomes an
+     * offline file that matches the online video (one downloader, one container).
      */
     private void maybeSaveStreamedTrackOffline(@NonNull String videoId) {
         if (TextUtils.isEmpty(videoId)) return;
@@ -1994,6 +1995,19 @@ public class SongPlayerFragment extends Fragment {
         final Context appContext = requireContext().getApplicationContext();
         if (OfflineAudioStore.hasOfflineAudio(appContext, normalized)) return;
 
+        // Respect the user's download-over-mobile-data setting, like every WorkManager download
+        // path does (UNMETERED constraint). This passive save fetches the full mp4 server-side —
+        // without this gate, every track played on mobile data would silently burn tens of MB.
+        android.content.SharedPreferences settingsPrefsForSave =
+                appContext.getSharedPreferences(CloudSyncManager.PREFS_SETTINGS, Context.MODE_PRIVATE);
+        boolean allowMobileForSave =
+                settingsPrefsForSave.getBoolean(CloudSyncManager.KEY_OFFLINE_DOWNLOAD_ALLOW_MOBILE_DATA, false);
+        if (!allowMobileForSave) {
+            android.net.ConnectivityManager cm = (android.net.ConnectivityManager)
+                    appContext.getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm == null || cm.isActiveNetworkMetered()) return;
+        }
+
         streamDownloadingVideoId = normalized;
         backgroundDownloadExecutor.execute(() -> {
             try {
@@ -2003,17 +2017,12 @@ public class SongPlayerFragment extends Fragment {
                     return;
                 }
 
-                // Prefer direct CDN download (URL already resolved by NewPipe)
-                boolean ok = downloadDirectFromCdn(appContext, normalized);
-
-                // Fallback to proxy if direct download failed
-                if (!ok) {
-                    java.io.File targetFile = OfflineAudioStore.getOfflineVideoFile(appContext, normalized);
-                    int serverIndex = Math.abs(normalized.hashCode()) % SleppifyDownloaderResolver.SERVER_COUNT;
-                    ok = SleppifyDownloaderResolver.INSTANCE.downloadVideoViaProxy(
-                            appContext, normalized, targetFile, serverIndex, null);
-                    if (!ok && targetFile.isFile()) targetFile.delete();
-                }
+                // Single download path: fetch the finished mp4 from the proxy (/api/descarga)
+                // so the offline file always matches the online video (one downloader, one container).
+                java.io.File targetFile = OfflineAudioStore.getOfflineVideoFile(appContext, normalized);
+                boolean ok = SleppifyDownloaderResolver.INSTANCE.downloadVideoViaProxy(
+                        appContext, normalized, targetFile, 0, null);
+                if (!ok && targetFile.isFile()) targetFile.delete();
 
                 if (ok) {
                     OfflineAudioStore.markOfflineAudioState(normalized, true);
@@ -2042,68 +2051,6 @@ public class SongPlayerFragment extends Fragment {
         });
     }
 
-    /**
-     * Downloads audio directly from the CDN URL cached by StreamResolver (NewPipe).
-     * Returns true if the file was saved successfully.
-     */
-    private boolean downloadDirectFromCdn(@NonNull Context context, @NonNull String videoId) {
-        try {
-            String cdnUrl = StreamResolver.resolveStreamUrl(context, videoId);
-            if (TextUtils.isEmpty(cdnUrl)) return false;
-
-            // Determine extension from URL content type or default to m4a
-            boolean isWebm = cdnUrl.contains("mime=audio%2Fwebm") || cdnUrl.contains("mime=audio/webm");
-            java.io.File targetFile = OfflineAudioStore.getOfflineAudioFileForFormat(context, videoId, isWebm);
-            java.io.File tempFile = new java.io.File(targetFile.getAbsolutePath() + ".tmp");
-            if (tempFile.isFile()) tempFile.delete();
-            targetFile.getParentFile().mkdirs();
-
-            Map<String, String> headers = StreamResolver.getHeadersFor(videoId);
-            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) new java.net.URL(cdnUrl).openConnection();
-            conn.setConnectTimeout(15_000);
-            conn.setReadTimeout(30_000);
-            for (Map.Entry<String, String> h : headers.entrySet()) {
-                conn.setRequestProperty(h.getKey(), h.getValue());
-            }
-
-            int code = conn.getResponseCode();
-            if (code < 200 || code >= 300) {
-                conn.disconnect();
-                Log.w(TAG, "cdn-download: HTTP " + code + " for " + videoId);
-                return false;
-            }
-
-            try (java.io.InputStream in = conn.getInputStream();
-                 java.io.FileOutputStream out = new java.io.FileOutputStream(tempFile)) {
-                byte[] buf = new byte[16384];
-                int read;
-                while ((read = in.read(buf)) != -1) {
-                    out.write(buf, 0, read);
-                }
-                out.flush();
-            } finally {
-                conn.disconnect();
-            }
-
-            if (tempFile.length() < 24 * 1024) {
-                tempFile.delete();
-                Log.w(TAG, "cdn-download: file too small for " + videoId);
-                return false;
-            }
-
-            if (targetFile.isFile()) targetFile.delete();
-            boolean renamed = tempFile.renameTo(targetFile);
-            if (!renamed) {
-                tempFile.delete();
-                return false;
-            }
-            Log.d(TAG, "cdn-download: saved " + videoId + " (" + targetFile.length() / 1024 + " KB)");
-            return true;
-        } catch (Exception e) {
-            Log.w(TAG, "cdn-download: failed " + videoId + " " + e.getMessage());
-            return false;
-        }
-    }
 
     private boolean isGaplessPlaybackEnabled() {
         return settingsPrefs != null
@@ -2513,12 +2460,26 @@ public class SongPlayerFragment extends Fragment {
                     audioTrackReinitToken = -1;
                     startLocalProgressTicker();
 
-                    // Start pre-fetching the next track once this one is successfully playing
-                    prefetchNextTrackStream();
-
-                    // Stream-as-download: save this track offline in the background
-                    if (networkSource) {
-                        maybeSaveStreamedTrackOffline(track.videoId);
+                    // Defer the two background network jobs so they don't fight the just-started
+                    // stream's buffering (which is what janked the UI the instant playback began).
+                    // Prefetch the next track a couple seconds in; save-offline (a full server-side
+                    // mp4 fetch) waits longer and only if this track is still the current one.
+                    final String startedVideoId = track.videoId;
+                    final boolean saveOffline = networkSource;
+                    localProgressHandler.postDelayed(() -> {
+                        if (!isAdded()) return;
+                        prefetchNextTrackStream();
+                    }, 2500L);
+                    if (saveOffline) {
+                        localProgressHandler.postDelayed(() -> {
+                            if (!isAdded() || startedVideoId == null) return;
+                            // Only save if the user is still on this track (skipped tracks don't
+                            // deserve a full mp4 fetch — that was the data/CPU burn at play-start).
+                            if (currentIndex >= 0 && currentIndex < tracks.size()
+                                    && startedVideoId.equals(tracks.get(currentIndex).videoId)) {
+                                maybeSaveStreamedTrackOffline(startedVideoId);
+                            }
+                        }, 8000L);
                     }
                 } catch (Exception startError) {
                     Log.e(TAG, "onPrepared: start failed for videoId=" + track.videoId, startError);
@@ -2677,7 +2638,25 @@ public class SongPlayerFragment extends Fragment {
         notifyPlaybackStateChanged();
     }
 
+    /** One-frame coalescer flag for {@link #notifyPlaybackStateChanged()}. */
+    private boolean playbackStateNotifyScheduled = false;
+
     private void notifyPlaybackStateChanged() {
+        // Starting a track fires this ≥4 times in the same main-thread burst
+        // (resetPlaybackStateForNewTrack, bindCurrentTrack, startMediaPlaybackFromSource,
+        // setPlaybackUiForPreparedSource) — each pass rebuilding the media notification,
+        // session metadata and cross-fragment sync. Coalesce the burst into ONE pass on the
+        // next main-loop message; it reads current state at execution time so nothing is lost.
+        if (playbackStateNotifyScheduled) return;
+        playbackStateNotifyScheduled = true;
+        localProgressHandler.post(() -> {
+            playbackStateNotifyScheduled = false;
+            if (!isAdded()) return;
+            notifyPlaybackStateChangedNow();
+        });
+    }
+
+    private void notifyPlaybackStateChangedNow() {
         updatePlayPauseIcon();
         updateMediaSessionMetadata();
         updateMediaSessionState();
@@ -4211,10 +4190,13 @@ public class SongPlayerFragment extends Fragment {
         androidx.work.OneTimeWorkRequest request = new androidx.work.OneTimeWorkRequest.Builder(OfflinePlaylistDownloadWorker.class)
                 .setInputData(input)
                 .setConstraints(constraints)
-                .addTag("offline_manual_track_queue")
+                // Short linear backoff: manual jobs share one APPEND chain — a retrying head
+                // must resolve fast or it blocks every download appended behind it.
+                .setBackoffCriteria(androidx.work.BackoffPolicy.LINEAR, 10, java.util.concurrent.TimeUnit.SECONDS)
+                .addTag(AppConstants.OFFLINE_MANUAL_TRACK_QUEUE)
                 .build();
         androidx.work.WorkManager.getInstance(requireContext().getApplicationContext())
-                .enqueueUniqueWork("offline_manual_track_queue", androidx.work.ExistingWorkPolicy.APPEND_OR_REPLACE, request);
+                .enqueueUniqueWork(AppConstants.OFFLINE_MANUAL_TRACK_QUEUE, androidx.work.ExistingWorkPolicy.APPEND_OR_REPLACE, request);
     }
 
     private void refreshSocialActionsForCurrentTrack(@Nullable PlayerTrack track) {
@@ -6486,9 +6468,14 @@ public class SongPlayerFragment extends Fragment {
             androidx.work.OneTimeWorkRequest request = new androidx.work.OneTimeWorkRequest.Builder(OfflinePlaylistDownloadWorker.class)
                     .setInputData(inputData)
                     .setConstraints(constraints)
+                    // Short linear backoff — shared manual chain, no stuck heads (see above).
+                    .setBackoffCriteria(androidx.work.BackoffPolicy.LINEAR, 10, java.util.concurrent.TimeUnit.SECONDS)
                     .addTag("offline_add_track_" + videoId)
                     .build();
-            androidx.work.WorkManager.getInstance(requireContext()).enqueue(request);
+            androidx.work.WorkManager.getInstance(requireContext()).enqueueUniqueWork(
+                    AppConstants.OFFLINE_MANUAL_TRACK_QUEUE,
+                    androidx.work.ExistingWorkPolicy.APPEND_OR_REPLACE,
+                    request);
         } catch (Exception e) {
             Log.w(TAG, "Failed to enqueue offline download", e);
         }
