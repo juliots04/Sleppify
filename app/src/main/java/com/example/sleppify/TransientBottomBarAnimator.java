@@ -4,19 +4,26 @@ import android.content.Context;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewParent;
-import android.view.animation.AccelerateInterpolator;
-import android.view.animation.DecelerateInterpolator;
-import android.view.animation.OvershootInterpolator;
+import android.view.animation.Interpolator;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import androidx.core.view.animation.PathInterpolatorCompat;
 
 final class TransientBottomBarAnimator {
 
-    private static final long ENTER_DURATION_MS = 280L;
-    private static final long EXIT_DURATION_MS = 200L;
-    private static final float ENTER_TRANSLATION_DP = 48f;
-    private static final float EXIT_TRANSLATION_DP = 32f;
+    private static final long ENTER_DURATION_MS = 380L;
+    private static final long EXIT_DURATION_MS = 240L;
+    private static final float ENTER_TRANSLATION_DP = 56f;
+    private static final float EXIT_TRANSLATION_DP = 28f;
+    private static final float ENTER_SCALE = 0.92f;
+    private static final float EXIT_SCALE = 0.95f;
+
+    // Fluid "liquid" easing: fast rise with a soft overshoot settle (easeOutBack-ish).
+    private static final Interpolator ENTER_INTERPOLATOR =
+            PathInterpolatorCompat.create(0.22f, 1.18f, 0.36f, 1f);
+    private static final Interpolator EXIT_INTERPOLATOR =
+            PathInterpolatorCompat.create(0.4f, 0f, 1f, 1f);
 
     private static final int STATE_HIDDEN = 0;
     private static final int STATE_VISIBLE = 1;
@@ -42,6 +49,8 @@ final class TransientBottomBarAnimator {
         bar.setTag(R.id.tag_transient_bar_state, STATE_VISIBLE);
         bar.setAlpha(0f);
         bar.setTranslationY(dp(bar.getContext(), ENTER_TRANSLATION_DP));
+        bar.setScaleX(ENTER_SCALE);
+        bar.setScaleY(ENTER_SCALE);
         rootView.addView(bar, layoutParams);
 
         bar.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
@@ -50,12 +59,16 @@ final class TransientBottomBarAnimator {
                                        int ol, int ot, int or2, int ob) {
                 v.removeOnLayoutChangeListener(this);
                 if (v.getParent() == null || getState(v) != STATE_VISIBLE) return;
+                v.setPivotX(v.getWidth() / 2f);
+                v.setPivotY(v.getHeight());
                 v.animate().cancel();
                 v.animate()
                         .alpha(1f)
                         .translationY(0f)
+                        .scaleX(1f)
+                        .scaleY(1f)
                         .setDuration(ENTER_DURATION_MS)
-                        .setInterpolator(new OvershootInterpolator(0.6f))
+                        .setInterpolator(ENTER_INTERPOLATOR)
                         .start();
             }
         });
@@ -75,6 +88,10 @@ final class TransientBottomBarAnimator {
         }
 
         bar.setTag(R.id.tag_transient_bar_state, STATE_DISMISSING);
+        // Clear the lookup tag so findViewWithTag (show() dedupe, MainActivity's saved-bar
+        // transfer) can never grab a bar that is already on its way out — re-hosting or
+        // "dismissing" a DISMISSING bar would otherwise leave it stuck on screen forever.
+        bar.setTag(null);
         if (bar.getParent() == null) {
             bar.setTag(R.id.tag_transient_bar_state, STATE_HIDDEN);
             if (endAction != null) endAction.run();
@@ -86,8 +103,10 @@ final class TransientBottomBarAnimator {
         bar.animate()
                 .alpha(0f)
                 .translationY(exitTranslation)
+                .scaleX(EXIT_SCALE)
+                .scaleY(EXIT_SCALE)
                 .setDuration(EXIT_DURATION_MS)
-                .setInterpolator(new AccelerateInterpolator())
+                .setInterpolator(EXIT_INTERPOLATOR)
                 .withEndAction(() -> {
                     ViewParent parent = bar.getParent();
                     if (parent instanceof ViewGroup) {

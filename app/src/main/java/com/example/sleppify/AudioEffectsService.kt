@@ -64,8 +64,7 @@ class AudioEffectsService : Service() {
 
         when (action) {
             ACTION_APPLY -> {
-                val sessionId = intent?.getIntExtra(EXTRA_AUDIO_SESSION_ID, GLOBAL_SESSION_ID) ?: GLOBAL_SESSION_ID
-                applyEffects(sessionId)
+                applyEffects()
             }
             ACTION_STOP -> {
                 releaseEngine()
@@ -73,7 +72,7 @@ class AudioEffectsService : Service() {
                 stopSelf()
             }
             else -> {
-                applyEffects(GLOBAL_SESSION_ID)
+                applyEffects()
             }
         }
 
@@ -170,7 +169,7 @@ class AudioEffectsService : Service() {
     // Core DSP Engine
     // ───────────────────────────────────────────────────────────────────
 
-    private fun applyEffects(sessionId: Int) {
+    private fun applyEffects() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
             Log.w(TAG, "DynamicsProcessing requires API 28+, current=${Build.VERSION.SDK_INT}")
             stopSelfResult(0)
@@ -178,7 +177,7 @@ class AudioEffectsService : Service() {
         }
 
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-        
+
         // Initial sync to ensure correct profile for current device on startup
         val manager = audioManager
         if (manager != null) {
@@ -194,7 +193,11 @@ class AudioEffectsService : Service() {
             return
         }
 
-        val targetSession = if (sessionId != GLOBAL_SESSION_ID) sessionId else GLOBAL_SESSION_ID
+        // Scope: global (session 0, all system audio — needs the heavier system routing) or
+        // app-only (the player's live audio session — cheaper, only touches Sleppify's output).
+        // Every apply path resolves from prefs so a scope flip or a new player session rebuilds
+        // the engine on the next apply without callers having to know the session.
+        val targetSession = resolveTargetSession(prefs)
 
         Thread {
             try {
@@ -373,15 +376,23 @@ class AudioEffectsService : Service() {
 
     }
 
+    private fun resolveTargetSession(prefs: SharedPreferences): Int {
+        if (prefs.getBoolean(KEY_APPLY_GLOBAL, true)) return GLOBAL_SESSION_ID
+        // App-only scope: attach to the player's last known audio session. Until playback has
+        // produced a real session id, fall back to global so the EQ never silently disappears.
+        val playerSession = prefs.getInt(KEY_PLAYER_SESSION_ID, GLOBAL_SESSION_ID)
+        return if (playerSession > 0) playerSession else GLOBAL_SESSION_ID
+    }
+
     private fun syncAndRefresh() {
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
         val manager = audioManager ?: return
         val selected = AudioDeviceProfileStore.selectPreferredOutput(manager)
-        
+
         val changed = AudioDeviceProfileStore.syncActiveProfileForOutput(prefs, selected)
         if (changed) {
             if (prefs.getBoolean(KEY_ENABLED, false)) {
-                applyEffects(currentAudioSessionId)
+                applyEffects()
             }
         }
     }
@@ -422,11 +433,14 @@ class AudioEffectsService : Service() {
         const val ACTION_APPLY = "com.example.sleppify.action.APPLY_EFFECTS"
         const val ACTION_STOP = "com.example.sleppify.action.STOP_EFFECTS"
 
-        const val EXTRA_AUDIO_SESSION_ID = "extra_audio_session_id"
-
         const val PREFS_NAME = "global_eq_prefs"
 
         const val KEY_ENABLED = "enabled"
+        // Scope del EQ: true = todo el sistema (session 0, comportamiento clásico); false = solo
+        // Sleppify (se ata al audio session del player — más liviano y sin tocar otras apps).
+        const val KEY_APPLY_GLOBAL = "apply_global"
+        // Última sesión de audio real reportada por el player (ExoMediaPlayer.onAudioSessionIdChanged).
+        const val KEY_PLAYER_SESSION_ID = "player_session_id"
         const val KEY_BASS_DB = "bass_db"
         const val KEY_BASS_FREQUENCY_HZ = "bass_frequency_hz"
         const val KEY_BASS_TYPE = "bass_type"
@@ -468,8 +482,7 @@ class AudioEffectsService : Service() {
          * Uses startForegroundService() on API 26+ so the service can call startForeground().
          */
         @JvmStatic
-        @JvmOverloads
-        fun sendApply(context: Context, audioSessionId: Int = GLOBAL_SESSION_ID) {
+        fun sendApply(context: Context) {
             val prefs = context.getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
             val enabled = prefs.getBoolean(KEY_ENABLED, false)
 
@@ -480,7 +493,6 @@ class AudioEffectsService : Service() {
 
             val intent = Intent(context, AudioEffectsService::class.java).apply {
                 action = ACTION_APPLY
-                putExtra(EXTRA_AUDIO_SESSION_ID, audioSessionId)
             }
             try {
                 // Use regular startService to avoid ForegroundServiceDidNotStartInTimeException
@@ -488,6 +500,21 @@ class AudioEffectsService : Service() {
                 context.startService(intent)
             } catch (e: Exception) {
                 Log.w(TAG, "sendApply:failed", e)
+            }
+        }
+
+        /**
+         * Called by ExoMediaPlayer whenever the live playback session id changes. Persists it and,
+         * when the EQ is enabled in app-only scope, re-applies so the engine chases the new session.
+         */
+        @JvmStatic
+        fun notifyPlayerSessionChanged(context: Context, sessionId: Int) {
+            if (sessionId <= 0) return // AUDIO_SESSION_ID_UNSET — keep the last known good one
+            val prefs = context.getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            if (prefs.getInt(KEY_PLAYER_SESSION_ID, GLOBAL_SESSION_ID) == sessionId) return
+            prefs.edit().putInt(KEY_PLAYER_SESSION_ID, sessionId).apply()
+            if (!prefs.getBoolean(KEY_APPLY_GLOBAL, true) && prefs.getBoolean(KEY_ENABLED, false)) {
+                sendApply(context)
             }
         }
 

@@ -14,8 +14,11 @@ android {
         applicationId = "com.example.sleppify"
         minSdk = 24
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        // IMPORTANTE: sube versionCode en CADA release y publícalo IGUAL en el panel.
+        // El chequeo compara este entero con el del hosting; si el APK instalado tiene un
+        // code menor que el publicado, la app ofrece la actualización una y otra vez.
+        versionCode = 3
+        versionName = "1.0.1"
         buildConfigField("int", "VERSION_CODE", "${versionCode!!}")
         buildConfigField("String", "VERSION_NAME", "\"${versionName!!}\"")
         buildConfigField("String", "YOUTUBE_DATA_API_KEY", "\"$youtubeDataApiKey\"")

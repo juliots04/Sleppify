@@ -32,7 +32,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -50,12 +49,21 @@ class SettingsFragment : Fragment() {
         private const val SECTION_HISTORY = 3
         private const val SECTION_ACCOUNT = 4
         private const val SECTION_DATA_SAVER = 5
+        private const val SECTION_UPDATE = 6
         private const val HISTORY_PAGE_SIZE = 20
         private const val HISTORY_DAY_VISIBLE_LIMIT = 20
-        private const val KEY_USE_SD_CARD = "use_sd_card"
+        // Única fuente de verdad de la clave: OfflineAudioStore (quien la consume al descargar).
+        private const val KEY_USE_SD_CARD = OfflineAudioStore.KEY_USE_SD_CARD
         private const val STATE_CURRENT_SECTION = "settings_current_section"
         private const val STATE_ENTRY_SECTION = "settings_entry_section"
         private const val STATE_PENDING_ENTRY = "settings_pending_entry"
+        // Update encontrado (para no re-buscar tras rotar). La descarga en curso NO se guarda aquí:
+        // su fuente de verdad es AppUpdateManager (re-enganchado en renderUpdateSection).
+        private const val STATE_UPD_NAME = "settings_upd_name"
+        private const val STATE_UPD_CODE = "settings_upd_code"
+        private const val STATE_UPD_URL = "settings_upd_url"
+        private const val STATE_UPD_NOTES = "settings_upd_notes"
+        private const val STATE_UPD_SIZE = "settings_upd_size"
     }
 
     // --- Navigation state ---
@@ -73,18 +81,22 @@ class SettingsFragment : Fragment() {
 
     // --- Views ---
     private lateinit var tvToolbarTitle: TextView
+    // El botón de cámara (scanner) solo tiene sentido en la raíz de Configuración.
+    private var btnSettingsCamera: View? = null
     private lateinit var sectionRoot: View
     private lateinit var sectionPlayback: View
     private lateinit var sectionDownloads: View
     private lateinit var sectionHistory: View
     private lateinit var sectionAccount: View
     private lateinit var sectionDataSaver: View
+    private lateinit var sectionUpdate: View
 
     // Playback sub-section
     private lateinit var sbPlaybackCrossfade: SeekBar
     private lateinit var tvPlaybackCrossfadeValue: TextView
     private lateinit var swPlaybackGapless: MaterialSwitch
     private lateinit var swPlaybackOffline: MaterialSwitch
+    private lateinit var swPlaybackEqGlobal: MaterialSwitch
 
     // Downloads sub-section
     private lateinit var tvDownloadsStorageFree: TextView
@@ -110,7 +122,6 @@ class SettingsFragment : Fragment() {
     private lateinit var swLimitMobileData: MaterialSwitch
     private lateinit var swWifiOnlyPlayback: MaterialSwitch
     private lateinit var swNoMusicVideos: MaterialSwitch
-    private lateinit var swNoPodcastVideos: MaterialSwitch
 
     // Account sub-section
     private lateinit var ivAccountPhoto: ShapeableImageView
@@ -118,6 +129,21 @@ class SettingsFragment : Fragment() {
     private lateinit var tvAccountEmail: TextView
     private lateinit var rvTopPlayed: RecyclerView
     private lateinit var llAccountTopPlayedEmpty: View
+
+    // Update sub-section
+    private lateinit var tvUpdateInstalledVersion: TextView
+    private lateinit var tvUpdateStatus: TextView
+    private lateinit var llUpdateCard: View
+    private lateinit var tvUpdateNewVersion: TextView
+    private lateinit var tvUpdateVersionPill: TextView
+    private lateinit var tvUpdateNotes: TextView
+    private lateinit var llUpdateProgress: View
+    private lateinit var pbUpdateDownload: ProgressBar
+    private lateinit var tvUpdatePercent: TextView
+    private lateinit var btnUpdateAction: TextView
+    private var availableUpdate: AppUpdateManager.UpdateInfo? = null
+    private var updateCheckInFlight = false
+    private var autoStartDownloadOnOpen = false
 
     private val settingsPrefs: SharedPreferences by lazy {
         requireContext().getSharedPreferences(CloudSyncManager.PREFS_SETTINGS, Context.MODE_PRIVATE)
@@ -135,7 +161,7 @@ class SettingsFragment : Fragment() {
         } else {
             LocalFilesStore.setEnabled(requireContext(), false)
             renderShowDeviceFiles()
-            Toast.makeText(requireContext(), "Se necesita permiso para acceder a la música", Toast.LENGTH_SHORT).show()
+            AppSnackbar.show(activity, "Se necesita permiso para acceder a la música")
         }
     }
 
@@ -161,7 +187,8 @@ class SettingsFragment : Fragment() {
         val llSettingsToolbar = view.findViewById<View>(R.id.llSettingsToolbar)
         tvToolbarTitle = view.findViewById(R.id.tvSettingsToolbarTitle)
         view.findViewById<View>(R.id.btnSettingsBack)?.setOnClickListener { onBackPressed() }
-        view.findViewById<View>(R.id.btnSettingsCamera)?.setOnClickListener {
+        btnSettingsCamera = view.findViewById(R.id.btnSettingsCamera)
+        btnSettingsCamera?.setOnClickListener {
             (activity as? MainActivity)?.openScannerFromSettings()
         }
         ViewCompat.setOnApplyWindowInsetsListener(view) { _, insets ->
@@ -176,6 +203,7 @@ class SettingsFragment : Fragment() {
         sectionDataSaver = view.findViewById(R.id.settingsDataSaver)
         sectionHistory = view.findViewById(R.id.settingsHistory)
         sectionAccount = view.findViewById(R.id.settingsAccount)
+        sectionUpdate = view.findViewById(R.id.settingsUpdate)
 
         setupRootSection(view)
         setupPlaybackSection(view)
@@ -183,6 +211,7 @@ class SettingsFragment : Fragment() {
         setupDataSaverSection(view)
         setupHistorySection(view)
         setupAccountSection(view)
+        setupUpdateSection(view)
 
         // Restore across process death (e.g. the user switched apps and the system reclaimed
         // us). MainActivity re-enters Settings by finding this fragment by tag without calling
@@ -193,6 +222,16 @@ class SettingsFragment : Fragment() {
             pendingEntry = savedInstanceState.getBoolean(STATE_PENDING_ENTRY, pendingEntry)
             if (pendingSection == null) {
                 currentSection = savedInstanceState.getInt(STATE_CURRENT_SECTION, currentSection)
+            }
+            val updName = savedInstanceState.getString(STATE_UPD_NAME)
+            if (updName != null) {
+                availableUpdate = AppUpdateManager.UpdateInfo(
+                    updName,
+                    savedInstanceState.getInt(STATE_UPD_CODE),
+                    savedInstanceState.getString(STATE_UPD_URL, ""),
+                    savedInstanceState.getString(STATE_UPD_NOTES, ""),
+                    savedInstanceState.getLong(STATE_UPD_SIZE, 0L)
+                )
             }
         }
 
@@ -206,6 +245,13 @@ class SettingsFragment : Fragment() {
         outState.putInt(STATE_CURRENT_SECTION, currentSection)
         outState.putInt(STATE_ENTRY_SECTION, entrySection)
         outState.putBoolean(STATE_PENDING_ENTRY, pendingEntry)
+        availableUpdate?.let {
+            outState.putString(STATE_UPD_NAME, it.versionName)
+            outState.putInt(STATE_UPD_CODE, it.versionCode)
+            outState.putString(STATE_UPD_URL, it.apkUrl)
+            outState.putString(STATE_UPD_NOTES, it.notes)
+            outState.putLong(STATE_UPD_SIZE, it.sizeBytes)
+        }
     }
 
     override fun onHiddenChanged(hidden: Boolean) {
@@ -226,6 +272,11 @@ class SettingsFragment : Fragment() {
         super.onResume()
         if (currentSection == SECTION_PLAYBACK) renderPlaybackSection()
         if (currentSection == SECTION_ACCOUNT) renderAccountSection()
+        // Al volver del instalador del sistema (p. ej. el usuario canceló), el botón se quedaba
+        // pegado en "Instalando…". Re-render deja la card lista para reintentar.
+        if (currentSection == SECTION_UPDATE && !AppUpdateManager.isDownloadInFlight()) {
+            restoreUpdateActionButton()
+        }
     }
 
     fun onBackPressed() {
@@ -253,6 +304,20 @@ class SettingsFragment : Fragment() {
     fun navigateToRoot() {
         pendingEntry = true
         requestSection(SECTION_ROOT)
+    }
+
+    /**
+     * Abre directo la sección Actualizar. Con [update] (viene de la ventana emergente) la card
+     * se pinta al instante y LA DESCARGA ARRANCA SOLA — el usuario llega con el % ya corriendo.
+     * Sin update, se dispara el chequeo automáticamente.
+     */
+    fun navigateToUpdate(update: AppUpdateManager.UpdateInfo?) {
+        if (update != null) {
+            availableUpdate = update
+            autoStartDownloadOnOpen = true
+        }
+        pendingEntry = true
+        requestSection(SECTION_UPDATE)
     }
 
     /**
@@ -286,6 +351,7 @@ class SettingsFragment : Fragment() {
         sectionDataSaver.visibility = if (section == SECTION_DATA_SAVER) View.VISIBLE else View.GONE
         sectionHistory.visibility = if (section == SECTION_HISTORY) View.VISIBLE else View.GONE
         sectionAccount.visibility = if (section == SECTION_ACCOUNT) View.VISIBLE else View.GONE
+        sectionUpdate.visibility = if (section == SECTION_UPDATE) View.VISIBLE else View.GONE
 
         tvToolbarTitle.text = when (section) {
             SECTION_PLAYBACK -> "Reproducción"
@@ -293,8 +359,12 @@ class SettingsFragment : Fragment() {
             SECTION_DATA_SAVER -> "Ahorro de datos"
             SECTION_HISTORY -> "Historial"
             SECTION_ACCOUNT -> "Cuenta"
+            SECTION_UPDATE -> "Actualizar"
             else -> "Configuración"
         }
+
+        // La cámara (scanner) solo en la raíz; en las subsecciones el header va limpio.
+        btnSettingsCamera?.visibility = if (section == SECTION_ROOT) View.VISIBLE else View.GONE
 
         // Scroll to top
         when (section) {
@@ -303,6 +373,7 @@ class SettingsFragment : Fragment() {
             SECTION_DATA_SAVER -> sectionDataSaver.findViewById<ScrollView>(R.id.svSettingsDataSaver)?.scrollTo(0, 0)
             SECTION_HISTORY -> rvHistory.scrollToPosition(0)
             SECTION_ACCOUNT -> sectionAccount.findViewById<ScrollView>(R.id.svSettingsAccount)?.scrollTo(0, 0)
+            SECTION_UPDATE -> sectionUpdate.findViewById<ScrollView>(R.id.svSettingsUpdate)?.scrollTo(0, 0)
         }
 
         // Render content on open
@@ -312,6 +383,7 @@ class SettingsFragment : Fragment() {
             SECTION_DATA_SAVER -> renderDataSaverSection()
             SECTION_HISTORY -> loadHistory(reset = true)
             SECTION_ACCOUNT -> renderAccountSection()
+            SECTION_UPDATE -> renderUpdateSection()
         }
 
         // Bottom nav + mini-player visibility for History and Account
@@ -333,6 +405,7 @@ class SettingsFragment : Fragment() {
         view.findViewById<View>(R.id.rowSettingsDataSaver)?.setOnClickListener { showSection(SECTION_DATA_SAVER) }
         view.findViewById<View>(R.id.rowSettingsHistory)?.setOnClickListener { showSection(SECTION_HISTORY) }
         view.findViewById<View>(R.id.rowSettingsAccount)?.setOnClickListener { showSection(SECTION_ACCOUNT) }
+        view.findViewById<View>(R.id.rowSettingsUpdate)?.setOnClickListener { showSection(SECTION_UPDATE) }
     }
 
     // --- Playback section ---
@@ -342,6 +415,7 @@ class SettingsFragment : Fragment() {
         tvPlaybackCrossfadeValue = view.findViewById(R.id.tvPlaybackCrossfadeValue)
         swPlaybackGapless = view.findViewById(R.id.swPlaybackGapless)
         swPlaybackOffline = view.findViewById(R.id.swPlaybackOffline)
+        swPlaybackEqGlobal = view.findViewById(R.id.swPlaybackEqGlobal)
 
         view.findViewById<View>(R.id.rowPlaybackEqualizer)?.setOnClickListener {
             (activity as? MainActivity)?.openEqualizerFromSettings()
@@ -377,6 +451,20 @@ class SettingsFragment : Fragment() {
                 (activity as? MainActivity)?.notifyOfflineModeChanged()
             }
         }
+
+        // EQ scope: global (session 0, todo el sistema) vs solo Sleppify (sesión del player).
+        // Vive en global_eq_prefs porque es AudioEffectsService quien la resuelve en cada apply.
+        val eqPrefs = requireContext().getSharedPreferences(AudioEffectsService.PREFS_NAME, Context.MODE_PRIVATE)
+        swPlaybackEqGlobal.apply {
+            setOnCheckedChangeListener(null)
+            isChecked = eqPrefs.getBoolean(AudioEffectsService.KEY_APPLY_GLOBAL, true)
+            setOnCheckedChangeListener { _, c ->
+                eqPrefs.edit().putBoolean(AudioEffectsService.KEY_APPLY_GLOBAL, c).apply()
+                // Re-apply inmediato: el service rehace el engine sobre la sesión que corresponda
+                // (si el EQ está apagado, sendApply degrada a stop y no pasa nada).
+                AudioEffectsService.sendApply(requireContext().applicationContext)
+            }
+        }
     }
 
     // --- Downloads section ---
@@ -398,39 +486,48 @@ class SettingsFragment : Fragment() {
 
     private fun renderDownloadsSection() {
         if (!isAdded) return
-        // Storage info
+        // Storage info. "En uso" = lo que OCUPA LA APP en ese volumen (descargas + caches),
+        // no el uso total del dispositivo; la barra muestra ese uso relativo al volumen.
+        val appCtx = requireContext().applicationContext
         viewLifecycleOwner.lifecycleScope.launch(Dispatchers.IO) {
-            // Internal storage
+            // Internal volume totals
             val stat = try { StatFs(Environment.getDataDirectory().absolutePath) } catch (_: Exception) { null }
             val totalInternal = stat?.totalBytes ?: 1L
             val freeInternal = stat?.availableBytes ?: 0L
-            val usedInternal = totalInternal - freeInternal
-            val internalPercent = ((usedInternal.toDouble() / totalInternal) * 100).toInt().coerceIn(0, 100)
-            val downloads = collectDownloadRoots(requireContext().applicationContext).sumOf { calculateSize(it) }
 
-            // SD card storage
-            val sdPaths = android.os.storage.StorageManager::class.java.let { sm ->
-                try {
-                    val ctx = requireContext()
-                    val externalDirs = ctx.getExternalFilesDirs(null)
-                    externalDirs.filterNotNull().drop(1) // skip primary, keep SD
-                } catch (_: Exception) { emptyList() }
-            }
-            val sdStat = sdPaths.firstOrNull()?.let { try { StatFs(it.absolutePath) } catch (_: Exception) { null } }
+            // App usage on the INTERNAL volume: downloads + every cache the app grows
+            // (exo_stream_cache, Glide image cache, comments cache, updates…).
+            val internalDownloads = calculateSize(File(appCtx.filesDir, "offline_audio"))
+            val internalCaches = calculateSize(appCtx.cacheDir)
+            val appUsedInternal = internalDownloads + internalCaches
+            val internalPercent = appUsagePercent(appUsedInternal, totalInternal)
+
+            // SD volume (slot 0 of getExternalFilesDirs is ALWAYS the primary/internal one)
+            val sdFilesDir = try {
+                appCtx.getExternalFilesDirs(null)?.drop(1)?.filterNotNull()
+                    ?.firstOrNull { Environment.getExternalStorageState(it) == Environment.MEDIA_MOUNTED }
+            } catch (_: Exception) { null }
+            val sdStat = sdFilesDir?.let { try { StatFs(it.absolutePath) } catch (_: Exception) { null } }
             val totalSd = sdStat?.totalBytes ?: 1L
             val freeSd = sdStat?.availableBytes ?: 0L
-            val usedSd = totalSd - freeSd
-            val sdPercent = if (sdStat != null) ((usedSd.toDouble() / totalSd) * 100).toInt().coerceIn(0, 100) else 0
+
+            // App usage on the SD volume: downloads there + any external cache on that card.
+            val sdDownloads = sdFilesDir?.let { calculateSize(File(it, "offline_audio")) } ?: 0L
+            val sdCaches = try {
+                appCtx.externalCacheDirs?.drop(1)?.filterNotNull()?.sumOf { calculateSize(it) } ?: 0L
+            } catch (_: Exception) { 0L }
+            val appUsedSd = sdDownloads + sdCaches
+            val sdPercent = if (sdStat != null) appUsagePercent(appUsedSd, totalSd) else 0
 
             withContext(Dispatchers.Main) {
                 if (!isAdded) return@withContext
                 tvDownloadsStorageFree.text = "${formatSize(freeInternal)} libres"
-                tvDownloadsStorageUsed.text = "${formatSize(downloads)} en uso"
+                tvDownloadsStorageUsed.text = "${formatSize(appUsedInternal)} en uso"
                 pbStorageInternal.progress = internalPercent
 
                 if (sdStat != null) {
                     tvDownloadsSdFree.text = "${formatSize(freeSd)} libres"
-                    tvDownloadsSdUsed.text = "${formatSize(usedSd)} en uso"
+                    tvDownloadsSdUsed.text = "${formatSize(appUsedSd)} en uso"
                     pbStorageSd.progress = sdPercent
                 } else {
                     tvDownloadsSdFree.text = "No disponible"
@@ -440,12 +537,22 @@ class SettingsFragment : Fragment() {
             }
         }
 
-        // SD card switch
+        // SD card switch — OfflineAudioStore lee esta pref para decidir el volumen de escritura.
         val useSd = settingsPrefs.getBoolean(KEY_USE_SD_CARD, false)
         swUseSdCard.apply {
             setOnCheckedChangeListener(null); isChecked = useSd
             setOnCheckedChangeListener { _, c ->
+                if (c && !OfflineAudioStore.hasSdCard(requireContext())) {
+                    // Sin SD montada no hay nada que activar — el switch vuelve solo.
+                    setOnCheckedChangeListener(null); isChecked = false
+                    renderDownloadsSection()
+                    AppSnackbar.show(activity, "No se detectó una tarjeta SD")
+                    return@setOnCheckedChangeListener
+                }
                 settingsPrefs.edit().putBoolean(KEY_USE_SD_CARD, c).apply()
+                // Los estados cacheados siguen siendo válidos (los lookups recorren ambos
+                // volúmenes), pero limpiar es barato y evita cualquier residuo de rutas.
+                OfflineAudioStore.clearOfflineAudioStateCache()
             }
         }
 
@@ -500,7 +607,6 @@ class SettingsFragment : Fragment() {
         swLimitMobileData = view.findViewById(R.id.swLimitMobileData)
         swWifiOnlyPlayback = view.findViewById(R.id.swWifiOnlyPlayback)
         swNoMusicVideos = view.findViewById(R.id.swNoMusicVideos)
-        swNoPodcastVideos = view.findViewById(R.id.swNoPodcastVideos)
 
         view.findViewById<View>(R.id.rowQualityMobile)?.setOnClickListener {
             showQualityDialog(CloudSyncManager.KEY_STREAMING_QUALITY_MOBILE, "Calidad del audio en redes móviles", tvQualityMobileValue)
@@ -538,13 +644,6 @@ class SettingsFragment : Fragment() {
             isChecked = settingsPrefs.getBoolean(CloudSyncManager.KEY_NO_MUSIC_VIDEOS, true)
             setOnCheckedChangeListener { _, c ->
                 settingsPrefs.edit().putBoolean(CloudSyncManager.KEY_NO_MUSIC_VIDEOS, c).apply()
-            }
-        }
-        swNoPodcastVideos.apply {
-            setOnCheckedChangeListener(null)
-            isChecked = settingsPrefs.getBoolean(CloudSyncManager.KEY_NO_PODCAST_VIDEOS, false)
-            setOnCheckedChangeListener { _, c ->
-                settingsPrefs.edit().putBoolean(CloudSyncManager.KEY_NO_PODCAST_VIDEOS, c).apply()
             }
         }
     }
@@ -735,9 +834,9 @@ class SettingsFragment : Fragment() {
             dialog.dismiss()
             if (hasOffline) {
                 OfflineAudioStore.deleteOfflineAudio(ctx, entry.videoId)
-                Toast.makeText(ctx, "Descarga eliminada", Toast.LENGTH_SHORT).show()
+                AppSnackbar.show(activity, "Descarga eliminada")
             } else {
-                Toast.makeText(ctx, "Descarga iniciada", Toast.LENGTH_SHORT).show()
+                AppSnackbar.show(activity, "Descarga iniciada")
             }
         }
 
@@ -791,7 +890,7 @@ class SettingsFragment : Fragment() {
             val player = fm.findFragmentByTag(AppConstants.TAG_SONG_PLAYER) as? SongPlayerFragment
             if (player != null && player.isAdded) {
                 player.externalEnqueue(entry.videoId, entry.title, entry.artist, "", entry.imageUrl)
-                Toast.makeText(ctx, "Agregado a la fila", Toast.LENGTH_SHORT).show()
+                AppSnackbar.show(activity, "Agregado a la fila")
             } else {
                 playHistoryEntry(entry)
             }
@@ -804,7 +903,7 @@ class SettingsFragment : Fragment() {
         btnFav.setOnClickListener {
             dialog.dismiss()
             FavoritesPlaylistStore.upsertFavorite(ctx, entry.videoId, entry.title, entry.artist, "", entry.imageUrl)
-            Toast.makeText(ctx, "Añadido a Favoritos", Toast.LENGTH_SHORT).show()
+            AppSnackbar.show(activity, "Añadido a Favoritos")
         }
 
         // Hide unused rows
@@ -1041,11 +1140,206 @@ class SettingsFragment : Fragment() {
                 if (!isAdded) return@withContext
                 downloadCleanupInFlight = false
                 tvDownloadsDeleteTitle.text = "Borrar descargas"
-                Toast.makeText(requireContext(), "Todas las descargas eliminadas", Toast.LENGTH_SHORT).show()
+                AppSnackbar.show(activity, "Todas las descargas eliminadas")
                 renderDownloadsSection()
                 (activity as? MainActivity)?.onAllDownloadsDeleted()
             }
         }
+    }
+
+    // --- Update section ---
+
+    private fun setupUpdateSection(view: View) {
+        tvUpdateInstalledVersion = view.findViewById(R.id.tvUpdateInstalledVersion)
+        tvUpdateStatus = view.findViewById(R.id.tvUpdateStatus)
+        llUpdateCard = view.findViewById(R.id.llUpdateCard)
+        tvUpdateNewVersion = view.findViewById(R.id.tvUpdateNewVersion)
+        tvUpdateVersionPill = view.findViewById(R.id.tvUpdateVersionPill)
+        tvUpdateNotes = view.findViewById(R.id.tvUpdateNotes)
+        llUpdateProgress = view.findViewById(R.id.llUpdateProgress)
+        pbUpdateDownload = view.findViewById(R.id.pbUpdateDownload)
+        tvUpdatePercent = view.findViewById(R.id.tvUpdatePercent)
+        btnUpdateAction = view.findViewById(R.id.btnUpdateAction)
+
+        tvUpdateInstalledVersion.text = "Versión instalada ${BuildConfig.VERSION_NAME}"
+        btnUpdateAction.setOnClickListener { onUpdateActionTapped() }
+    }
+
+    private fun renderUpdateSection() {
+        if (!isAdded) return
+
+        // Descarga viva (posible recreación del fragment por rotación/tema): reconstruir la card
+        // de "descargando" y RE-ENGANCHAR los callbacks a esta instancia para que el % avance.
+        if (AppUpdateManager.isDownloadInFlight()) {
+            val u = AppUpdateManager.getInProgressUpdate() ?: return
+            availableUpdate = u
+            showAvailableUpdate(u)
+            enterDownloadingUi(AppUpdateManager.getLastProgress())
+            AppUpdateManager.reattach(::onUpdateProgress, ::onUpdateInstallStarted, ::onUpdateDownloadError)
+            return
+        }
+
+        val update = availableUpdate
+        if (update != null) {
+            // Ya sabemos que hay versión nueva (vino del popup o de un chequeo previo).
+            showAvailableUpdate(update)
+            if (autoStartDownloadOnOpen) {
+                autoStartDownloadOnOpen = false
+                startUpdateDownload(update)
+            }
+            return
+        }
+        // Sin datos previos: buscamos SOLOS al abrir la sección, así el usuario no adivina.
+        startUpdateCheck()
+    }
+
+    private fun onUpdateActionTapped() {
+        val update = availableUpdate
+        if (update == null) startUpdateCheck() else startUpdateDownload(update)
+    }
+
+    /** Deja el botón listo para reintentar tras volver del instalador (sin re-buscar). */
+    private fun restoreUpdateActionButton() {
+        if (!isAdded || availableUpdate == null) return
+        llUpdateProgress.visibility = View.GONE
+        btnUpdateAction.visibility = View.VISIBLE
+        btnUpdateAction.isEnabled = true
+        btnUpdateAction.text = "Actualizar"
+        styleUpdateButton(prominent = true)
+    }
+
+    /**
+     * "Actualizar" (hay descarga real) = botón prominente (accent, ancho completo).
+     * Buscar de nuevo / Reintentar = botón sutil, chico y centrado (acción secundaria).
+     */
+    private fun styleUpdateButton(prominent: Boolean) {
+        if (!isAdded) return
+        val lp = btnUpdateAction.layoutParams as? LinearLayout.LayoutParams ?: return
+        val hPad = dp(22)
+        if (prominent) {
+            lp.width = LinearLayout.LayoutParams.MATCH_PARENT
+            lp.height = dp(48)
+            lp.gravity = android.view.Gravity.NO_GRAVITY
+            btnUpdateAction.layoutParams = lp
+            btnUpdateAction.setBackgroundResource(R.drawable.bg_update_button)
+            btnUpdateAction.setTextColor(0xFF000000.toInt())
+        } else {
+            lp.width = LinearLayout.LayoutParams.WRAP_CONTENT
+            lp.height = dp(40)
+            lp.gravity = android.view.Gravity.CENTER_HORIZONTAL
+            btnUpdateAction.layoutParams = lp
+            btnUpdateAction.setBackgroundResource(R.drawable.bg_update_button_subtle)
+            btnUpdateAction.setTextColor(ContextCompat.getColor(requireContext(), R.color.text_primary))
+        }
+        btnUpdateAction.setPadding(hPad, 0, hPad, 0)
+    }
+
+    private fun startUpdateCheck() {
+        if (updateCheckInFlight || !isAdded) return
+        updateCheckInFlight = true
+        // Estado "buscando": ocultamos card y botón, dejamos solo el mensaje.
+        llUpdateCard.visibility = View.GONE
+        tvUpdateStatus.visibility = View.VISIBLE
+        tvUpdateStatus.text = "Buscando actualización…"
+        btnUpdateAction.visibility = View.GONE
+
+        AppUpdateManager.checkForUpdate(requireContext().applicationContext) { update, error ->
+            updateCheckInFlight = false
+            if (!isAdded) return@checkForUpdate
+            btnUpdateAction.visibility = View.VISIBLE
+            btnUpdateAction.isEnabled = true
+            when {
+                error != null -> {
+                    tvUpdateStatus.visibility = View.VISIBLE
+                    tvUpdateStatus.text = "No se pudo conectar con el servidor de actualizaciones.\nRevisa tu conexión e inténtalo de nuevo."
+                    llUpdateCard.visibility = View.GONE
+                    btnUpdateAction.text = "Reintentar"
+                    styleUpdateButton(prominent = false)
+                }
+                update == null -> {
+                    availableUpdate = null // por si había una card previa ya instalada
+                    tvUpdateStatus.visibility = View.VISIBLE
+                    tvUpdateStatus.text = "Tienes la última versión ✓"
+                    llUpdateCard.visibility = View.GONE
+                    btnUpdateAction.text = "Buscar de nuevo"
+                    styleUpdateButton(prominent = false)
+                }
+                else -> {
+                    availableUpdate = update
+                    showAvailableUpdate(update)
+                }
+            }
+        }
+    }
+
+    private fun showAvailableUpdate(update: AppUpdateManager.UpdateInfo) {
+        tvUpdateStatus.visibility = View.GONE
+        // "🔥 Nueva versión" es fijo (XML); la versión va en la pastilla de la derecha.
+        tvUpdateVersionPill.text = update.versionName
+        // Mismo formateo que la vista previa del panel (viñetas, guion opcional).
+        tvUpdateNotes.text = AppUpdateManager.formatNotesAsBullets(update.notes)
+        llUpdateCard.visibility = View.VISIBLE
+        llUpdateProgress.visibility = View.GONE
+        btnUpdateAction.visibility = View.VISIBLE
+        btnUpdateAction.text = "Actualizar"
+        btnUpdateAction.isEnabled = true
+        styleUpdateButton(prominent = true)
+    }
+
+    private fun startUpdateDownload(update: AppUpdateManager.UpdateInfo) {
+        if (!isAdded || AppUpdateManager.isDownloadInFlight()) return
+        val ctx = requireContext()
+
+        // Sin el permiso de "instalar apps desconocidas" el instalador no abre: pedirlo primero.
+        if (!AppUpdateManager.canInstallUnknownApps(ctx)) {
+            AppSnackbar.show(activity, "Permite instalar apps de Sleppify y vuelve a tocar Actualizar")
+            try {
+                startActivity(AppUpdateManager.buildUnknownSourcesIntent(ctx))
+            } catch (_: Exception) {
+            }
+            return
+        }
+
+        enterDownloadingUi(0)
+        AppUpdateManager.downloadAndInstall(
+            ctx.applicationContext, update,
+            onProgress = ::onUpdateProgress,
+            onInstallStarted = ::onUpdateInstallStarted,
+            onError = ::onUpdateDownloadError
+        )
+    }
+
+    /** Card en modo "descargando": barra visible + botón prominente deshabilitado. */
+    private fun enterDownloadingUi(initialPercent: Int) {
+        if (!isAdded) return
+        llUpdateProgress.visibility = View.VISIBLE
+        pbUpdateDownload.progress = initialPercent
+        tvUpdatePercent.text = "$initialPercent%"
+        btnUpdateAction.visibility = View.VISIBLE
+        styleUpdateButton(prominent = true)
+        btnUpdateAction.isEnabled = false
+        btnUpdateAction.text = "Descargando…"
+    }
+
+    // Callbacks de descarga compartidos por startUpdateDownload y por reattach (tras recrearse).
+    private fun onUpdateProgress(percent: Int) {
+        if (!isAdded) return
+        pbUpdateDownload.progress = percent
+        tvUpdatePercent.text = "$percent%"
+    }
+
+    private fun onUpdateInstallStarted() {
+        if (isAdded) btnUpdateAction.text = "Instalando…"
+    }
+
+    private fun onUpdateDownloadError(message: String) {
+        if (!isAdded) return
+        llUpdateProgress.visibility = View.GONE
+        btnUpdateAction.visibility = View.VISIBLE
+        btnUpdateAction.isEnabled = true
+        btnUpdateAction.text = "Actualizar"
+        styleUpdateButton(prominent = true)
+        AppSnackbar.show(activity, "Error al descargar: $message")
     }
 
     // --- Helpers ---
@@ -1055,20 +1349,17 @@ class SettingsFragment : Fragment() {
         return if (mb < 1024.0) "%.0f MB".format(mb) else "%.2f GB".format(mb / 1024.0)
     }
 
-    private fun collectDownloadRoots(context: Context) = mutableListOf<File>().apply {
-        addDistinct(OfflineAudioStore.getOfflineAudioDir(context))
-        context.getExternalFilesDirs(null)?.filterNotNull()?.forEach { addDistinct(File(it, "offline_audio")) }
+    /** % de la barra: uso de la app relativo al volumen; nunca 0 si hay algo ocupado. */
+    private fun appUsagePercent(used: Long, total: Long): Int {
+        if (total <= 0L || used <= 0L) return 0
+        val percent = ((used * 100.0) / total).toInt().coerceIn(0, 100)
+        return if (percent == 0) 1 else percent
     }
 
     private fun calculateSize(f: File?): Long {
         if (f == null || !f.exists()) return 0L
         if (f.isFile) return f.length().coerceAtLeast(0L)
         return f.listFiles()?.sumOf { calculateSize(it) } ?: 0L
-    }
-
-    private fun MutableList<File>.addDistinct(f: File?) {
-        val path = try { f?.canonicalPath } catch (_: IOException) { f?.absolutePath } ?: return
-        if (none { try { it.canonicalPath == path } catch (_: IOException) { it.absolutePath == path } }) add(f!!)
     }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()

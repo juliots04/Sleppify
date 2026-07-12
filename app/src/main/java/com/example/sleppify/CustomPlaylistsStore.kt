@@ -14,18 +14,28 @@ object CustomPlaylistsStore {
     const val YT_MIRROR_PREFIX = "yt_mirror_"
     private const val KEY_PLAYLIST_NAMES = "all_playlist_names"
 
+    // In-memory caches over the SharedPreferences JSON. buildDisplayLibrary re-reads every custom
+    // playlist's tracks on EVERY library render (once per playlist, on the main thread) — without
+    // these caches each render re-parsed all of that JSON from scratch. All writes go through this
+    // object, so invalidating on the write paths below keeps them coherent.
+    @Volatile private var namesCache: List<String>? = null
+    private val trackListCache = java.util.concurrent.ConcurrentHashMap<String, List<FavoritesPlaylistStore.FavoriteTrack>>()
+
     private fun getPrefs(context: Context): SharedPreferences {
         return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     }
 
     fun getAllPlaylistNames(context: Context): List<String> {
+        namesCache?.let { return it }
         val arr = getPrefs(context).getJsonArray(KEY_PLAYLIST_NAMES)
         val names = mutableListOf<String>()
         for (i in 0 until arr.length()) {
             val name = arr.optString(i, "")
             if (name.isNotEmpty() && !name.startsWith(YT_MIRROR_PREFIX)) names.add(name)
         }
-        return names.sorted()
+        val sorted = names.sorted()
+        namesCache = sorted
+        return sorted
     }
 
     fun createPlaylist(context: Context, name: String): Boolean {
@@ -37,7 +47,8 @@ object CustomPlaylistsStore {
         
         names.add(trimmed)
         getPrefs(context).edit().putString(KEY_PLAYLIST_NAMES, JSONArray(names).toString()).apply()
-        
+        namesCache = null
+
         // Sync empty playlist to cloud if signed in
         if (AuthManager.getInstance(context).isSignedIn()) {
             CloudSyncManager.getInstance(context).syncPlaylistToCloud(trimmed, emptyList())
@@ -79,7 +90,8 @@ object CustomPlaylistsStore {
         }
         
         prefs.edit().putString(key, newArr.toString()).apply()
-        
+        trackListCache.remove(key)
+
         // Sync to cloud if signed in
         if (AuthManager.getInstance(context).isSignedIn()) {
             val updatedTracks = getTracksFromPlaylist(context, playlistName)
@@ -100,6 +112,7 @@ object CustomPlaylistsStore {
             }
         }
         prefs.edit().putString(key, newArr.toString()).apply()
+        trackListCache.remove(key)
 
         if (AuthManager.getInstance(context).isSignedIn()) {
             val updatedTracks = getTracksFromPlaylist(context, playlistName)
@@ -149,6 +162,7 @@ object CustomPlaylistsStore {
         } else {
             prefs.edit().putString(key, newArr.toString()).apply()
         }
+        trackListCache.remove(key)
 
         if (AuthManager.getInstance(context).isSignedIn()) {
             val updatedTracks = getYtMirrorTracks(context, playlistId)
@@ -168,6 +182,7 @@ object CustomPlaylistsStore {
             if (obj.optString("videoId", "") != videoId) newArr.put(obj)
         }
         prefs.edit().putString(key, newArr.toString()).apply()
+        trackListCache.remove(key)
 
         if (AuthManager.getInstance(context).isSignedIn()) {
             val updatedTracks = getYtMirrorTracks(context, playlistId)
@@ -177,7 +192,8 @@ object CustomPlaylistsStore {
 
     fun getYtMirrorTracks(context: Context, playlistId: String): List<FavoritesPlaylistStore.FavoriteTrack> {
         val key = YT_MIRROR_PREFIX + playlistId
-        return getPrefs(context).mapJsonArray(key) { obj ->
+        trackListCache[key]?.let { return it }
+        val parsed = getPrefs(context).mapJsonArray(key) { obj ->
             FavoritesPlaylistStore.FavoriteTrack(
                 obj.optString("videoId", ""),
                 obj.optString("title", ""),
@@ -186,6 +202,8 @@ object CustomPlaylistsStore {
                 obj.optString("thumbnailUrl", "")
             )
         }
+        trackListCache[key] = parsed
+        return parsed
     }
 
     fun isTrackInYtMirror(context: Context, playlistId: String, videoId: String): Boolean {
@@ -196,7 +214,8 @@ object CustomPlaylistsStore {
 
     fun getTracksFromPlaylist(context: Context, playlistName: String): List<FavoritesPlaylistStore.FavoriteTrack> {
         val key = CUSTOM_PLAYLIST_PREFIX + playlistName
-        return getPrefs(context).mapJsonArray(key) { obj ->
+        trackListCache[key]?.let { return it }
+        val parsed = getPrefs(context).mapJsonArray(key) { obj ->
             FavoritesPlaylistStore.FavoriteTrack(
                 obj.optString("videoId", ""),
                 obj.optString("title", ""),
@@ -205,6 +224,8 @@ object CustomPlaylistsStore {
                 obj.optString("thumbnailUrl", "")
             )
         }
+        trackListCache[key] = parsed
+        return parsed
     }
 
     fun savePlaylist(context: Context, playlistName: String, tracks: List<FavoritesPlaylistStore.FavoriteTrack>) {
@@ -222,7 +243,8 @@ object CustomPlaylistsStore {
             newArr.put(trackObj)
         }
         prefs.edit().putString(key, newArr.toString()).apply()
-        
+        trackListCache.remove(key)
+
         if (AuthManager.getInstance(context).isSignedIn()) {
             CloudSyncManager.getInstance(context).syncPlaylistToCloud(playlistName, tracks)
         }
@@ -237,6 +259,7 @@ object CustomPlaylistsStore {
 
         names.add(trimmed)
         getPrefs(context).edit().putString(KEY_PLAYLIST_NAMES, JSONArray(names).toString()).apply()
+        namesCache = null
     }
 
     fun deletePlaylist(context: Context, name: String): Boolean {
@@ -251,11 +274,13 @@ object CustomPlaylistsStore {
         // Remove from names list
         names.removeAt(index)
         prefs.edit().putString(KEY_PLAYLIST_NAMES, JSONArray(names).toString()).apply()
-        
+        namesCache = null
+
         // Remove playlist tracks data
         val key = CUSTOM_PLAYLIST_PREFIX + trimmed
         prefs.edit().remove(key).apply()
-        
+        trackListCache.remove(key)
+
         // Note: Cloud sync deletion can be added here when implemented
         return true
     }
@@ -282,9 +307,12 @@ object CustomPlaylistsStore {
             .putString(newKey, existingJson)
             .remove(oldKey)
             .apply()
+        trackListCache.remove(oldKey)
+        trackListCache.remove(newKey)
 
         names[index] = to
         prefs.edit().putString(KEY_PLAYLIST_NAMES, JSONArray(names).toString()).apply()
+        namesCache = null
 
         // Sync rename as a full re-sync under new name if signed in.
         if (AuthManager.getInstance(context).isSignedIn()) {

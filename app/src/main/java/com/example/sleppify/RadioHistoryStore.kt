@@ -32,6 +32,13 @@ object RadioHistoryStore {
         return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     }
 
+    // In-memory copy of the parsed radio list. getRadios() re-parsed every radio AND its full
+    // track list from SharedPreferences JSON on each call — it runs on the main thread from the
+    // library render pipeline (Radios chip) and the home carousel. Invalidated on the three
+    // KEY_RADIOS write paths (saveRadio / deleteRadio / importFromCloud).
+    @Volatile
+    private var radiosCache: List<RadioEntry>? = null
+
     fun saveRadio(
         context: Context,
         radioPlaylistId: String,
@@ -84,13 +91,16 @@ object RadioHistoryStore {
         }
 
         prefs.edit().putString(KEY_RADIOS, JSONArray(result).toString()).apply()
+        radiosCache = null
         pushToCloud(context)
     }
 
     fun getRadios(context: Context): List<RadioEntry> {
+        radiosCache?.let { return it }
         val prefs = getPrefs(context)
-        val list = loadRadiosInternal(prefs)
-        return list.mapNotNull { parseEntry(it) }
+        val parsed = loadRadiosInternal(prefs).mapNotNull { parseEntry(it) }
+        radiosCache = parsed
+        return parsed
     }
 
     fun deleteRadio(context: Context, radioPlaylistId: String) {
@@ -98,6 +108,7 @@ object RadioHistoryStore {
         val existing = loadRadiosInternal(prefs)
         val filtered = existing.filter { it.optString("radioPlaylistId") != radioPlaylistId }
         prefs.edit().putString(KEY_RADIOS, JSONArray(filtered).toString()).apply()
+        radiosCache = null
         // Also unpin if pinned
         unpinRadio(context, radioPlaylistId)
         pushToCloud(context)
@@ -203,6 +214,7 @@ object RadioHistoryStore {
             .putString(KEY_RADIOS, JSONArray(result).toString())
             .putString(KEY_PINNED, JSONArray(mergedPinned.toList()).toString())
             .apply()
+        radiosCache = null
     }
 
     // --- Pinned playlists (any type, not just radios) ---

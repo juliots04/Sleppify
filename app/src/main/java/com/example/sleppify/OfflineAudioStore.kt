@@ -2,6 +2,7 @@ package com.example.sleppify
 
 import android.content.Context
 import android.media.MediaMetadataRetriever
+import android.os.Environment
 import java.io.File
 import java.util.LinkedHashMap
 
@@ -12,6 +13,20 @@ object OfflineAudioStore {
     private const val OFFLINE_VIDEO_EXTENSION = ".mp4"
     private const val LEGACY_OFFLINE_AUDIO_EXTENSION = ".mp3"
     private const val LEGACY_BIN_OFFLINE_AUDIO_EXTENSION = ".bin"
+
+    // Pref del toggle "Usar tarjeta SD" (Configuración > Descargas, archivo "sleppify_settings").
+    // Redirige el directorio de ESCRITURA a la SD; las búsquedas/borrados siempre recorren ambos
+    // volúmenes, así que las descargas viejas siguen encontrándose después de cambiar el toggle.
+    const val KEY_USE_SD_CARD = "use_sd_card"
+
+    // Lookup priority shared by every existing-file search (video first, then audio, then legacy).
+    private val LOOKUP_EXTENSIONS = arrayOf(
+        OFFLINE_VIDEO_EXTENSION,
+        OFFLINE_AUDIO_EXTENSION_WEBM,
+        OFFLINE_AUDIO_EXTENSION,
+        LEGACY_OFFLINE_AUDIO_EXTENSION,
+        LEGACY_BIN_OFFLINE_AUDIO_EXTENSION
+    )
     private const val MIN_VALID_AUDIO_FILE_BYTES = 24L * 1024L
     private const val MIN_VALID_AUDIO_DURATION_SECONDS = 6
     private const val EXPECTED_DURATION_MATCH_RATIO = 0.88f
@@ -41,9 +56,60 @@ object OfflineAudioStore {
         return file.absolutePath + ":" + file.length() + ":" + file.lastModified()
     }
 
+    // Resolved once per process: getExternalFilesDirs es una llamada binder — no queremos pagarla
+    // en cada lookup (hasOfflineAudio corre por fila visible). Un cambio de montaje de SD en
+    // caliente es rarísimo; refreshSdCardState() permite re-evaluar si hiciera falta.
+    @Volatile
+    private var cachedSdDir: File? = null
+    @Volatile
+    private var sdDirResolved = false
+
+    private fun getSdOfflineAudioDir(context: Context): File? {
+        if (sdDirResolved) return cachedSdDir
+        val resolved = try {
+            context.getExternalFilesDirs(null)
+                ?.drop(1) // el slot 0 es SIEMPRE el volumen primario (interno); el resto es SD real
+                ?.filterNotNull()
+                ?.firstOrNull { Environment.getExternalStorageState(it) == Environment.MEDIA_MOUNTED }
+                ?.let { File(it, OFFLINE_AUDIO_DIR) }
+        } catch (_: Exception) {
+            null
+        }
+        cachedSdDir = resolved
+        sdDirResolved = true
+        return resolved
+    }
+
+    @JvmStatic
+    fun refreshSdCardState() {
+        sdDirResolved = false
+    }
+
+    @JvmStatic
+    fun hasSdCard(context: Context): Boolean = getSdOfflineAudioDir(context) != null
+
+    private fun useSdCard(context: Context): Boolean {
+        return context.getSharedPreferences(AppConstants.PREFS_SETTINGS, Context.MODE_PRIVATE)
+            .getBoolean(KEY_USE_SD_CARD, false)
+    }
+
+    private fun internalOfflineAudioDir(context: Context): File =
+        File(context.filesDir, OFFLINE_AUDIO_DIR)
+
+    /** WRITE directory: SD when the toggle is on and a card is mounted, internal otherwise. */
     @JvmStatic
     fun getOfflineAudioDir(context: Context): File {
-        return File(context.filesDir, OFFLINE_AUDIO_DIR)
+        if (useSdCard(context)) {
+            getSdOfflineAudioDir(context)?.let { return it }
+        }
+        return internalOfflineAudioDir(context)
+    }
+
+    /** Every volume that can hold downloads — current write dir first, for lookup locality. */
+    private fun allOfflineAudioDirs(context: Context): List<File> {
+        val internal = internalOfflineAudioDir(context)
+        val sd = getSdOfflineAudioDir(context) ?: return listOf(internal)
+        return if (useSdCard(context)) listOf(sd, internal) else listOf(internal, sd)
     }
 
     @JvmStatic
@@ -68,40 +134,46 @@ object OfflineAudioStore {
     @JvmStatic
     fun hasOfflineVideo(context: Context, trackId: String): Boolean {
         val normalized = normalizeTrackId(trackId)
-        val mp4 = File(getOfflineAudioDir(context), normalized + OFFLINE_VIDEO_EXTENSION)
-        return mp4.isFile && mp4.length() >= MIN_VALID_AUDIO_FILE_BYTES
+        for (dir in allOfflineAudioDirs(context)) {
+            val mp4 = File(dir, normalized + OFFLINE_VIDEO_EXTENSION)
+            if (mp4.isFile && mp4.length() >= MIN_VALID_AUDIO_FILE_BYTES) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /** El .mp4 offline existente en cualquiera de los volúmenes, o null si no hay. */
+    @JvmStatic
+    fun findExistingOfflineVideoFile(context: Context, trackId: String): File? {
+        val normalized = normalizeTrackId(trackId)
+        for (dir in allOfflineAudioDirs(context)) {
+            val mp4 = File(dir, normalized + OFFLINE_VIDEO_EXTENSION)
+            if (mp4.isFile && mp4.length() > 0L) {
+                return mp4
+            }
+        }
+        return null
     }
 
     @JvmStatic
     fun getExistingOfflineAudioFile(context: Context, trackId: String): File {
         val normalized = normalizeTrackId(trackId)
+        val dirs = allOfflineAudioDirs(context)
 
-        val mp4 = File(getOfflineAudioDir(context), normalized + OFFLINE_VIDEO_EXTENSION)
-        if (mp4.isFile && mp4.length() > 0L) {
-            return mp4
+        // Extension priority outranks volume: an .mp4 on either volume beats a .webm anywhere.
+        for (ext in LOOKUP_EXTENSIONS) {
+            for (dir in dirs) {
+                val candidate = File(dir, normalized + ext)
+                if (candidate.isFile && candidate.length() > 0L) {
+                    return candidate
+                }
+            }
         }
 
-        val webm = File(getOfflineAudioDir(context), normalized + OFFLINE_AUDIO_EXTENSION_WEBM)
-        if (webm.isFile && webm.length() > 0L) {
-            return webm
-        }
-
-        val preferred = File(getOfflineAudioDir(context), normalized + OFFLINE_AUDIO_EXTENSION)
-        if (preferred.isFile && preferred.length() > 0L) {
-            return preferred
-        }
-
-        val legacy = File(getOfflineAudioDir(context), normalized + LEGACY_OFFLINE_AUDIO_EXTENSION)
-        if (legacy.isFile && legacy.length() > 0L) {
-            return legacy
-        }
-
-        val legacyBin = File(getOfflineAudioDir(context), normalized + LEGACY_BIN_OFFLINE_AUDIO_EXTENSION)
-        if (legacyBin.isFile && legacyBin.length() > 0L) {
-            return legacyBin
-        }
-
-        return preferred
+        // Nothing on disk: report the preferred-format path on the current WRITE volume
+        // (callers treat a non-existing result as "not downloaded").
+        return File(getOfflineAudioDir(context), normalized + OFFLINE_AUDIO_EXTENSION)
     }
 
     @JvmStatic
@@ -209,28 +281,15 @@ object OfflineAudioStore {
     @JvmStatic
     fun deleteOfflineAudio(context: Context, trackId: String): Boolean {
         val normalized = normalizeTrackId(trackId)
-        val dir = getOfflineAudioDir(context)
-        val mp4 = File(dir, normalized + OFFLINE_VIDEO_EXTENSION)
-        val webm = File(dir, normalized + OFFLINE_AUDIO_EXTENSION_WEBM)
-        val preferred = File(dir, normalized + OFFLINE_AUDIO_EXTENSION)
-        val legacy = File(dir, normalized + LEGACY_OFFLINE_AUDIO_EXTENSION)
-        val legacyBin = File(dir, normalized + LEGACY_BIN_OFFLINE_AUDIO_EXTENSION)
-
         var removedAny = false
-        if (mp4.exists()) {
-            removedAny = mp4.delete() || removedAny
-        }
-        if (webm.exists()) {
-            removedAny = webm.delete() || removedAny
-        }
-        if (preferred.exists()) {
-            removedAny = preferred.delete() || removedAny
-        }
-        if (legacy.exists()) {
-            removedAny = legacy.delete() || removedAny
-        }
-        if (legacyBin.exists()) {
-            removedAny = legacyBin.delete() || removedAny
+        // Purga en TODOS los volúmenes: la pista pudo descargarse antes de cambiar el toggle SD.
+        for (dir in allOfflineAudioDirs(context)) {
+            for (ext in LOOKUP_EXTENSIONS) {
+                val file = File(dir, normalized + ext)
+                if (file.exists()) {
+                    removedAny = file.delete() || removedAny
+                }
+            }
         }
         putCachedOfflineState(normalized, false)
         synchronized(OFFLINE_STATE_CACHE_LOCK) { VALIDATED_FINGERPRINTS.remove(normalized) }
@@ -253,12 +312,13 @@ object OfflineAudioStore {
 
     @JvmStatic
     fun deleteAllOfflineAudio(context: Context): Int {
-        val dir = getOfflineAudioDir(context)
-        val files = dir.listFiles() ?: return 0
         var removedCount = 0
-        for (file in files) {
-            if (file.isFile) {
-                if (file.delete()) removedCount++
+        for (dir in allOfflineAudioDirs(context)) {
+            val files = dir.listFiles() ?: continue
+            for (file in files) {
+                if (file.isFile) {
+                    if (file.delete()) removedCount++
+                }
             }
         }
         clearOfflineAudioStateCache()
@@ -308,33 +368,14 @@ object OfflineAudioStore {
     }
 
     private fun hasOfflineAudioOnDisk(context: Context, normalizedTrackId: String): Boolean {
-        val dir = getOfflineAudioDir(context)
-
-        val mp4 = File(dir, normalizedTrackId + OFFLINE_VIDEO_EXTENSION)
-        if (mp4.isFile && mp4.length() >= MIN_VALID_AUDIO_FILE_BYTES) {
-            return true
+        for (dir in allOfflineAudioDirs(context)) {
+            for (ext in LOOKUP_EXTENSIONS) {
+                val file = File(dir, normalizedTrackId + ext)
+                if (file.isFile && file.length() >= MIN_VALID_AUDIO_FILE_BYTES) {
+                    return true
+                }
+            }
         }
-
-        val webm = File(dir, normalizedTrackId + OFFLINE_AUDIO_EXTENSION_WEBM)
-        if (webm.isFile && webm.length() >= MIN_VALID_AUDIO_FILE_BYTES) {
-            return true
-        }
-
-        val preferred = File(dir, normalizedTrackId + OFFLINE_AUDIO_EXTENSION)
-        if (preferred.isFile && preferred.length() >= MIN_VALID_AUDIO_FILE_BYTES) {
-            return true
-        }
-
-        val legacy = File(dir, normalizedTrackId + LEGACY_OFFLINE_AUDIO_EXTENSION)
-        if (legacy.isFile && legacy.length() >= MIN_VALID_AUDIO_FILE_BYTES) {
-            return true
-        }
-
-        val legacyBin = File(dir, normalizedTrackId + LEGACY_BIN_OFFLINE_AUDIO_EXTENSION)
-        if (legacyBin.isFile && legacyBin.length() >= MIN_VALID_AUDIO_FILE_BYTES) {
-            return true
-        }
-
         return false
     }
 

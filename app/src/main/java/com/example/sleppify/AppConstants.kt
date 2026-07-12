@@ -9,11 +9,9 @@ object AppConstants {
 
     const val MEDIA_NOTIFICATION_ID = 11031
 
-    // Single Sleppify proxy/download host — the one place to change if the hosting moves.
-    // (Was a 3-server round-robin across alwaysdata copies; collapsed to a single host.)
-    // Streaming:  "$PROXY_BASE_URL/api/stream/<videoId>"
-    // Download:   "$PROXY_BASE_URL/api/descarga"
-    const val PROXY_BASE_URL = "https://sleppifydownload.alwaysdata.net"
+    // No proxy host anymore: streaming (audio + muxed mp4-360 music video) and offline downloads
+    // all resolve directly from the googlevideo CDN via NewPipe (see StreamResolver /
+    // SleppifyDownloaderResolver).
 
     // Unique WorkManager queue for single-track (manual) offline downloads. Enqueue single-track
     // work with this exact name + ExistingWorkPolicy.APPEND_OR_REPLACE so its progress/counter is

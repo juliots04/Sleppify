@@ -306,8 +306,8 @@ class OfflinePlaylistDownloadWorker(
         } finally {
             if (addedToActive) activeTrackIds.remove(id)
             activeTrackProgressFractions.remove(id)
-            // Throttle between downloads to avoid proxy saturation
-            try { Thread.sleep(710L) } catch (_: InterruptedException) { Thread.currentThread().interrupt() }
+            // Brief gap between CDN fetches so back-to-back NewPipe resolves don't hammer YouTube.
+            try { Thread.sleep(150L) } catch (_: InterruptedException) { Thread.currentThread().interrupt() }
         }
     }
 
@@ -400,17 +400,15 @@ class OfflinePlaylistDownloadWorker(
         if (isStopped || networkIssueTracker.hasIssue()) return false
         progressReporter?.onProgress(0.05f)
 
-        val videoTarget = OfflineAudioStore.getOfflineVideoFile(context, videoId)
-
         val ok = try {
-            // The resolver now reports a real 0..1 fraction (computed from Content-Length),
-            // so just forward it instead of dividing raw bytes by a fixed 12MB denominator.
-            SleppifyDownloaderResolver.downloadVideoViaProxy(context, videoId, videoTarget, primaryServer, onProgress = { fraction ->
+            // Direct googlevideo-CDN audio download (NewPipe-resolved URL). The resolver reports a
+            // real 0..1 fraction (from Content-Length) and owns the offline file path/extension.
+            SleppifyDownloaderResolver.downloadTrackAudio(context, videoId, onProgress = { fraction ->
                 progressReporter?.onProgress(fraction)
             })
         } catch (e: Exception) {
             if (isLikelyNetworkException(e)) networkIssueTracker.markIssue()
-            Log.w(TAG, "proxy:exception id=$videoId s=$primaryServer msg=${e.message}")
+            Log.w(TAG, "cdn:exception id=$videoId msg=${e.message}")
             false
         }
 

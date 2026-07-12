@@ -22,8 +22,15 @@ object FavoritesPlaylistStore {
     private var favoritesCache: List<FavoriteTrack>? = null
     private var favoritesIdSet: Set<String>? = null
     private var likedMusicIdSet: Set<String>? = null
+    private var likedTombstones: MutableSet<String>? = null
     private val CACHE_LOCK = Any()
     private const val LIKED_PLAYLIST_ID = "__liked_videos__"
+
+    // Un-liking is local-only (there is no YouTube unlike API in the app), so the next server
+    // refetch of "Música que te gustó" would silently resurrect the track. Tombstones make the
+    // removal stick: a tombstoned id is treated as not-liked even if the server cache contains
+    // it, until the user likes it again (which clears the tombstone).
+    private const val PREF_LIKED_REMOVED_IDS = "liked_music_removed_ids"
 
     @JvmStatic
     fun buildSubtitle(count: Int): String {
@@ -45,6 +52,7 @@ object FavoritesPlaylistStore {
         val target = safe(videoId)
         if (target.isEmpty()) return false
         synchronized(CACHE_LOCK) {
+            if (loadTombstonesLocked(context).contains(target)) return false
             val cached = likedMusicIdSet
             if (cached != null) return cached.contains(target)
 
@@ -73,6 +81,92 @@ object FavoritesPlaylistStore {
     @JvmStatic
     fun invalidateLikedMusicCache() {
         synchronized(CACHE_LOCK) { likedMusicIdSet = null }
+    }
+
+    /**
+     * Removes a track from the server-synced "Música que te gustó" cache
+     * (playlist_tracks_data___liked_videos__). The liked playlist the user sees is the union of
+     * this cache and the local yt_mirror, so un-liking must clear this half too — otherwise a
+     * song liked on the YouTube account would stay "liked" forever locally.
+     */
+    /** Membership tombstones for the liked playlist; treat these ids as removed. */
+    @JvmStatic
+    fun getLikedTombstones(context: Context): Set<String> {
+        synchronized(CACHE_LOCK) {
+            return HashSet(loadTombstonesLocked(context))
+        }
+    }
+
+    /** Called on every "like" so a re-liked song stops being filtered out. */
+    @JvmStatic
+    fun clearLikedTombstone(context: Context, videoId: String) {
+        val target = safe(videoId)
+        if (target.isEmpty()) return
+        synchronized(CACHE_LOCK) {
+            val set = loadTombstonesLocked(context)
+            if (set.remove(target)) persistTombstonesLocked(context, set)
+        }
+    }
+
+    private fun loadTombstonesLocked(context: Context): MutableSet<String> {
+        likedTombstones?.let { return it }
+        val raw = context.applicationContext
+            .getSharedPreferences(PREFS_STREAMING_CACHE, Activity.MODE_PRIVATE)
+            .getStringSet(PREF_LIKED_REMOVED_IDS, null)
+        val set = HashSet(raw ?: emptySet())
+        likedTombstones = set
+        return set
+    }
+
+    private fun persistTombstonesLocked(context: Context, set: Set<String>) {
+        context.applicationContext
+            .getSharedPreferences(PREFS_STREAMING_CACHE, Activity.MODE_PRIVATE)
+            .edit()
+            .putStringSet(PREF_LIKED_REMOVED_IDS, HashSet(set))
+            .apply()
+    }
+
+    @JvmStatic
+    fun removeFromLikedMusic(context: Context, videoId: String): Boolean {
+        val target = safe(videoId)
+        if (target.isEmpty()) return false
+        synchronized(CACHE_LOCK) {
+            // Tombstone first: even if the local cache copy is empty/missing, the id must stay
+            // removed after the next server refetch repopulates the cache.
+            val tombstones = loadTombstonesLocked(context)
+            if (tombstones.add(target)) persistTombstonesLocked(context, tombstones)
+
+            val appContext = context.applicationContext
+            val prefs = appContext.getSharedPreferences(PREFS_STREAMING_CACHE, Activity.MODE_PRIVATE)
+            val key = "playlist_tracks_data_$LIKED_PLAYLIST_ID"
+            val raw = prefs.getString(key, "").orEmpty()
+            if (raw.isBlank()) {
+                likedMusicIdSet = null
+                return false
+            }
+            return try {
+                val array = JSONArray(raw)
+                val out = JSONArray()
+                var removed = false
+                for (i in 0 until array.length()) {
+                    val obj = array.optJSONObject(i) ?: continue
+                    if (safe(obj.optString("videoId", "")) == target) {
+                        removed = true
+                        continue
+                    }
+                    out.put(obj)
+                }
+                if (removed) {
+                    prefs.edit().putString(key, out.toString()).apply()
+                }
+                likedMusicIdSet = null
+                removed
+            } catch (e: Exception) {
+                Log.w("FavPlaylistStore", "Failed to remove from liked music", e)
+                likedMusicIdSet = null
+                false
+            }
+        }
     }
 
     @JvmStatic

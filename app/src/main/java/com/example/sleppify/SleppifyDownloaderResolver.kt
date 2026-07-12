@@ -2,35 +2,50 @@ package com.example.sleppify
 
 import android.content.Context
 import android.util.Log
-import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
-import java.nio.charset.StandardCharsets
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.locks.ReentrantLock
 
 /**
- * Downloads a track for offline use from the single Sleppify proxy host
- * ([AppConstants.PROXY_BASE_URL]) via its /api/descarga endpoint: the server fetches the track
- * server-side (yt-dlp) and streams the finished mp4 back with a Content-Length.
+ * Downloads a track for offline use by pulling its audio **directly from Google's CDN**
+ * (googlevideo.com), using the same NewPipe-resolved stream URL the player streams from
+ * ([StreamResolver.resolveAudioDownloadSource]).
+ *
+ * This replaces the old proxy path (`/api/descarga`, server-side yt-dlp): there is no second
+ * hop and no server-side fetch-then-forward wait — the device downloads the finished file
+ * straight from Google at full CDN speed, which is faster and no longer depends on the proxy
+ * host being up. The googlevideo URL is pre-signed (deciphered n-param), so the GET needs no
+ * cookies and is not throttled.
+ *
+ * Files are saved audio-only (.m4a / .webm) with the container chosen from the resolved stream;
+ * callers locate the result later via [OfflineAudioStore.getExistingOfflineAudioFile] (which
+ * searches every extension), so a plain song downloads light and plays as music offline.
  */
 object SleppifyDownloaderResolver {
 
     private const val TAG = "SleppifyDL"
 
-    // Single host now (was a 3-server round-robin). One endpoint, retried on transient errors.
-    private val DOWNLOAD_ENDPOINT = "${AppConstants.PROXY_BASE_URL}/api/descarga"
-
-    // Kept so existing callers that do `index % SERVER_COUNT` collapse to 0 (single host).
+    // Kept so existing callers that do `index % SERVER_COUNT` collapse to 0 (single logical source).
     const val SERVER_COUNT = 1
 
-    private const val MAX_ATTEMPTS = 2
+    private const val CONNECT_TIMEOUT_MS = 12000
+    private const val READ_TIMEOUT_MS = 30000
+    private const val MIN_VALID_BYTES = 24L * 1024L // 24KB, matches the worker's floor
+    private const val MAX_ATTEMPTS = 2              // re-resolve + re-download on a hard failure
+    private const val MAX_STALL_RETRIES = 5         // transient drops → retry the same chunk
 
-    private const val CONNECT_TIMEOUT_MS = 10000
-    private const val VIDEO_READ_TIMEOUT_MS = 120000
-    private const val MIN_VALID_VIDEO_BYTES = 24L * 1024L // 24KB to match worker limit
+    // googlevideo throttles a single sustained stream to ~playback speed. Requesting the file in
+    // discrete chunks via its `&range=START-END` URL parameter signals "download" mode and serves
+    // each chunk at full CDN speed — the same trick yt-dlp uses. 1MB keeps every chunk comfortably
+    // under the throttle threshold (a typical song is only a handful of chunks).
+    private const val CHUNK_SIZE = 1L * 1024 * 1024L
+
+    private const val UA =
+        "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) " +
+            "Chrome/131.0.0.0 Mobile Safari/537.36"
 
     private val downloadLocks = ConcurrentHashMap<String, ReentrantLock>()
 
@@ -38,18 +53,16 @@ object SleppifyDownloaderResolver {
         downloadLocks.computeIfAbsent(videoId) { ReentrantLock() }
 
     /**
-     * Downloads [videoId] for offline use into [targetFile] by asking the single Sleppify proxy host
-     * to fetch it server-side (yt-dlp) and stream it back. Retried up to [MAX_ATTEMPTS] times on a
-     * transient error / busy (503). [serverIndex] is kept for source compatibility and ignored.
-     *
-     * Downloads VIDEO mp4 (the server falls back to audio-only for tracks with no real video, so
-     * plain songs stay light). Returns true on success, false if every attempt failed.
+     * Downloads [videoId]'s audio for offline use, straight from the googlevideo CDN.
+     * The saved file's extension (.m4a / .webm) is chosen from the resolved stream format.
+     * Retried up to [MAX_ATTEMPTS] times (each attempt re-resolves a fresh CDN URL).
+     * Returns true on success, false if every attempt failed. Call from a background thread.
      */
-    fun downloadVideoViaProxy(
+    @JvmStatic
+    @JvmOverloads
+    fun downloadTrackAudio(
         context: Context,
         videoId: String,
-        targetFile: File,
-        @Suppress("UNUSED_PARAMETER") serverIndex: Int = 0,
         onProgress: ((Float) -> Unit)? = null
     ): Boolean {
         if (videoId.isBlank()) return false
@@ -57,115 +70,162 @@ object SleppifyDownloaderResolver {
         val lock = lockFor(videoId)
         lock.lock()
         try {
-            // Another concurrent task may have just finished this exact file.
-            if (targetFile.exists() && targetFile.length() >= MIN_VALID_VIDEO_BYTES) {
-                Log.d(TAG, "video_proxy_ok id=$videoId reason=already_downloaded")
+            // Another concurrent task may have just finished this exact track (any extension).
+            val existing = OfflineAudioStore.getExistingOfflineAudioFile(context, videoId)
+            if (existing.isFile && existing.length() >= MIN_VALID_BYTES) {
+                Log.d(TAG, "cdn_ok id=$videoId reason=already_downloaded")
                 return true
             }
-
-            val tempFile = File(targetFile.absolutePath + ".tmp")
-            if (tempFile.isFile) tempFile.delete()
-
-            val cookie = StreamResolver.getAuthCookieHeader()
-            val payload = JSONObject()
-                .put("url", "https://www.youtube.com/watch?v=$videoId")
-                .put("format", "video")
-                .toString()
-                .toByteArray(StandardCharsets.UTF_8)
+            // A stale/corrupt partial of ANY extension would shadow the fresh file in lookups
+            // (getExistingOfflineAudioFile returns the first non-empty match by extension priority).
+            if (existing.isFile) OfflineAudioStore.deleteOfflineAudio(context, videoId)
 
             val startMs = System.currentTimeMillis()
-            // Single host, retried on transient busy/error (503 "Server busy, retry").
             for (attempt in 0 until MAX_ATTEMPTS) {
-                val downloaded = downloadFromServer(
-                    DOWNLOAD_ENDPOINT, attempt, videoId, payload, cookie, tempFile, onProgress
-                )
-                if (downloaded && finalizeDownload(tempFile, targetFile, videoId, attempt, startMs)) {
+                onProgress?.invoke(0.03f)
+
+                val source = StreamResolver.resolveAudioDownloadSource(videoId)
+                if (source == null || source.url.isBlank()) {
+                    Log.w(TAG, "cdn_fail id=$videoId reason=no_stream attempt=$attempt")
+                    continue
+                }
+
+                val targetFile = OfflineAudioStore.getOfflineAudioFileForFormat(context, videoId, source.isWebm)
+                targetFile.parentFile?.let { if (!it.exists()) it.mkdirs() }
+                val tempFile = File(targetFile.absolutePath + ".tmp")
+                if (tempFile.isFile) tempFile.delete()
+
+                val downloaded = downloadDirect(source.url, tempFile, onProgress)
+                if (downloaded && finalizeDownload(tempFile, targetFile, videoId, startMs)) {
                     return true
                 }
                 if (tempFile.isFile) tempFile.delete()
             }
 
-            Log.w(TAG, "video_proxy_fail id=$videoId all_attempts_failed elapsed=${System.currentTimeMillis() - startMs}ms")
+            Log.w(TAG, "cdn_fail id=$videoId all_attempts_failed elapsed=${System.currentTimeMillis() - startMs}ms")
             return false
         } finally {
-            // Keep the lock instance in the map (do NOT remove): computeIfAbsent + remove cannot
-            // provide per-id mutual exclusion. The bounded per-process leak is negligible.
+            // Keep the lock instance (computeIfAbsent + remove cannot give per-id mutual exclusion).
             lock.unlock()
         }
     }
 
-    /** POSTs to the proxy's /api/descarga and streams the result into [tempFile]. Returns true if
-     *  a complete, large-enough file was written; false on any HTTP/IO error (caller tries next server). */
-    private fun downloadFromServer(
-        endpoint: String,
-        server: Int,
-        videoId: String,
-        payload: ByteArray,
-        cookie: String,
+    /**
+     * Streams [streamUrl] into [tempFile] in [CHUNK_SIZE] pieces, each fetched with googlevideo's
+     * `&range=START-END` URL parameter so the CDN serves it at full speed (no streaming throttle).
+     * A chunk shorter than requested marks EOF. Returns true only when a complete, large-enough
+     * file was written. A transient chunk failure is retried up to [MAX_STALL_RETRIES] times.
+     */
+    private fun downloadDirect(
+        streamUrl: String,
         tempFile: File,
         onProgress: ((Float) -> Unit)?
     ): Boolean {
-        var connection: HttpURLConnection? = null
-        return try {
-            connection = (URL(endpoint).openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                connectTimeout = CONNECT_TIMEOUT_MS
-                // The server downloads the whole track BEFORE sending the first byte, so this must
-                // cover the full server-side fetch time.
-                readTimeout = VIDEO_READ_TIMEOUT_MS
-                doOutput = true
-                setRequestProperty("Content-Type", "application/json")
-                setRequestProperty("Accept", "audio/mp4, video/mp4, */*")
-                setRequestProperty("User-Agent", "Sleppify-Android/1.0")
-                if (cookie.isNotBlank()) setRequestProperty("X-Youtube-Cookie", cookie)
-            }
-            connection.outputStream.use { it.write(payload) }
+        var total = -1L
+        var written = 0L
+        var stalls = 0
 
-            val code = connection.responseCode
-            if (code != HttpURLConnection.HTTP_OK) {
-                val err = try { connection.errorStream?.bufferedReader()?.readText()?.take(200) } catch (_: Exception) { null }
-                Log.w(TAG, "video_proxy_fail id=$videoId server=$server http=$code err=$err")
-                return false
-            }
-
-            val expected = connection.getHeaderField("Content-Length")?.toLongOrNull() ?: -1L
-            tempFile.parentFile?.let { if (!it.exists()) it.mkdirs() }
-
-            var total = 0L
-            connection.inputStream.use { input ->
-                FileOutputStream(tempFile, false).use { output ->
-                    val buf = ByteArray(16384)
-                    var n: Int
-                    while (input.read(buf).also { n = it } != -1) {
-                        output.write(buf, 0, n)
-                        total += n
-                        if (onProgress != null) {
-                            val fraction = if (expected > 0L) {
-                                (total.toDouble() / expected).coerceIn(0.02, 0.99).toFloat()
-                            } else {
-                                (1.0 - kotlin.math.exp(-total / 4_000_000.0)).coerceIn(0.02, 0.95).toFloat()
-                            }
-                            onProgress.invoke(fraction)
+        try {
+            FileOutputStream(tempFile, false).use { output ->
+                loop@ while (true) {
+                    val rangeEnd = written + CHUNK_SIZE - 1
+                    val chunkUrl = appendRangeParam(streamUrl, written, rangeEnd)
+                    var connection: HttpURLConnection? = null
+                    try {
+                        connection = (URL(chunkUrl).openConnection() as HttpURLConnection).apply {
+                            requestMethod = "GET"
+                            connectTimeout = CONNECT_TIMEOUT_MS
+                            readTimeout = READ_TIMEOUT_MS
+                            setRequestProperty("User-Agent", UA)
                         }
+
+                        val code = connection.responseCode
+                        if (code != HttpURLConnection.HTTP_OK && code != HttpURLConnection.HTTP_PARTIAL) {
+                            Log.w(TAG, "cdn http=$code at offset=$written")
+                            return false
+                        }
+                        if (total < 0L) total = parseTotalLength(connection, written)
+
+                        var chunkRead = 0L
+                        connection.inputStream.use { input ->
+                            val buf = ByteArray(64 * 1024)
+                            var n: Int
+                            while (input.read(buf).also { n = it } != -1) {
+                                output.write(buf, 0, n)
+                                written += n
+                                chunkRead += n
+                                if (onProgress != null) {
+                                    val fraction = if (total > 0L) {
+                                        written.toDouble() / total
+                                    } else {
+                                        // Total unknown (no Content-Range) → smooth approximation.
+                                        1.0 - kotlin.math.exp(-written / 4_000_000.0)
+                                    }
+                                    onProgress(fraction.coerceIn(0.03, 0.99).toFloat())
+                                }
+                            }
+                        }
+                        stalls = 0
+
+                        when {
+                            total in 1..written -> break@loop        // reached the known total
+                            chunkRead == 0L -> break@loop             // server served nothing → EOF
+                            chunkRead < CHUNK_SIZE -> break@loop      // short chunk → last piece
+                            // else: a full chunk with more to come → request the next range
+                        }
+                    } catch (e: Exception) {
+                        stalls++
+                        if (stalls > MAX_STALL_RETRIES) {
+                            Log.w(TAG, "cdn stall give_up written=$written total=$total msg=${e.message}")
+                            return false
+                        }
+                        // Re-request the SAME chunk. Truncate anything partially written past `written`
+                        // so the retry appends cleanly from the chunk boundary.
+                        try {
+                            output.flush()
+                            output.channel.truncate(written)
+                            output.channel.position(written)
+                        } catch (_: Exception) { /* best-effort */ }
+                    } finally {
+                        connection?.disconnect()
                     }
                 }
             }
-
-            if (expected > 0L && total < expected) {
-                Log.w(TAG, "video_proxy_fail id=$videoId server=$server truncated got=$total expected=$expected")
-                return false
-            }
-            if (total < MIN_VALID_VIDEO_BYTES) {
-                Log.w(TAG, "video_proxy_fail id=$videoId server=$server too_small bytes=$total")
-                return false
-            }
-            true
         } catch (e: Exception) {
-            Log.w(TAG, "video_proxy_exception id=$videoId server=$server reason=${e.javaClass.simpleName} msg=${e.message}")
-            false
-        } finally {
-            connection?.disconnect()
+            Log.w(TAG, "cdn_exception reason=${e.javaClass.simpleName} msg=${e.message}")
+            return false
         }
+
+        if (written < MIN_VALID_BYTES) {
+            Log.w(TAG, "cdn too_small bytes=$written")
+            return false
+        }
+        if (total > 0L && written < total) {
+            Log.w(TAG, "cdn truncated got=$written expected=$total")
+            return false
+        }
+        return true
+    }
+
+    /** Appends googlevideo's `&range=start-end` download-mode parameter (never streaming-throttled). */
+    private fun appendRangeParam(url: String, start: Long, end: Long): String {
+        val separator = if (url.contains('?')) '&' else '?'
+        return "$url${separator}range=$start-$end"
+    }
+
+    /**
+     * The FULL file size, taken only from Content-Range's `bytes start-end/TOTAL`. With the
+     * `&range=` param the plain Content-Length is just this chunk's length, never the total, so it
+     * must not be used here (that would make the first full chunk look like the whole file).
+     * Returns -1 when unknown — completion then relies on a short chunk marking EOF.
+     */
+    private fun parseTotalLength(connection: HttpURLConnection, @Suppress("UNUSED_PARAMETER") written: Long): Long {
+        return connection.getHeaderField("Content-Range")
+            ?.substringAfterLast('/', "")
+            ?.trim()
+            ?.toLongOrNull()
+            ?.takeIf { it > 0L }
+            ?: -1L
     }
 
     /** Validates the freshly-downloaded temp file is playable, then atomically renames to target. */
@@ -173,19 +233,18 @@ object SleppifyDownloaderResolver {
         tempFile: File,
         targetFile: File,
         videoId: String,
-        server: Int,
         startMs: Long
     ): Boolean {
         if (!isPlayable(tempFile)) {
-            Log.w(TAG, "video_proxy_fail id=$videoId server=$server corrupt_or_not_playable")
+            Log.w(TAG, "cdn_fail id=$videoId corrupt_or_not_playable")
             return false
         }
         if (targetFile.exists()) targetFile.delete()
         if (!tempFile.renameTo(targetFile)) {
-            Log.w(TAG, "video_proxy_fail id=$videoId reason=rename_failed")
+            Log.w(TAG, "cdn_fail id=$videoId reason=rename_failed")
             return false
         }
-        Log.d(TAG, "video_proxy_ok id=$videoId server=$server bytes=${targetFile.length()} elapsed=${System.currentTimeMillis() - startMs}ms")
+        Log.d(TAG, "cdn_ok id=$videoId bytes=${targetFile.length()} elapsed=${System.currentTimeMillis() - startMs}ms")
         return true
     }
 
@@ -208,5 +267,4 @@ object SleppifyDownloaderResolver {
             false
         }
     }
-
 }

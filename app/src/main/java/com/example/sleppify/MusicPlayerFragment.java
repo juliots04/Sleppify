@@ -354,7 +354,66 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         displayLibraryDirty = true;
     }
     @NonNull
+    /** Display list with the active chip filter applied — what the adapter should show. */
     private List<YouTubeMusicService.TrackResult> buildDisplayLibrary() {
+        if (LIBRARY_CHIP_FILTER_RADIOS.equals(libraryChipFilter)) {
+            return buildRadiosDisplay();
+        }
+        if (LIBRARY_CHIP_FILTER_FILES.equals(libraryChipFilter)) {
+            return buildLocalFilesDisplay();
+        }
+        return applyLibraryChipFilter(buildDisplayLibraryUnfiltered());
+    }
+
+    /** Radios chip: the stations the user has generated (RadioHistoryStore). Each opens its queue
+     *  via the existing radio path in openPlaylistDetail (contentId = radioPlaylistId). */
+    @NonNull
+    private List<YouTubeMusicService.TrackResult> buildRadiosDisplay() {
+        List<YouTubeMusicService.TrackResult> out = new ArrayList<>();
+        if (!isAdded()) return out;
+        List<RadioHistoryStore.RadioEntry> radios = RadioHistoryStore.INSTANCE.getRadios(requireContext());
+        for (RadioHistoryStore.RadioEntry r : radios) {
+            if (r == null || TextUtils.isEmpty(r.getRadioPlaylistId())) continue;
+            int n = r.getTracks() != null ? r.getTracks().size() : 0;
+            String subtitle = "Radio • " + (n == 1 ? "1 canción" : n + " canciones");
+            String title = TextUtils.isEmpty(r.getSongTitle()) ? "Radio" : r.getSongTitle();
+            out.add(new YouTubeMusicService.TrackResult(
+                    "playlist", r.getRadioPlaylistId(), title, subtitle, r.getSongThumbnail()));
+        }
+        return out;
+    }
+
+    // Album rows are laid out in a non-recycling RecyclerView (it lives inside a NestedScrollView),
+    // so the Files view must stay BOUNDED. We never inline every song (a large device library froze
+    // the UI); the full song list lives behind the "Archivos locales" playlist row, which opens a
+    // properly-recycling PlaylistDetail. Albums are far fewer than songs but still capped defensively.
+    private static final int LOCAL_ALBUMS_MAX_ROWS = 120;
+
+    /** Files chip: the "Archivos locales" playlist (all songs) + on-device albums. Bounded so it can
+     *  never freeze the non-recycling list. Individual songs open via those two entries. */
+    @NonNull
+    private List<YouTubeMusicService.TrackResult> buildLocalFilesDisplay() {
+        List<YouTubeMusicService.TrackResult> out = new ArrayList<>();
+        if (!isAdded()) return out;
+        List<LocalFilesStore.LocalTrack> local = LocalFilesStore.getCachedFiles(requireContext());
+        int n = local.size();
+        out.add(new YouTubeMusicService.TrackResult(
+                "playlist", LocalFilesStore.PLAYLIST_ID, "Archivos locales",
+                n == 1 ? "1 canción" : n + " canciones", ""));
+        List<LocalFilesStore.LocalAlbum> albums = LocalFilesStore.albumsFrom(local);
+        int limit = Math.min(albums.size(), LOCAL_ALBUMS_MAX_ROWS);
+        for (int i = 0; i < limit; i++) {
+            LocalFilesStore.LocalAlbum a = albums.get(i);
+            int c = a.getTrackCount();
+            String subtitle = "Álbum • " + (c == 1 ? "1 canción" : c + " canciones");
+            out.add(new YouTubeMusicService.TrackResult(
+                    "playlist", LocalFilesStore.albumIdFor(a.getName()), a.getName(), subtitle, ""));
+        }
+        return out;
+    }
+
+    /** Full library list regardless of the chip filter — for non-UI consumers (search, scans). */
+    private List<YouTubeMusicService.TrackResult> buildDisplayLibraryUnfiltered() {
         if (!displayLibraryDirty && cachedDisplayLibrary != null) {
             return new ArrayList<>(cachedDisplayLibrary);
         }
@@ -484,12 +543,156 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         displayLibraryDirty = false;
         return display;
     }
+
+    /** Applies the active filter chip (Playlists / Artistas) on a copy — the cache stays full. */
+    @NonNull
+    private List<YouTubeMusicService.TrackResult> applyLibraryChipFilter(
+            @NonNull List<YouTubeMusicService.TrackResult> display) {
+        if (LIBRARY_CHIP_FILTER_NONE.equals(libraryChipFilter)) {
+            return new ArrayList<>(display);
+        }
+        boolean artistsOnly = LIBRARY_CHIP_FILTER_ARTISTS.equals(libraryChipFilter);
+        List<YouTubeMusicService.TrackResult> filtered = new ArrayList<>(display.size());
+        for (YouTubeMusicService.TrackResult item : display) {
+            if (item == null) continue;
+            boolean isArtist = "artist".equals(item.resultType);
+            if (isArtist == artistsOnly) {
+                filtered.add(item);
+            }
+        }
+        return filtered;
+    }
+    private void setupLibraryFilterChips(@NonNull View root) {
+        chipLibraryPlaylists = root.findViewById(R.id.chipLibraryPlaylists);
+        chipLibraryArtists = root.findViewById(R.id.chipLibraryArtists);
+        chipLibraryRadios = root.findViewById(R.id.chipLibraryRadios);
+        chipLibraryFiles = root.findViewById(R.id.chipLibraryFiles);
+        chipLibraryPodcast = root.findViewById(R.id.chipLibraryPodcast);
+        if (chipLibraryPlaylists != null) {
+            chipLibraryPlaylists.setOnClickListener(v ->
+                    toggleLibraryChipFilter(LIBRARY_CHIP_FILTER_PLAYLISTS));
+        }
+        if (chipLibraryArtists != null) {
+            chipLibraryArtists.setOnClickListener(v ->
+                    toggleLibraryChipFilter(LIBRARY_CHIP_FILTER_ARTISTS));
+        }
+        if (chipLibraryRadios != null) {
+            chipLibraryRadios.setOnClickListener(v ->
+                    toggleLibraryChipFilter(LIBRARY_CHIP_FILTER_RADIOS));
+        }
+        if (chipLibraryFiles != null) {
+            chipLibraryFiles.setOnClickListener(v -> onFilesChipClicked());
+        }
+        // "Podcast" is intentionally decorative only (no filter / no content), per request.
+        refreshLibraryChipStyles();
+    }
+
+    private void toggleLibraryChipFilter(@NonNull String filter) {
+        libraryChipFilter = filter.equals(libraryChipFilter) ? LIBRARY_CHIP_FILTER_NONE : filter;
+        refreshLibraryChipStyles();
+        if (adapter != null) {
+            // The trailing "create playlist" row only makes sense on the full/Playlists views.
+            adapter.setShowCreatePlaylistRow(
+                    LIBRARY_CHIP_FILTER_NONE.equals(libraryChipFilter)
+                            || LIBRARY_CHIP_FILTER_PLAYLISTS.equals(libraryChipFilter));
+        }
+        if (activeScreen == ScreenMode.LIBRARY) {
+            renderLibraryResults();
+        }
+    }
+
+    /** Files chip: needs audio permission before it can list device audio. */
+    private void onFilesChipClicked() {
+        if (LIBRARY_CHIP_FILTER_FILES.equals(libraryChipFilter)) {
+            toggleLibraryChipFilter(LIBRARY_CHIP_FILTER_FILES); // toggle back off
+            return;
+        }
+        String permission = android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU
+                ? android.Manifest.permission.READ_MEDIA_AUDIO
+                : android.Manifest.permission.READ_EXTERNAL_STORAGE;
+        boolean granted = androidx.core.content.ContextCompat.checkSelfPermission(requireContext(), permission)
+                == android.content.pm.PackageManager.PERMISSION_GRANTED;
+        if (granted) {
+            LocalFilesStore.setEnabled(requireContext(), true);
+            enterFilesFilterAndScan();
+        } else if (audioPermissionLauncher != null) {
+            audioPermissionLauncher.launch(permission);
+        }
+    }
+
+    /** Switch to the Files view and (re)scan device audio off the UI thread. */
+    private void enterFilesFilterAndScan() {
+        libraryChipFilter = LIBRARY_CHIP_FILTER_FILES;
+        refreshLibraryChipStyles();
+        if (adapter != null) adapter.setShowCreatePlaylistRow(false);
+        // First-ever scan (no cached files yet): show the skeleton while the device scan runs
+        // instead of a nearly-empty list that pops fully populated a moment later. With a warm
+        // cache, render immediately and let the background rescan diff in any changes.
+        boolean hasCachedFiles = libraryStoresWarmed && isAdded()
+                && !LocalFilesStore.getCachedFiles(requireContext()).isEmpty();
+        if (activeScreen == ScreenMode.LIBRARY) {
+            if (hasCachedFiles) {
+                renderLibraryResults();
+            } else {
+                showLibraryEntrySkeleton();
+            }
+        }
+        final Context appCtx = requireContext().getApplicationContext();
+        authExecutor.execute(() -> {
+            final List<LocalFilesStore.LocalTrack> tracks = LocalFilesStore.scanLocalFiles(appCtx);
+            LocalFilesStore.cacheFiles(appCtx, tracks);
+            mainHandler.post(() -> {
+                if (!isAdded()) return;
+                if (LIBRARY_CHIP_FILTER_FILES.equals(libraryChipFilter)
+                        && activeScreen == ScreenMode.LIBRARY) {
+                    renderLibraryResults();
+                }
+            });
+        });
+    }
+
+    /** Clears any active library filter chip back to "none" (the full library). Re-renders only if
+     *  a filter was actually active, so a plain module re-entry with no chip selected is a no-op. */
+    private void resetLibraryChipFilterToNone() {
+        if (LIBRARY_CHIP_FILTER_NONE.equals(libraryChipFilter)) return;
+        libraryChipFilter = LIBRARY_CHIP_FILTER_NONE;
+        refreshLibraryChipStyles();
+        if (adapter != null) adapter.setShowCreatePlaylistRow(true);
+        if (libraryStoresWarmed && activeScreen == ScreenMode.LIBRARY) {
+            renderLibraryResults();
+        }
+    }
+
+    private void refreshLibraryChipStyles() {
+        styleLibraryChip(chipLibraryPlaylists, LIBRARY_CHIP_FILTER_PLAYLISTS.equals(libraryChipFilter));
+        styleLibraryChip(chipLibraryArtists, LIBRARY_CHIP_FILTER_ARTISTS.equals(libraryChipFilter));
+        styleLibraryChip(chipLibraryRadios, LIBRARY_CHIP_FILTER_RADIOS.equals(libraryChipFilter));
+        styleLibraryChip(chipLibraryFiles, LIBRARY_CHIP_FILTER_FILES.equals(libraryChipFilter));
+        // Podcast chip stays in its default (unselected) style — decorative only.
+    }
+
+    private void styleLibraryChip(@Nullable TextView chip, boolean selected) {
+        if (chip == null) return;
+        chip.setBackgroundResource(selected
+                ? R.drawable.bg_library_filter_chip_selected
+                : R.drawable.bg_library_filter_chip);
+        chip.setTextColor(selected
+                ? 0xFF111319
+                : ContextCompat.getColor(chip.getContext(), R.color.text_primary));
+    }
+
     /**
      * Asynchronously fetches cloud playlists and refreshes the adapter if new ones are found.
      */
     private void maybeAppendCloudPlaylists() {
         if (!isAdded()) return;
         if (!AuthManager.getInstance(requireContext()).isSignedIn() || cloudPlaylistFetchInFlight) return;
+        // renderLibraryResults calls this on EVERY render — without a throttle each render fired
+        // a full Firestore round-trip. Cloud-only playlists change rarely; refresh at most every
+        // 5 minutes (pull-to-refresh resets lastCloudPlaylistsFetchMs to force a fresh fetch).
+        long now = System.currentTimeMillis();
+        if (now - lastCloudPlaylistsFetchMs < 5L * 60L * 1000L) return;
+        lastCloudPlaylistsFetchMs = now;
         cloudPlaylistFetchInFlight = true;
         CloudSyncManager.getInstance(requireContext()).fetchCloudPlaylists(cloudMap -> {
             if (!isAdded()) {
@@ -578,12 +781,36 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     private ImageView btnFragHeaderSearch;
     private com.google.android.material.button.MaterialButton btnFragSignIn;
     private com.google.android.material.imageview.ShapeableImageView btnFragProfilePhoto;
+    // Floating quick-return header (pinned clone of the brand header; slides in on scroll-up)
+    @Nullable private View llFloatingBrandHeader;
+    @Nullable private com.google.android.material.imageview.ShapeableImageView btnFloatProfilePhoto;
+    private boolean floatingHeaderShown = false;
     private View tvLibraryTitle;
     private View llMusicState;
     private MaterialButton btnYoutubeLogin;
     private LinearLayout llLibraryEmptyState;
     private ProgressBar progressMusic;
     private TextView tvMusicState;
+    // Library filter chips
+    private static final String LIBRARY_CHIP_FILTER_NONE = "";
+    private static final String LIBRARY_CHIP_FILTER_PLAYLISTS = "playlists";
+    private static final String LIBRARY_CHIP_FILTER_ARTISTS = "artists";
+    private static final String LIBRARY_CHIP_FILTER_RADIOS = "radios";
+    private static final String LIBRARY_CHIP_FILTER_FILES = "files";
+    @NonNull
+    private String libraryChipFilter = LIBRARY_CHIP_FILTER_NONE;
+    @Nullable
+    private TextView chipLibraryPlaylists;
+    @Nullable
+    private TextView chipLibraryArtists;
+    @Nullable
+    private TextView chipLibraryRadios;
+    @Nullable
+    private TextView chipLibraryFiles;
+    @Nullable
+    private TextView chipLibraryPodcast;
+    @Nullable
+    private androidx.activity.result.ActivityResultLauncher<String> audioPermissionLauncher;
     private RecyclerView rvMusicResults;
     private LinearLayout llFeaturedResult;
     private ImageView ivFeaturedThumb;
@@ -600,6 +827,15 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     private boolean libraryGridOverlayActive;
     private boolean suppressGridOverlay;
     private int libraryGridPendingCount;
+    // One-shot off-main warmup of the JSON-backed stores + persisted library the first render
+    // reads. Until it completes, renderLibraryResults shows the entry skeleton instead of doing
+    // the cold parses on the main thread (which froze the module's first seconds).
+    private boolean libraryStoresWarmed;
+    private boolean libraryWarmupInFlight;
+    // Stable runnable for the overlay safety-timeout: the old `this::dismissLibraryGridOverlay`
+    // passed to removeCallbacks created a NEW lambda each call, so the timeout was never actually
+    // cancelled and could dismiss a later overlay early.
+    private final Runnable libraryOverlayTimeout = this::dismissLibraryGridOverlay;
     private final YouTubeMusicService youTubeMusicService = new YouTubeMusicService();
     private final ExecutorService offlinePrefetchExecutor = Executors.newFixedThreadPool(3);
     private final YouTubeMusicService offlinePrefetchService = new YouTubeMusicService(offlinePrefetchExecutor);
@@ -678,6 +914,11 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     private final Map<String, Float> manualQueueProgressByPlaylist = new HashMap<>();
     private final Set<String> manualQueueDownloading = new HashSet<>();
     private boolean cloudPlaylistFetchInFlight;
+    private long lastCloudPlaylistsFetchMs;
+    private long lastRenderAutoOfflineCheckMs;
+    // First-paint window size: rows shown in the first frame of a large list; the rest follow next
+    // frame so 100+ rows never inflate in a single frame in the non-recycling library list.
+    private static final int LIBRARY_FIRST_WINDOW = 12;
     private boolean lastMiniPlayerIsPlaying;
     private boolean snapshotOfflineRecalcDirty;
     private long lastSnapshotHandledAtMs;
@@ -707,6 +948,18 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         signInLauncher = registerForActivityResult(
                 new ActivityResultContracts.StartActivityForResult(),
                 result -> handleGoogleSignInResult(result.getData())
+        );
+        audioPermissionLauncher = registerForActivityResult(
+                new ActivityResultContracts.RequestPermission(),
+                granted -> {
+                    if (!isAdded()) return;
+                    if (Boolean.TRUE.equals(granted)) {
+                        LocalFilesStore.setEnabled(requireContext(), true);
+                        enterFilesFilterAndScan();
+                    } else {
+                        AppSnackbar.show(getActivity(), "Permiso de audio necesario para mostrar archivos locales");
+                    }
+                }
         );
         recoverAuthLauncher = registerForActivityResult(
                 new ActivityResultContracts.StartActivityForResult(),
@@ -760,10 +1013,10 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         PlaybackEventBus.addListener(this);
         setupFragBrandHeader(view);
         ivLibraryBackdrop = view.findViewById(R.id.ivLibraryBackdrop);
-        // Defer blur setup off the cold-start path. This fragment starts HIDDEN, so setting the
-        // RenderEffect synchronously here is wasted work competing with Principal's first frame;
-        // deferring is visually identical (the backdrop has no image yet).
-        view.post(() -> applyLibraryBackdropBlur());
+        // No RenderEffect blur: the backdrop only ever shows a static gradient now
+        // (updateLibraryBackdropImage sets imageDrawable(null) + gradient bg), and a 60px blur of a
+        // linear gradient is visually indistinguishable from it — while re-rendering the blurred
+        // layer on every relayout/scroll during the exact entry window we're trying to smooth.
         tvLibraryTitle = tvFragBrandTitle;
         llMusicState = view.findViewById(R.id.llMusicState);
         btnYoutubeLogin = view.findViewById(R.id.btnYoutubeLogin);
@@ -780,6 +1033,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         swipeLibraryRefresh = view.findViewById(R.id.swipeLibraryRefresh);
         flLibraryLoadingOverlay = view.findViewById(R.id.flLibraryLoadingOverlay);
         llLibrarySkeletonContent = view.findViewById(R.id.llLibrarySkeletonContent);
+        setupLibraryFilterChips(view);
 
         // Status bar overlay: set height to status bar, fade to solid on scroll
         vStatusBarOverlay = view.findViewById(R.id.vStatusBarOverlay);
@@ -796,14 +1050,14 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         if (nsvLib != null) {
             nsvLib.setOnScrollChangeListener((androidx.core.widget.NestedScrollView.OnScrollChangeListener)
                 (v, scrollX, scrollY, oldScrollX, oldScrollY) -> {
-                    if (vStatusBarOverlay == null) return;
-                    View target = rvMusicResults;
-                    if (target == null) return;
-                    float density = getResources().getDisplayMetrics().density;
-                    float startY = target.getTop();
-                    float endY = startY + (120 * density);
-                    float fraction = endY <= startY ? 1f : Math.min(1f, Math.max(0f, (scrollY - startY) / (endY - startY)));
-                    vStatusBarOverlay.setAlpha(fraction);
+                    if (vStatusBarOverlay != null && rvMusicResults != null) {
+                        float density = getResources().getDisplayMetrics().density;
+                        float startY = rvMusicResults.getTop();
+                        float endY = startY + (120 * density);
+                        float fraction = endY <= startY ? 1f : Math.min(1f, Math.max(0f, (scrollY - startY) / (endY - startY)));
+                        vStatusBarOverlay.setAlpha(fraction);
+                    }
+                    updateFloatingHeaderOnScroll(scrollY, scrollY - oldScrollY);
                 });
         }
         adapter = new MusicResultsAdapter(this::openTrack, this::onMusicResultMoreClicked);
@@ -883,8 +1137,6 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     @Override
     public void onResume() {
         super.onResume();
-        offlineQueueHadActiveWork = false;
-        offlineManualQueueHadActiveWork = false;
         if (isHidden()) return;
 
         // Skip heavy work on first onResume — onViewCreated already did it
@@ -900,6 +1152,12 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             snapshotOfflineRecalcDirty = false;
             adapter.invalidatePlaylistOfflineState(null);
         }
+        // Progress dispatches / per-playlist refreshes deferred while backgrounded must run now —
+        // onHiddenChanged(false) doesn't fire on a plain background→foreground return, so without
+        // this a download that finished while the app was paused kept the stale ring forever.
+        // (Deliberately do NOT clear offlineQueueHadActiveWork flags here: they let the observer
+        // detect work that finished while we were away and force the full invalidate pass.)
+        flushDeferredOfflineWork();
         maybeRestoreHiddenMiniPlayerFromPausedSnapshot();
         maybeSyncLibraryIfAuthorized();
         if (isAdded()) {
@@ -940,6 +1198,9 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         if (hidden) {
             return;
         }
+        // Re-entering Biblioteca from another module always resets to no chip selected (the full
+        // library), per request. Only re-render if we actually cleared an active filter.
+        resetLibraryChipFilterToNone();
         refreshFragHeaderProfilePhoto();
         scrollToTop();
         refreshCurrentPlayingPlaylistState();
@@ -983,14 +1244,41 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         btnFragSignIn = root.findViewById(R.id.btnFragSignIn);
         btnFragProfilePhoto = root.findViewById(R.id.btnFragProfilePhoto);
 
-        // Apply status bar inset as top padding so header doesn't render under the status bar
-        if (llFragBrandHeader != null) {
-            androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(llFragBrandHeader, (v, insets) -> {
+        // Floating quick-return clone (same slide behavior as PrincipalFragment).
+        llFloatingBrandHeader = root.findViewById(R.id.llFloatingBrandHeader);
+        btnFloatProfilePhoto = root.findViewById(R.id.btnFloatProfilePhoto);
+        ImageView btnFloatHeaderHistory = root.findViewById(R.id.btnFloatHeaderHistory);
+        ImageView btnFloatHeaderSearch = root.findViewById(R.id.btnFloatHeaderSearch);
+
+        // Apply status bar inset as top padding so the headers don't render under the status bar
+        for (View header : new View[]{llFragBrandHeader, llFloatingBrandHeader}) {
+            if (header == null) continue;
+            androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(header, (v, insets) -> {
                 int statusBarHeight = insets.getInsets(androidx.core.view.WindowInsetsCompat.Type.systemBars()).top;
                 v.setPadding(v.getPaddingLeft(), statusBarHeight, v.getPaddingRight(), v.getPaddingBottom());
                 return insets;
             });
-            llFragBrandHeader.requestApplyInsets();
+            header.requestApplyInsets();
+        }
+        // Park the floating clone above the top edge so its first appearance slides down into view.
+        if (llFloatingBrandHeader != null) {
+            final View fh = llFloatingBrandHeader;
+            fh.post(() -> fh.setTranslationY(-fh.getHeight()));
+        }
+        if (btnFloatHeaderHistory != null) {
+            btnFloatHeaderHistory.setOnClickListener(v -> {
+                if (getActivity() instanceof MainActivity) ((MainActivity) getActivity()).enterSettingsAtHistory();
+            });
+        }
+        if (btnFloatHeaderSearch != null) {
+            btnFloatHeaderSearch.setOnClickListener(v -> {
+                if (getActivity() instanceof MainActivity) ((MainActivity) getActivity()).openSearchFragment();
+            });
+        }
+        if (btnFloatProfilePhoto != null) {
+            btnFloatProfilePhoto.setOnClickListener(v -> {
+                if (getActivity() instanceof MainActivity) ((MainActivity) getActivity()).enterSettings();
+            });
         }
 
         // Brand title — "Biblioteca" text (no app icon, same style as old tvLibraryTitle)
@@ -1046,6 +1334,39 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         refreshFragHeaderProfilePhoto();
     }
 
+    /**
+     * Quick-return floating header (identical to PrincipalFragment): the pinned clone of the brand
+     * header TRACKS the scroll via translationY — scroll up slides it down into view from the top
+     * edge, scroll down slides it back up. No fade. Near the top it's driven fully off-screen so it
+     * never overlaps the real in-flow header / status bar.
+     */
+    private void updateFloatingHeaderOnScroll(int scrollY, int dy) {
+        View header = llFloatingBrandHeader;
+        if (header == null) return;
+        int h = header.getHeight();
+        if (h <= 0) return;
+        float hf = h;
+
+        float offset = header.getTranslationY() - dy;
+
+        float revealPoint = (llFragBrandHeader != null) ? llFragBrandHeader.getBottom() : 0f;
+        float topCap;
+        if (scrollY <= revealPoint) {
+            topCap = -hf;
+        } else if (scrollY >= revealPoint + hf) {
+            topCap = 0f;
+        } else {
+            topCap = -(revealPoint + hf - scrollY);
+        }
+
+        offset = Math.max(-hf, Math.min(0f, offset));
+        offset = Math.min(offset, topCap);
+        header.setTranslationY(offset);
+        boolean shown = offset > -hf + 0.5f;
+        header.setVisibility(shown ? View.VISIBLE : View.INVISIBLE);
+        floatingHeaderShown = offset > -hf / 2f;
+    }
+
     void refreshFragHeaderProfilePhoto() {
         if (!isAdded() || btnFragProfilePhoto == null || btnFragSignIn == null) return;
         android.content.SharedPreferences prefs = requireContext().getSharedPreferences(AppConstants.PREFS_STREAMING_CACHE, android.app.Activity.MODE_PRIVATE);
@@ -1061,19 +1382,28 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         if (signedIn) {
             btnFragSignIn.setVisibility(View.GONE);
             btnFragProfilePhoto.setVisibility(View.VISIBLE);
-            if (photoUri != null) {
-                Glide.with(this)
-                        .load(photoUri)
-                        .diskCacheStrategy(DiskCacheStrategy.ALL)
-                        .circleCrop()
-                        .into(btnFragProfilePhoto);
-            } else {
-                btnFragProfilePhoto.setImageResource(android.R.drawable.ic_menu_myplaces);
+            if (btnFloatProfilePhoto != null) btnFloatProfilePhoto.setVisibility(View.VISIBLE);
+            for (com.google.android.material.imageview.ShapeableImageView iv :
+                    new com.google.android.material.imageview.ShapeableImageView[]{btnFragProfilePhoto, btnFloatProfilePhoto}) {
+                if (iv == null) continue;
+                if (photoUri != null) {
+                    Glide.with(this)
+                            .load(photoUri)
+                            .diskCacheStrategy(DiskCacheStrategy.ALL)
+                            .circleCrop()
+                            .into(iv);
+                } else {
+                    iv.setImageResource(android.R.drawable.ic_menu_myplaces);
+                }
             }
         } else {
             btnFragProfilePhoto.setVisibility(View.GONE);
             btnFragProfilePhoto.setImageDrawable(null);
             btnFragSignIn.setVisibility(View.VISIBLE);
+            if (btnFloatProfilePhoto != null) {
+                btnFloatProfilePhoto.setVisibility(View.GONE);
+                btnFloatProfilePhoto.setImageDrawable(null);
+            }
         }
     }
 
@@ -1217,6 +1547,12 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         } else if (!libraryTracks.isEmpty()) {
             libraryInlineManualModeActive = false;
             renderLibraryResults();
+        } else if (!libraryStoresWarmed) {
+            // Cold entry with nothing hydrated yet: renderLibraryResults shows the skeleton and
+            // defers to the off-main warmup, which decides between content and the real empty
+            // state. Flashing the login empty-state here first was the "sale vacío" symptom.
+            libraryInlineManualModeActive = false;
+            renderLibraryResults();
         } else {
             libraryInlineManualModeActive = false;
             adapter.submitResults(new ArrayList<>());
@@ -1291,6 +1627,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         setLibraryPullRefreshState(true);
         suppressGridOverlay = true;
         lastLibrarySyncAtMs = 0L;
+        lastCloudPlaylistsFetchMs = 0L;
         // Keep persisted YouTube grid entries â€” only clear Favorites and custom playlists
         java.util.Iterator<java.util.Map.Entry<String, List<String>>> gridIter =
                 playlistGridUrlsCache.entrySet().iterator();
@@ -1343,17 +1680,23 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                         requireActivity().runOnUiThread(() -> {
                             displayLibraryDirty = true;
                             setLibraryPullRefreshState(false);
+                            suppressGridOverlay = false;
                             renderLibraryResults();
                         });
                     }
                 });
             } else {
                 setLibraryPullRefreshState(false);
+                suppressGridOverlay = false;
                 renderLibraryResults();
             }
+            // suppressGridOverlay is normally reset by fetchLibraryPlaylists' forceRefresh
+            // callbacks; these early returns never reach them, and a leaked `true` permanently
+            // disabled the skeleton overlay for the rest of the fragment's life.
             return;
         }
         if (!streamingOauthCompleted) {
+            suppressGridOverlay = false;
             onYoutubeLoginClicked();
             return;
         }
@@ -1953,6 +2296,15 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             showLibraryInlineBlankState();
             return;
         }
+        // Cold entry: the display build below reads several JSON-backed stores plus the persisted
+        // library — parsing all of that on the main thread here is what froze the module's first
+        // seconds. Show the skeleton and warm everything off-main; the warmup post-back re-enters
+        // this method with every read memory-cached.
+        if (!libraryStoresWarmed) {
+            showLibraryEntrySkeleton();
+            warmLibraryStoresOffMain();
+            return;
+        }
         featuredTrack = null;
         llFeaturedResult.setVisibility(View.GONE);
         if (tvLibraryTitle != null) tvLibraryTitle.setVisibility(View.VISIBLE);
@@ -1964,12 +2316,31 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         List<YouTubeMusicService.TrackResult> displayList = buildDisplayLibrary();
         List<YouTubeMusicService.TrackResult> visibleLibraryTracks = displayList;
 
-        adapter.submitResults(new ArrayList<>(visibleLibraryTracks));
-        if (visibleLibraryTracks.isEmpty()) {
-            tvMusicState.setText("");
-            showLibraryEmptyState();
+        int newSize = visibleLibraryTracks.size();
+        if (newSize > LIBRARY_FIRST_WINDOW && adapter.dataSize() < newSize) {
+            // Spread a large first paint (e.g. the Files view's ~120 album rows) across two frames:
+            // inflating 100+ rows at once in this non-recycling list is a visible stall. Show one
+            // viewport now, then the full list next frame. submitResults coalesces via
+            // pendingIncoming, so the second submit just appends the below-the-fold rows.
+            adapter.submitResults(new ArrayList<>(visibleLibraryTracks.subList(0, LIBRARY_FIRST_WINDOW)));
+            final List<YouTubeMusicService.TrackResult> full = new ArrayList<>(visibleLibraryTracks);
+            mainHandler.post(() -> {
+                if (isAdded() && activeScreen == ScreenMode.LIBRARY) adapter.submitResults(full);
+            });
         } else {
-            tvMusicState.setText("");
+            adapter.submitResults(new ArrayList<>(visibleLibraryTracks));
+        }
+        tvMusicState.setText("");
+        // The login empty-state only applies to a genuinely empty library — an empty FILTERED
+        // view (e.g. Artistas with no artists yet) must not drop the user onto the login overlay.
+        if (visibleLibraryTracks.isEmpty() && LIBRARY_CHIP_FILTER_NONE.equals(libraryChipFilter)) {
+            showLibraryEmptyState();
+        }
+        // A real render landed — drop the entry/scan skeleton. The grid-prefetch overlay
+        // (pendingCount > 0) manages its own dismissal via onLibraryGridPrefetchComplete.
+        // resubmit=false: we just submitted this exact list above.
+        if (libraryGridOverlayActive && libraryGridPendingCount <= 0) {
+            dismissLibraryGridOverlay(false);
         }
         if (rvMusicResults != null) {
             rvMusicResults.animate().cancel();
@@ -1980,9 +2351,78 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 rvMusicResults.animate().alpha(1f).setDuration(180L).start();
             }
         }
-        maybeEnqueueNextOfflineAutoPlaylist();
+        // Throttled on the render path only: every render used to re-validate the whole
+        // auto-offline library on the same executor that serves the offline-state scans.
+        // Event-driven call sites (WorkManager observer, flushDeferredOfflineWork, resume)
+        // stay unthrottled so download chaining remains responsive.
+        long nowAutoCheck = System.currentTimeMillis();
+        if (nowAutoCheck - lastRenderAutoOfflineCheckMs > 10_000L) {
+            lastRenderAutoOfflineCheckMs = nowAutoCheck;
+            maybeEnqueueNextOfflineAutoPlaylist();
+        }
         maybeAppendCloudPlaylists();
         updateLibraryBackdropImage();
+    }
+
+    /**
+     * One-shot, off-main warmup of everything the first library render needs: the persisted
+     * library/artists JSON (deferred out of onViewCreated) and every JSON-backed store the
+     * display build reads (favorites, custom playlists, pinned ids, radios, local files). The
+     * entry skeleton stays visible while this runs; the post-back re-renders with all of those
+     * reads served from memory caches, so the synchronous render body is cheap from then on.
+     */
+    private void warmLibraryStoresOffMain() {
+        if (libraryStoresWarmed || libraryWarmupInFlight || !isAdded()) return;
+        libraryWarmupInFlight = true;
+        final Context appCtx = requireContext().getApplicationContext();
+        final String accountKey = resolveAccountKey();
+        final boolean needLibraryRestore = libraryTracks.isEmpty();
+        final boolean needArtistsRestore = libraryArtists.isEmpty();
+        authExecutor.execute(() -> {
+            final List<YouTubeMusicService.TrackResult> restoredLibrary =
+                    needLibraryRestore ? loadPersistedLibrary(accountKey)
+                            : java.util.Collections.<YouTubeMusicService.TrackResult>emptyList();
+            final List<YouTubeMusicService.ArtistResult> restoredArtists =
+                    needArtistsRestore ? loadPersistedArtists(accountKey)
+                            : java.util.Collections.<YouTubeMusicService.ArtistResult>emptyList();
+            try {
+                FavoritesPlaylistStore.loadFavorites(appCtx);
+                for (String name : CustomPlaylistsStore.INSTANCE.getAllPlaylistNames(appCtx)) {
+                    CustomPlaylistsStore.INSTANCE.getTracksFromPlaylist(appCtx, name);
+                }
+                RadioHistoryStore.INSTANCE.getPinnedPlaylistIds(appCtx);
+                RadioHistoryStore.INSTANCE.getRadios(appCtx);
+                if (LocalFilesStore.isEnabled(appCtx)) {
+                    LocalFilesStore.getCachedFiles(appCtx);
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "library store warmup failed", e);
+            }
+            mainHandler.post(() -> {
+                libraryWarmupInFlight = false;
+                libraryStoresWarmed = true;
+                if (!isAdded()) return;
+                if (needLibraryRestore && !restoredLibrary.isEmpty() && libraryTracks.isEmpty()) {
+                    libraryTracks.addAll(restoredLibrary);
+                    LIBRARY_CACHE.clear();
+                    LIBRARY_CACHE.addAll(libraryTracks);
+                    libraryCacheAccountKey = accountKey;
+                    libraryCacheUpdatedAtMs = getPersistedLibraryUpdatedAt(accountKey);
+                    // A restored library counts as an authorized streaming session (same rule as
+                    // restoreCachedStreamingSessionState's hasCachedLibrary input).
+                    streamingOauthCompleted = true;
+                    displayLibraryDirty = true;
+                }
+                if (needArtistsRestore && !restoredArtists.isEmpty() && libraryArtists.isEmpty()) {
+                    libraryArtists.addAll(restoredArtists);
+                    displayLibraryDirty = true;
+                }
+                if (activeScreen == ScreenMode.LIBRARY) {
+                    renderLibraryResults();
+                }
+                maybeSyncLibraryIfAuthorized();
+            });
+        });
     }
     private void showLibraryEmptyState() {
         if (tvLibraryTitle != null) tvLibraryTitle.setVisibility(View.GONE);
@@ -2224,7 +2664,8 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             return result;
         }
         Set<String> seenVideoIds = new HashSet<>();
-        List<YouTubeMusicService.TrackResult> allPlaylists = buildDisplayLibrary();
+        // Unfiltered: an active Artistas chip must not hide cached songs from the search.
+        List<YouTubeMusicService.TrackResult> allPlaylists = buildDisplayLibraryUnfiltered();
         for (YouTubeMusicService.TrackResult playlist : allPlaylists) {
             if (playlist == null || !"playlist".equals(playlist.resultType)) {
                 continue;
@@ -2332,12 +2773,35 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         flLibraryLoadingOverlay.setVisibility(View.VISIBLE);
         startSkeletonPulse();
         // Safety timeout: dismiss after 5 seconds even if prefetches haven't finished
-        mainHandler.postDelayed(this::dismissLibraryGridOverlay, 5000L);
+        mainHandler.removeCallbacks(libraryOverlayTimeout);
+        mainHandler.postDelayed(libraryOverlayTimeout, 5000L);
+    }
+
+    /**
+     * Entry/loading skeleton: the same overlay as the grid-prefetch path, but not driven by a
+     * prefetch count. Shown while the off-main library warmup runs on module entry and while a
+     * Files-chip device scan is in flight, so those windows show a pulsing skeleton instead of an
+     * empty screen. Dismissed by the next successful warm render (renderLibraryResults).
+     */
+    private void showLibraryEntrySkeleton() {
+        if (flLibraryLoadingOverlay == null || libraryGridOverlayActive) return;
+        libraryGridOverlayActive = true;
+        libraryGridPendingCount = 0;
+        flLibraryLoadingOverlay.setAlpha(1f);
+        flLibraryLoadingOverlay.setVisibility(View.VISIBLE);
+        startSkeletonPulse();
+        mainHandler.removeCallbacks(libraryOverlayTimeout);
+        mainHandler.postDelayed(libraryOverlayTimeout, 6000L);
     }
     /** Gently pulses the skeleton placeholders' alpha while the library loads. */
     private void startSkeletonPulse() {
         if (llLibrarySkeletonContent == null) return;
         stopSkeletonPulse();
+        // Promote the static skeleton subtree to a hardware layer while its alpha animates: without
+        // it, the ~20-view group re-draws its whole subtree every vsync (alpha < 1 forces a redraw),
+        // right during the entry window we're smoothing. The cached texture is valid because the
+        // content is static while pulsing.
+        llLibrarySkeletonContent.setLayerType(View.LAYER_TYPE_HARDWARE, null);
         android.animation.ObjectAnimator pulse = android.animation.ObjectAnimator.ofFloat(
                 llLibrarySkeletonContent, "alpha", 1f, 0.4f);
         pulse.setDuration(650L);
@@ -2354,6 +2818,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         }
         if (llLibrarySkeletonContent != null) {
             llLibrarySkeletonContent.setAlpha(1f);
+            llLibrarySkeletonContent.setLayerType(View.LAYER_TYPE_NONE, null);
         }
     }
     private void onLibraryGridPrefetchComplete() {
@@ -2364,15 +2829,20 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         }
     }
     private void dismissLibraryGridOverlay() {
+        dismissLibraryGridOverlay(true);
+    }
+    private void dismissLibraryGridOverlay(boolean resubmit) {
         if (!libraryGridOverlayActive) return;
         libraryGridOverlayActive = false;
         libraryGridPendingCount = 0;
-        mainHandler.removeCallbacks(this::dismissLibraryGridOverlay);
+        mainHandler.removeCallbacks(libraryOverlayTimeout);
         stopSkeletonPulse();
         mainHandler.post(() -> {
             if (!isAdded()) return;
-            // Refresh adapter so grids appear with fade
-            if (activeScreen == ScreenMode.LIBRARY && adapter != null) {
+            // Refresh adapter so grids appear with fade. Skipped when the caller (a warm render)
+            // JUST submitted this exact list — re-submitting it only schedules a redundant
+            // background DiffUtil pass in the same frame as the initial big insert.
+            if (resubmit && activeScreen == ScreenMode.LIBRARY && adapter != null) {
                 List<YouTubeMusicService.TrackResult> display = buildDisplayLibrary();
                 adapter.submitResults(new ArrayList<>(display));
             }
@@ -2480,23 +2950,15 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             youtubeAccessToken = cachedYoutubeAccessToken;
         }
         if (hasValidLibraryCache(accountKey) && libraryTracks.isEmpty()) {
+            // Warm process: the static LIBRARY_CACHE is already parsed — adopt it for free.
             libraryTracks.clear();
             libraryTracks.addAll(new ArrayList<>(LIBRARY_CACHE));
             displayLibraryDirty = true;
-            restoreCachedArtists(accountKey);
-            return;
         }
-        List<YouTubeMusicService.TrackResult> persisted = loadPersistedLibrary(accountKey);
-        if (!persisted.isEmpty() && libraryTracks.isEmpty()) {
-            libraryTracks.clear();
-            libraryTracks.addAll(persisted);
-            displayLibraryDirty = true;
-            LIBRARY_CACHE.clear();
-            LIBRARY_CACHE.addAll(libraryTracks);
-            libraryCacheAccountKey = accountKey;
-            libraryCacheUpdatedAtMs = getPersistedLibraryUpdatedAt(accountKey);
-        }
-        restoreCachedArtists(accountKey);
+        // Cold process: the persisted library/artists JSON parse is DEFERRED to the off-main
+        // library warmup (warmLibraryStoresOffMain). Parsing it here — synchronously inside
+        // onViewCreated — blocked the module's first frame for the entire cache size; the entry
+        // skeleton now covers that gap instead.
     }
     private void restoreCachedArtists(@NonNull String accountKey) {
         if (!libraryArtists.isEmpty()) return;
@@ -2892,27 +3354,27 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                         boolean isYtPlaylist = !FavoritesPlaylistStore.PLAYLIST_ID.equals(targetPlaylistId)
                                 && !targetPlaylistId.startsWith("custom_");
                         // Eagerly resolve grid URLs from freshly cached tracks so the
-                        // 2x2 grid is available immediately when the adapter rebinds.
-                        boolean gridJustResolved = false;
-                        if (!playlistGridUrlsCache.containsKey(targetPlaylistId)) {
+                        // 2x2 grid is available immediately when the adapter rebinds. Also
+                        // re-resolve when the cached entry is a negative/partial (<4 urls)
+                        // result — the fresh tracks may now provide a full grid.
+                        List<String> cachedGrid = playlistGridUrlsCache.get(targetPlaylistId);
+                        if (cachedGrid == null || cachedGrid.size() < 4) {
                             playlistGridUrlsCache.remove(targetPlaylistId);
-                            List<String> resolved = resolveGridUrlsSync(targetPlaylistId, isYtPlaylist);
-                            gridJustResolved = resolved.size() >= 4;
+                            resolveGridUrlsSync(targetPlaylistId, isYtPlaylist);
                         } else if (!isYtPlaylist) {
                             playlistGridUrlsCache.remove(targetPlaylistId);
                         }
-                        final boolean needsFullRebind = gridJustResolved;
-                        // Refresh adapter immediately per-playlist as soon as data is cached
+                        // Refresh ONLY this playlist's row. The previous code ran a full
+                        // notifyDataSetChanged (or a full rebuild+submit) here — once per
+                        // prefetched playlist, up to 12 times right after entry — and each one
+                        // re-bound and re-laid-out EVERY row of the non-recycling list. The
+                        // targeted full rebind still picks up freshly-resolved grid art (which
+                        // DiffUtil alone would skip, since grid URLs live outside the item model).
                         mainHandler.post(() -> {
                             if (isAdded() && activeScreen == ScreenMode.LIBRARY && adapter != null) {
-                                if (needsFullRebind) {
-                                    // Grid just became available — force full rebind so DiffUtil
-                                    // doesn't skip the ViewHolder that was showing a placeholder.
-                                    adapter.notifyDataSetChanged();
-                                } else {
-                                    List<YouTubeMusicService.TrackResult> display = buildDisplayLibrary();
-                                    adapter.submitResults(new ArrayList<>(display));
-                                }
+                                // Only the grid art changed for this playlist — repaint the thumb in
+                                // place (no full-list relayout, no notify).
+                                adapter.refreshPlaylistThumbInPlace(targetPlaylistId);
                             }
                             onLibraryGridPrefetchComplete();
                         });
@@ -3295,14 +3757,14 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         if (TextUtils.isEmpty(token)) {
             // Only local
             if (localNames.isEmpty()) {
-                android.widget.Toast.makeText(requireContext(), "No tienes playlists. Crea una primero.", android.widget.Toast.LENGTH_SHORT).show();
+                AppSnackbar.show(getActivity(), "No tienes playlists. Crea una primero.");
                 return;
             }
             showAddToPlaylistDialogInternal(track, localNames, Collections.emptyList());
             return;
         }
         // Show loading and fetch YT playlists
-        android.widget.Toast.makeText(requireContext(), "Cargando tus listas de YouTube...", android.widget.Toast.LENGTH_SHORT).show();
+        AppSnackbar.show(getActivity(), "Cargando tus listas de YouTube...");
         youTubeMusicService.fetchMyPlaylists(token, 50, new YouTubeMusicService.PlaylistsCallback() {
             @Override
             public void onSuccess(@NonNull List<YouTubeMusicService.PlaylistResult> playlists) {
@@ -3325,7 +3787,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             displayNames.add("[YT] " + playlist.title);
         }
         if (displayNames.isEmpty()) {
-            android.widget.Toast.makeText(requireContext(), "No tienes playlists. Crea una primero.", android.widget.Toast.LENGTH_SHORT).show();
+            AppSnackbar.show(getActivity(), "No tienes playlists. Crea una primero.");
             return;
         }
         String[] array = displayNames.toArray(new String[0]);
@@ -3343,7 +3805,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                         "",
                         track.thumbnailUrl == null ? "" : track.thumbnailUrl
                     );
-                    android.widget.Toast.makeText(requireContext(), "Añadida a local: " + selected, android.widget.Toast.LENGTH_SHORT).show();
+                    AppSnackbar.show(getActivity(), "Añadida a local: " + selected);
                     fetchLibraryPlaylists(true);
                 } else {
                     int ytIdx = which - localNames.size();
@@ -3352,9 +3814,9 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                     youTubeMusicService.insertTrackToPlaylist(token, selected.playlistId, track.videoId, (success, error) -> {
                         if (!isAdded()) return;
                         if (success) {
-                            android.widget.Toast.makeText(requireContext(), "Añadida a YouTube: " + selected.title, android.widget.Toast.LENGTH_SHORT).show();
+                            AppSnackbar.show(getActivity(), "Añadida a YouTube: " + selected.title);
                         } else {
-                            android.widget.Toast.makeText(requireContext(), "Error YouTube: " + error, android.widget.Toast.LENGTH_SHORT).show();
+                            AppSnackbar.show(getActivity(), "Error YouTube: " + error);
                         }
                     });
                 }
@@ -3366,7 +3828,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         if (!isAdded()) return;
         final String oldName = playlistTrack.title == null ? "" : playlistTrack.title.trim();
         if (TextUtils.isEmpty(oldName)) {
-            android.widget.Toast.makeText(requireContext(), "Nombre inválido", android.widget.Toast.LENGTH_SHORT).show();
+            AppSnackbar.show(getActivity(), "Nombre inválido");
             return;
         }
         final android.widget.EditText input = new android.widget.EditText(requireContext());
@@ -3380,10 +3842,10 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 String newName = input.getText() == null ? "" : input.getText().toString().trim();
                 boolean ok = CustomPlaylistsStore.INSTANCE.renamePlaylist(requireContext(), oldName, newName);
                 if (ok) {
-                    android.widget.Toast.makeText(requireContext(), "Playlist renombrada", android.widget.Toast.LENGTH_SHORT).show();
+                    AppSnackbar.show(getActivity(), "Playlist renombrada");
                     renderLibraryResults();
                 } else {
-                    android.widget.Toast.makeText(requireContext(), "No se pudo renombrar", android.widget.Toast.LENGTH_SHORT).show();
+                    AppSnackbar.show(getActivity(), "No se pudo renombrar");
                 }
             })
             .setNegativeButton("Cancelar", null)
@@ -3839,7 +4301,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         tvRadio.setText("Iniciar radio");
         btnRadio.setOnClickListener(v -> {
             dialog.dismiss();
-            android.widget.Toast.makeText(requireContext(), "Próximamente disponible para playlists", android.widget.Toast.LENGTH_SHORT).show();
+            AppSnackbar.show(getActivity(), "Próximamente disponible para playlists");
         });
 
         View btnDeletePlaylist = view.findViewById(R.id.btnBsFavorite);
@@ -3961,7 +4423,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                     OfflineAudioStore.deleteOfflineAudio(requireContext().getApplicationContext(), new ArrayList<>(Collections.singletonList(videoId)));
                 }
             } else {
-                android.widget.Toast.makeText(requireContext(), "Descarga disponible desde búsqueda", android.widget.Toast.LENGTH_SHORT).show();
+                AppSnackbar.show(getActivity(), "Descarga disponible desde búsqueda");
             }
         });
         // Top row slot 3: Compartir
@@ -4011,7 +4473,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         if (LocalFilesStore.PLAYLIST_ID.equals(plId)) {
             List<LocalFilesStore.LocalTrack> localTracks = LocalFilesStore.getCachedFiles(requireContext());
             if (localTracks.isEmpty()) {
-                android.widget.Toast.makeText(requireContext(), "No hay archivos locales", android.widget.Toast.LENGTH_SHORT).show();
+                AppSnackbar.show(getActivity(), "No hay archivos locales");
                 return;
             }
             ArrayList<String> ids = new ArrayList<>();
@@ -4036,7 +4498,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 java.util.List<FavoritesPlaylistStore.FavoriteTrack> tracks =
                         CustomPlaylistsStore.INSTANCE.getTracksFromPlaylist(requireContext(), customName);
                 if (tracks.isEmpty()) {
-                    android.widget.Toast.makeText(requireContext(), "La playlist está vacía", android.widget.Toast.LENGTH_SHORT).show();
+                    AppSnackbar.show(getActivity(), "La playlist está vacía");
                     return;
                 }
                 ArrayList<String> ids = new ArrayList<>();
@@ -4053,7 +4515,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                     images.add(t.imageUrl == null ? "" : t.imageUrl);
                 }
                 if (ids.isEmpty()) {
-                    android.widget.Toast.makeText(requireContext(), "La playlist está vacía", android.widget.Toast.LENGTH_SHORT).show();
+                    AppSnackbar.show(getActivity(), "La playlist está vacía");
                     return;
                 }
                 startPlaybackQueue(ids, titles, artists, durations, images, 0);
@@ -4063,12 +4525,12 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         // 2) YouTube playlist by id
         String playlistId = playlistTrack.contentId == null ? "" : playlistTrack.contentId.trim();
         if (TextUtils.isEmpty(playlistId)) {
-            android.widget.Toast.makeText(requireContext(), "Playlist inválida", android.widget.Toast.LENGTH_SHORT).show();
+            AppSnackbar.show(getActivity(), "Playlist inválida");
             return;
         }
         String token = resolveAccessTokenForPlaylistDetail();
         if (TextUtils.isEmpty(token)) {
-            android.widget.Toast.makeText(requireContext(), "Inicia sesión para reproducir esta playlist", android.widget.Toast.LENGTH_SHORT).show();
+            AppSnackbar.show(getActivity(), "Inicia sesión para reproducir esta playlist");
             return;
         }
         youTubeMusicService.fetchPlaylistTracks(token, playlistId, 250, new YouTubeMusicService.PlaylistTracksCallback() {
@@ -4076,7 +4538,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             public void onSuccess(java.util.List<YouTubeMusicService.PlaylistTrackResult> tracks) {
                 if (!isAdded()) return;
                 if (tracks == null || tracks.isEmpty()) {
-                    android.widget.Toast.makeText(requireContext(), "La playlist está vacía", android.widget.Toast.LENGTH_SHORT).show();
+                    AppSnackbar.show(getActivity(), "La playlist está vacía");
                     return;
                 }
                 ArrayList<String> ids = new ArrayList<>();
@@ -4093,7 +4555,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                     images.add(t.thumbnailUrl == null ? "" : t.thumbnailUrl);
                 }
                 if (ids.isEmpty()) {
-                    android.widget.Toast.makeText(requireContext(), "La playlist está vacía", android.widget.Toast.LENGTH_SHORT).show();
+                    AppSnackbar.show(getActivity(), "La playlist está vacía");
                     return;
                 }
                 startPlaybackQueue(ids, titles, artists, durations, images, 0);
@@ -4101,7 +4563,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             @Override
             public void onError(String error) {
                 if (!isAdded()) return;
-                android.widget.Toast.makeText(requireContext(), "No se pudo cargar la playlist", android.widget.Toast.LENGTH_SHORT).show();
+                AppSnackbar.show(getActivity(), "No se pudo cargar la playlist");
             }
         });
     }
@@ -4169,9 +4631,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                     sp.externalEnqueue(t.getVideoId(), t.getTitle(), t.getArtist(), t.getDuration(), t.getAlbumArtUri());
                 }
             }
-            android.widget.Toast.makeText(requireContext(),
-                    insertNext ? "Se reproducirá a continuación" : "Agregado a la fila",
-                    android.widget.Toast.LENGTH_SHORT).show();
+            AppSnackbar.show(getActivity(), insertNext ? "Se reproducirá a continuación" : "Agregado a la fila");
             return;
         }
 
@@ -4194,9 +4654,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                             sp.externalEnqueue(t.getVideoId(), t.getTitle(), t.getArtist(), "--:--", t.getThumbnailUrl());
                         }
                     }
-                    android.widget.Toast.makeText(requireContext(),
-                            insertNext ? "Se reproducirá a continuación" : "Agregado a la fila",
-                            android.widget.Toast.LENGTH_SHORT).show();
+                    AppSnackbar.show(getActivity(), insertNext ? "Se reproducirá a continuación" : "Agregado a la fila");
                     return;
                 }
             }
@@ -4219,9 +4677,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                     sp.externalEnqueue(t.videoId, t.title, t.artist, t.duration, t.imageUrl);
                 }
             }
-            android.widget.Toast.makeText(requireContext(),
-                    insertNext ? "Se reproducirá a continuación" : "Agregado a la fila",
-                    android.widget.Toast.LENGTH_SHORT).show();
+            AppSnackbar.show(getActivity(), insertNext ? "Se reproducirá a continuación" : "Agregado a la fila");
             return;
         }
 
@@ -4244,9 +4700,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                         sp.externalEnqueue(t.videoId, t.title, t.artist, t.duration, t.imageUrl);
                     }
                 }
-                android.widget.Toast.makeText(requireContext(),
-                        insertNext ? "Se reproducirá a continuación" : "Agregado a la fila",
-                        android.widget.Toast.LENGTH_SHORT).show();
+                AppSnackbar.show(getActivity(), insertNext ? "Se reproducirá a continuación" : "Agregado a la fila");
                 return;
             }
         }
@@ -4254,7 +4708,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         // 3. YouTube playlists — fetch from API
         String token = resolveAccessTokenForPlaylistDetail();
         if (TextUtils.isEmpty(token)) {
-            android.widget.Toast.makeText(requireContext(), "Inicia sesión para esta acción", android.widget.Toast.LENGTH_SHORT).show();
+            AppSnackbar.show(getActivity(), "Inicia sesión para esta acción");
             return;
         }
         youTubeMusicService.fetchPlaylistTracks(token, playlistId, 250, new YouTubeMusicService.PlaylistTracksCallback() {
@@ -4283,14 +4737,12 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                                 t.thumbnailUrl == null ? "" : t.thumbnailUrl);
                     }
                 }
-                android.widget.Toast.makeText(requireContext(),
-                        insertNext ? "Se reproducirá a continuación" : "Agregado a la fila",
-                        android.widget.Toast.LENGTH_SHORT).show();
+                AppSnackbar.show(getActivity(), insertNext ? "Se reproducirá a continuación" : "Agregado a la fila");
             }
             @Override
             public void onError(String error) {
                 if (!isAdded()) return;
-                android.widget.Toast.makeText(requireContext(), "No se pudo cargar la playlist", android.widget.Toast.LENGTH_SHORT).show();
+                AppSnackbar.show(getActivity(), "No se pudo cargar la playlist");
             }
         });
     }
@@ -4317,9 +4769,9 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                     renderLibraryResults();
                     // Refresh from source to ensure consistency
                     fetchLibraryPlaylists(true);
-                    android.widget.Toast.makeText(requireContext(), "Playlist eliminada", android.widget.Toast.LENGTH_SHORT).show();
+                    AppSnackbar.show(getActivity(), "Playlist eliminada");
                 } else {
-                    android.widget.Toast.makeText(requireContext(), "No se pudo eliminar la playlist", android.widget.Toast.LENGTH_SHORT).show();
+                    AppSnackbar.show(getActivity(), "No se pudo eliminar la playlist");
                 }
             })
             .setNegativeButton("Cancelar", null)
@@ -4340,7 +4792,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                     }
                 }
                 renderLibraryResults();
-                android.widget.Toast.makeText(requireContext(), "Playlist eliminada de la nube", android.widget.Toast.LENGTH_SHORT).show();
+                AppSnackbar.show(getActivity(), "Playlist eliminada de la nube");
             })
             .setNegativeButton("Cancelar", null)
             .show();
@@ -4389,7 +4841,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             adapter.invalidatePlaylistOfflineState(playlistId);
         }
         String message = deleted > 0 ? "Eliminadas " + deleted + " descargas" : "No hay descargas para eliminar";
-        android.widget.Toast.makeText(requireContext(), message, android.widget.Toast.LENGTH_SHORT).show();
+        AppSnackbar.show(getActivity(), message);
     }
     private void dismissPlaylistActionTooltip() {
         if (playlistActionPopupWindow != null) {
@@ -4507,7 +4959,10 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     }
     private void enqueueOfflineDownloadUniqueWork(@NonNull OneTimeWorkRequest request) {
         WorkManager manager = WorkManager.getInstance(requireContext().getApplicationContext());
-        manager.enqueueUniqueWork(OFFLINE_DOWNLOAD_QUEUE_UNIQUE_NAME, ExistingWorkPolicy.KEEP, request);
+        // APPEND_OR_REPLACE (same policy as PlaylistDetailFragment): with KEEP, any unfinished
+        // work in the chain silently discarded the new request — the tile showed an optimistic
+        // 0% ring for a download that was never actually enqueued.
+        manager.enqueueUniqueWork(OFFLINE_DOWNLOAD_QUEUE_UNIQUE_NAME, ExistingWorkPolicy.APPEND_OR_REPLACE, request);
     }
     private void startObservingOfflineQueue() {
         if (!isAdded()) {
@@ -4731,8 +5186,16 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             return;
         }
         pendingDownloadProgressDispatch = false;
+        // Merge keeping the HIGHER fraction per playlist: a concurrent single-track manual job
+        // (fraction over total=1) must not replace the whole-playlist auto fraction — that made
+        // the ring jump from e.g. 90% (45/50 tracks) down to the lone track's byte progress.
         Map<String, Float> merged = new HashMap<>(autoQueueProgressByPlaylist);
-        merged.putAll(manualQueueProgressByPlaylist);
+        for (Map.Entry<String, Float> e : manualQueueProgressByPlaylist.entrySet()) {
+            Float existing = merged.get(e.getKey());
+            if (existing == null || e.getValue() > existing) {
+                merged.put(e.getKey(), e.getValue());
+            }
+        }
         Set<String> mergedDownloading = new HashSet<>(autoQueueDownloading);
         mergedDownloading.addAll(manualQueueDownloading);
         if (!mergedDownloading.isEmpty() || !adapter.playlistsCurrentlyDownloading.isEmpty()) {
@@ -5315,11 +5778,18 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                             persistGridUrls(playlistId, resolvedUrls);
                         }
                         if (adapter != null) {
-                            int pos = adapter.findPlaylistPositionById(playlistId);
-                            if (pos >= 0) {
-                                adapter.safeNotify(() -> adapter.notifyItemChanged(pos));
-                            }
+                            // Repaint just this row's thumb in place — a notifyItemChanged here
+                            // full-relayouts the whole non-recycling list, and these resolutions
+                            // land staggered (one per playlist) across the entry window.
+                            adapter.refreshPlaylistThumbInPlace(playlistId);
                         }
+                    } else {
+                        // Cache the negative/partial result too. Without it, every later bind of a
+                        // playlist with fewer than 4 distinct thumbnails re-dispatched this whole
+                        // resolution (cached-tracks JSON parse included) — endless executor churn
+                        // for small playlists. The prefetch path upgrades this entry (it re-resolves
+                        // whenever the cached grid has <4 urls and fresh tracks just arrived).
+                        playlistGridUrlsCache.put(playlistId, resolvedUrls);
                     }
                 });
             });
@@ -5458,7 +5928,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 @Override
                 public void onSuccess(@NonNull List<YouTubeMusicService.TrackResult> radioTracks) {
                     if (!isAdded() || radioTracks.isEmpty()) {
-                        android.widget.Toast.makeText(requireContext(), "No se pudo cargar la radio. Inténtalo más tarde.", android.widget.Toast.LENGTH_SHORT).show();
+                        AppSnackbar.show(getActivity(), "No se pudo cargar la radio. Inténtalo más tarde.");
                         return;
                     }
                     // Build radio queue: selected track first, then radio tracks (deduplicated)
@@ -5514,9 +5984,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 @Override
                 public void onError(@NonNull String error) {
                     if (!isAdded()) return;
-                    android.widget.Toast.makeText(requireContext(),
-                            "No se pudo cargar la radio. Inténtalo más tarde.",
-                            android.widget.Toast.LENGTH_SHORT).show();
+                    AppSnackbar.show(getActivity(), "No se pudo cargar la radio. Inténtalo más tarde.");
                 }
             });
         }
@@ -5530,7 +5998,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         SongPlayerFragment player = findSongPlayerFragment();
         if (player != null && player.isAdded()) {
             player.externalInsertNext(videoId, title, subtitle, "", thumbnailUrl);
-            android.widget.Toast.makeText(requireContext(), "Se reproducirá a continuación", android.widget.Toast.LENGTH_SHORT).show();
+            AppSnackbar.show(getActivity(), "Se reproducirá a continuación");
         }
     }
     public void addToQueueFromSearch(@NonNull Intent data) {
@@ -5541,7 +6009,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         SongPlayerFragment player = findSongPlayerFragment();
         if (player != null && player.isAdded()) {
             player.externalEnqueue(videoId, title, subtitle, "", thumbnailUrl);
-            android.widget.Toast.makeText(requireContext(), "Agregado a la fila", android.widget.Toast.LENGTH_SHORT).show();
+            AppSnackbar.show(getActivity(), "Agregado a la fila");
         }
     }
     private void openTrack(@NonNull YouTubeMusicService.TrackResult track) {
@@ -5898,10 +6366,10 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                     if (!TextUtils.isEmpty(name)) {
                         boolean success = CustomPlaylistsStore.INSTANCE.createPlaylist(requireContext(), name);
                         if (success) {
-                            android.widget.Toast.makeText(requireContext(), "Playlist creada", android.widget.Toast.LENGTH_SHORT).show();
+                            AppSnackbar.show(getActivity(), "Playlist creada");
                             fetchLibraryPlaylists(true);
                         } else {
-                            android.widget.Toast.makeText(requireContext(), "La playlist ya existe", android.widget.Toast.LENGTH_SHORT).show();
+                            AppSnackbar.show(getActivity(), "La playlist ya existe");
                         }
                     }
                 })
@@ -5909,16 +6377,6 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 .show();
     }
     // ========== Library Backdrop ==========
-
-    private void applyLibraryBackdropBlur() {
-        ImageView backdrop = ivLibraryBackdrop;
-        if (backdrop == null) return;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            backdrop.setRenderEffect(
-                android.graphics.RenderEffect.createBlurEffect(60f, 60f, android.graphics.Shader.TileMode.CLAMP)
-            );
-        }
-    }
 
     public void updateLibraryBackdropImage() {
         ImageView backdrop = ivLibraryBackdrop;
@@ -5939,6 +6397,10 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         mainHandler.removeCallbacksAndMessages(null);
         ivLibraryBackdrop = null;
         vStatusBarOverlay = null;
+        if (llFloatingBrandHeader != null) llFloatingBrandHeader.animate().cancel();
+        llFloatingBrandHeader = null;
+        btnFloatProfilePhoto = null;
+        floatingHeaderShown = false;
         PlaybackEventBus.removeListener(this);
         super.onDestroyView();
     }
@@ -5955,8 +6417,22 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         snapshotOfflineRecalcDirty = false;
         lastSnapshotHandledAtMs = android.os.SystemClock.elapsedRealtime();
         refreshCurrentPlayingPlaylistState();
-        scheduleOfflineStateRecalc();
+        maybeScheduleOfflineRecalcForPlayback();
     };
+
+    /**
+     * A playback snapshot fires every ~5s while music plays. It updates the "now playing" indicator
+     * (refreshCurrentPlayingPlaylistState, cheap), but it must NOT trigger an offline-state recalc:
+     * a plain position tick never changes whether a playlist is downloaded, yet invalidate(null)
+     * full-relayouts the entire non-recycling list AND can re-scan every playlist off-main. Only
+     * recompute while a download is actually advancing (its per-track completions move a ring);
+     * download completions themselves are already handled by the WorkManager observer path.
+     */
+    private void maybeScheduleOfflineRecalcForPlayback() {
+        if (adapter != null && !adapter.playlistsCurrentlyDownloading.isEmpty()) {
+            scheduleOfflineStateRecalc();
+        }
+    }
     @Override
     public void onPlaybackSnapshotUpdated() {
         if (isAdded() && getActivity() != null) {
@@ -5976,7 +6452,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 }
                 lastSnapshotHandledAtMs = now;
                 refreshCurrentPlayingPlaylistState();
-                scheduleOfflineStateRecalc();
+                maybeScheduleOfflineRecalcForPlayback();
             });
         }
     }
@@ -6082,6 +6558,10 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         private final Map<String, Float> playlistRealFractionCache = new HashMap<>();
         private final Map<String, Integer> playlistPositionCache = new HashMap<>();  // Cache for O(1) lookups
         private final Set<String> playlistOfflineRefreshInFlight = new HashSet<>();
+        // Forced refreshes that arrived while a scan for the same playlist was already in flight.
+        // The in-flight scan may have snapshotted disk BEFORE the last track landed, so the forced
+        // request must re-run afterwards instead of being dropped (stuck "100% but no check" bug).
+        private final Set<String> playlistOfflineRefreshRerunRequested = new HashSet<>();
         private final Map<String, Float> playlistDownloadProgressCache = new HashMap<>();
         private final Set<String> playlistsCurrentlyDownloading = new HashSet<>();
         private long playlistOfflineStateGeneration;
@@ -6089,6 +6569,8 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         private long lastFullOfflineInvalidateAtMs = 0L;
         private static final long FULL_OFFLINE_INVALIDATE_THROTTLE_MS = 5000L;
         private boolean searchMode;
+        // Trailing "create playlist" row — hidden while the Artistas chip filter is active
+        private boolean showCreatePlaylistRow = true;
         MusicResultsAdapter(
                 @NonNull OnLibraryTrackClick onTrackClick,
                 @NonNull OnLibraryTrackMoreClick onTrackMoreClick
@@ -6222,7 +6704,12 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                         ? progressByPlaylistId.get(pid) : -1f;
                 boolean wasDownloading = playlistsCurrentlyDownloading.contains(pid);
                 boolean nowDownloading = downloading.contains(pid);
-                if (wasDownloading != nowDownloading || Math.abs(oldVal - newVal) > 0.005f) {
+                // Crossing into the terminal band must never be deduped: per-track fractions cap
+                // at 0.99, so on an N-track playlist the final 1.0 tick differs from the previous
+                // one by only 0.01/N — under the epsilon for N>=2, which kept the ring stuck and
+                // the check from lighting (the "100% but no check" bug).
+                boolean crossedFull = newVal >= 0.999f && oldVal < 0.999f;
+                if (wasDownloading != nowDownloading || crossedFull || Math.abs(oldVal - newVal) > 0.005f) {
                     anyChanged = true;
                     break;
                 }
@@ -6236,10 +6723,101 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
 
             for (String pid : changed) {
                 int pos = findPlaylistPositionById(pid);
-                if (pos >= 0) {
-                    safeNotify(() -> notifyItemChanged(pos, PAYLOAD_DOWNLOAD_PROGRESS));
+                if (pos < 0) continue;
+                // Progress ticks arrive ~1.5x/second per download. A notifyItemChanged — even with a
+                // payload — re-measures/re-lays-out EVERY row of this non-recycling list. The offline
+                // widgets are all fixed-size (22dp ring/icon), so a progress/icon change never alters
+                // layout: update the live ViewHolder IN PLACE (bindOfflineState only sets progress +
+                // icon + fixed-size visibility, no relayout). Fall back to notify only when the row's
+                // holder isn't currently bound (rare here — the list never recycles).
+                RecyclerView.ViewHolder vh = rvMusicResults != null
+                        ? rvMusicResults.findViewHolderForAdapterPosition(pos) : null;
+                if (vh instanceof TrackViewHolder && pos < data.size()) {
+                    bindOfflineState((TrackViewHolder) vh, data.get(pos));
+                } else {
+                    final int notifyPos = pos;
+                    safeNotify(() -> notifyItemChanged(notifyPos, PAYLOAD_DOWNLOAD_PROGRESS));
                 }
             }
+        }
+
+        /** The thumbnail block of a playlist/track row (folder icon / album icon / radio cover /
+         *  2x2 grid / single cover / placeholder). Extracted so grid-art resolution can repaint
+         *  just the thumb IN PLACE (see refreshPlaylistThumbInPlace) rather than notifyItemChanged,
+         *  which full-relayouts this non-recycling list. */
+        private void bindPlaylistThumb(@NonNull TrackViewHolder holder, @NonNull YouTubeMusicService.TrackResult item) {
+            String pid = item.contentId == null ? "" : item.contentId.trim();
+            boolean isLocalFilesItem = LocalFilesStore.PLAYLIST_ID.equals(pid);
+            boolean isLocalAlbumItem = LocalFilesStore.isLocalAlbumId(pid);
+            boolean isRadioItem = pid.startsWith("RDAMVM") || pid.startsWith("RDEM") || pid.startsWith("RDTMAK");
+            if (isLocalFilesItem) {
+                // Local files: white folder icon on black background
+                holder.ivTrackThumb.setTag(R.id.tag_artwork_signature, null);
+                holder.ivTrackThumb.setScaleType(ImageView.ScaleType.CENTER);
+                holder.ivTrackThumb.setBackgroundColor(android.graphics.Color.BLACK);
+                holder.ivTrackThumb.setImageResource(R.drawable.ic_folder_white);
+            } else if (isLocalAlbumItem) {
+                // Local device album: generic music icon — never a network cover. Only touch Glide
+                // if this view actually held network art before (signature set) — the Files view
+                // paints ~120 of these at once, and an unconditional Glide.with().clear() per row
+                // was pure overhead on a fresh album list (no pending load to cancel).
+                if (holder.ivTrackThumb.getTag(R.id.tag_artwork_signature) != null) {
+                    Glide.with(holder.ivTrackThumb).clear(holder.ivTrackThumb);
+                    holder.ivTrackThumb.setTag(R.id.tag_artwork_signature, null);
+                }
+                holder.ivTrackThumb.setScaleType(ImageView.ScaleType.CENTER);
+                holder.ivTrackThumb.setBackgroundColor(
+                        ContextCompat.getColor(holder.itemView.getContext(), R.color.surface_high));
+                holder.ivTrackThumb.setImageResource(R.drawable.ic_music);
+            } else if (isRadioItem && !TextUtils.isEmpty(item.thumbnailUrl)) {
+                // Radio items: single image, no grid
+                holder.ivTrackThumb.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                holder.ivTrackThumb.setBackgroundColor(android.graphics.Color.TRANSPARENT);
+                loadArtworkInto(holder.ivTrackThumb, item.thumbnailUrl);
+            } else {
+                holder.ivTrackThumb.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                holder.ivTrackThumb.setBackgroundColor(android.graphics.Color.TRANSPARENT);
+                List<String> gridUrls = pid.isEmpty() ? java.util.Collections.emptyList() : resolvePlaylistGridUrls(pid);
+                if (gridUrls.size() >= 4) {
+                    float density = holder.itemView.getContext().getResources().getDisplayMetrics().density;
+                    int sizePx = Math.round(50 * density);
+                    PlaylistGridArtLoader.load(holder.ivTrackThumb, gridUrls, sizePx);
+                } else if (!TextUtils.isEmpty(item.thumbnailUrl)) {
+                    loadArtworkInto(holder.ivTrackThumb, item.thumbnailUrl);
+                } else {
+                    // No art for THIS item. A content-derived signature still on the view belongs
+                    // to a DIFFERENT item — reset it (and cancel that load) so a stale cover can't
+                    // stay painted. Only touch Glide when there was actually a prior request.
+                    if (holder.ivTrackThumb.getTag(R.id.tag_artwork_signature) != null) {
+                        Glide.with(holder.ivTrackThumb).clear(holder.ivTrackThumb);
+                        holder.ivTrackThumb.setTag(R.id.tag_artwork_signature, null);
+                    }
+                    holder.ivTrackThumb.setImageDrawable(new android.graphics.drawable.ColorDrawable(
+                            ContextCompat.getColor(holder.itemView.getContext(), R.color.surface_high)));
+                }
+            }
+        }
+
+        /** Repaint just one playlist's thumbnail in place when its 2x2 grid art resolves, instead
+         *  of notifyItemChanged (which full-relayouts the non-recycling list). ivTrackThumb is a
+         *  FixedSizeImageView, so the drawable swap does not trigger a layout pass. Falls back to a
+         *  notify only if the row's holder isn't currently bound. */
+        void refreshPlaylistThumbInPlace(@NonNull String playlistId) {
+            int pos = findPlaylistPositionById(playlistId);
+            if (pos < 0 || pos >= data.size()) return;
+            RecyclerView.ViewHolder vh = rvMusicResults != null
+                    ? rvMusicResults.findViewHolderForAdapterPosition(pos) : null;
+            YouTubeMusicService.TrackResult item = data.get(pos);
+            if (vh instanceof TrackViewHolder && !isLikedPlaylistStyle(item)) {
+                bindPlaylistThumb((TrackViewHolder) vh, item);
+            } else {
+                final int notifyPos = pos;
+                safeNotify(() -> notifyItemChanged(notifyPos));
+            }
+        }
+
+        int dataSize() {
+            return data.size();
         }
 
         void safeNotifyItemInserted(int position) {
@@ -6390,7 +6968,10 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                     if (!pid.isEmpty()) incomingPlaylistIds.add(pid);
                 }
                 playlistOfflineCompleteCache.keySet().removeIf(id -> !incomingPlaylistIds.contains(id));
-                playlistOfflineRefreshInFlight.clear();
+                // Do NOT clear playlistOfflineRefreshInFlight here: completions remove their own
+                // id (see requestPlaylistOfflineStateRefreshAsync's post-back). Clearing on every
+                // submit re-allowed duplicate disk scans of the same playlists mid-flight — part
+                // of the post-entry scan stampede.
 
                 // Dispatch granular updates instead of notifyDataSetChanged
                 diffResult.dispatchUpdatesTo(MusicResultsAdapter.this);
@@ -6407,6 +6988,9 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                     if (!"playlist".equals(item.resultType)) continue;
                     String pid = item.contentId == null ? "" : item.contentId.trim();
                     if (pid.isEmpty()) continue;
+                    // Local content is always on device — never scan it (the Files view's ~120
+                    // album rows would otherwise queue ~120 no-op disk scans on the single executor).
+                    if (LocalFilesStore.PLAYLIST_ID.equals(pid) || LocalFilesStore.isLocalAlbumId(pid)) continue;
                     if (forceRecalc) {
                         requestPlaylistOfflineStateRefreshAsync(pid, playlistOfflineStateGeneration, true);
                     } else if (!playlistOfflineCompleteCache.containsKey(pid)) {
@@ -6549,39 +7133,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 holder.ivLikedIcon.setColorFilter(Color.WHITE);
             }
             if (!isLikedPlaylistStyle) {
-                String pid = item.contentId == null ? "" : item.contentId.trim();
-                boolean isLocalFilesItem = LocalFilesStore.PLAYLIST_ID.equals(pid);
-                boolean isRadioItem = pid.startsWith("RDAMVM") || pid.startsWith("RDEM") || pid.startsWith("RDTMAK");
-                if (isLocalFilesItem) {
-                    // Local files: white folder icon on black background
-                    holder.ivTrackThumb.setTag(R.id.tag_artwork_signature, null);
-                    holder.ivTrackThumb.setScaleType(ImageView.ScaleType.CENTER);
-                    holder.ivTrackThumb.setBackgroundColor(android.graphics.Color.BLACK);
-                    holder.ivTrackThumb.setImageResource(R.drawable.ic_folder_white);
-                } else if (isRadioItem && !TextUtils.isEmpty(item.thumbnailUrl)) {
-                    // Radio items: single image, no grid
-                    holder.ivTrackThumb.setScaleType(ImageView.ScaleType.CENTER_CROP);
-                    holder.ivTrackThumb.setBackgroundColor(android.graphics.Color.TRANSPARENT);
-                    loadArtworkInto(holder.ivTrackThumb, item.thumbnailUrl);
-                } else {
-                    holder.ivTrackThumb.setScaleType(ImageView.ScaleType.CENTER_CROP);
-                    holder.ivTrackThumb.setBackgroundColor(android.graphics.Color.TRANSPARENT);
-                    List<String> gridUrls = pid.isEmpty() ? java.util.Collections.emptyList() : resolvePlaylistGridUrls(pid);
-                    if (gridUrls.size() >= 4) {
-                        float density = holder.itemView.getContext().getResources().getDisplayMetrics().density;
-                        int sizePx = Math.round(50 * density);
-                        PlaylistGridArtLoader.load(holder.ivTrackThumb, gridUrls, sizePx);
-                    } else if (!TextUtils.isEmpty(item.thumbnailUrl)) {
-                        loadArtworkInto(holder.ivTrackThumb, item.thumbnailUrl);
-                    } else {
-                        // Grey placeholder only if no previous grid image is loaded
-                        Object prevSignature = holder.ivTrackThumb.getTag(R.id.tag_artwork_signature);
-                        if (prevSignature == null) {
-                            holder.ivTrackThumb.setImageDrawable(new android.graphics.drawable.ColorDrawable(
-                                    ContextCompat.getColor(holder.itemView.getContext(), R.color.surface_high)));
-                        }
-                    }
-                }
+                bindPlaylistThumb(holder, item);
             }
             boolean isPlaylistItem = "playlist".equals(item.resultType);
             String itemContentId = item.contentId == null ? "" : item.contentId;
@@ -6616,8 +7168,10 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
 
         /** Real (disk-computed) offline fraction for a playlist, falling back to the persisted
          *  value on a cache miss (cold start) so the ring opens near the true value instead of 0.
-         *  Reads a SharedPreferences float only on miss; does NOT populate the in-memory cache
-         *  (so the async disk scan's corrective notify is never deduped away). */
+         *  Reads a SharedPreferences float only on miss. Note: bindOfflineState seeds the fraction
+         *  cache with this same persisted value, so the scan-completion dedupe can skip notifies
+         *  that would repaint exactly what the bind already painted — a REAL correction (disk
+         *  truth differing from prefs) still differs from the seed and still notifies. */
         private float realFractionFor(@NonNull String playlistId) {
             Float cached = playlistRealFractionCache.get(playlistId);
             if (cached != null) {
@@ -6630,11 +7184,25 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             String playlistId = item.contentId == null ? "" : item.contentId.trim();
             if (playlistId.isEmpty()) return;
 
+            // Local content (device files playlist + on-device albums) is inherently offline — the
+            // download ring is meaningless. Hide it and bail BEFORE any prefs read / disk-scan
+            // queue: the Files view can show ~120 album rows, and running the full offline machinery
+            // per row (prefs reads on the bind frame + an async scan each on the single-thread
+            // executor) was a big part of the "mucho lag al presionar Archivos" spike.
+            if (LocalFilesStore.PLAYLIST_ID.equals(playlistId) || LocalFilesStore.isLocalAlbumId(playlistId)) {
+                holder.flPlaylistOfflineContainer.setVisibility(View.GONE);
+                return;
+            }
+
             boolean offlineAutoEnabled = isPersistedPlaylistOfflineAutoEnabled(playlistId);
             Boolean cachedState = playlistOfflineCompleteCache.get(playlistId);
             if (cachedState == null) {
-                // Force recalculation from actual files — SharedPreferences may be stale after app restart
-                requestPlaylistOfflineStateRefreshAsync(playlistId, playlistOfflineStateGeneration, true);
+                // Recalculate from actual files (SharedPreferences may be stale after restart),
+                // but WITHOUT force: the submit-time loop already requested a scan for every
+                // cache-miss playlist, and force=true here queued a re-run behind each in-flight
+                // scan — every playlist was scanned twice on entry (disk + MediaMetadataRetriever
+                // work, serialized on one executor, notifying a full relayout per completion).
+                requestPlaylistOfflineStateRefreshAsync(playlistId, playlistOfflineStateGeneration, false);
             }
             boolean completeOffline;
             if (cachedState != null) {
@@ -6647,6 +7215,15 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 // window render consistently and (b) the callback's dedupe compares against what
                 // was actually painted — if the scan agrees with prefs, no redundant rebind.
                 playlistOfflineCompleteCache.put(playlistId, completeOffline);
+                // Seed the fraction too: the scan-completion dedupe requires BOTH caches to match
+                // (previousFraction != null). Unseeded, EVERY first scan dispatched a notify — and
+                // each notify re-lays-out this entire non-recycling list, which is what kept the
+                // module lagging for the first seconds after entry while the scans trickled in.
+                // Dedupe is safe here: it only skips when the scan CONFIRMS what this bind painted.
+                if (playlistRealFractionCache.get(playlistId) == null) {
+                    playlistRealFractionCache.put(playlistId,
+                            completeOffline ? 1f : getPersistedPlaylistOfflineFraction(playlistId));
+                }
             }
 
             boolean isDownloading = playlistsCurrentlyDownloading.contains(playlistId);
@@ -6830,10 +7407,30 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         }
         @Override
         public int getItemCount() {
-            if (searchMode) {
+            if (searchMode || !showCreatePlaylistRow) {
                 return data.size();
             }
             return data.size() + 1;
+        }
+
+        void setShowCreatePlaylistRow(boolean show) {
+            if (showCreatePlaylistRow == show) return;
+            showCreatePlaylistRow = show;
+            // The create row is always the trailing position (data.size(), see getItemViewType).
+            // Insert/remove just that row — the old notifyDataSetChanged here re-bound the ENTIRE
+            // non-recycling list, and chip toggles then paid a second full pass via submitResults.
+            safeNotify(() -> {
+                if (searchMode) {
+                    // getItemCount ignores the row in search mode — the flag change has no
+                    // visible effect now and takes effect with the next full submit.
+                    return;
+                }
+                if (showCreatePlaylistRow) {
+                    notifyItemInserted(data.size());
+                } else {
+                    notifyItemRemoved(data.size());
+                }
+            });
         }
         private void requestPlaylistOfflineStateRefreshAsync(
                 @NonNull String playlistId,
@@ -6855,6 +7452,11 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 return;
             }
             if (playlistOfflineRefreshInFlight.contains(playlistId)) {
+                // A forced request must not be lost: the running scan may predate the state
+                // change that triggered it (e.g. last track just finished). Queue a re-run.
+                if (forceRecalculate) {
+                    playlistOfflineRefreshRerunRequested.add(playlistId);
+                }
                 return;
             }
             playlistOfflineRefreshInFlight.add(playlistId);
@@ -6883,6 +7485,11 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                     playlistOfflineRefreshInFlight.remove(playlistId);
                     if (!isAdded()) {
                         return;
+                    }
+                    if (playlistOfflineRefreshRerunRequested.remove(playlistId)) {
+                        // A forced refresh arrived mid-scan: this result may be stale (snapshotted
+                        // before the triggering change). Apply it, then scan again for the truth.
+                        requestPlaylistOfflineStateRefreshAsync(playlistId, playlistOfflineStateGeneration, true);
                     }
                     if (generation != playlistOfflineStateGeneration) {
                         // A full invalidate bumped the generation while this scan ran. Don't

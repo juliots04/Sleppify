@@ -241,6 +241,14 @@ class ExoMediaPlayer {
             }
         }
 
+        override fun onAudioSessionIdChanged(audioSessionId: Int) {
+            // The value captured in the constructor is usually AUDIO_SESSION_ID_UNSET (the sink
+            // isn't initialized yet) — this callback is the only reliable source of the real
+            // session. Feed it to the EQ service so app-scoped EQ can attach to the live session.
+            this@ExoMediaPlayer.audioSessionId = audioSessionId
+            AudioEffectsService.notifyPlayerSessionChanged(appContext, audioSessionId)
+        }
+
         override fun onPlayerError(error: PlaybackException) {
             Log.w(TAG, "onPlayerError: code=${error.errorCode} message=${error.message}")
             mainHandler.post {

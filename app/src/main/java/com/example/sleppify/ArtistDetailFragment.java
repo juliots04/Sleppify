@@ -58,6 +58,10 @@ public class ArtistDetailFragment extends Fragment {
     // Cloud-synced key (whitelisted in CloudSyncManager.isStreamingFavoritesKey), stored in the
     // shared streaming_cache prefs so it uploads on change + restores on sign-in for free.
     private static final String KEY_FOLLOWED_ARTISTS = "followed_artists_channel_ids";
+    // Tombstone set of artists the user has explicitly UN-followed. The library only ever surfaces
+    // artists you already follow, so an artist page defaults to "Siguiendo" unless its id is here.
+    // Whitelisted in CloudSyncManager.isStreamingFavoritesKey so unfollows sync + restore for free.
+    private static final String KEY_UNFOLLOWED_ARTISTS = "unfollowed_artists_channel_ids";
 
     private static final int TYPE_HEADER = 0;
     private static final int TYPE_TRACK = 1;
@@ -321,8 +325,10 @@ public class ArtistDetailFragment extends Fragment {
         if (getActivity() instanceof MainActivity) {
             ((MainActivity) getActivity()).showModuleLoadingOverlay();
         }
+        // Pass the artist as the album subtitle so the detail header shows the artist and each
+        // track row can fall back to it when the album page omits a per-row artist.
         PlaylistDetailFragment detail = PlaylistDetailFragment.newInstance(
-                album.playlistId, album.title, "", album.thumbnailUrl, "");
+                album.playlistId, album.title, artistName == null ? "" : artistName, album.thumbnailUrl, "");
         fm.beginTransaction().setReorderingAllowed(true)
                 .add(R.id.fragmentContainer, detail, "playlist_detail")
                 .addToBackStack("playlist_detail")
@@ -337,18 +343,22 @@ public class ArtistDetailFragment extends Fragment {
     }
 
     private boolean isFollowed(String id) {
-        if (TextUtils.isEmpty(id) || getContext() == null) return false;
-        Set<String> set = streamingPrefs().getStringSet(KEY_FOLLOWED_ARTISTS, new HashSet<>());
-        return set != null && set.contains(id);
+        // You only reach an artist page from your library's artists (all followed), so default to
+        // followed and only fall back to "Seguir" when the id sits in the unfollowed tombstone set.
+        if (TextUtils.isEmpty(id) || getContext() == null) return true;
+        Set<String> unfollowed = streamingPrefs().getStringSet(KEY_UNFOLLOWED_ARTISTS, null);
+        return unfollowed == null || !unfollowed.contains(id);
     }
 
     private void toggleFollow() {
         if (TextUtils.isEmpty(channelId) || getContext() == null) return;
-        Set<String> set = new HashSet<>(streamingPrefs().getStringSet(KEY_FOLLOWED_ARTISTS, new HashSet<>()));
+        Set<String> unfollowed = new HashSet<>(
+                streamingPrefs().getStringSet(KEY_UNFOLLOWED_ARTISTS, new HashSet<>()));
         following = !following;
-        if (following) set.add(channelId); else set.remove(channelId);
-        // Writing this whitelisted key triggers CloudSyncManager's streaming listener -> Firebase.
-        streamingPrefs().edit().putStringSet(KEY_FOLLOWED_ARTISTS, set).apply();
+        // Following = not in the tombstone; unfollowing = add the tombstone. Writing this
+        // whitelisted key triggers CloudSyncManager's streaming listener -> Firebase.
+        if (following) unfollowed.remove(channelId); else unfollowed.add(channelId);
+        streamingPrefs().edit().putStringSet(KEY_UNFOLLOWED_ARTISTS, unfollowed).apply();
     }
 
     private void bindFollowButton(@NonNull TextView btn) {

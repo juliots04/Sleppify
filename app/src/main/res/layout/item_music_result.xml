@@ -1,6 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
-<RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<!-- Flattened: the row used to be a RelativeLayout wrapping a single LinearLayout, which measured
+     the whole 16-view subtree TWICE per pass. Since this list lives in a non-recycling
+     NestedScrollView (every row is measured/laid-out together, dozens of times during entry),
+     that doubled cost mattered — so the LinearLayout is now the root. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/llContentRow"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:background="@drawable/bg_playlist_track_default"
@@ -12,15 +17,9 @@
     android:layout_marginBottom="6dp"
     android:minHeight="60dp"
     android:paddingStart="8dp"
-    android:paddingEnd="0dp">
-
-    <LinearLayout
-        android:id="@+id/llContentRow"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_centerVertical="true"
-        android:gravity="center_vertical"
-        android:orientation="horizontal">
+    android:paddingEnd="0dp"
+    android:gravity="center_vertical"
+    android:orientation="horizontal">
 
         <FrameLayout
             android:layout_width="50dp"
@@ -42,7 +41,7 @@
                 android:visibility="gone"
                 app:tint="@android:color/white" />
 
-            <ImageView
+            <com.example.sleppify.FixedSizeImageView
                 android:id="@+id/ivTrackThumb"
                 android:layout_width="match_parent"
                 android:layout_height="match_parent"
@@ -152,6 +151,5 @@
                 android:src="@drawable/ic_more_vert"
                 app:tint="@color/text_secondary" />
         </LinearLayout>
-    </LinearLayout>
 
-</RelativeLayout>
+</LinearLayout>

@@ -1,249 +1,270 @@
 package com.example.sleppify
 
-import android.app.Activity
+import android.content.Context
 import android.content.Intent
+import android.net.Uri
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.util.Log
-import android.view.LayoutInflater
-import android.view.View
-import android.widget.ProgressBar
-import android.widget.TextView
 import androidx.core.content.FileProvider
-import com.google.android.material.dialog.MaterialAlertDialogBuilder
-import com.google.firebase.firestore.FirebaseFirestore
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
+/**
+ * Actualizaciones autohospedadas: la app consulta el `version.json` que publica el minipanel
+ * (update-server/ en alwaysdata) y, si el versionCode remoto supera al instalado, descarga el APK
+ * con progreso y lanza el instalador del sistema. SIN Firebase y SIN notificaciones: al abrir la
+ * app se consulta en silencio y, si hay versión nueva, salta una ventana emergente; el flujo
+ * completo también vive en Configuración > Actualizar (SettingsFragment). Este object pone la red,
+ * el estado de descarga re-enganchable y el install.
+ */
 object AppUpdateManager {
 
     private const val TAG = "AppUpdateManager"
-    private const val FIRESTORE_COLLECTION = "app_config"
-    private const val FIRESTORE_DOCUMENT = "update"
-    private const val FIELD_VERSION_CODE = "versionCode"
-    private const val FIELD_VERSION_NAME = "versionName"
-    private const val FIELD_RELEASE_NOTES = "releaseNotes"
-    private const val FIELD_APK_URL = "apkUrl"
 
-    @Volatile
-    private var shownThisSession = false
+    // Panel real en alwaysdata (la app busca version.json en la raíz del dominio).
+    private const val UPDATE_BASE_URL = "https://sleppifymanagerupdate.alwaysdata.net/"
+    private const val MANIFEST_URL = UPDATE_BASE_URL + "version.json"
+
+    class UpdateInfo(
+        @JvmField val versionName: String,
+        @JvmField val versionCode: Int,
+        @JvmField val apkUrl: String,
+        @JvmField val notes: String,
+        @JvmField val sizeBytes: Long
+    )
 
     @Volatile
     private var downloadInFlight = false
 
+    // Estado de la descarga retenido en el singleton (sobrevive a la recreación del fragment por
+    // rotación/tema/muerte de proceso). Cualquier instancia nueva del fragment lo re-engancha con
+    // reattach() para seguir mostrando el % real en vez de una UI ociosa mientras baja el APK.
+    @Volatile private var inProgressUpdate: UpdateInfo? = null
+    @Volatile private var lastProgress: Int = 0
+    @Volatile private var progressListener: ((Int) -> Unit)? = null
+    @Volatile private var installStartedListener: (() -> Unit)? = null
+    @Volatile private var errorListener: ((String) -> Unit)? = null
+
+    @JvmStatic
+    fun isDownloadInFlight(): Boolean = downloadInFlight
+
+    @JvmStatic
+    fun getInProgressUpdate(): UpdateInfo? = inProgressUpdate
+
+    @JvmStatic
+    fun getLastProgress(): Int = lastProgress
+
+    /** Re-engancha los callbacks a la instancia viva del fragment (tras recrearse). Main thread. */
+    @JvmStatic
+    fun reattach(onProgress: (Int) -> Unit, onInstallStarted: () -> Unit, onError: (String) -> Unit) {
+        progressListener = onProgress
+        installStartedListener = onInstallStarted
+        errorListener = onError
+    }
+
+    /**
+     * Convierte las notas del manifiesto en viñetas (blanco y negro, igual que la vista previa del
+     * panel): una viñeta por línea no vacía, quitando un guion inicial con o sin espacio
+     * ("- item" y "-item" quedan igual). Compartido por la sección Actualizar y el popup.
+     */
+    @JvmStatic
+    @JvmOverloads
+    fun formatNotesAsBullets(notes: String, maxLines: Int = Int.MAX_VALUE): CharSequence {
+        val trimmed = notes.trim()
+        if (trimmed.isEmpty()) return "Mejoras y correcciones."
+        val dashPrefix = Regex("^-\\s*")
+        return trimmed.lines()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .take(maxLines)
+            .joinToString("\n") { "•  " + it.replaceFirst(dashPrefix, "") }
+    }
+
     private val mainHandler = Handler(Looper.getMainLooper())
+    // Chequeos y descargas en pools SEPARADOS: una descarga larga no debe bloquear los chequeos.
+    private val checkExecutor = Executors.newSingleThreadExecutor()
     private val downloadExecutor = Executors.newSingleThreadExecutor()
 
     private val httpClient by lazy {
         OkHttpClient.Builder()
-            .connectTimeout(30, TimeUnit.SECONDS)
+            .connectTimeout(20, TimeUnit.SECONDS)
             .readTimeout(5, TimeUnit.MINUTES)
             .followRedirects(true)
             .build()
     }
 
     /**
-     * Check Firestore for a newer version. If available and not yet shown this session,
-     * shows the update dialog. Safe to call from main thread — Firestore call is async.
+     * Lee el manifiesto del hosting de forma BLOQUEANTE (llamar solo fuera del main thread —
+     * lo usa el executor de checkForUpdate). Devuelve null si ya estás al día; lanza excepción
+     * en errores de red/parseo.
      */
-    fun checkForUpdate(activity: Activity) {
-        if (shownThisSession || downloadInFlight) return
-        if (activity.isFinishing || activity.isDestroyed) return
+    @JvmStatic
+    @Throws(Exception::class)
+    fun fetchUpdateBlocking(): UpdateInfo? {
+        val request = Request.Builder().url(MANIFEST_URL).build()
+        httpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                throw IllegalStateException("HTTP ${response.code}")
+            }
+            val json = JSONObject(response.body?.string().orEmpty())
+            val remoteCode = json.optInt("versionCode", 0)
+            val remoteName = json.optString("versionName", "")
+            val apk = json.optString("apk", "")
+            val notes = json.optString("notes", "")
+            val size = json.optLong("size", 0L)
 
-        val currentVersionCode = try {
-            BuildConfig.VERSION_CODE
-        } catch (e: Exception) {
-            Log.w(TAG, "Could not read VERSION_CODE", e)
-            return
+            if (remoteCode <= BuildConfig.VERSION_CODE || apk.isBlank()) {
+                return null // al día
+            }
+            val apkUrl = if (apk.startsWith("http")) apk else UPDATE_BASE_URL + apk
+            return UpdateInfo(remoteName, remoteCode, apkUrl, notes, size)
         }
-
-        FirebaseFirestore.getInstance()
-            .collection(FIRESTORE_COLLECTION)
-            .document(FIRESTORE_DOCUMENT)
-            .get()
-            .addOnSuccessListener { doc ->
-                if (activity.isFinishing || activity.isDestroyed) return@addOnSuccessListener
-                if (!doc.exists()) {
-                    Log.d(TAG, "No update document found")
-                    return@addOnSuccessListener
-                }
-
-                val remoteVersionCode = doc.getLong(FIELD_VERSION_CODE)?.toInt() ?: return@addOnSuccessListener
-                val remoteVersionName = doc.getString(FIELD_VERSION_NAME) ?: ""
-                val releaseNotes = doc.getString(FIELD_RELEASE_NOTES) ?: ""
-                val apkUrl = doc.getString(FIELD_APK_URL) ?: ""
-
-                if (remoteVersionCode <= currentVersionCode) {
-                    Log.d(TAG, "App is up to date (local=$currentVersionCode, remote=$remoteVersionCode)")
-                    return@addOnSuccessListener
-                }
-
-                if (apkUrl.isBlank()) {
-                    Log.w(TAG, "Update available but apkUrl is empty")
-                    return@addOnSuccessListener
-                }
-
-                if (shownThisSession) return@addOnSuccessListener
-                shownThisSession = true
-
-                showUpdateDialog(activity, remoteVersionName, releaseNotes, apkUrl)
-            }
-            .addOnFailureListener { e ->
-                Log.w(TAG, "Failed to check for update", e)
-            }
     }
 
-    private fun showUpdateDialog(
-        activity: Activity,
-        versionName: String,
-        releaseNotes: String,
-        apkUrl: String
-    ) {
-        if (activity.isFinishing || activity.isDestroyed) return
-
-        val dialogView = LayoutInflater.from(activity).inflate(R.layout.dialog_app_update, null)
-        val tvVersion = dialogView.findViewById<TextView>(R.id.tvUpdateVersion)
-        val tvNotes = dialogView.findViewById<TextView>(R.id.tvUpdateNotes)
-        val llInfo = dialogView.findViewById<View>(R.id.llUpdateInfo)
-        val llProgress = dialogView.findViewById<View>(R.id.llUpdateProgress)
-        val btnLater = dialogView.findViewById<View>(R.id.btnUpdateLater)
-        val btnUpdate = dialogView.findViewById<View>(R.id.btnUpdateNow)
-        val pbDownload = dialogView.findViewById<ProgressBar>(R.id.pbDownload)
-        val tvStatus = dialogView.findViewById<TextView>(R.id.tvDownloadStatus)
-        val tvPercent = dialogView.findViewById<TextView>(R.id.tvDownloadPercent)
-
-        tvVersion.text = "Versión $versionName"
-        tvNotes.text = releaseNotes.ifBlank { "Mejoras y correcciones." }
-
-        val dialog = MaterialAlertDialogBuilder(activity)
-            .setTitle("Nueva versión disponible")
-            .setView(dialogView)
-            .setCancelable(false)
-            .create()
-
-        btnLater.setOnClickListener {
-            dialog.dismiss()
+    /**
+     * Consulta el manifiesto del hosting. En el main thread invoca callback(update, error):
+     * update == null && error == null → ya estás al día; update != null → hay versión nueva.
+     */
+    @JvmStatic
+    fun checkForUpdate(context: Context, callback: (UpdateInfo?, String?) -> Unit) {
+        checkExecutor.execute {
+            try {
+                postResult(callback, fetchUpdateBlocking(), null)
+            } catch (e: Exception) {
+                Log.w(TAG, "checkForUpdate failed", e)
+                postResult(callback, null, e.message ?: "sin conexión")
+            }
         }
-
-        btnUpdate.setOnClickListener {
-            // Switch to progress mode
-            llInfo.visibility = View.GONE
-            llProgress.visibility = View.VISIBLE
-            dialog.setCancelable(false)
-
-            downloadAndInstall(activity, apkUrl, pbDownload, tvStatus, tvPercent, dialog)
-        }
-
-        dialog.show()
     }
 
-    private fun downloadAndInstall(
-        activity: Activity,
-        apkUrl: String,
-        progressBar: ProgressBar,
-        tvStatus: TextView,
-        tvPercent: TextView,
-        dialog: androidx.appcompat.app.AlertDialog
+    private fun postResult(callback: (UpdateInfo?, String?) -> Unit, update: UpdateInfo?, error: String?) {
+        mainHandler.post { callback(update, error) }
+    }
+
+    /**
+     * Descarga el APK a cacheDir/updates/ reportando el % en el main thread y, al completar,
+     * lanza el instalador del sistema. onError también llega en el main thread.
+     */
+    @JvmStatic
+    fun downloadAndInstall(
+        context: Context,
+        update: UpdateInfo,
+        onProgress: (Int) -> Unit,
+        onInstallStarted: () -> Unit,
+        onError: (String) -> Unit
     ) {
         if (downloadInFlight) return
         downloadInFlight = true
+        inProgressUpdate = update
+        lastProgress = 0
+        progressListener = onProgress
+        installStartedListener = onInstallStarted
+        errorListener = onError
 
-        // Clean old APKs
-        val updatesDir = File(activity.cacheDir, "updates")
+        val appContext = context.applicationContext
+        val updatesDir = File(appContext.cacheDir, "updates")
         if (updatesDir.exists()) {
             updatesDir.listFiles()?.forEach { it.delete() }
         } else {
             updatesDir.mkdirs()
         }
-
         val targetFile = File(updatesDir, "sleppify-update.apk")
 
         downloadExecutor.execute {
             try {
-                val request = Request.Builder().url(apkUrl).build()
-                val response = httpClient.newCall(request).execute()
-
-                if (!response.isSuccessful) {
-                    mainHandler.post {
-                        tvStatus.text = "Error de descarga (${response.code})"
-                        tvPercent.text = ""
-                        downloadInFlight = false
+                val request = Request.Builder().url(update.apkUrl).build()
+                httpClient.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        finishDownloadWithError("Error de descarga (${response.code})")
+                        return@execute
                     }
-                    response.close()
-                    return@execute
-                }
-
-                val body = response.body ?: run {
-                    mainHandler.post {
-                        tvStatus.text = "Error: respuesta vacía"
-                        tvPercent.text = ""
-                        downloadInFlight = false
+                    val body = response.body ?: run {
+                        finishDownloadWithError("Respuesta vacía del servidor")
+                        return@execute
                     }
-                    response.close()
-                    return@execute
-                }
 
-                val contentLength = body.contentLength()
-                val inputStream = body.byteStream()
-                val buffer = ByteArray(8192)
-                var bytesRead: Int
-                var totalBytesRead = 0L
-                var lastProgressUpdate = 0L
+                    // El panel publica el tamaño en el manifiesto — fallback si el server no manda length.
+                    val contentLength = if (body.contentLength() > 0) body.contentLength() else update.sizeBytes
+                    val buffer = ByteArray(8192)
+                    var totalBytesRead = 0L
+                    var lastProgressUpdate = 0L
 
-                inputStream.use { input ->
-                    FileOutputStream(targetFile).use { output ->
-                        while (input.read(buffer).also { bytesRead = it } != -1) {
-                            output.write(buffer, 0, bytesRead)
-                            totalBytesRead += bytesRead
+                    body.byteStream().use { input ->
+                        FileOutputStream(targetFile).use { output ->
+                            while (true) {
+                                val bytesRead = input.read(buffer)
+                                if (bytesRead == -1) break
+                                output.write(buffer, 0, bytesRead)
+                                totalBytesRead += bytesRead
 
-                            val now = System.currentTimeMillis()
-                            if (now - lastProgressUpdate > 150 && contentLength > 0) {
-                                lastProgressUpdate = now
-                                val percent = ((totalBytesRead * 100) / contentLength).toInt()
-                                    .coerceIn(0, 100)
-                                val downloadedMb = totalBytesRead / (1024.0 * 1024.0)
-                                val totalMb = contentLength / (1024.0 * 1024.0)
-                                mainHandler.post {
-                                    progressBar.progress = percent
-                                    tvPercent.text = "$percent% — %.1f / %.1f MB".format(downloadedMb, totalMb)
+                                val now = System.currentTimeMillis()
+                                if (contentLength > 0 && now - lastProgressUpdate > 150) {
+                                    lastProgressUpdate = now
+                                    val percent = ((totalBytesRead * 100) / contentLength).toInt().coerceIn(0, 99)
+                                    lastProgress = percent
+                                    mainHandler.post { progressListener?.invoke(percent) }
                                 }
                             }
                         }
                     }
                 }
 
+                downloadInFlight = false
+                lastProgress = 100
                 mainHandler.post {
-                    progressBar.progress = 100
-                    tvPercent.text = "100%"
-                    tvStatus.text = "Descarga completa. Instalando..."
-                    downloadInFlight = false
-
-                    if (!activity.isFinishing && !activity.isDestroyed) {
-                        dialog.dismiss()
-                        installApk(activity, targetFile)
+                    progressListener?.invoke(100)
+                    installStartedListener?.invoke()
+                    val launched = installApk(appContext, targetFile)
+                    inProgressUpdate = null
+                    if (!launched) {
+                        errorListener?.invoke("No se pudo abrir el instalador. Habilita \"instalar apps desconocidas\".")
                     }
                 }
-
             } catch (e: Exception) {
-                Log.e(TAG, "Download failed", e)
-                mainHandler.post {
-                    tvStatus.text = "Error: ${e.message ?: "descarga fallida"}"
-                    tvPercent.text = ""
-                    downloadInFlight = false
-                }
+                Log.e(TAG, "download failed", e)
+                finishDownloadWithError(e.message ?: "descarga fallida")
             }
         }
     }
 
-    private fun installApk(activity: Activity, apkFile: File) {
-        try {
+    private fun finishDownloadWithError(message: String) {
+        downloadInFlight = false
+        inProgressUpdate = null
+        mainHandler.post { errorListener?.invoke(message) }
+    }
+
+    /** ¿Puede la app lanzar el instalador de APKs? (permiso "instalar apps desconocidas"). */
+    @JvmStatic
+    fun canInstallUnknownApps(context: Context): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            context.packageManager.canRequestPackageInstalls()
+        } else {
+            true
+        }
+    }
+
+    /** Ajustes del sistema para conceder "instalar apps desconocidas" a Sleppify. */
+    @JvmStatic
+    fun buildUnknownSourcesIntent(context: Context): Intent {
+        return Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES)
+            .setData(Uri.parse("package:${context.packageName}"))
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+
+    /** Lanza el instalador del sistema. Devuelve false si no se pudo (para dar feedback al usuario). */
+    private fun installApk(context: Context, apkFile: File): Boolean {
+        return try {
             val uri = FileProvider.getUriForFile(
-                activity,
-                "${activity.packageName}.fileprovider",
+                context,
+                "${context.packageName}.fileprovider",
                 apkFile
             )
             val intent = Intent(Intent.ACTION_VIEW).apply {
@@ -251,9 +272,11 @@ object AppUpdateManager {
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
-            activity.startActivity(intent)
+            context.startActivity(intent)
+            true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to launch APK installer", e)
+            false
         }
     }
 }

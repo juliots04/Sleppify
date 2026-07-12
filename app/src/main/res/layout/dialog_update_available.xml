@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Ventana emergente de nueva versión: negro puro, título con emoji + pastilla de versión,
+     novedades y acción única. Actualización obligatoria: no tiene "Ahora no" y el diálogo no
+     se puede cerrar tocando fuera ni con el botón atrás (ver MainActivity.showUpdateAvailablePopup). -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:background="@drawable/bg_update_card"
+    android:orientation="vertical"
+    android:paddingHorizontal="18dp"
+    android:paddingVertical="24dp">
+
+    <!-- Fila título -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <TextView
+            android:id="@+id/tvUpdateDialogTitle"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:fontFamily="sans-serif-black"
+            android:text="🔥 Nueva versión"
+            android:textColor="#FFFFFFFF"
+            android:textSize="18sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/tvUpdateDialogPill"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="10dp"
+            android:background="@drawable/bg_version_pill"
+            android:paddingHorizontal="12dp"
+            android:paddingVertical="4dp"
+            android:text="1.2"
+            android:textColor="#FFFFFFFF"
+            android:textSize="12sp"
+            android:textStyle="bold" />
+    </LinearLayout>
+
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:layout_marginTop="20dp"
+        android:layout_marginBottom="16dp"
+        android:background="#FF232323" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:letterSpacing="0.1"
+        android:text="NOVEDADES"
+        android:textColor="#FF8A8A8A"
+        android:textSize="11sp" />
+
+    <TextView
+        android:id="@+id/tvUpdateDialogNotes"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="10dp"
+        android:lineSpacingExtra="7dp"
+        android:textColor="#FFEDEDED"
+        android:textSize="14sp" />
+
+    <!-- Acción única: no hay forma de omitir la actualización. -->
+    <TextView
+        android:id="@+id/btnUpdateDialogGo"
+        android:layout_width="match_parent"
+        android:layout_height="52dp"
+        android:layout_marginTop="24dp"
+        android:background="@drawable/bg_update_button"
+        android:clickable="true"
+        android:focusable="true"
+        android:foreground="?attr/selectableItemBackground"
+        android:gravity="center"
+        android:text="Actualizar"
+        android:textColor="#FF000000"
+        android:textSize="15sp"
+        android:textStyle="bold" />
+
+</LinearLayout>

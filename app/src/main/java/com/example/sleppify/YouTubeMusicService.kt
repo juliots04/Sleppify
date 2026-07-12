@@ -25,6 +25,11 @@ class YouTubeMusicService @JvmOverloads constructor(
     private val TAG = "YouTubeMusicService"
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    // Autocomplete runs on its own tiny pool so a typed suggestion never waits in line behind a
+    // heavy full-search / playlist-hydration job on the shared 3-thread executor. That queueing
+    // was the "the suggestions lag while it loads library music" latency.
+    private val suggestionsExecutor: ExecutorService = SUGGESTIONS_EXECUTOR
+
     // ----- Public interfaces -----
 
     interface SearchCallback {
@@ -34,6 +39,16 @@ class YouTubeMusicService @JvmOverloads constructor(
 
     interface SearchPageCallback {
         fun onSuccess(pageResult: SearchPageResult)
+        fun onError(error: String)
+    }
+
+    interface SearchSuggestionsCallback {
+        fun onSuccess(suggestions: List<String>)
+        fun onError(error: String)
+    }
+
+    interface ArtistSearchCallback {
+        fun onSuccess(artist: ArtistResult)
         fun onError(error: String)
     }
 
@@ -98,15 +113,20 @@ class YouTubeMusicService @JvmOverloads constructor(
 
     // ----- Public data classes (field-accessible from Java via @JvmField) -----
 
-    class TrackResult(
+    class TrackResult @JvmOverloads constructor(
         @JvmField val resultType: String,
         @JvmField val contentId: String,
         rawTitle: String,
         rawSubtitle: String,
-        @JvmField val thumbnailUrl: String
+        @JvmField val thumbnailUrl: String,
+        // Optional standalone duration ("2:12"); album rows carry it in a fixedColumn, most other
+        // sources fold it into the subtitle and leave this empty. Default keeps every existing
+        // 5-arg constructor call (Kotlin + Java) working unchanged.
+        rawDuration: String = ""
     ) {
         @JvmField val title: String = androidx.core.text.HtmlCompat.fromHtml(rawTitle, androidx.core.text.HtmlCompat.FROM_HTML_MODE_LEGACY).toString()
         @JvmField val subtitle: String = androidx.core.text.HtmlCompat.fromHtml(rawSubtitle, androidx.core.text.HtmlCompat.FROM_HTML_MODE_LEGACY).toString()
+        @JvmField val duration: String = rawDuration.trim()
         @JvmField
         val videoId: String = if ("video" == resultType) contentId else ""
 
@@ -279,6 +299,79 @@ class YouTubeMusicService @JvmOverloads constructor(
         }
     }
 
+    /** YT Music autocomplete via music/get_search_suggestions — the same suggestions YTM shows. */
+    fun fetchSearchSuggestions(query: String, cookieHeader: String = "", callback: SearchSuggestionsCallback) {
+        val normalized = query.trim()
+        if (normalized.isEmpty()) {
+            callback.onSuccess(emptyList())
+            return
+        }
+        suggestionsExecutor.execute {
+            try {
+                val clientContext = JSONObject().apply {
+                    put("clientName", "WEB_REMIX")
+                    put("clientVersion", buildClientVersion())
+                    put("hl", "es")
+                }
+                val body = JSONObject().apply {
+                    put("context", JSONObject().apply { put("client", clientContext) })
+                    put("input", normalized)
+                }.toString().toByteArray(StandardCharsets.UTF_8)
+
+                val conn = URL("https://music.youtube.com/youtubei/v1/music/get_search_suggestions?prettyPrint=false")
+                    .openConnection() as HttpURLConnection
+                conn.requestMethod = "POST"
+                conn.connectTimeout = 8000
+                conn.readTimeout = 8000
+                conn.doOutput = true
+                conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                conn.setRequestProperty("Accept", "application/json")
+                conn.setRequestProperty("User-Agent", "Mozilla/5.0")
+                conn.setRequestProperty("Origin", "https://music.youtube.com")
+                conn.setRequestProperty("Referer", "https://music.youtube.com/")
+                if (cookieHeader.isNotEmpty()) {
+                    conn.setRequestProperty("Cookie", cookieHeader)
+                }
+                val root: JSONObject
+                try {
+                    conn.outputStream.use { it.write(body) }
+                    val status = conn.responseCode
+                    val responseBody = readResponse(conn, status >= 400)
+                    if (status != HttpURLConnection.HTTP_OK) {
+                        throw IllegalStateException("Suggestions error $status")
+                    }
+                    root = JSONObject(responseBody)
+                } finally {
+                    conn.disconnect()
+                }
+
+                val suggestions = mutableListOf<String>()
+                val sections = root.optJSONArray("contents") ?: JSONArray()
+                for (i in 0 until sections.length()) {
+                    val items = sections.optJSONObject(i)
+                        ?.optJSONObject("searchSuggestionsSectionRenderer")
+                        ?.optJSONArray("contents") ?: continue
+                    for (j in 0 until items.length()) {
+                        val runs = items.optJSONObject(j)
+                            ?.optJSONObject("searchSuggestionRenderer")
+                            ?.optJSONObject("suggestion")
+                            ?.optJSONArray("runs") ?: continue
+                        val sb = StringBuilder()
+                        for (k in 0 until runs.length()) {
+                            sb.append(runs.optJSONObject(k)?.optString("text").orEmpty())
+                        }
+                        val text = sb.toString().trim()
+                        if (text.isNotEmpty()) suggestions.add(text)
+                    }
+                }
+                mainHandler.post { callback.onSuccess(suggestions) }
+            } catch (e: Exception) {
+                val error = e.message ?: "No se pudieron cargar sugerencias."
+                mainHandler.post { callback.onError(error) }
+            }
+        }
+    }
+
     /** Continue an Innertube search using a previously returned continuation token. */
     fun continueInnertubeSearch(continuationToken: String, maxResults: Int, cookieHeader: String = "", callback: SearchPageCallback) {
         if (continuationToken.isEmpty()) {
@@ -335,29 +428,23 @@ class YouTubeMusicService @JvmOverloads constructor(
 
     @Throws(Exception::class)
     private fun performInnertubeSearchRequest(query: String, maxResults: Int, cookieHeader: String = ""): SearchPageResult {
-        val endpoint = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false"
-        
         // Detectar si el usuario busca contenido tipo video (subtítulos, letras, en vivo, covers, karaoke, etc.)
         val lower = query.lowercase(Locale.ROOT)
-        val isVideoQuery = lower.contains("sub") || 
-                           lower.contains("español") || 
-                           lower.contains("spanish") || 
-                           lower.contains("lyrics") || 
-                           lower.contains("letra") || 
-                           lower.contains("cover") || 
-                           lower.contains("live") || 
-                           lower.contains("en vivo") || 
-                           lower.contains("traducido") || 
-                           lower.contains("karaoke") || 
-                           lower.contains("video") || 
-                           lower.contains("clip") || 
-                           lower.contains("subtitulado") || 
+        val isVideoQuery = lower.contains("sub") ||
+                           lower.contains("español") ||
+                           lower.contains("spanish") ||
+                           lower.contains("lyrics") ||
+                           lower.contains("letra") ||
+                           lower.contains("cover") ||
+                           lower.contains("live") ||
+                           lower.contains("en vivo") ||
+                           lower.contains("traducido") ||
+                           lower.contains("karaoke") ||
+                           lower.contains("video") ||
+                           lower.contains("clip") ||
+                           lower.contains("subtitulado") ||
                            lower.contains("traduccion")
 
-        val isAuthenticated = cookieHeader.isNotEmpty()
-
-        // When authenticated, use Songs filter always (YTM returns proper top result + ranked songs).
-        // When unauthenticated, use filter to get 20+ results per page with proper continuation.
         // Params from ytmusicapi reference (no URL-encoding needed — body is JSON):
         //   songs:  EgWKAQIIAWoMEA4QChADEAQQCRAF
         //   videos: EgWKAQIQAWoMEA4QChADEAQQCRAF
@@ -367,21 +454,147 @@ class YouTubeMusicService @JvmOverloads constructor(
             "EgWKAQIIAWoMEA4QChADEAQQCRAF" // Songs filter (default)
         }
 
+        // Both legs run CONCURRENTLY — they are independent requests, and running them back to
+        // back doubled first-page latency. The filtered leg goes on its own thread (not the
+        // shared executor, to avoid starving the pool this method already runs on).
+        //
+        // Filtered (Songs/Videos) leg: a deep single-type shelf. It supplies the continuation
+        // token for infinite scroll plus extra tracks beyond the unfiltered page (appended at
+        // the tail, deduped, so it never disturbs the YTM page order).
+        var filteredResults: List<TrackResult> = emptyList()
+        var filteredToken = ""
+        var filteredError: Exception? = null
+        val filteredThread = Thread({
+            try {
+                val filteredJson = postInnertubeSearch(query, searchParams, cookieHeader)
+                filteredResults = parseInnertubeSearchResults(filteredJson, maxResults)
+                filteredToken = extractSearchContinuationToken(filteredJson) ?: ""
+            } catch (e: Exception) {
+                filteredError = e
+                Log.w("YouTubeMusicService", "[INNERTUBE] Filtered search failed: ${e.message}")
+            }
+        }, "innertube-filtered-search")
+        filteredThread.start()
+
+        // Unfiltered leg (inline): its shelf order (top result → songs → videos) is exactly what
+        // the YT Music search page shows, so it drives the visible ranking of the first page.
+        var pageResults: List<TrackResult> = emptyList()
+        var pageToken = ""
+        var pageError: Exception? = null
+        try {
+            val pageJson = postInnertubeSearch(query, null, cookieHeader)
+            pageResults = parseInnertubeSearchResults(pageJson, maxResults)
+            pageToken = extractSearchContinuationToken(pageJson) ?: ""
+            if (pageResults.isEmpty()) logEmptyInnertubeResponse(pageJson)
+        } catch (e: Exception) {
+            pageError = e
+            Log.w("YouTubeMusicService", "[INNERTUBE] Unfiltered search failed: ${e.message}")
+        }
+
+        try {
+            // Bounded by the connection's own 14s/18s timeouts; join guards against a hang.
+            filteredThread.join(40_000)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+
+        // Both legs failed → propagate so the caller can fall back to the Data API.
+        if (pageError != null && filteredError != null) throw pageError
+
+        val results = pageResults.toMutableList()
+        val existingIds = results.mapTo(HashSet()) { it.videoId }
+        for (track in filteredResults) {
+            if (track.videoId !in existingIds) {
+                results.add(track)
+                existingIds.add(track.videoId)
+            }
+        }
+        // One leg errored and the surviving leg parsed nothing → treat as failure too, so the
+        // caller's Data-API fallback still fires instead of showing an empty "no results" page.
+        if (results.isEmpty()) {
+            (pageError ?: filteredError)?.let { throw it }
+        }
+        // Prefer the filtered continuation: it pages through the full Songs/Videos shelf.
+        val continuationToken = filteredToken.ifEmpty { pageToken }
+
+        // Return first page immediately — further pages loaded via continueInnertubeSearch + scroll
+        return SearchPageResult(results, continuationToken)
+    }
+
+    /** Resolve an artist's channelId by name via an Artists-filtered Innertube search. */
+    fun searchArtistByName(name: String, cookieHeader: String = "", callback: ArtistSearchCallback) {
+        val normalized = name.trim()
+        if (normalized.isEmpty()) {
+            callback.onError("Artista vacío.")
+            return
+        }
+        executor.execute {
+            try {
+                // ytmusicapi artists filter param
+                val root = postInnertubeSearch(normalized, "EgWKAQIgAWoMEA4QChADEAQQCRAF", cookieHeader)
+                val artist = extractFirstArtistFromSearch(root)
+                if (artist != null && artist.channelId.startsWith("UC")) {
+                    mainHandler.post { callback.onSuccess(artist) }
+                } else {
+                    mainHandler.post { callback.onError("No se encontró el artista.") }
+                }
+            } catch (e: Exception) {
+                val error = e.message ?: "No se encontró el artista."
+                mainHandler.post { callback.onError(error) }
+            }
+        }
+    }
+
+    private fun extractFirstArtistFromSearch(root: JSONObject): ArtistResult? {
+        val rootContents = root.optJSONObject("contents") ?: return null
+        val allSectionContents = mutableListOf<JSONArray>()
+        val tabbed = rootContents.optJSONObject("tabbedSearchResultsRenderer")
+        if (tabbed != null) {
+            val tabs = tabbed.optJSONArray("tabs") ?: JSONArray()
+            for (t in 0 until tabs.length()) {
+                val c = tabs.optJSONObject(t)
+                    ?.optJSONObject("tabRenderer")
+                    ?.optJSONObject("content")
+                    ?.optJSONObject("sectionListRenderer")
+                    ?.optJSONArray("contents") ?: continue
+                allSectionContents.add(c)
+            }
+        } else {
+            rootContents.optJSONObject("sectionListRenderer")
+                ?.optJSONArray("contents")?.let { allSectionContents.add(it) }
+        }
+        for (contents in allSectionContents) {
+            for (c in 0 until contents.length()) {
+                val items = contents.optJSONObject(c)
+                    ?.optJSONObject("musicShelfRenderer")
+                    ?.optJSONArray("contents") ?: continue
+                for (i in 0 until items.length()) {
+                    val renderer = items.optJSONObject(i)
+                        ?.optJSONObject("musicResponsiveListItemRenderer") ?: continue
+                    val artist = parseArtistFromRenderer(renderer) ?: continue
+                    if (artist.channelId.startsWith("UC")) return artist
+                }
+            }
+        }
+        return null
+    }
+
+    /** POST one Innertube search request (optionally filtered) and return the parsed response. */
+    @Throws(Exception::class)
+    private fun postInnertubeSearch(query: String, searchParams: String?, cookieHeader: String): JSONObject {
         val clientContext = JSONObject().apply {
             put("clientName", "WEB_REMIX")
             put("clientVersion", buildClientVersion())
             put("hl", "en")
         }
-
-        val bodyJson = JSONObject().apply {
+        val body = JSONObject().apply {
             put("context", JSONObject().apply { put("client", clientContext) })
             put("query", query)
-            put("params", searchParams)
-        }
-        val body = bodyJson.toString().toByteArray(StandardCharsets.UTF_8)
+            if (searchParams != null) put("params", searchParams)
+        }.toString().toByteArray(StandardCharsets.UTF_8)
 
-        val url = URL(endpoint)
-        val connection = url.openConnection() as HttpURLConnection
+        val connection = URL("https://music.youtube.com/youtubei/v1/search?prettyPrint=false")
+            .openConnection() as HttpURLConnection
         connection.requestMethod = "POST"
         connection.connectTimeout = 14000
         connection.readTimeout = 18000
@@ -391,10 +604,9 @@ class YouTubeMusicService @JvmOverloads constructor(
         connection.setRequestProperty("User-Agent", "Mozilla/5.0")
         connection.setRequestProperty("Origin", "https://music.youtube.com")
         connection.setRequestProperty("Referer", "https://music.youtube.com/")
-        if (isAuthenticated) {
+        if (cookieHeader.isNotEmpty()) {
             connection.setRequestProperty("Cookie", cookieHeader)
         }
-        val rootJson: JSONObject
         try {
             connection.outputStream.use { it.write(body) }
             val statusCode = connection.responseCode
@@ -402,68 +614,17 @@ class YouTubeMusicService @JvmOverloads constructor(
             if (statusCode != HttpURLConnection.HTTP_OK) {
                 throw IllegalStateException("Innertube search error $statusCode")
             }
-            rootJson = JSONObject(responseBody)
+            return JSONObject(responseBody)
         } finally {
             connection.disconnect()
         }
+    }
 
-        var results = parseInnertubeSearchResults(rootJson, maxResults).toMutableList()
-        var continuationToken = extractSearchContinuationToken(rootJson) ?: ""
-
-        // Always also fetch unfiltered "Top" results to maximize result count
-        try {
-            val topBody = JSONObject().apply {
-                put("context", JSONObject().apply { put("client", clientContext) })
-                put("query", query)
-            }.toString().toByteArray(StandardCharsets.UTF_8)
-
-            val topConn = URL(endpoint).openConnection() as HttpURLConnection
-            topConn.requestMethod = "POST"
-            topConn.connectTimeout = 12000
-            topConn.readTimeout = 15000
-            topConn.doOutput = true
-            topConn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
-            topConn.setRequestProperty("Accept", "application/json")
-            topConn.setRequestProperty("User-Agent", "Mozilla/5.0")
-            topConn.setRequestProperty("Origin", "https://music.youtube.com")
-            topConn.setRequestProperty("Referer", "https://music.youtube.com/")
-            if (isAuthenticated) {
-                topConn.setRequestProperty("Cookie", cookieHeader)
-            }
-            try {
-                topConn.outputStream.use { it.write(topBody) }
-                val topStatus = topConn.responseCode
-                if (topStatus == HttpURLConnection.HTTP_OK) {
-                    val topResponse = readResponse(topConn, false)
-                    val topJson = JSONObject(topResponse)
-                    val topResults = parseInnertubeSearchResults(topJson, maxResults)
-                    val existingIds = results.map { it.videoId }.toHashSet()
-                    for (track in topResults) {
-                        if (track.videoId !in existingIds) {
-                            results.add(track)
-                            existingIds.add(track.videoId)
-                        }
-                    }
-                    if (continuationToken.isEmpty()) {
-                        continuationToken = extractSearchContinuationToken(topJson) ?: ""
-                    }
-                }
-            } finally {
-                topConn.disconnect()
-            }
-        } catch (e: Exception) {
-            Log.w("YouTubeMusicService", "[INNERTUBE] Top search merge failed: ${e.message}")
-        }
-
-        if (results.isEmpty()) {
-            val topKeys = rootJson.keys().asSequence().toList()
-            val contentsKeys = rootJson.optJSONObject("contents")?.keys()?.asSequence()?.toList()
-            Log.w("YouTubeMusicService", "[INNERTUBE_DBG] 0 results. topKeys=$topKeys contentsKeys=$contentsKeys")
-            Log.w("YouTubeMusicService", "[INNERTUBE_DBG] raw=${rootJson.toString().take(2000)}")
-        }
-
-        // Return first page immediately — further pages loaded via continueInnertubeSearch + scroll
-        return SearchPageResult(results, continuationToken)
+    private fun logEmptyInnertubeResponse(rootJson: JSONObject) {
+        val topKeys = rootJson.keys().asSequence().toList()
+        val contentsKeys = rootJson.optJSONObject("contents")?.keys()?.asSequence()?.toList()
+        Log.w("YouTubeMusicService", "[INNERTUBE_DBG] 0 results. topKeys=$topKeys contentsKeys=$contentsKeys")
+        Log.w("YouTubeMusicService", "[INNERTUBE_DBG] raw=${rootJson.toString().take(2000)}")
     }
 
     private fun extractSearchContinuationToken(root: JSONObject): String? {
@@ -2511,11 +2672,128 @@ class YouTubeMusicService @JvmOverloads constructor(
             val browseId = nav?.optJSONObject("browseEndpoint")?.optString("browseId", "")?.trim() ?: ""
             val id = if (playlistId.isNotEmpty()) playlistId else browseId
             if (id.isEmpty()) return@forEachObject
+            // Keep ONLY the artist's own releases (albums/singles). Album cards carry an album
+            // browse id (MPRE...) or an album-playlist id (OLAK5uy...). "Aparece en" / "Fans también
+            // escuchan" cards are editorial playlists (VL/PL/RDCLAK...) — those don't belong in an
+            // artist's discography, so drop them here.
+            val isOwnRelease = browseId.startsWith("MPRE") ||
+                    playlistId.startsWith("OLAK5uy") || browseId.startsWith("OLAK5uy")
+            if (!isOwnRelease) return@forEachObject
             val title = artistRunsToText(r.optJSONObject("title"))
             if (title.isEmpty()) return@forEachObject
             val sub = artistRunsToText(r.optJSONObject("subtitle"))
             val thumb = artistThumbUrl(r.optJSONObject("thumbnailRenderer")?.optJSONObject("musicThumbnailRenderer"))
             out.add(PlaylistResult(id, title, sub, 0, thumb, "", ""))
+        }
+        return out
+    }
+
+    /**
+     * Loads the tracks of an album/single opened from an artist page. Album cards expose an album
+     * BROWSE id (starts with "MPRE"), which is NOT a valid playlist id for the OAuth Data API — that
+     * endpoint returns empty. So we resolve it through the InnerTube browse endpoint with the web
+     * cookie, exactly like radios/mixes, and read the track shelf directly.
+     */
+    fun fetchAlbumTracks(cookieHeader: String, browseId: String, callback: MixTracksCallback) {
+        if (browseId.isEmpty()) {
+            callback.onError("Datos insuficientes para cargar el álbum.")
+            return
+        }
+        executor.execute {
+            try {
+                val tracks = performAlbumTracksRequest(cookieHeader.trim(), browseId.trim())
+                mainHandler.post { callback.onSuccess(tracks) }
+            } catch (e: Exception) {
+                mainHandler.post { callback.onError(e.message ?: "No se pudo cargar el álbum.") }
+            }
+        }
+    }
+
+    private fun performAlbumTracksRequest(cookieHeader: String, browseId: String): List<TrackResult> {
+        val endpoint = "https://music.youtube.com/youtubei/v1/browse?prettyPrint=false"
+        val body = JSONObject().apply {
+            put("context", JSONObject().apply {
+                put("client", JSONObject().apply {
+                    put("clientName", "WEB_REMIX")
+                    put("clientVersion", buildClientVersion())
+                    put("hl", "es")
+                })
+            })
+            put("browseId", browseId)
+        }.toString().toByteArray(StandardCharsets.UTF_8)
+        val responseBody = postInnerTubeBrowse(endpoint, body, cookieHeader)
+        return parseAlbumTracks(JSONObject(responseBody))
+    }
+
+    private fun parseAlbumTracks(root: JSONObject): List<TrackResult> {
+        val out = mutableListOf<TrackResult>()
+        try {
+            // The track shelf lives in different places depending on the layout the server returns
+            // (single- vs two-column). Collect every sectionList we can reach, then take the first
+            // that yields a track shelf (musicShelfRenderer / musicPlaylistShelfRenderer).
+            val sectionLists = mutableListOf<JSONArray>()
+            root.optJSONObject("contents")?.let { contents ->
+                contents.optJSONObject("singleColumnBrowseResultsRenderer")
+                    ?.optJSONArray("tabs")?.optJSONObject(0)
+                    ?.optJSONObject("tabRenderer")?.optJSONObject("content")
+                    ?.optJSONObject("sectionListRenderer")?.optJSONArray("contents")
+                    ?.let { sectionLists.add(it) }
+                contents.optJSONObject("twoColumnBrowseResultsRenderer")?.let { two ->
+                    two.optJSONObject("secondaryContents")
+                        ?.optJSONObject("sectionListRenderer")?.optJSONArray("contents")
+                        ?.let { sectionLists.add(it) }
+                    two.optJSONArray("tabs")?.optJSONObject(0)
+                        ?.optJSONObject("tabRenderer")?.optJSONObject("content")
+                        ?.optJSONObject("sectionListRenderer")?.optJSONArray("contents")
+                        ?.let { sectionLists.add(it) }
+                }
+            }
+            for (sections in sectionLists) {
+                sections.forEachObject { section ->
+                    val shelf = section.optJSONObject("musicShelfRenderer")?.optJSONArray("contents")
+                        ?: section.optJSONObject("musicPlaylistShelfRenderer")?.optJSONArray("contents")
+                    shelf?.let { out.addAll(parseAlbumTrackRows(it)) }
+                }
+                if (out.isNotEmpty()) break
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "parseAlbumTracks failed", e)
+        }
+        return out
+    }
+
+    private fun parseAlbumTrackRows(items: JSONArray): List<TrackResult> {
+        val out = mutableListOf<TrackResult>()
+        items.forEachObject { item ->
+            val r = item.optJSONObject("musicResponsiveListItemRenderer") ?: return@forEachObject
+            var videoId = r.optJSONObject("playlistItemData")?.optString("videoId", "")?.trim() ?: ""
+            if (videoId.isEmpty()) {
+                videoId = r.optJSONObject("overlay")
+                    ?.optJSONObject("musicItemThumbnailOverlayRenderer")
+                    ?.optJSONObject("content")
+                    ?.optJSONObject("musicPlayButtonRenderer")
+                    ?.optJSONObject("playNavigationEndpoint")
+                    ?.optJSONObject("watchEndpoint")
+                    ?.optString("videoId", "")?.trim() ?: ""
+            }
+            if (videoId.isEmpty()) return@forEachObject
+            val flex = r.optJSONArray("flexColumns")
+            val title = artistRunsToText(
+                flex?.optJSONObject(0)
+                    ?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")?.optJSONObject("text")
+            )
+            if (title.isEmpty()) return@forEachObject
+            val artist = artistRunsToText(
+                flex?.optJSONObject(1)
+                    ?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")?.optJSONObject("text")
+            )
+            // Album pages put the track duration in a fixedColumn ("2:12"), not in the subtitle.
+            val duration = artistRunsToText(
+                r.optJSONArray("fixedColumns")?.optJSONObject(0)
+                    ?.optJSONObject("musicResponsiveListItemFixedColumnRenderer")?.optJSONObject("text")
+            )
+            val thumb = artistThumbUrl(r.optJSONObject("thumbnail")?.optJSONObject("musicThumbnailRenderer"))
+            out.add(TrackResult("video", videoId, title, artist, thumb, duration))
         }
         return out
     }
@@ -3052,6 +3330,7 @@ class YouTubeMusicService @JvmOverloads constructor(
         private const val MAX_MIX_CONTINUATIONS = 4
 
         private val SHARED_EXECUTOR: ExecutorService = Executors.newFixedThreadPool(3)
+        private val SUGGESTIONS_EXECUTOR: ExecutorService = Executors.newFixedThreadPool(2)
 
         private fun buildClientVersion(): String {
             val sdf = java.text.SimpleDateFormat("yyyyMMdd", Locale.US)

@@ -18,7 +18,8 @@ import androidx.media3.ui.PlayerView;
  * SurfaceView is reused, ExoPlayer never rebuilds its video decoder pipeline —
  * eliminating all lag when opening/closing the full player.
  * <p>
- * All playback is video (proxy stream or offline mp4). No static detection needed.
+ * Video is either a muxed mp4-360 network stream (music videos on) or an offline mp4 with a
+ * real video track; audio-only playback simply never attaches the surface.
  */
 @androidx.annotation.OptIn(markerClass = androidx.media3.common.util.UnstableApi.class)
 public final class VideoSurfaceRouter {
@@ -58,7 +59,9 @@ public final class VideoSurfaceRouter {
             playerView.setUseController(false);
             playerView.setBackgroundColor(Color.BLACK);
             playerView.setVisibility(View.GONE);
-            playerView.setResizeMode(androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT);
+            // FIXED_WIDTH: el video SIEMPRE ocupa todo el ancho del contenedor y la altura sigue
+            // su aspecto (nunca barras a los lados). FIT dejaba videos angostos sin llenar el ancho.
+            playerView.setResizeMode(androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIXED_WIDTH);
         }
     }
 

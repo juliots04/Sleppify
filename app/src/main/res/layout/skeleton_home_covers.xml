@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Cold-start placeholder for the "Covers y remixes" section: a title bar + four track-row
+     placeholders (reusing item_library_skeleton_row's 50dp thumb + 2 text lines) approximating a
+     vpCovers page (248dp). Reserves the section height so real covers swap in without a jump. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:paddingHorizontal="8dp"
+    android:importantForAccessibility="no">
+
+    <View
+        android:layout_width="160dp"
+        android:layout_height="18dp"
+        android:layout_marginStart="8dp"
+        android:layout_marginTop="20dp"
+        android:layout_marginBottom="6dp"
+        android:background="@drawable/bg_skeleton_block" />
+
+    <include layout="@layout/item_library_skeleton_row" />
+    <include layout="@layout/item_library_skeleton_row" />
+    <include layout="@layout/item_library_skeleton_row" />
+    <include layout="@layout/item_library_skeleton_row" />
+</LinearLayout>

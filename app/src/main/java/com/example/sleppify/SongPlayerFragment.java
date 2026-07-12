@@ -190,11 +190,23 @@ public class SongPlayerFragment extends Fragment {
     private View actionRadio;
     private View actionShare;
     private View actionDownloadTrack;
-    private View actionSearchOnline;
     private View actionGoToArtist;
     // lastSavedPlaylistKey/Name now read from CustomPlaylistsStore (global persistent)
     private ImageView ivActionDownloadIcon;
     private TextView tvActionDownloadLabel;
+
+    // Pastilla Audio|Video: switch del modo de reproducción (default AUDIO por sesión).
+    private TextView tvModeAudio;
+    private TextView tvModeVideo;
+    private boolean playerVideoMode = false;
+    /** Un hot-swap de modo a la vez; el toggle se ignora mientras uno está en vuelo. */
+    private boolean modeSwapInProgress = false;
+    @Nullable
+    private ExoMediaPlayer pendingModeSwapPlayer;
+    /** Adelanto de seek al preparar el player del swap: compensa el tiempo de commit. */
+    private static final int HOT_SWAP_SEEK_LEAD_MS = 450;
+    private static final long HOT_SWAP_COMMIT_DELAY_MS = 400L;
+    private static final long HOT_SWAP_TIMEOUT_MS = 12000L;
 
     private NextUpAdapter nextUpAdapter;
     @Nullable
@@ -682,7 +694,6 @@ public class SongPlayerFragment extends Fragment {
         actionRadio = view.findViewById(R.id.actionRadio);
         actionShare = view.findViewById(R.id.actionShare);
         actionDownloadTrack = view.findViewById(R.id.actionDownloadTrack);
-        actionSearchOnline = view.findViewById(R.id.actionSearchOnline);
         actionGoToArtist = view.findViewById(R.id.actionGoToArtist);
         ivActionDownloadIcon = view.findViewById(R.id.ivActionDownloadIcon);
         tvActionDownloadLabel = view.findViewById(R.id.tvActionDownloadLabel);
@@ -708,6 +719,15 @@ public class SongPlayerFragment extends Fragment {
         if (btnPlayerClose != null) {
             btnPlayerClose.setOnClickListener(v -> collapseToMiniMode(true));
         }
+
+        // Pastilla Audio|Video. El modo vive en StreamResolver (sesión completa), así una
+        // recreación del fragment (rotación, restauración) no lo desincroniza del stream real.
+        tvModeAudio = view.findViewById(R.id.tvModeAudio);
+        tvModeVideo = view.findViewById(R.id.tvModeVideo);
+        if (tvModeAudio != null) tvModeAudio.setOnClickListener(v -> onPlaybackModeSelected(false));
+        if (tvModeVideo != null) tvModeVideo.setOnClickListener(v -> onPlaybackModeSelected(true));
+        playerVideoMode = StreamResolver.isPreferVideoMode();
+        updatePlaybackModePillUi();
 
         // Apply status-bar inset to the internal nav bar so buttons sit below the status bar
         androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(view, (v, insets) -> {
@@ -1010,6 +1030,12 @@ public class SongPlayerFragment extends Fragment {
         cancelNextUpReveal();
         cancelPendingSocialStatsFetch();
         cancelPendingStreamResolver();
+        // Un hot-swap de modo Audio/Video a medio preparar no debe filtrar su player.
+        if (pendingModeSwapPlayer != null) {
+            try { pendingModeSwapPlayer.release(); } catch (Exception ignored) { }
+            pendingModeSwapPlayer = null;
+            modeSwapInProgress = false;
+        }
         // Release video surface before destroying view
         videoRouter.onPlayerReleased();
         stopLocalProgressTicker();
@@ -1459,6 +1485,31 @@ public class SongPlayerFragment extends Fragment {
             return;
         }
 
+        // While the current online track is still resolving/preparing (the restore/cold-start "still
+        // loading" window), treat every play tap as an idempotent "start when it's ready" instead of
+        // toggling isPlaying's parity. Previously, taps during this window flipped isPlaying on/off
+        // and onPrepared honored whatever parity it landed on — which is exactly why the last-played
+        // track needed several taps to actually start and appeared to "reload" on each one. Keeping
+        // isPlaying=true here lets onPrepared (shouldStart = isPlaying || playWhenReady) auto-start
+        // once, from a single tap, without re-triggering a resolve.
+        if (!usingOfflineSource) {
+            String curVideoId = tracks.isEmpty() ? "" : tracks.get(currentIndex).videoId;
+            boolean currentTrackLoading =
+                    (localSourcePreparing && localExoMediaPlayer != null)
+                    || (hasPendingStreamResolution() && TextUtils.equals(pendingResolutionVideoId, curVideoId));
+            if (currentTrackLoading) {
+                Log.d(TAG, "[PLAYBACK_DBG] togglePlayback: track still loading, arming play-when-ready (idempotent)");
+                pauseRequestedByUser = false;
+                isPlaying = true;
+                updatePlayPauseIcon();
+                updateMediaSessionState();
+                updateMediaNotification();
+                syncMiniStateWithPlaylist();
+                persistPlaybackSnapshot(false);
+                return;
+            }
+        }
+
         if (isPlaying) {
             Log.d(TAG, "[PLAYBACK_DBG] togglePlayback: PAUSING (isPlaying was true)");
             pauseRequestedByUser = true;
@@ -1778,8 +1829,11 @@ public class SongPlayerFragment extends Fragment {
 
         // ✅ FAST-PATH: check offline on the main thread immediately — no executor queue wait.
         // OfflineAudioStore.hasOfflineAudio is a simple SharedPrefs/file existence check.
+        // En modo VIDEO (pastilla Audio|Video) los tracks descargados van igual a red: el
+        // offline es audio y el usuario pidió ver el video musical.
         boolean hasOfflineLocal = LocalFilesStore.isLocalVideoId(track.videoId)
-                || OfflineAudioStore.hasOfflineAudio(requireContext(), track.videoId);
+                || (!StreamResolver.isPreferVideoMode()
+                        && OfflineAudioStore.hasOfflineAudio(requireContext(), track.videoId));
         if (hasOfflineLocal) {
             // Offline/local sources start instantly anyway; the pre-buffered network player
             // (if any) is not needed. adoptGaplessPlayer assumes a network source, so do
@@ -1980,9 +2034,9 @@ public class SongPlayerFragment extends Fragment {
     }
 
     /**
-     * After a network track starts playing, download it in the background to the offline directory
-     * via the single proxy download path (/api/descarga → .mp4), so a streamed track becomes an
-     * offline file that matches the online video (one downloader, one container).
+     * After a network track starts playing, download its audio in the background to the offline
+     * directory straight from the googlevideo CDN (NewPipe-resolved URL, no proxy), so a streamed
+     * track quietly becomes a light offline file that plays as music.
      */
     private void maybeSaveStreamedTrackOffline(@NonNull String videoId) {
         if (TextUtils.isEmpty(videoId)) return;
@@ -1996,8 +2050,8 @@ public class SongPlayerFragment extends Fragment {
         if (OfflineAudioStore.hasOfflineAudio(appContext, normalized)) return;
 
         // Respect the user's download-over-mobile-data setting, like every WorkManager download
-        // path does (UNMETERED constraint). This passive save fetches the full mp4 server-side —
-        // without this gate, every track played on mobile data would silently burn tens of MB.
+        // path does (UNMETERED constraint). This passive save pulls the audio from the CDN —
+        // without this gate, every track played on mobile data would silently burn data.
         android.content.SharedPreferences settingsPrefsForSave =
                 appContext.getSharedPreferences(CloudSyncManager.PREFS_SETTINGS, Context.MODE_PRIVATE);
         boolean allowMobileForSave =
@@ -2017,12 +2071,9 @@ public class SongPlayerFragment extends Fragment {
                     return;
                 }
 
-                // Single download path: fetch the finished mp4 from the proxy (/api/descarga)
-                // so the offline file always matches the online video (one downloader, one container).
-                java.io.File targetFile = OfflineAudioStore.getOfflineVideoFile(appContext, normalized);
-                boolean ok = SleppifyDownloaderResolver.INSTANCE.downloadVideoViaProxy(
-                        appContext, normalized, targetFile, 0, null);
-                if (!ok && targetFile.isFile()) targetFile.delete();
+                // Direct CDN audio download (NewPipe-resolved googlevideo URL). The resolver owns
+                // the offline file path/extension (.m4a/.webm) and cleans up its own temp on failure.
+                boolean ok = SleppifyDownloaderResolver.downloadTrackAudio(appContext, normalized);
 
                 if (ok) {
                     OfflineAudioStore.markOfflineAudioState(normalized, true);
@@ -2526,11 +2577,11 @@ public class SongPlayerFragment extends Fragment {
                     + " videoId=" + track.videoId
                     + " token=" + requestToken);
 
-            // Codec/renderer errors (not proxy/network issues) — device codec crashed
+            // Codec/renderer errors (not network issues) — device codec crashed
             boolean isCodecError = (what == 4003 || what == 4006);
 
             // Codec crash (DEAD_OBJECT / MediaCodecRenderer error): error codes 4003, 4006.
-            // The device codec process died — NOT a network/proxy issue. Don't destroy the
+            // The device codec process died — NOT a network issue. Don't destroy the
             // player; just call start() which triggers ExoPlayer's internal prepare() from
             // STATE_IDLE, reinitializing codecs without losing position or media source.
             if (isCodecError && localExoMediaPlayer == mp && isAdded()) {
@@ -2553,7 +2604,8 @@ public class SongPlayerFragment extends Fragment {
                 return true;
             }
 
-            // Only mark the proxy server as failed for network/source errors, not codec crashes
+            // Drop the cached stream URL on network/source errors (forces a fresh NewPipe resolve
+            // on the next attempt), but not on codec crashes — those keep the same valid URL.
             if (networkSource && !isCodecError) {
                 StreamResolver.markFailed(track.videoId);
             }
@@ -3269,11 +3321,14 @@ public class SongPlayerFragment extends Fragment {
         }
         loadedTrackIsVideo = isVideoTrackId(loadedVideoId);
 
-        // All playback is video
+        // All playback is video. Resolve the offline .mp4 across BOTH volumes (internal + SD):
+        // building the path with the write-dir API pointed at a nonexistent file whenever the
+        // download lived on the other volume (e.g. after flipping "Usar tarjeta SD").
         currentSourceIsVideo = true;
-        currentVideoFilePath = (!wasNetwork && isAdded())
-                ? OfflineAudioStore.getOfflineVideoFile(requireContext(), track.videoId).getAbsolutePath()
+        java.io.File existingVideo = (!wasNetwork && isAdded())
+                ? OfflineAudioStore.findExistingOfflineVideoFile(requireContext(), track.videoId)
                 : null;
+        currentVideoFilePath = existingVideo != null ? existingVideo.getAbsolutePath() : null;
         updatePlayerSurfaceForSource();
 
         incoming.setOnCompletionListener(mp -> {
@@ -3487,7 +3542,6 @@ public class SongPlayerFragment extends Fragment {
         if (actionRadio != null) actionRadio.setVisibility(isLocalFile ? View.GONE : View.VISIBLE);
         if (actionShare != null) actionShare.setVisibility(isLocalFile ? View.GONE : View.VISIBLE);
         if (actionDownloadTrack != null) actionDownloadTrack.setVisibility(isLocalFile ? View.GONE : View.VISIBLE);
-        if (actionSearchOnline != null) actionSearchOnline.setVisibility(View.VISIBLE);
         if (actionGoToArtist != null) actionGoToArtist.setVisibility(!TextUtils.isEmpty(track.artist) ? View.VISIBLE : View.GONE);
         if (llSimilarTrigger != null) llSimilarTrigger.setVisibility(isLocalFile ? View.GONE : View.VISIBLE);
 
@@ -3756,9 +3810,7 @@ public class SongPlayerFragment extends Fragment {
         applySocialStatsToUi(SocialStats.unavailable());
 
         if (actionLike != null) {
-            actionLike.setOnClickListener(v -> {
-                // Visual only for now.
-            });
+            actionLike.setOnClickListener(v -> toggleCurrentTrackLiked());
         }
         if (actionDislike != null) {
             actionDislike.setOnClickListener(v -> {
@@ -3780,9 +3832,6 @@ public class SongPlayerFragment extends Fragment {
         if (actionDownloadTrack != null) {
             actionDownloadTrack.setOnClickListener(v -> toggleOfflineDownloadForCurrentTrack());
         }
-        if (actionSearchOnline != null) {
-            actionSearchOnline.setOnClickListener(v -> searchCurrentTrackOnline());
-        }
         if (actionGoToArtist != null) {
             actionGoToArtist.setOnClickListener(v -> goToArtistForCurrentTrack());
         }
@@ -3791,32 +3840,13 @@ public class SongPlayerFragment extends Fragment {
         observeManualDownloadWork();
     }
 
-    private void searchCurrentTrackOnline() {
-        if (!isAdded() || tracks.isEmpty() || currentIndex < 0 || currentIndex >= tracks.size()) return;
-        PlayerTrack track = tracks.get(currentIndex);
-        String query = "";
-        if (!TextUtils.isEmpty(track.title)) {
-            query = track.title;
-            if (!TextUtils.isEmpty(track.artist)) {
-                query += " " + track.artist;
-            }
-        }
-        if (TextUtils.isEmpty(query)) return;
-
-        // Collapse player and open search with the query
-        collapseToMiniMode(true);
-        if (getActivity() instanceof MainActivity) {
-            ((MainActivity) getActivity()).openSearchFragmentWithQuery(query);
-        }
-    }
-
     private void goToArtistForCurrentTrack() {
         if (!isAdded() || tracks.isEmpty() || currentIndex < 0 || currentIndex >= tracks.size()) return;
         PlayerTrack track = tracks.get(currentIndex);
         if (TextUtils.isEmpty(track.artist)) return;
         collapseToMiniMode(true);
         if (getActivity() instanceof MainActivity) {
-            ((MainActivity) getActivity()).openSearchFragmentWithQuery(track.artist);
+            ((MainActivity) getActivity()).openArtistDetailByName(track.artist);
         }
     }
 
@@ -4159,12 +4189,14 @@ public class SongPlayerFragment extends Fragment {
         if (isDownloaded) {
             pendingDownloadVideoId = "";
             OfflineAudioStore.deleteOfflineAudio(requireContext(), track.videoId);
-            android.widget.Toast.makeText(requireContext(), "Descarga eliminada", android.widget.Toast.LENGTH_SHORT).show();
+            AppSnackbar.showInView(getPlayerToastRoot(), "Descarga eliminada",
+                    null, null, playerToastBottomMarginPx());
             refreshDownloadChipState();
         } else {
             pendingDownloadVideoId = track.videoId;
             enqueueOfflineDownloadForTrack(track);
-            android.widget.Toast.makeText(requireContext(), "Descarga en cola", android.widget.Toast.LENGTH_SHORT).show();
+            AppSnackbar.showInView(getPlayerToastRoot(), "Descarga en cola",
+                    null, null, playerToastBottomMarginPx());
             refreshDownloadChipState();
         }
     }
@@ -4395,8 +4427,7 @@ public class SongPlayerFragment extends Fragment {
             return;
         }
         String videoId = tracks.get(currentIndex).videoId;
-        boolean isFavorite = !TextUtils.isEmpty(videoId)
-                && FavoritesPlaylistStore.isInLikedMusic(requireContext(), videoId);
+        boolean isFavorite = !TextUtils.isEmpty(videoId) && isTrackInLikedMusic(videoId);
         if (isFavorite) {
             ivActionLikeIcon.setImageResource(R.drawable.ic_thumb_up_liked);
             ivActionLikeIcon.clearColorFilter();
@@ -4404,6 +4435,73 @@ public class SongPlayerFragment extends Fragment {
             ivActionLikeIcon.setImageResource(R.drawable.ic_social_thumb_up);
             ivActionLikeIcon.setColorFilter(ContextCompat.getColor(requireContext(), R.color.text_primary));
         }
+    }
+
+    /**
+     * "Música que te gustó" membership is the union of the server-synced cache and the local
+     * yt_mirror (the same union PlaylistDetailFragment renders), so the like icon fills for a
+     * liked song no matter where it was liked from or which playlist it is playing from.
+     */
+    private boolean isTrackInLikedMusic(@NonNull String videoId) {
+        if (!isAdded()) return false;
+        Context ctx = requireContext();
+        return FavoritesPlaylistStore.isInLikedMusic(ctx, videoId)
+                || CustomPlaylistsStore.INSTANCE.isTrackInYtMirror(
+                        ctx, YouTubeMusicService.SPECIAL_LIKED_VIDEOS_ID, videoId);
+    }
+
+    /**
+     * Like tap = toggle membership in "Música que te gustó". Adding mirrors exactly what the
+     * save-to-playlist sheet's liked row does (local yt_mirror, insert at top, cloud-synced).
+     * Removing clears BOTH stores — the fill state is a union, so a mirror-only remove would
+     * leave server-cache-only songs permanently filled.
+     */
+    private void toggleCurrentTrackLiked() {
+        if (!isAdded() || tracks.isEmpty() || currentIndex < 0 || currentIndex >= tracks.size()) return;
+        PlayerTrack current = tracks.get(currentIndex);
+        if (TextUtils.isEmpty(current.videoId)) return;
+        Context ctx = requireContext();
+        String likedPid = YouTubeMusicService.SPECIAL_LIKED_VIDEOS_ID;
+
+        boolean wasLiked = isTrackInLikedMusic(current.videoId);
+        if (wasLiked) {
+            CustomPlaylistsStore.INSTANCE.removeTrackFromYtMirror(ctx, likedPid, current.videoId);
+            FavoritesPlaylistStore.removeFromLikedMusic(ctx, current.videoId);
+        } else {
+            String tTitle = TextUtils.isEmpty(current.title) ? "Tema" : current.title;
+            String tArtist = current.artist == null ? "" : current.artist;
+            String tDuration = current.duration == null ? "" : current.duration;
+            String tImage = current.imageUrl == null ? "" : current.imageUrl;
+            CustomPlaylistsStore.INSTANCE.addTrackToYtMirror(
+                    ctx, likedPid, current.videoId, tTitle, tArtist, tDuration, tImage, true);
+            FavoritesPlaylistStore.clearLikedTombstone(ctx, current.videoId);
+        }
+        FavoritesPlaylistStore.invalidateLikedMusicCache();
+
+        refreshLikeIconState();
+        animateLikeIconPop();
+        notifyFavoritesPlaylistIfVisible();
+
+        if (wasLiked) {
+            AppSnackbar.showInView(getPlayerToastRoot(), "Se eliminó de Música que te gustó",
+                    null, null, playerToastBottomMarginPx());
+        } else {
+            AppSnackbar.showInView(getPlayerToastRoot(), "Se guardó en Música que te gustó",
+                    null, null, playerToastBottomMarginPx());
+        }
+    }
+
+    private void animateLikeIconPop() {
+        if (ivActionLikeIcon == null) return;
+        ivActionLikeIcon.animate().cancel();
+        ivActionLikeIcon.setScaleX(0.7f);
+        ivActionLikeIcon.setScaleY(0.7f);
+        ivActionLikeIcon.animate()
+                .scaleX(1f)
+                .scaleY(1f)
+                .setDuration(320L)
+                .setInterpolator(new android.view.animation.OvershootInterpolator(2.2f))
+                .start();
     }
 
     @NonNull
@@ -4955,22 +5053,26 @@ public class SongPlayerFragment extends Fragment {
         return false;
     }
 
-    /** True when the track currently being played from an OFFLINE file whose .mp4 actually
-     *  contains a video track. Gating on {@link #usingOfflineSource} is what prevents the old bug
-     *  where a download landing mid-song flipped an online (audio) stream into black video mode. */
+    /** True when the current source carries video: an OFFLINE .mp4 with a real video track, or a
+     *  NETWORK muxed mp4-360 stream (music videos enabled → StreamResolver resolved a VIDEO source).
+     *  Gating the offline case on {@link #usingOfflineSource} still prevents the old bug where a
+     *  download landing mid-song flipped an online audio stream into black video mode; the network
+     *  case is driven by the resolved source type, which is audio unless music videos are enabled. */
     private boolean isVideoTrack(PlayerTrack track) {
         if (track == null) return false;
-        return usingOfflineSource && offlineFileHasVideoTrack(track.videoId);
+        if (usingOfflineSource) return offlineFileHasVideoTrack(track.videoId);
+        return StreamResolver.isVideoSource(track.videoId);
     }
 
     /** Video/music classification for PRESENTATION (cover, backdrop, hero, surface). Only the
-     *  actively-loaded track can be video, and only while its live source is the offline video. */
+     *  actively-loaded track can be video, whether from an offline .mp4 or a network mp4-360 stream. */
     private boolean isVideoPresentation(@Nullable PlayerTrack track) {
         if (track == null) return false;
         if (TextUtils.isEmpty(loadedVideoId) || !TextUtils.equals(loadedVideoId, track.videoId)) {
             return false;
         }
-        return usingOfflineSource && offlineFileHasVideoTrack(track.videoId);
+        if (usingOfflineSource) return offlineFileHasVideoTrack(track.videoId);
+        return StreamResolver.isVideoSource(track.videoId);
     }
 
     /** Probes the offline file for a real video track (cached). Returns false for online-only or
@@ -5016,6 +5118,272 @@ public class SongPlayerFragment extends Fragment {
             });
         });
         return false;
+    }
+
+    // ─── Pastilla Audio|Video: cambio de modo EN CALIENTE (sin pausar) ──────────────
+
+    private void onPlaybackModeSelected(boolean videoMode) {
+        if (videoMode == playerVideoMode || modeSwapInProgress) return;
+
+        PlayerTrack track = (currentIndex >= 0 && currentIndex < tracks.size())
+                ? tracks.get(currentIndex) : null;
+        if (videoMode && track != null && LocalFilesStore.isLocalVideoId(track.videoId)) {
+            if (isAdded()) {
+                AppSnackbar.showInView(getPlayerToastRoot(), "No disponible para archivos locales",
+                        null, null, playerToastBottomMarginPx());
+            }
+            return;
+        }
+
+        playerVideoMode = videoMode;
+        StreamResolver.setPreferVideoMode(videoMode);
+        updatePlaybackModePillUi();
+        // Los prefetch/pre-buffers del siguiente track se hicieron con el modo anterior —
+        // invalidarlos para que se re-preparen con la fuente correcta.
+        invalidateNextTrackPreparations();
+
+        if (track == null || TextUtils.isEmpty(track.videoId) || localExoMediaPlayer == null) {
+            return; // nada sonando: la próxima reproducción ya usará el modo nuevo
+        }
+        if (LocalFilesStore.isLocalVideoId(track.videoId)) {
+            return; // archivo local: ya suena como audio, no hay nada que intercambiar
+        }
+        if (crossfadeManager.isInProgress()) {
+            return; // transición en curso: el track entrante ya resolverá con el modo nuevo
+        }
+        hotSwapPlaybackMode(track, videoMode);
+    }
+
+    private void updatePlaybackModePillUi() {
+        if (tvModeAudio == null || tvModeVideo == null) return;
+        // Ambas letras en blanco puro; el segmento activo llena TODA su mitad (drawable con la
+        // esquina exterior redondeada según el lado).
+        tvModeAudio.setTextColor(0xFFFFFFFF);
+        tvModeVideo.setTextColor(0xFFFFFFFF);
+        if (playerVideoMode) {
+            tvModeVideo.setBackgroundResource(R.drawable.bg_player_mode_segment_active_right);
+            tvModeAudio.setBackground(null);
+        } else {
+            tvModeAudio.setBackgroundResource(R.drawable.bg_player_mode_segment_active_left);
+            tvModeVideo.setBackground(null);
+        }
+    }
+
+    /** Vuelve la pastilla al modo contrario tras un fallo de swap y avisa. */
+    private void revertPlaybackModeAfterFailure(boolean attemptedVideo) {
+        playerVideoMode = !attemptedVideo;
+        StreamResolver.setPreferVideoMode(playerVideoMode);
+        updatePlaybackModePillUi();
+        invalidateNextTrackPreparations();
+        if (isAdded()) {
+            AppSnackbar.showInView(getPlayerToastRoot(), attemptedVideo
+                    ? "Video no disponible para esta canción"
+                    : "Audio no disponible", null, null, playerToastBottomMarginPx());
+        }
+    }
+
+    /**
+     * Cambia la fuente Audio↔Video EN CALIENTE: resuelve la fuente nueva en background,
+     * prepara un SEGUNDO player en silencio sincronizado a la posición actual, y solo
+     * entonces intercambia — la música nunca se pausa (ver commitHotSwap).
+     */
+    private void hotSwapPlaybackMode(@NonNull PlayerTrack track, boolean videoMode) {
+        final String swapVideoId = track.videoId;
+        final Context appCtx = requireContext().getApplicationContext();
+        modeSwapInProgress = true;
+
+        backgroundExecutor.execute(() -> {
+            String source = null;
+            if (!videoMode) {
+                // Modo audio: preferir el archivo offline si existe (sin red, instantáneo).
+                java.io.File offline = OfflineAudioStore.getExistingOfflineAudioFile(appCtx, swapVideoId);
+                if (offline.isFile() && offline.length() > 0L) {
+                    source = offline.getAbsolutePath();
+                }
+            }
+            if (source == null) {
+                source = StreamResolver.resolveStreamUrl(appCtx, swapVideoId);
+            }
+            final String resolved = source;
+            localProgressHandler.post(() -> {
+                if (!isAdded() || !TextUtils.equals(loadedVideoId, swapVideoId) || localExoMediaPlayer == null) {
+                    modeSwapInProgress = false; // cambió la canción mientras resolvíamos
+                    return;
+                }
+                if (TextUtils.isEmpty(resolved)
+                        || (videoMode && !StreamResolver.isVideoSource(swapVideoId))) {
+                    // Sin fuente, o pidió video y el track no tiene video muxed (el resolver
+                    // cayó a audio): revertir la pastilla y avisar.
+                    modeSwapInProgress = false;
+                    revertPlaybackModeAfterFailure(videoMode);
+                    return;
+                }
+                prepareHotSwapPlayer(track, resolved, videoMode, appCtx);
+            });
+        });
+    }
+
+    private void prepareHotSwapPlayer(
+            @NonNull PlayerTrack track,
+            @NonNull String source,
+            boolean videoMode,
+            @NonNull Context appCtx
+    ) {
+        final String swapVideoId = track.videoId;
+        final boolean networkSource = isHttpStreamSource(source);
+
+        final ExoMediaPlayer next;
+        try {
+            // Player PROPIO: el actual puede estar sobre el ExoPlayer compartido; usarlo para
+            // los dos a la vez es imposible. isCrossfadeComponent evita que stopOthers pause
+            // al player actual cuando el nuevo haga start() (y viceversa).
+            next = new ExoMediaPlayer(appCtx);
+        } catch (Exception e) {
+            modeSwapInProgress = false;
+            revertPlaybackModeAfterFailure(videoMode);
+            return;
+        }
+        pendingModeSwapPlayer = next;
+        next.isCrossfadeComponent = true;
+        next.setVolume(0f, 0f); // se prepara en silencio; suena recién en el commit
+        next.setAudioAttributes(new AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                .build());
+
+        final java.util.concurrent.atomic.AtomicBoolean settled =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
+
+        final Runnable swapTimeout = () -> {
+            if (!settled.compareAndSet(false, true)) return;
+            if (pendingModeSwapPlayer == next) pendingModeSwapPlayer = null;
+            try { next.release(); } catch (Exception ignored) { }
+            modeSwapInProgress = false;
+            revertPlaybackModeAfterFailure(videoMode);
+        };
+        localProgressHandler.postDelayed(swapTimeout, HOT_SWAP_TIMEOUT_MS);
+
+        next.setOnErrorListener((mp, what, extra) -> {
+            if (!settled.compareAndSet(false, true)) return true;
+            localProgressHandler.removeCallbacks(swapTimeout);
+            if (pendingModeSwapPlayer == next) pendingModeSwapPlayer = null;
+            try { mp.release(); } catch (Exception ignored) { }
+            modeSwapInProgress = false;
+            revertPlaybackModeAfterFailure(videoMode);
+            return true;
+        });
+
+        next.setOnPreparedListener(mp -> {
+            if (settled.get()) return;
+            if (!isAdded() || !TextUtils.equals(loadedVideoId, swapVideoId) || localExoMediaPlayer == null) {
+                if (settled.compareAndSet(false, true)) {
+                    localProgressHandler.removeCallbacks(swapTimeout);
+                    if (pendingModeSwapPlayer == next) pendingModeSwapPlayer = null;
+                    try { mp.release(); } catch (Exception ignored) { }
+                    modeSwapInProgress = false;
+                }
+                return;
+            }
+            // Sincronizar por delante de la posición actual (compensa el delay del commit)
+            // y comprometer el intercambio tras un pequeño margen de re-buffer.
+            int pos = localExoMediaPlayer.getCurrentPosition();
+            mp.seekTo(pos + HOT_SWAP_SEEK_LEAD_MS);
+            localProgressHandler.postDelayed(() -> {
+                if (!settled.compareAndSet(false, true)) return;
+                localProgressHandler.removeCallbacks(swapTimeout);
+                commitHotSwap(mp, track, videoMode, networkSource, source);
+            }, HOT_SWAP_COMMIT_DELAY_MS);
+        });
+
+        try {
+            if (networkSource) {
+                next.setDataSource(appCtx, Uri.parse(source), StreamResolver.getHeadersFor(swapVideoId));
+            } else {
+                next.setDataSource(source);
+            }
+            next.prepareAsync();
+        } catch (Exception e) {
+            if (settled.compareAndSet(false, true)) {
+                localProgressHandler.removeCallbacks(swapTimeout);
+                if (pendingModeSwapPlayer == next) pendingModeSwapPlayer = null;
+                try { next.release(); } catch (Exception ignored) { }
+                modeSwapInProgress = false;
+                revertPlaybackModeAfterFailure(videoMode);
+            }
+        }
+    }
+
+    /** El intercambio real: silencia el viejo, arranca el nuevo ya sincronizado y lo adopta
+     *  como player activo con los listeners de régimen normal. La música no se pausa. */
+    private void commitHotSwap(
+            @NonNull ExoMediaPlayer next,
+            @NonNull PlayerTrack track,
+            boolean videoMode,
+            boolean networkSource,
+            @NonNull String source
+    ) {
+        if (pendingModeSwapPlayer == next) pendingModeSwapPlayer = null;
+        if (!isAdded() || !TextUtils.equals(loadedVideoId, track.videoId)
+                || localExoMediaPlayer == null || crossfadeManager.isInProgress()) {
+            try { next.release(); } catch (Exception ignored) { }
+            modeSwapInProgress = false;
+            return;
+        }
+
+        ExoMediaPlayer old = localExoMediaPlayer;
+        boolean keepPlaying = isPlaying && !pauseRequestedByUser;
+
+        // Re-sincronización fina: si el buffering del nuevo tardó más de lo previsto y el
+        // viejo se adelantó, corregir antes de sonar (el seek cae dentro del buffer → rápido).
+        try {
+            int drift = old.getCurrentPosition() - next.getCurrentPosition();
+            if (Math.abs(drift) > 900) next.seekTo(old.getCurrentPosition() + 120);
+        } catch (Exception ignored) { }
+
+        // Swap sin pausa: mute del viejo y start del nuevo en el mismo frame.
+        try { old.setVolume(0f, 0f); } catch (Exception ignored) { }
+        next.setVolume(1f, 1f);
+        if (keepPlaying) next.start();
+
+        localExoMediaPlayer = next;
+        next.isCrossfadeComponent = false;
+        usingOfflineSource = !networkSource;
+        currentSourceIsVideo = true;
+        currentVideoFilePath = networkSource ? null : source;
+
+        next.setOnCompletionListener(mp -> {
+            if (localExoMediaPlayer != mp) return;
+            handleLocalPlaybackCompletion();
+        });
+        next.setOnErrorListener((mp, what, extra) -> {
+            if (localExoMediaPlayer == mp) {
+                stopLocalProgressTicker();
+                releaseLocalExoMediaPlayer();
+                usingOfflineSource = false;
+            } else {
+                releaseSingleExoMediaPlayer(mp);
+            }
+            advanceToNextTrackAfterFailure();
+            return true;
+        });
+
+        try { old.release(); } catch (Exception ignored) { }
+
+        try {
+            AudioEffectsService.sendApply(requireContext().getApplicationContext());
+        } catch (Exception ignored) { }
+
+        try {
+            totalSeconds = Math.max(1, next.getDuration() / 1000);
+        } catch (Exception ignored) { }
+
+        videoRouter.onTrackStarted(next, track.videoId, isVideoTrack(track));
+        updatePlayerSurfaceForSource();
+        updatePlayPauseIcon();
+        updateMediaSessionState();
+        if (keepPlaying) startLocalProgressTicker();
+        modeSwapInProgress = false;
+        Log.d(TAG, "modeSwap: committed videoMode=" + videoMode + " videoId=" + track.videoId);
     }
 
     private void updatePlayerSurfaceForSource() {
@@ -6196,12 +6564,17 @@ public class SongPlayerFragment extends Fragment {
             ivThumb.setImageResource(R.drawable.ic_thumb_up_liked);
             ivThumb.setScaleType(ImageView.ScaleType.CENTER);
             ivThumb.setColorFilter(android.graphics.Color.WHITE, android.graphics.PorterDuff.Mode.SRC_IN);
-            boolean isIn = CustomPlaylistsStore.INSTANCE.isTrackInYtMirror(ctx, likedPid, track.videoId);
+            // Checked = same union the like icon uses (server cache OR local mirror), so the
+            // sheet row and the heart can never disagree about liked membership.
+            boolean isIn = isTrackInLikedMusic(track.videoId);
             if (ivCheck != null) ivCheck.setVisibility(isIn ? View.VISIBLE : View.GONE);
             final boolean[] checked = {isIn};
             row.setOnClickListener(v -> {
                 if (checked[0]) {
+                    // Remove from BOTH stores (union semantics — mirror-only removal would leave
+                    // server-cached likes permanently "liked").
                     CustomPlaylistsStore.INSTANCE.removeTrackFromYtMirror(ctx, likedPid, track.videoId);
+                    FavoritesPlaylistStore.removeFromLikedMusic(ctx, track.videoId);
                     checked[0] = false;
                     didRemove[0] = true;
                     if (ivCheck != null) ivCheck.setVisibility(View.GONE);
@@ -6216,11 +6589,13 @@ public class SongPlayerFragment extends Fragment {
                     String tImage = track.imageUrl == null ? "" : track.imageUrl;
                     CustomPlaylistsStore.INSTANCE.addTrackToYtMirror(ctx, likedPid, track.videoId,
                             tTitle, tArtist, tDuration, tImage, true);
+                    FavoritesPlaylistStore.clearLikedTombstone(ctx, track.videoId);
                     checked[0] = true;
                     if (ivCheck != null) ivCheck.setVisibility(View.VISIBLE);
                     lastAddedKey[0] = likedMirrorKey;
                     lastAddedName[0] = "Música que te gustó";
                 }
+                refreshLikeIconState();
             });
             llList.addView(row);
         }
@@ -6399,6 +6774,9 @@ public class SongPlayerFragment extends Fragment {
             }
         } else if (playlistKey.startsWith(CustomPlaylistsStore.YT_MIRROR_PREFIX)) {
             String pid = playlistKey.substring(CustomPlaylistsStore.YT_MIRROR_PREFIX.length());
+            if (YouTubeMusicService.SPECIAL_LIKED_VIDEOS_ID.equals(pid)) {
+                return isTrackInLikedMusic(videoId);
+            }
             return CustomPlaylistsStore.INSTANCE.isTrackInYtMirror(ctx, pid, videoId);
         }
         return false;
@@ -6434,8 +6812,12 @@ public class SongPlayerFragment extends Fragment {
             String pid = playlistKey.substring(CustomPlaylistsStore.YT_MIRROR_PREFIX.length());
             CustomPlaylistsStore.INSTANCE.addTrackToYtMirror(requireContext(), pid,
                     track.videoId, title, artist, duration, imageUrl, false);
+            if (YouTubeMusicService.SPECIAL_LIKED_VIDEOS_ID.equals(pid)) {
+                FavoritesPlaylistStore.clearLikedTombstone(requireContext(), track.videoId);
+            }
         }
         maybeEnqueueOfflineDownloadForTrack(playlistKey, track.videoId, title, artist, duration);
+        refreshLikeIconState();
     }
 
     private void maybeEnqueueOfflineDownloadForTrack(@NonNull String playlistKey, @NonNull String videoId,
@@ -6491,7 +6873,11 @@ public class SongPlayerFragment extends Fragment {
         } else if (playlistKey.startsWith(CustomPlaylistsStore.YT_MIRROR_PREFIX)) {
             String pid = playlistKey.substring(CustomPlaylistsStore.YT_MIRROR_PREFIX.length());
             CustomPlaylistsStore.INSTANCE.removeTrackFromYtMirror(requireContext(), pid, videoId);
+            if (YouTubeMusicService.SPECIAL_LIKED_VIDEOS_ID.equals(pid)) {
+                FavoritesPlaylistStore.removeFromLikedMusic(requireContext(), videoId);
+            }
         }
+        refreshLikeIconState();
     }
 
     private void showSavedInPlaylistBarPlayer(@NonNull PlayerTrack track, @NonNull String playlistKey, @NonNull String playlistName) {
@@ -6507,66 +6893,21 @@ public class SongPlayerFragment extends Fragment {
         });
     }
 
+    /** Toast host inside the full player surface (renders above the footer triggers). */
+    @Nullable
+    private android.view.ViewGroup getPlayerToastRoot() {
+        return (getView() instanceof android.view.ViewGroup) ? (android.view.ViewGroup) getView() : null;
+    }
+
+    private int playerToastBottomMarginPx() {
+        float density = getResources().getDisplayMetrics().density;
+        return (int) (56 * density);
+    }
+
     private void showPlayerActionBar(@NonNull String message, @NonNull String actionLabel, @NonNull View.OnClickListener actionClick) {
         if (!isAdded() || getView() == null) return;
-
-        android.view.ViewGroup rootView = (android.view.ViewGroup) getView();
-
-        float density = getResources().getDisplayMetrics().density;
-
-        android.widget.LinearLayout bar = new android.widget.LinearLayout(requireContext());
-        bar.setTag("saved_bar");
-        bar.setId(View.generateViewId());
-        bar.setOrientation(android.widget.LinearLayout.HORIZONTAL);
-        bar.setGravity(android.view.Gravity.CENTER_VERTICAL);
-        bar.setBackgroundColor(android.graphics.Color.parseColor("#FF1E1E1E"));
-        int hPad = (int) (16 * density);
-        int vPad = (int) (14 * density);
-        bar.setPadding(hPad, vPad, hPad, vPad);
-        bar.setElevation(8 * density);
-
-        TextView tvMsg = new TextView(requireContext());
-        tvMsg.setText(message);
-        tvMsg.setTextColor(android.graphics.Color.WHITE);
-        tvMsg.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 15);
-        tvMsg.setTypeface(null, android.graphics.Typeface.NORMAL);
-        tvMsg.setMaxLines(1);
-        tvMsg.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        android.widget.LinearLayout.LayoutParams tvParams = new android.widget.LinearLayout.LayoutParams(
-                0, android.view.ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-        tvMsg.setLayoutParams(tvParams);
-        bar.addView(tvMsg);
-
-        TextView btnAction = new TextView(requireContext());
-        btnAction.setText(actionLabel);
-        btnAction.setTextColor(android.graphics.Color.parseColor("#8AB4F8"));
-        btnAction.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 15);
-        btnAction.setTypeface(null, android.graphics.Typeface.BOLD);
-        btnAction.setPadding((int) (16 * density), 0, 0, 0);
-        btnAction.setOnClickListener(v -> {
-            TransientBottomBarAnimator.dismiss(bar, () -> actionClick.onClick(v));
-        });
-        bar.addView(btnAction);
-
-        int barBottomMargin = (int) (56 * density);
-        if (rootView instanceof androidx.constraintlayout.widget.ConstraintLayout) {
-            androidx.constraintlayout.widget.ConstraintLayout.LayoutParams clp =
-                    new androidx.constraintlayout.widget.ConstraintLayout.LayoutParams(
-                            androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.MATCH_PARENT,
-                            androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.WRAP_CONTENT);
-            clp.bottomToBottom = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.PARENT_ID;
-            clp.bottomMargin = barBottomMargin;
-            clp.startToStart = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.PARENT_ID;
-            clp.endToEnd = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.PARENT_ID;
-            TransientBottomBarAnimator.show(rootView, bar, clp, "saved_bar", 4000L);
-        } else {
-            FrameLayout.LayoutParams flp = new FrameLayout.LayoutParams(
-                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
-                    android.view.ViewGroup.LayoutParams.WRAP_CONTENT);
-            flp.gravity = android.view.Gravity.BOTTOM;
-            flp.bottomMargin = barBottomMargin;
-            TransientBottomBarAnimator.show(rootView, bar, flp, "saved_bar", 4000L);
-        }
+        AppSnackbar.showInView(getPlayerToastRoot(), message, actionLabel,
+                () -> actionClick.onClick(getView()), playerToastBottomMarginPx(), 4000L);
     }
 
     private void showQueueBottomSheet() {

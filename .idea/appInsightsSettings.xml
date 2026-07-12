@@ -9,10 +9,10 @@
             <InsightsFilterSettings>
               <option name="connection">
                 <ConnectionSetting>
-                  <option name="appId" value="PLACEHOLDER" />
-                  <option name="mobileSdkAppId" value="" />
-                  <option name="projectId" value="" />
-                  <option name="projectNumber" value="" />
+                  <option name="appId" value="com.example.sleppify" />
+                  <option name="mobileSdkAppId" value="1:579664672215:android:8d24dbce95ea0f16dc8792" />
+                  <option name="projectId" value="sleppify" />
+                  <option name="projectNumber" value="579664672215" />
                 </ConnectionSetting>
               </option>
               <option name="signal" value="SIGNAL_UNSPECIFIED" />

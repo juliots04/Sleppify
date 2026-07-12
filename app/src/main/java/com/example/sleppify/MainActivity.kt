@@ -19,7 +19,6 @@ import android.view.View
 import android.view.KeyEvent
 import android.widget.ImageView
 import android.widget.TextView
-import android.widget.Toast
 import android.provider.Settings
 import android.transition.TransitionManager
 import android.util.Log
@@ -61,6 +60,7 @@ class MainActivity : AppCompatActivity() {
         const val TAG_MODULE_SETTINGS = "module_settings"
         const val TAG_MODULE_SEARCH = "module_search"
         private const val TAG_PLAYLIST_DETAIL = "playlist_detail"
+        private const val TAG_ARTIST_DETAIL = "artist_detail"
         private const val TAG_SONG_PLAYER = AppConstants.TAG_SONG_PLAYER
 
         private const val PREFS_PLAYER_STATE = AppConstants.PREFS_PLAYER_STATE
@@ -86,6 +86,10 @@ class MainActivity : AppCompatActivity() {
         const val ACTION_MEDIA_NEXT = "com.example.sleppify.action.NEXT"
         const val ACTION_MEDIA_PREV = "com.example.sleppify.action.PREV"
         private const val REQUEST_CODE_RECORD_AUDIO = 4107
+
+        // El popup de nueva versión solo debe saltar una vez por proceso.
+        @Volatile
+        private var updatePopupShownThisProcess = false
 
         @Volatile
         private var activeInstance: WeakReference<MainActivity>? = null
@@ -170,6 +174,9 @@ class MainActivity : AppCompatActivity() {
     private var searchFragment: Fragment? = null
     private var playlistDetailFragment: Fragment? = null
     private var songPlayerFragment: Fragment? = null
+
+    // Resolves "Ir a artista" (name → channelId) for openArtistDetailByName
+    private val artistLookupService by lazy { YouTubeMusicService() }
 
     private lateinit var settingsPrefs: SharedPreferences
     private lateinit var localPrefs: SharedPreferences
@@ -313,9 +320,11 @@ class MainActivity : AppCompatActivity() {
             if (authManagerLazy.isSignedIn()) {
                 authManagerLazy.getCurrentUser()?.let { handleSignedInUser(it, null) }
             }
-            // Check for app updates after UI is fully ready
+            // Actualizaciones sin Firebase ni notificaciones: al abrir la app se consulta el
+            // version.json del hosting en silencio y, si hay versión nueva, salta la ventana
+            // emergente con los detalles (una vez por proceso).
             delay(1400)
-            AppUpdateManager.checkForUpdate(this@MainActivity)
+            maybeShowStartupUpdatePopup()
         }
 
         if (intent?.getBooleanExtra("SHOW_SETTINGS", false) == true) {
@@ -633,6 +642,10 @@ class MainActivity : AppCompatActivity() {
         cloudSyncManager.setSyncStateListener(null)
         unregisterNetworkCallback()
         mainHandler.removeCallbacksAndMessages(null)
+        // Evita WindowLeaked del popup de actualización si la Activity se destruye (p. ej. rotación).
+        updateDialog?.setOnDismissListener(null)
+        updateDialog?.dismiss()
+        updateDialog = null
         super.onDestroy()
     }
 
@@ -690,86 +703,15 @@ class MainActivity : AppCompatActivity() {
     private fun onNetworkLost() {
         if (isFinishing || isDestroyed) return
         settingsPrefs.edit().putBoolean(CloudSyncManager.KEY_OFFLINE_MODE_ENABLED, true).apply()
-        showNetworkStatusBar("Modo offline activado", android.graphics.Color.parseColor("#FF1E1E1E"))
+        AppSnackbar.show(this, "Modo offline activado", 4000L)
         mainHandler.postDelayed({ if (!isFinishing && !isDestroyed) notifyOfflineModeChanged() }, 1500L)
     }
 
     private fun onNetworkRestored() {
         if (isFinishing || isDestroyed) return
         settingsPrefs.edit().putBoolean(CloudSyncManager.KEY_OFFLINE_MODE_ENABLED, false).apply()
-        showNetworkStatusBar("Vuelves a tener conexión", android.graphics.Color.parseColor("#FF00C853"))
+        AppSnackbar.show(this, "Vuelves a tener conexión", 4000L)
         mainHandler.postDelayed({ if (!isFinishing && !isDestroyed) notifyOfflineModeChanged() }, 1500L)
-    }
-
-    private fun showNetworkStatusBar(message: String, bgColor: Int) {
-        val root = findViewById<androidx.constraintlayout.widget.ConstraintLayout>(R.id.main) ?: return
-        val existing = root.findViewWithTag<View>("network_status_bar")
-        if (existing != null) root.removeView(existing)
-
-        val density = resources.displayMetrics.density
-
-        val bar = android.widget.LinearLayout(this).apply {
-            tag = "network_status_bar"
-            id = View.generateViewId()
-            orientation = android.widget.LinearLayout.HORIZONTAL
-            gravity = android.view.Gravity.CENTER_VERTICAL
-            setBackgroundColor(bgColor)
-            val hPad = (16 * density).toInt()
-            val vPad = (12 * density).toInt()
-            setPadding(hPad, vPad, hPad, vPad)
-            elevation = 45 * density
-        }
-
-        val tv = TextView(this).apply {
-            text = message
-            setTextColor(android.graphics.Color.WHITE)
-            textSize = 14f
-            maxLines = 1
-            ellipsize = android.text.TextUtils.TruncateAt.END
-            val font = ResourcesCompat.getFont(this@MainActivity, R.font.inter_variable)
-            setTypeface(font, android.graphics.Typeface.NORMAL)
-        }
-        bar.addView(tv)
-
-        // Compute extra margin if global mini-player is visible
-        var extraMiniPlayerMargin = 0
-        val miniPlayer = findViewById<View>(R.id.llGlobalMiniPlayer)
-        if (miniPlayer != null && miniPlayer.visibility == View.VISIBLE) {
-            extraMiniPlayerMargin = miniPlayer.height
-        }
-
-        val clp = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams(
-            androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.MATCH_PARENT,
-            androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.WRAP_CONTENT
-        ).apply {
-            bottomToTop = R.id.bottomNavigation
-            bottomMargin = (12 * density).toInt() + extraMiniPlayerMargin
-            startToStart = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.PARENT_ID
-            endToEnd = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.PARENT_ID
-        }
-
-        // Start off-screen and slide up
-        bar.translationY = 100 * density
-        bar.alpha = 0f
-        root.addView(bar, clp)
-        bar.animate()
-            .translationY(0f)
-            .alpha(1f)
-            .setDuration(300)
-            .start()
-
-        // Auto-dismiss after 4 seconds
-        mainHandler.postDelayed({
-            if (isFinishing || isDestroyed) return@postDelayed
-            if (bar.parent != null) {
-                bar.animate()
-                    .translationY(100 * density)
-                    .alpha(0f)
-                    .setDuration(280)
-                    .withEndAction { (bar.parent as? android.view.ViewGroup)?.removeView(bar) }
-                    .start()
-            }
-        }, 4000L)
     }
 
     fun requestAudioEffectsApplyFromUi() = syncAudioEffectsServiceFromPreferences(true, true)
@@ -828,9 +770,7 @@ class MainActivity : AppCompatActivity() {
             syncAudioEffectsServiceFromPreferences(true)
         } else {
             AudioEffectsService.sendStop(applicationContext)
-            // applicationContext, not `this`: a LENGTH_LONG Toast built with the Activity keeps
-            // ToastPresenter.mContext pointing at a destroyed MainActivity (the ~3MB heap-dump leak).
-            Toast.makeText(applicationContext, "Permiso denegado para el EQ system-wide.", Toast.LENGTH_LONG).show()
+            AppSnackbar.show(this, "Permiso denegado para el EQ system-wide.", 3500L)
         }
     }
 
@@ -846,8 +786,7 @@ class MainActivity : AppCompatActivity() {
             } else {
                 pendingAudioProcessingAuthorization = false
                 AudioEffectsService.sendStop(applicationContext)
-                // applicationContext, not `this`, so the Toast never retains a destroyed MainActivity.
-                Toast.makeText(applicationContext, "Se requiere permiso de micrófono.", Toast.LENGTH_LONG).show()
+                AppSnackbar.show(this, "Se requiere permiso de micrófono.", 3500L)
             }
         }
     }
@@ -1087,11 +1026,70 @@ class MainActivity : AppCompatActivity() {
 
     private fun resolveHeaderSettingsTypeface() = headerSettingsTypeface ?: ResourcesCompat.getFont(this, R.font.inter_variable).also { headerSettingsTypeface = it } ?: Typeface.DEFAULT_BOLD
 
-    fun enterSettings() = enterSettingsForSection(atHistory = false)
+    // ───────────────────── Actualizaciones (sin Firebase) ─────────────────────
 
-    fun enterSettingsAtHistory() = enterSettingsForSection(atHistory = true)
+    /** Chequeo silencioso al abrir la app: si hay versión nueva, muestra la ventana emergente. */
+    private fun maybeShowStartupUpdatePopup() {
+        if (updatePopupShownThisProcess) return
+        AppUpdateManager.checkForUpdate(applicationContext) { update, _ ->
+            if (update == null || isFinishing || isDestroyed || updatePopupShownThisProcess) return@checkForUpdate
+            updatePopupShownThisProcess = true
+            showUpdateAvailablePopup(update)
+        }
+    }
 
-    private fun enterSettingsForSection(atHistory: Boolean) {
+    /**
+     * Ventana emergente de nueva versión: mismo estilo AMOLED que la pantalla Actualizar.
+     * Actualización obligatoria: no tiene "Ahora no" y no se puede cerrar con el botón atrás
+     * ni tocando fuera — la única salida es tocar "Actualizar".
+     */
+    fun showUpdateAvailablePopup(update: AppUpdateManager.UpdateInfo) {
+        if (isFinishing || isDestroyed) return
+        updateDialog?.dismiss() // nunca dos a la vez
+        val view = layoutInflater.inflate(R.layout.dialog_update_available, null)
+        // "🔥 Nueva versión" es fijo; la versión va en la pastilla de la derecha.
+        view.findViewById<TextView>(R.id.tvUpdateDialogPill).text = update.versionName
+        // Novedades (formatNotesAsBullets ya da "Mejoras y correcciones." si vienen vacías).
+        view.findViewById<TextView>(R.id.tvUpdateDialogNotes).text =
+            AppUpdateManager.formatNotesAsBullets(update.notes, 4)
+
+        val dialog = android.app.Dialog(this).apply {
+            requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
+            setContentView(view)
+            window?.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(Color.TRANSPARENT))
+            window?.setLayout(
+                (resources.displayMetrics.widthPixels * 0.92).toInt(),
+                android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+            setCancelable(false)
+            setCanceledOnTouchOutside(false)
+            setOnDismissListener { if (updateDialog === this) updateDialog = null }
+        }
+        updateDialog = dialog
+        view.findViewById<View>(R.id.btnUpdateDialogGo).setOnClickListener {
+            dialog.dismiss()
+            enterSettingsAtUpdate(update)
+        }
+        dialog.show()
+    }
+
+    fun enterSettings() = enterSettingsForSection(SettingsEntry.ROOT)
+
+    fun enterSettingsAtHistory() = enterSettingsForSection(SettingsEntry.HISTORY)
+
+    /** Abre Configuración directo en "Actualizar"; si viene del popup ya trae el UpdateInfo. */
+    fun enterSettingsAtUpdate(update: AppUpdateManager.UpdateInfo?) {
+        pendingSettingsUpdateInfo = update
+        enterSettingsForSection(SettingsEntry.UPDATE)
+    }
+
+    private enum class SettingsEntry { ROOT, HISTORY, UPDATE }
+
+    private var pendingSettingsUpdateInfo: AppUpdateManager.UpdateInfo? = null
+    // Ventana emergente de nueva versión (referencia para descartarla y no filtrarla al destruir).
+    private var updateDialog: android.app.Dialog? = null
+
+    private fun enterSettingsForSection(entry: SettingsEntry) {
         val target = (settingsFragment as? SettingsFragment)
             ?: SettingsFragment().also { settingsFragment = it }
         // Declare the entry section up front. requestSection() applies it immediately
@@ -1099,7 +1097,11 @@ class MainActivity : AppCompatActivity() {
         // that the fragment applies as soon as it appears. Doing this before the
         // transaction means the section is fixed regardless of which lifecycle callback
         // (onViewCreated or onHiddenChanged) ends up driving the first render.
-        if (atHistory) target.navigateToHistory() else target.navigateToRoot()
+        when (entry) {
+            SettingsEntry.ROOT -> target.navigateToRoot()
+            SettingsEntry.HISTORY -> target.navigateToHistory()
+            SettingsEntry.UPDATE -> target.navigateToUpdate(pendingSettingsUpdateInfo.also { pendingSettingsUpdateInfo = null })
+        }
         if (inSettings) return
         // Capture the origin module AFTER the re-entrancy guard, so a second enter-Settings call
         // while already in Settings can't overwrite it. Back out of Settings returns here.
@@ -1365,6 +1367,51 @@ class MainActivity : AppCompatActivity() {
                 sf.externalSearchQuery(query)
             }
         }, 400)
+    }
+
+    /**
+     * "Ir a artista" from a track: resolve the artist's channelId by name (Artists-filtered
+     * Innertube search, top hit) and open ArtistDetailFragment. Falls back to a plain search
+     * if the artist can't be resolved.
+     */
+    fun openArtistDetailByName(artistName: String) {
+        // Subtitles often decorate the artist ("Artista • Álbum • 3:45") — keep only the name part.
+        val name = artistName.substringBefore("•").trim()
+        if (name.isEmpty() || isFinishing || isDestroyed) return
+        dismissSavedBar()
+        showModuleLoadingOverlay()
+        val cookie = getSharedPreferences(AppConstants.PREFS_PLAYER_STATE, MODE_PRIVATE)
+            .getString(AppConstants.PREF_LAST_YOUTUBE_WEB_COOKIE, "")?.trim() ?: ""
+        artistLookupService.searchArtistByName(name, cookie, object : YouTubeMusicService.ArtistSearchCallback {
+            override fun onSuccess(artist: YouTubeMusicService.ArtistResult) {
+                if (isFinishing || isDestroyed) return
+                openArtistDetail(artist)
+            }
+
+            override fun onError(error: String) {
+                if (isFinishing || isDestroyed) return
+                openSearchFragmentWithQuery(name)
+            }
+        })
+    }
+
+    private fun openArtistDetail(artist: YouTubeMusicService.ArtistResult) {
+        if (supportFragmentManager.isStateSaved) {
+            hideModuleLoadingOverlayImmediate()
+            return
+        }
+        hideTopAppBarForPlaylistDetail()
+        val detail = ArtistDetailFragment.newInstance(
+            artist.channelId, artist.name, artist.subtitle, artist.thumbnailUrl
+        )
+        val existing = supportFragmentManager.findFragmentByTag(TAG_ARTIST_DETAIL)
+        supportFragmentManager.beginTransaction().apply {
+            setReorderingAllowed(true)
+            if (existing != null && existing.isAdded) remove(existing)
+            add(R.id.fragmentContainer, detail, TAG_ARTIST_DETAIL)
+            addToBackStack(TAG_ARTIST_DETAIL)
+            commit()
+        }
     }
 
     fun openSearchFragment() {
@@ -1858,7 +1905,10 @@ class MainActivity : AppCompatActivity() {
     private fun transferPlayerSavedBarToActivity(player: SongPlayerFragment) {
         val playerRoot = player.view as? android.view.ViewGroup ?: return
         val bar = playerRoot.findViewWithTag<View>("saved_bar") ?: return
-        bar.handler?.removeCallbacksAndMessages(null)
+        // NOTE: do NOT call bar.handler.removeCallbacksAndMessages(null) here — View.getHandler()
+        // is the window-shared ViewRootImpl handler, so that purged EVERY pending view.post in the
+        // activity. The bar's original auto-dismiss timer firing later is harmless: dismiss() is
+        // idempotent via the state machine.
         bar.animate().cancel()
         (bar.parent as? android.view.ViewGroup)?.removeView(bar)
 
@@ -1870,16 +1920,20 @@ class MainActivity : AppCompatActivity() {
         val miniPlayer = findViewById<View>(R.id.llGlobalMiniPlayer)
         if (miniPlayer != null && miniPlayer.visibility == View.VISIBLE) margin += miniPlayer.height
 
-        // Prepare for slide-up entry animation
+        // Prepare for slide-up entry animation (reset any mid-flight scale from AppSnackbar)
         val enterTranslation = 48 * density
         bar.alpha = 0f
         bar.translationY = enterTranslation
+        bar.scaleX = 1f
+        bar.scaleY = 1f
         val flp = android.widget.FrameLayout.LayoutParams(
             android.view.ViewGroup.LayoutParams.MATCH_PARENT,
             android.view.ViewGroup.LayoutParams.WRAP_CONTENT
         )
         flp.gravity = android.view.Gravity.BOTTOM
         flp.bottomMargin = margin
+        flp.marginStart = (10 * density).toInt()
+        flp.marginEnd = (10 * density).toInt()
 
         val existing = activityRoot.findViewWithTag<View>("saved_bar")
         if (existing != null) activityRoot.removeView(existing)

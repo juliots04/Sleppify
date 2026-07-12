@@ -20,7 +20,6 @@ import android.view.inputmethod.InputMethodManager
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
-import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
@@ -39,13 +38,13 @@ import com.bumptech.glide.load.DataSource
 import com.bumptech.glide.load.engine.GlideException
 import android.graphics.drawable.Drawable
 import com.example.sleppify.utils.YouTubeCropTransformation
+import com.google.android.material.appbar.AppBarLayout
 import com.google.android.material.imageview.ShapeableImageView
 import com.google.android.material.textfield.TextInputEditText
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
-import android.graphics.Typeface
 import androidx.core.content.res.ResourcesCompat
 import java.text.Normalizer
 import java.util.Locale
@@ -54,7 +53,6 @@ import androidx.work.Data
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequest
 import androidx.work.WorkManager
-import android.text.TextUtils
 
 class SearchFragment : Fragment() {
 
@@ -74,6 +72,11 @@ class SearchFragment : Fragment() {
         private const val PREF_RECENT_SEARCH_DATA = "stream_recent_search_data"
         private const val SEARCH_PAGE_SIZE = 30
         private const val SEARCH_SUGGESTION_RECENT_LIMIT = 6
+        // Stored recents (memory + prefs + Firebase). Larger than the text-row limit so the
+        // images carousel can surface up to RECENT_IMAGES_LIMIT entries that have a thumbnail.
+        private const val SEARCH_RECENT_STORE_LIMIT = 20
+        private const val RECENT_IMAGES_LIMIT = 10
+        private const val SERVER_SUGGESTIONS_LIMIT = 6
         private const val SEARCH_SCROLL_LOAD_MORE_THRESHOLD = 4
 
         private val DEFAULT_SEARCH_SUGGESTIONS = emptyArray<String>()
@@ -105,12 +108,30 @@ class SearchFragment : Fragment() {
     private val allTracks = mutableListOf<YouTubeMusicService.TrackResult>()
     private val tracks = mutableListOf<YouTubeMusicService.TrackResult>()
     private val recentSearchData = mutableListOf<RecentSearch>()
-    private val localTrackIndex = mutableListOf<FavoritesPlaylistStore.FavoriteTrack>()
+
+    /**
+     * Library index for autocomplete. Titles/artists are normalized + word-split ONCE at load
+     * time (off the UI thread) instead of re-normalizing the whole library on every keystroke —
+     * the old hot path called normalizeForFilter per track per key, defeating its 256-entry
+     * cache and stalling suggestions on large libraries.
+     */
+    private class IndexedTrack(
+        val track: FavoritesPlaylistStore.FavoriteTrack,
+        val normTitle: String,
+        val normArtist: String,
+        val titleWords: List<String>,
+        val artistWords: List<String>
+    )
+    private val localTrackIndex = mutableListOf<IndexedTrack>()
 
     private val suggestionsDebounceHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private var suggestionsDebounceRunnable: Runnable? = null
     private var suggestionsJob: kotlinx.coroutines.Job? = null
     private var cachedSmartSuggestions: List<String>? = null
+    // YT Music server autocomplete for the draft currently typed (query -> suggestions)
+    private var serverSuggestions: List<String> = emptyList()
+    private var serverSuggestionsQuery = ""
+    private var latestServerSuggestionsToken = 0L
     // lastSavedPlaylistKey/Name now read from CustomPlaylistsStore (global persistent)
 
     private lateinit var etSearchQuery: TextInputEditText
@@ -124,6 +145,8 @@ class SearchFragment : Fragment() {
     private lateinit var llSearchSuggestionsContainer: View
     private lateinit var moduleLoadingOverlay: View
     private lateinit var llFeaturedResult: View
+    private lateinit var vSearchStatusBarScrim: View
+    private lateinit var llSearchBar: View
     private lateinit var ivFeaturedThumb: ImageView
     private lateinit var tvFeaturedTitle: TextView
     private lateinit var tvFeaturedSubtitle: TextView
@@ -132,9 +155,16 @@ class SearchFragment : Fragment() {
     private var featuredTrack: YouTubeMusicService.TrackResult? = null
     private var searchResultsBaseBottomPadding = 0
     private var searchContentBaseBottomPadding = 0
-    
+    // Row/autocomplete thumbnails are ~50dp cells. Request the CDN at this px size (same
+    // convention as PlaylistDetailFragment.trackArtSizePx) so covers download tiny and reuse the
+    // same Glide cache keys across the app instead of transferring full-resolution art per row.
+    private val rowThumbPx: Int by lazy { maxOf(100, Math.round(50 * resources.displayMetrics.density)) }
+
     private var searching = false
     private var searchPaginationInFlight = false
+    // true while the visible results came from Innertube (YTM page order — trusted as-is);
+    // false once the Data-API fallback fed them (needs local relevance sorting)
+    private var resultsFromInnertube = true
     private var hasMoreSearchPages = false
     private var nextSearchPageToken = ""
     private var innertubeNextToken = ""
@@ -184,6 +214,15 @@ class SearchFragment : Fragment() {
         llSearchSuggestionsContainer = root.findViewById(R.id.llSearchSuggestionsContainer)
         moduleLoadingOverlay = root.findViewById(R.id.moduleLoadingOverlay)
         llFeaturedResult = root.findViewById(R.id.llFeaturedResult)
+        vSearchStatusBarScrim = root.findViewById(R.id.vSearchStatusBarScrim)
+        llSearchBar = root.findViewById(R.id.llSearchBar)
+        // Fade the status-bar scrim in as the search bar collapses: fully transparent with the
+        // bar at rest, solid black once it has scrolled away (content passes under the status bar).
+        root.findViewById<AppBarLayout>(R.id.appBarLayout)
+            ?.addOnOffsetChangedListener(AppBarLayout.OnOffsetChangedListener { appBar, verticalOffset ->
+                val range = appBar.totalScrollRange
+                vSearchStatusBarScrim.alpha = if (range > 0) (-verticalOffset).toFloat() / range else 0f
+            })
         ivFeaturedThumb = root.findViewById(R.id.ivFeaturedThumb)
         tvFeaturedTitle = root.findViewById(R.id.tvFeaturedTitle)
         tvFeaturedSubtitle = root.findViewById(R.id.tvFeaturedSubtitle)
@@ -227,6 +266,8 @@ class SearchFragment : Fragment() {
                 llSearchBar.paddingRight,
                 llSearchBar.paddingBottom
             )
+            vSearchStatusBarScrim.layoutParams = vSearchStatusBarScrim.layoutParams
+                .apply { height = systemBars.top }
             val bottomInset = maxOf(systemBars.bottom, ime.bottom)
             nsvSearchContent.setPadding(
                 nsvSearchContent.paddingLeft,
@@ -300,6 +341,19 @@ class SearchFragment : Fragment() {
                 }
             }
         })
+
+        // The results RecyclerView is non-scrolling (it lives inside nsvSearchContent), so its own
+        // scroll listener above never fires — pagination is driven from the NestedScrollView. Load
+        // the next page as the user nears the bottom instead of eagerly prefetching many pages up
+        // front. Without this the reduced prefetch would cap results at the first couple of pages.
+        (nsvSearchContent as? androidx.core.widget.NestedScrollView)?.setOnScrollChangeListener(
+            androidx.core.widget.NestedScrollView.OnScrollChangeListener { v, _, scrollY, _, _ ->
+                if (!hasMoreSearchPages || searchPaginationInFlight || searching) return@OnScrollChangeListener
+                val content = v.getChildAt(0) ?: return@OnScrollChangeListener
+                val distanceToBottom = content.height - (v.height + scrollY)
+                if (distanceToBottom <= v.height) loadMoreSearchResults()
+            }
+        )
     }
 
     private fun setupSuggestionsRecyclerView() {
@@ -342,7 +396,7 @@ class SearchFragment : Fragment() {
                 suggestionsDebounceRunnable?.let { suggestionsDebounceHandler.removeCallbacks(it) }
                 val r = Runnable { refreshSearchSuggestions(query) }
                 suggestionsDebounceRunnable = r
-                suggestionsDebounceHandler.postDelayed(r, 170)
+                suggestionsDebounceHandler.postDelayed(r, 110)
             }
         })
     }
@@ -407,10 +461,23 @@ class SearchFragment : Fragment() {
                 Log.w(TAG, "Unexpected error", e)
             }
 
+            // Normalize + word-split every track ONCE here (on IO), not per keystroke later.
+            val indexed = result.map { t ->
+                val normTitle = normalizeRaw(t.title)
+                val normArtist = normalizeRaw(t.artist)
+                IndexedTrack(
+                    t,
+                    normTitle,
+                    normArtist,
+                    normTitle.split(WHITESPACE_REGEX).filter { it.isNotEmpty() },
+                    normArtist.split(WHITESPACE_REGEX).filter { it.isNotEmpty() }
+                )
+            }
+
             launch(Dispatchers.Main) {
                 if (!isAdded) return@launch
                 localTrackIndex.clear()
-                localTrackIndex.addAll(result)
+                localTrackIndex.addAll(indexed)
             }
         }
     }
@@ -423,7 +490,20 @@ class SearchFragment : Fragment() {
         rvSearchSuggestions.visibility = View.VISIBLE
         nsvSearchContent.visibility = View.GONE
         llSearchState.visibility = View.GONE
+        // No results showing → remove the search-bar bottom padding (it's only present with results).
+        setSearchBarBottomPadding(0)
         view?.requestLayout()
+    }
+
+    /**
+     * Adds bottom padding to the header search bar. Applied only while results are visible so the
+     * bar gets a little breathing room above the results, and removed on the suggestions screen.
+     * The window-insets listener re-reads the live paddingBottom, so this survives inset/IME passes.
+     */
+    private fun setSearchBarBottomPadding(dp: Int) {
+        if (!::llSearchBar.isInitialized) return
+        val px = Math.round(dp * resources.displayMetrics.density)
+        llSearchBar.setPadding(llSearchBar.paddingLeft, llSearchBar.paddingTop, llSearchBar.paddingRight, px)
     }
 
     private fun clearResults() {
@@ -468,11 +548,16 @@ class SearchFragment : Fragment() {
         nextSearchPageToken = ""
         innertubeNextToken = ""
         useInnertubePagination = false
+        // A stale in-flight append from the PREVIOUS query must not block this search's
+        // pagination forever (its callback bails on the requestId check without resetting).
+        searchPaginationInFlight = false
 
         refreshSearchSuggestions(query)
         rvSearchSuggestions.visibility = View.GONE
         llSearchSuggestionsContainer.visibility = View.GONE
         nsvSearchContent.visibility = View.VISIBLE
+        // Results are now showing → give the header search bar a little bottom padding.
+        setSearchBarBottomPadding(7)
         rememberRecentSearchQuery(query)
 
         requestPagedSearchResults(query, "", false)
@@ -533,9 +618,17 @@ class SearchFragment : Fragment() {
         val tInnertube = android.os.SystemClock.elapsedRealtime()
         youTubeMusicService.searchTracksViaInnertube(query, maxResultsToFetch, getCookieHeader(), object : YouTubeMusicService.SearchPageCallback {
             override fun onSuccess(pageResult: YouTubeMusicService.SearchPageResult) {
-                if (activity == null || !isAdded || requestId != latestSearchRequestId) return
+                if (activity == null || !isAdded) {
+                    // View gone: release the flags or performSearch/pagination stay dead forever.
+                    searching = false
+                    searchPaginationInFlight = false
+                    return
+                }
+                if (requestId != latestSearchRequestId) return
                 Log.d(TAG, "[SEARCH] INNERTUBE ok in ${android.os.SystemClock.elapsedRealtime() - tInnertube}ms — ${pageResult.tracks.size} tracks hasMore=${pageResult.nextPageToken.isNotEmpty()} totalElapsed=${android.os.SystemClock.elapsedRealtime() - t0}ms")
                 if (append) searchPaginationInFlight = false
+
+                resultsFromInnertube = true
 
                 // Enable infinite scroll if Innertube returned a continuation token
                 innertubeNextToken = pageResult.nextPageToken
@@ -570,31 +663,47 @@ class SearchFragment : Fragment() {
                     rvSearchResults.animate().alpha(1f).setDuration(250).start()
                     hideKeyboard()
 
-                    // Auto-fetch continuation pages in background for richer results
+                    // Prefetch ONE page as a small buffer; the rest load on demand as the user
+                    // scrolls (see the NestedScrollView listener in setupRecyclerView). Eagerly
+                    // prefetching 4 pages bound ~150 non-recycled rows up front, which is what made
+                    // results "wait for everything to load" instead of appearing instantly.
                     if (hasMoreSearchPages) {
-                        autoPrefetchPagesRemaining = 4
+                        autoPrefetchPagesRemaining = 0
                         loadMoreSearchResults()
                     }
                 }
             }
 
             override fun onError(error: String) {
-                if (activity == null || !isAdded || requestId != latestSearchRequestId) return
+                if (activity == null || !isAdded) {
+                    searching = false
+                    searchPaginationInFlight = false
+                    return
+                }
+                if (requestId != latestSearchRequestId) return
                 Log.w(TAG, "[SEARCH] INNERTUBE error in ${android.os.SystemClock.elapsedRealtime() - tInnertube}ms — $error — falling back to YT Data API")
                 // Fallback al API de datos oficial de YouTube en caso de fallo de Innertube
                 val tFallback = android.os.SystemClock.elapsedRealtime()
                 youTubeMusicService.searchTracksPaged(query, SEARCH_PAGE_SIZE, pageToken.takeIf { it.isNotEmpty() }, object : YouTubeMusicService.SearchPageCallback {
                     override fun onSuccess(pageResult: YouTubeMusicService.SearchPageResult) {
-                        if (activity == null || !isAdded || requestId != latestSearchRequestId) return
+                        if (activity == null || !isAdded) {
+                            searching = false
+                            searchPaginationInFlight = false
+                            return
+                        }
+                        if (requestId != latestSearchRequestId) return
                         Log.d(TAG, "[SEARCH] FALLBACK ok in ${android.os.SystemClock.elapsedRealtime() - tFallback}ms — ${pageResult.tracks.size} tracks totalElapsed=${android.os.SystemClock.elapsedRealtime() - t0}ms")
                         if (append) searchPaginationInFlight = false
-                        
+
+                        resultsFromInnertube = false
                         nextSearchPageToken = pageResult.nextPageToken
                         hasMoreSearchPages = nextSearchPageToken.isNotEmpty()
                         useInnertubePagination = false
 
                         appendUniqueTracks(pageResult.tracks)
-                        applyActiveFilter(query, forceSort = true)
+                        // Sort only the first page: re-sorting the whole accumulated list on
+                        // every appended page visibly reshuffled results mid-scroll.
+                        applyActiveFilter(query, forceSort = !append)
 
                         if (allTracks.isEmpty() && !append) {
                             setSearchLoadingState(false, "No encontré resultados para: $query")
@@ -606,7 +715,12 @@ class SearchFragment : Fragment() {
                     }
 
                     override fun onError(error: String) {
-                        if (activity == null || !isAdded || requestId != latestSearchRequestId) return
+                        if (activity == null || !isAdded) {
+                            searching = false
+                            searchPaginationInFlight = false
+                            return
+                        }
+                        if (requestId != latestSearchRequestId) return
                         Log.w(TAG, "[SEARCH] FALLBACK error in ${android.os.SystemClock.elapsedRealtime() - tFallback}ms — $error totalElapsed=${android.os.SystemClock.elapsedRealtime() - t0}ms")
                         if (append) searchPaginationInFlight = false
                         
@@ -614,7 +728,7 @@ class SearchFragment : Fragment() {
                             setSearchLoadingState(false, "Error: $error")
                         } else {
                             setSearchLoadingState(false, "")
-                            if (append) Toast.makeText(requireContext(), "Error al cargar más resultados", Toast.LENGTH_SHORT).show()
+                            if (append) AppSnackbar.show(activity, "Error al cargar más resultados")
                         }
                     }
                 })
@@ -663,9 +777,10 @@ class SearchFragment : Fragment() {
         val normalizedQuery = query?.trim() ?: ""
         val filtered = allTracks.toMutableList()
 
-        // When authenticated, trust YTM's ranking for online results — only sort if no cookie
-        val hasSession = getCookieHeader().isNotEmpty()
-        if (forceSort && normalizedQuery.isNotEmpty() && filtered.size > 1 && !hasSession) {
+        // Innertube results already come in YT Music's own page order (top result → songs →
+        // videos), so they are never re-sorted locally. Only the Data-API fallback — whose
+        // order is generic YouTube relevance — gets the local relevance sort.
+        if (forceSort && normalizedQuery.isNotEmpty() && filtered.size > 1 && !resultsFromInnertube) {
             val signals = loadUserSignals()
             sortResults(filtered, normalizedQuery, signals)
         }
@@ -682,7 +797,10 @@ class SearchFragment : Fragment() {
         Log.d(TAG, "[SEARCH] applyFilter: allTracks=${allTracks.size} filtered=${filtered.size} tracksForAdapter=${tracks.size} featured=${featuredTrack?.title}")
         adapter?.submitResults(tracks.toList())
 
-        view?.requestLayout()
+        // Scope the relayout to the results list. submitResults already dispatches DiffUtil updates
+        // that relayout the RecyclerView and propagate its new height up the NestedScrollView; the
+        // old view?.requestLayout() re-measured the entire fragment tree once per appended page.
+        rvSearchResults.requestLayout()
     }
 
     private fun sortResults(list: MutableList<YouTubeMusicService.TrackResult>, query: String, signals: UserSignals = UserSignals(emptySet(), emptySet(), emptySet())) {
@@ -1015,14 +1133,13 @@ class SearchFragment : Fragment() {
         }
 
         // Save to recent searches only when user plays a track from search results
-        if (activeSearchQuery.isNotEmpty()) {
-            rememberRecentSearchQuery(activeSearchQuery, track)
-        }
+        rememberRecentTrackPlayback(track)
 
         playTrackDirectlyInternal(track)
     }
 
     private fun playTrackDirectly(track: YouTubeMusicService.TrackResult) {
+        rememberRecentTrackPlayback(track)
         playTrackDirectlyInternal(track)
     }
 
@@ -1542,12 +1659,16 @@ class SearchFragment : Fragment() {
             ivThumb.setImageResource(R.drawable.ic_thumb_up_liked)
             ivThumb.scaleType = ImageView.ScaleType.CENTER
             ivThumb.setColorFilter(android.graphics.Color.WHITE, android.graphics.PorterDuff.Mode.SRC_IN)
-            val isIn = CustomPlaylistsStore.isTrackInYtMirror(ctx, likedPid, track.videoId ?: "")
+            // Checked = union of server cache + local mirror, matching the player's like icon.
+            val isIn = CustomPlaylistsStore.isTrackInYtMirror(ctx, likedPid, track.videoId ?: "") ||
+                FavoritesPlaylistStore.isInLikedMusic(ctx, track.videoId ?: "")
             ivCheck?.visibility = if (isIn) View.VISIBLE else View.GONE
             var checked = isIn
             row.setOnClickListener {
                 if (checked) {
+                    // Remove from BOTH stores so server-cached likes actually un-like.
                     CustomPlaylistsStore.removeTrackFromYtMirror(ctx, likedPid, track.videoId ?: "")
+                    FavoritesPlaylistStore.removeFromLikedMusic(ctx, track.videoId ?: "")
                     checked = false
                     didRemove = true
                     ivCheck?.visibility = View.GONE
@@ -1561,6 +1682,7 @@ class SearchFragment : Fragment() {
                     val tImage = track.thumbnailUrl ?: ""
                     CustomPlaylistsStore.addTrackToYtMirror(ctx, likedPid, track.videoId ?: "",
                         tTitle, tArtist, "--:--", tImage, true)
+                    FavoritesPlaylistStore.clearLikedTombstone(ctx, track.videoId ?: "")
                     checked = true
                     ivCheck?.visibility = View.VISIBLE
                     lastAddedKey = likedMirrorKey
@@ -1702,73 +1824,11 @@ class SearchFragment : Fragment() {
 
     private fun showStatusBarSearch(message: String, onChangeClick: (() -> Unit)? = null) {
         if (!isAdded) return
-        val activity = requireActivity() as? MainActivity ?: return
-        val rootView = activity.findViewById<android.view.ViewGroup>(android.R.id.content) ?: return
-
-        val density = resources.displayMetrics.density
-
-        val bar = android.widget.LinearLayout(requireContext()).apply {
-            tag = "saved_bar"
-            id = View.generateViewId()
-            orientation = android.widget.LinearLayout.HORIZONTAL
-            gravity = android.view.Gravity.CENTER_VERTICAL
-            setBackgroundColor(android.graphics.Color.parseColor("#FF1E1E1E"))
-            val hPad = (16 * density).toInt()
-            val vPad = (14 * density).toInt()
-            setPadding(hPad, vPad, hPad, vPad)
-            elevation = 8 * density
+        if (onChangeClick != null) {
+            AppSnackbar.showAction(activity, message, "Cambiar", Runnable { onChangeClick() })
+        } else {
+            AppSnackbar.show(activity, message)
         }
-
-        val tvMsg = TextView(requireContext()).apply {
-            text = message
-            setTextColor(android.graphics.Color.WHITE)
-            textSize = 15f
-            setTypeface(null, android.graphics.Typeface.NORMAL)
-            maxLines = 1
-            ellipsize = android.text.TextUtils.TruncateAt.END
-            layoutParams = android.widget.LinearLayout.LayoutParams(0, android.view.ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        bar.addView(tvMsg)
-
-        val changeClick = onChangeClick
-        if (changeClick != null) {
-            val btnChange = TextView(requireContext()).apply {
-                text = "Cambiar"
-                setTextColor(android.graphics.Color.parseColor("#8AB4F8"))
-                textSize = 15f
-                setTypeface(null, android.graphics.Typeface.BOLD)
-                setPadding((16 * density).toInt(), 0, 0, 0)
-                setOnClickListener {
-                    TransientBottomBarAnimator.dismiss(bar) {
-                        changeClick()
-                    }
-                }
-            }
-            bar.addView(btnChange)
-        }
-
-        val barBottomMargin = computeSnackbarBottomMargin(activity, density)
-        val flp = android.widget.FrameLayout.LayoutParams(
-            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
-            android.view.ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply {
-            gravity = android.view.Gravity.BOTTOM
-            this.bottomMargin = barBottomMargin
-        }
-        TransientBottomBarAnimator.show(rootView, bar, flp, "saved_bar", 4000L)
-    }
-
-    private fun computeSnackbarBottomMargin(activity: android.app.Activity, density: Float): Int {
-        var margin = (8 * density).toInt()
-        val bottomNav = activity.findViewById<View>(R.id.bottomNavigation)
-        if (bottomNav != null && bottomNav.visibility == View.VISIBLE) {
-            margin += bottomNav.height
-        }
-        val miniPlayer = activity.findViewById<View>(R.id.llGlobalMiniPlayer)
-        if (miniPlayer != null && miniPlayer.visibility == View.VISIBLE) {
-            margin += miniPlayer.height
-        }
-        return margin
     }
 
     private fun resolvePlaylistName(playlistKey: String): String {
@@ -1787,58 +1847,10 @@ class SearchFragment : Fragment() {
 
     private fun showStatusBarSearchWithUndo(message: String, playlistKey: String, track: YouTubeMusicService.TrackResult) {
         if (!isAdded) return
-        val activity = requireActivity() as? MainActivity ?: return
-        val rootView = activity.findViewById<android.view.ViewGroup>(android.R.id.content) ?: return
-
-        val density = resources.displayMetrics.density
-
-        val bar = android.widget.LinearLayout(requireContext()).apply {
-            tag = "saved_bar"
-            id = View.generateViewId()
-            orientation = android.widget.LinearLayout.HORIZONTAL
-            gravity = android.view.Gravity.CENTER_VERTICAL
-            setBackgroundColor(android.graphics.Color.parseColor("#FF1E1E1E"))
-            val hPad = (16 * density).toInt()
-            val vPad = (14 * density).toInt()
-            setPadding(hPad, vPad, hPad, vPad)
-            elevation = 8 * density
-        }
-
-        val tvMsg = TextView(requireContext()).apply {
-            text = message
-            setTextColor(android.graphics.Color.WHITE)
-            textSize = 15f
-            setTypeface(null, android.graphics.Typeface.NORMAL)
-            maxLines = 1
-            ellipsize = android.text.TextUtils.TruncateAt.END
-            layoutParams = android.widget.LinearLayout.LayoutParams(0, android.view.ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        bar.addView(tvMsg)
-
-        val btnUndo = TextView(requireContext()).apply {
-            text = "Deshacer"
-            setTextColor(android.graphics.Color.parseColor("#8AB4F8"))
-            textSize = 15f
-            setTypeface(null, android.graphics.Typeface.BOLD)
-            setPadding((16 * density).toInt(), 0, 0, 0)
-            setOnClickListener {
-                TransientBottomBarAnimator.dismiss(bar) {
-                    addTrackToPlaylistByKey(playlistKey, track)
-                    Toast.makeText(requireContext(), "Restaurado en ${resolvePlaylistName(playlistKey)}", Toast.LENGTH_SHORT).show()
-                }
-            }
-        }
-        bar.addView(btnUndo)
-
-        val barBottomMargin = computeSnackbarBottomMargin(activity, density)
-        val flp = android.widget.FrameLayout.LayoutParams(
-            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
-            android.view.ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply {
-            gravity = android.view.Gravity.BOTTOM
-            this.bottomMargin = barBottomMargin
-        }
-        TransientBottomBarAnimator.show(rootView, bar, flp, "saved_bar", 4000L)
+        AppSnackbar.showAction(activity, message, "Deshacer", Runnable {
+            addTrackToPlaylistByKey(playlistKey, track)
+            AppSnackbar.show(activity, "Restaurado en ${resolvePlaylistName(playlistKey)}")
+        })
     }
 
     private fun isTrackInPlaylist(ctx: android.content.Context, videoId: String, playlistKey: String): Boolean {
@@ -1850,6 +1862,10 @@ class SearchFragment : Fragment() {
             return CustomPlaylistsStore.getTracksFromPlaylist(ctx, name).any { it.videoId == videoId }
         } else if (playlistKey.startsWith(CustomPlaylistsStore.YT_MIRROR_PREFIX)) {
             val pid = playlistKey.removePrefix(CustomPlaylistsStore.YT_MIRROR_PREFIX)
+            if (pid == YouTubeMusicService.SPECIAL_LIKED_VIDEOS_ID) {
+                return CustomPlaylistsStore.isTrackInYtMirror(ctx, pid, videoId) ||
+                    FavoritesPlaylistStore.isInLikedMusic(ctx, videoId)
+            }
             return CustomPlaylistsStore.isTrackInYtMirror(ctx, pid, videoId)
         }
         return false
@@ -1879,6 +1895,9 @@ class SearchFragment : Fragment() {
         } else if (playlistKey.startsWith(CustomPlaylistsStore.YT_MIRROR_PREFIX)) {
             val pid = playlistKey.removePrefix(CustomPlaylistsStore.YT_MIRROR_PREFIX)
             CustomPlaylistsStore.removeTrackFromYtMirror(ctx, pid, videoId)
+            if (pid == YouTubeMusicService.SPECIAL_LIKED_VIDEOS_ID) {
+                FavoritesPlaylistStore.removeFromLikedMusic(ctx, videoId)
+            }
         }
     }
 
@@ -1897,6 +1916,9 @@ class SearchFragment : Fragment() {
         } else if (playlistKey.startsWith(CustomPlaylistsStore.YT_MIRROR_PREFIX)) {
             val pid = playlistKey.removePrefix(CustomPlaylistsStore.YT_MIRROR_PREFIX)
             CustomPlaylistsStore.addTrackToYtMirror(ctx, pid, track.videoId, title, artist, duration, imageUrl, false)
+            if (pid == YouTubeMusicService.SPECIAL_LIKED_VIDEOS_ID) {
+                FavoritesPlaylistStore.clearLikedTombstone(ctx, track.videoId)
+            }
         }
         maybeEnqueueOfflineDownloadForTrack(playlistKey, track.videoId, title, artist)
     }
@@ -1944,6 +1966,7 @@ class SearchFragment : Fragment() {
     }
 
     private fun addToQueue(track: YouTubeMusicService.TrackResult, playNext: Boolean) {
+        rememberRecentTrackPlayback(track)
         val intent = Intent(requireContext(), MainActivity::class.java).apply {
             action = if (playNext) MainActivity.ACTION_PLAY_NEXT else MainActivity.ACTION_ADD_TO_QUEUE
             putExtra(EXTRA_RESULT_TYPE, track.resultType ?: "")
@@ -1968,6 +1991,7 @@ class SearchFragment : Fragment() {
     private fun startRadioForTrack(track: YouTubeMusicService.TrackResult) {
         val videoId = track.videoId ?: return
         if (videoId.isEmpty()) return
+        rememberRecentTrackPlayback(track)
         val radioPlaylistId = "RDAMVM$videoId"
         val radioTitle = "Radio: ${track.title?.takeIf { it.isNotEmpty() } ?: "Tema"}"
         val intent = Intent(requireContext(), MainActivity::class.java).apply {
@@ -2047,20 +2071,48 @@ class SearchFragment : Fragment() {
         val norm = query.trim()
         if (norm.isEmpty()) return
         
+        // A plain text search calls this with firstResult == null (blank videoId/title/thumbnail).
+        // If a thumbnailed entry for this query (or this videoId) already exists — created earlier
+        // when the user PLAYED a track for it — MERGE instead of clobbering, so the recent-images
+        // carousel keeps its thumbnail across re-searches. Clobbering it with a blank entry (and
+        // then uploading that to Firestore) is why the carousel thumbnails vanished "de la nada".
+        val incomingVideoId = firstResult?.videoId?.takeIf { it.isNotEmpty() }
+        val existing = recentSearchData.firstOrNull {
+            it.query.equals(norm, ignoreCase = true) || (incomingVideoId != null && it.videoId == incomingVideoId)
+        }
+        val incomingArtist = extractArtistFromSubtitle(firstResult?.subtitle).takeIf { it.isNotEmpty() }
         val newSearch = RecentSearch(
             query = norm,
-            videoId = firstResult?.videoId ?: "",
-            title = firstResult?.title ?: "",
-            thumbnail = firstResult?.thumbnailUrl ?: "",
-            artist = firstResult?.subtitle ?: ""
+            videoId = incomingVideoId ?: existing?.videoId ?: "",
+            title = firstResult?.title?.takeIf { it.isNotEmpty() } ?: existing?.title ?: "",
+            thumbnail = firstResult?.thumbnailUrl?.takeIf { it.isNotEmpty() } ?: existing?.thumbnail ?: "",
+            // Subtitles decorate the artist ("Canción • Artista • Álbum • 3:22") — persist only
+            // the name: this value syncs to Firestore and feeds the player queue as artist.
+            artist = incomingArtist ?: existing?.artist ?: ""
         )
-        
+
         recentSearchData.run {
-            removeAll { it.query == norm }
+            removeAll { it.query.equals(norm, ignoreCase = true) || (newSearch.videoId.isNotEmpty() && it.videoId == newSearch.videoId) }
             add(0, newSearch)
-            if (size > SEARCH_SUGGESTION_RECENT_LIMIT) removeAt(size - 1)
+            // Over capacity: drop thumbnail-less entries first so the carousel's history (the
+            // thumbnailed recents) survives a burst of plain searches instead of being evicted
+            // from the tail.
+            while (size > SEARCH_RECENT_STORE_LIMIT) {
+                val victim = indexOfLast { it.thumbnail.isEmpty() }.takeIf { it >= 0 } ?: (size - 1)
+                removeAt(victim)
+            }
         }
         saveRecentSearchQueries()
+    }
+
+    private fun rememberRecentTrackPlayback(track: YouTubeMusicService.TrackResult) {
+        val textQuery = etSearchQuery.text?.toString()?.trim() ?: ""
+        val query = when {
+            activeSearchQuery.isNotEmpty() -> activeSearchQuery
+            textQuery.isNotEmpty() -> textQuery
+            else -> track.title ?: ""
+        }
+        rememberRecentSearchQuery(query, track)
     }
 
     private fun saveRecentSearchQueries() {
@@ -2121,10 +2173,38 @@ class SearchFragment : Fragment() {
                         artist = map["artist"] as? String ?: ""
                     )
                 }
-                val localHasImages = recentSearchData.any { it.thumbnail.isNotEmpty() }
-                if (parsed.isNotEmpty() && (recentSearchData.isEmpty() || !localHasImages)) {
-                    recentSearchData.clear()
-                    recentSearchData.addAll(parsed)
+                if (parsed.isEmpty()) return@addOnSuccessListener
+                // MERGE local-first instead of replacing: the async Firestore response used to
+                // clobber searches typed in this session (which had no thumbnails yet) with the
+                // older cloud copy, and then re-upload the clobbered state. Cloud entries only
+                // append at the tail or backfill missing thumbnails on matching queries.
+                var changed = false
+                for (cloud in parsed) {
+                    val idx = recentSearchData.indexOfFirst { it.query.equals(cloud.query, ignoreCase = true) }
+                    if (idx >= 0) {
+                        val local = recentSearchData[idx]
+                        if (local.thumbnail.isEmpty() && cloud.thumbnail.isNotEmpty()) {
+                            recentSearchData[idx] = local.copy(
+                                videoId = local.videoId.ifEmpty { cloud.videoId },
+                                title = local.title.ifEmpty { cloud.title },
+                                thumbnail = cloud.thumbnail,
+                                artist = local.artist.ifEmpty { cloud.artist }
+                            )
+                            changed = true
+                        }
+                    } else if (cloud.videoId.isEmpty() || recentSearchData.none { it.videoId == cloud.videoId }) {
+                        // videoId dedup keeps the images carousel from showing the same song
+                        // twice under two different query strings.
+                        recentSearchData.add(cloud)
+                        changed = true
+                    }
+                }
+                if (changed) {
+                    while (recentSearchData.size > SEARCH_RECENT_STORE_LIMIT) {
+                        val victim = recentSearchData.indexOfLast { it.thumbnail.isEmpty() }
+                            .takeIf { it >= 0 } ?: (recentSearchData.size - 1)
+                        recentSearchData.removeAt(victim)
+                    }
                     saveRecentSearchQueries()
                     refreshSearchSuggestions(etSearchQuery.text?.toString()?.trim() ?: "")
                 }
@@ -2151,26 +2231,49 @@ class SearchFragment : Fragment() {
         val norm = draft?.trim() ?: ""
         val recentSnapshot = recentSearchData.toList()
         val trackSnapshot = localTrackIndex.toList()
+        val serverSnapshot = if (norm.isNotEmpty() && norm == serverSuggestionsQuery) serverSuggestions else emptyList()
         suggestionsJob = lifecycleScope.launch {
             val items = kotlinx.coroutines.withContext(Dispatchers.Default) {
-                poolSuggestionItems(norm, recentSnapshot, trackSnapshot)
+                poolSuggestionItems(norm, recentSnapshot, trackSnapshot, serverSnapshot)
             }
             if (!isAdded) return@launch
             (rvSearchSuggestions.adapter as? SuggestionsAdapter)?.updateItems(items)
             rvSearchSuggestions.visibility = if (items.isEmpty()) View.GONE else View.VISIBLE
         }
+        maybeFetchServerSuggestions(norm)
     }
 
-    private fun poolSuggestionItems(draft: String, recentSearchData: List<RecentSearch> = this.recentSearchData, localTrackIndex: List<FavoritesPlaylistStore.FavoriteTrack> = this.localTrackIndex): List<SuggestionItem> {
+    /** Fetch YT Music autocomplete for the current draft (once per draft; merged on arrival). */
+    private fun maybeFetchServerSuggestions(draft: String) {
+        if (draft.length < 2 || draft == serverSuggestionsQuery) return
+        val requestToken = ++latestServerSuggestionsToken
+        youTubeMusicService.fetchSearchSuggestions(draft, getCookieHeader(), object : YouTubeMusicService.SearchSuggestionsCallback {
+            override fun onSuccess(suggestions: List<String>) {
+                if (!isAdded) return
+                // A newer draft's request is in flight — a late stale response must not
+                // clobber its suggestions.
+                if (requestToken != latestServerSuggestionsToken) return
+                serverSuggestionsQuery = draft
+                serverSuggestions = suggestions
+                // Re-pool only if the user is still on this draft (otherwise the next debounce wins).
+                if (etSearchQuery.text?.toString()?.trim() == draft) refreshSearchSuggestions(draft)
+            }
+            override fun onError(error: String) { /* local suggestions remain */ }
+        })
+    }
+
+    private fun poolSuggestionItems(draft: String, recentSearchData: List<RecentSearch> = this.recentSearchData, localTrackIndex: List<IndexedTrack> = this.localTrackIndex, serverSuggestions: List<String> = emptyList()): List<SuggestionItem> {
         val normDraft = normalizeForFilter(draft)
-        val recentQueries = recentSearchData.map { it.query }
 
         val matchingRecent = recentSearchData.filter { candidate ->
             if (normDraft.isEmpty()) true
             else normalizeForFilter(candidate.query).let { it.contains(normDraft) || normDraft.contains(it) }
         }.take(SEARCH_SUGGESTION_RECENT_LIMIT)
 
-        val smartSuggestions = buildSmartSuggestions(normDraft, recentQueries)
+        // Dedupe "Temas relacionados" only against the recent rows actually shown, not every stored
+        // query. Deduping against all recents removed exactly the playback-history artists the user
+        // searches for (they end up in both lists), so "Temas relacionados" emptied out over time.
+        val smartSuggestions = buildSmartSuggestions(normDraft, matchingRecent.map { it.query })
 
         val result = mutableListOf<SuggestionItem>()
 
@@ -2180,19 +2283,28 @@ class SearchFragment : Fragment() {
             result.add(SuggestionItem.Suggestion(draft.trim()))
         }
 
+        // Shared dedup set across server + local autocomplete rows (normalized text)
+        val seenAutocompleteNorms = mutableSetOf(normDraft)
+
+        // Server (YT Music) autocomplete — the same suggestions the YTM search box shows,
+        // in server order. Deduped against the raw query and the recent rows shown below.
+        if (normDraft.isNotEmpty() && serverSuggestions.isNotEmpty()) {
+            val recentNorms = matchingRecent.mapTo(mutableSetOf()) { normalizeForFilter(it.query) }
+            serverSuggestions.asSequence()
+                .filter { s -> normalizeForFilter(s).let { it !in recentNorms && seenAutocompleteNorms.add(it) } }
+                .take(SERVER_SUGGESTIONS_LIMIT)
+                .forEach { result.add(SuggestionItem.Autocomplete(it)) }
+        }
+
         // Text-based autocomplete: suggest full track titles/artists that match the typed text (with fuzzy fallback)
         if (normDraft.length >= 2 && localTrackIndex.isNotEmpty()) {
-            val normDraftLower = normDraft.lowercase()
-            val seenNorm = mutableSetOf<String>()
             val autocompleteCandidates = localTrackIndex
-                .mapNotNull { track ->
-                    val normTitle = normalizeForFilter(track.title)
-                    val normArtist = normalizeForFilter(track.artist)
-                    val titleMatch = normTitle.startsWith(normDraftLower) || (normDraftLower.length >= 3 && normTitle.split(WHITESPACE_REGEX).any { suggestFuzzyMatch(normDraftLower, it) })
-                    val artistMatch = normArtist.startsWith(normDraftLower) || (normDraftLower.length >= 3 && normArtist.split(WHITESPACE_REGEX).any { suggestFuzzyMatch(normDraftLower, it) })
-                    val label = if (titleMatch) normTitle else normArtist
-                    val display = if (titleMatch) track.title.trim() else track.artist.trim()
-                    if ((titleMatch || artistMatch) && label != normDraftLower && seenNorm.add(label)) {
+                .mapNotNull { idx ->
+                    val titleMatch = idx.normTitle.startsWith(normDraft) || (normDraft.length >= 3 && idx.titleWords.any { suggestFuzzyMatch(normDraft, it) })
+                    val artistMatch = idx.normArtist.startsWith(normDraft) || (normDraft.length >= 3 && idx.artistWords.any { suggestFuzzyMatch(normDraft, it) })
+                    val label = if (titleMatch) idx.normTitle else idx.normArtist
+                    val display = if (titleMatch) idx.track.title.trim() else idx.track.artist.trim()
+                    if ((titleMatch || artistMatch) && seenAutocompleteNorms.add(label)) {
                         display
                     } else null
                 }
@@ -2202,7 +2314,7 @@ class SearchFragment : Fragment() {
 
         // Show recent images carousel only when bar is empty (no query typed)
         if (normDraft.isEmpty()) {
-            val itemsWithImages = recentSearchData.filter { it.thumbnail.isNotEmpty() }.take(5)
+            val itemsWithImages = recentSearchData.filter { it.thumbnail.isNotEmpty() }.take(RECENT_IMAGES_LIMIT)
             if (itemsWithImages.isNotEmpty()) {
                 result.add(SuggestionItem.RecentImages(itemsWithImages))
             }
@@ -2221,43 +2333,39 @@ class SearchFragment : Fragment() {
         if (normDraft.length >= 3 && localTrackIndex.isNotEmpty()) {
             val draftTokens = normDraft.split(WHITESPACE_REGEX).filter { it.isNotEmpty() }
             val trackMatches = localTrackIndex
-                .filter { track ->
-                    val titleNorm = normalizeForFilter(track.title)
-                    val artistNorm = normalizeForFilter(track.artist)
+                .filter { idx ->
                     // Full-string contains (original fast path)
-                    if (titleNorm.contains(normDraft) || artistNorm.contains(normDraft)) return@filter true
+                    if (idx.normTitle.contains(normDraft) || idx.normArtist.contains(normDraft)) return@filter true
                     // Per-token prefix matching: each query token must be a prefix of some word in title or artist
-                    val titleWords = titleNorm.split(WHITESPACE_REGEX)
-                    val artistWords = artistNorm.split(WHITESPACE_REGEX)
-                    val allWords = titleWords + artistWords
+                    val allWords = idx.titleWords + idx.artistWords
                     val hits = draftTokens.count { tok ->
                         allWords.any { w -> w.startsWith(tok) || suggestFuzzyMatch(tok, w) }
                     }
                     hits >= (draftTokens.size + 1) / 2
                 }
                 .sortedByDescending {
-                    val titleNorm = normalizeForFilter(it.title)
-                    val artistNorm = normalizeForFilter(it.artist)
                     when {
-                        titleNorm.startsWith(normDraft) -> 3
-                        titleNorm.contains(normDraft) -> 2
-                        artistNorm.startsWith(normDraft) -> 1
+                        it.normTitle.startsWith(normDraft) -> 3
+                        it.normTitle.contains(normDraft) -> 2
+                        it.normArtist.startsWith(normDraft) -> 1
                         else -> 0
                     }
                 }
                 .take(5)
             if (trackMatches.isNotEmpty()) {
                 result.add(SuggestionItem.Header("En tu biblioteca"))
-                trackMatches.forEach { result.add(SuggestionItem.Track(it)) }
+                trackMatches.forEach { result.add(SuggestionItem.Track(it.track)) }
             }
 
             // Add artist suggestions from local library (with fuzzy fallback)
             val matchingArtists = localTrackIndex
-                .map { it.artist.trim() }
-                .filter { it.isNotEmpty() &&
-                    (normalizeForFilter(it).contains(normDraft) ||
-                     normalizeForFilter(it).split(WHITESPACE_REGEX).any { w -> suggestFuzzyMatch(normDraft, w) })
+                .filter { idx ->
+                    idx.normArtist.isNotEmpty() &&
+                    (idx.normArtist.contains(normDraft) ||
+                     idx.artistWords.any { w -> suggestFuzzyMatch(normDraft, w) })
                 }
+                .map { it.track.artist.trim() }
+                .filter { it.isNotEmpty() }
                 .distinct()
                 .sorted()
                 .take(4)
@@ -2367,7 +2475,7 @@ class SearchFragment : Fragment() {
         }
     }
 
-    private fun loadArtworkInto(target: ImageView, url: String?, videoId: String? = null) {
+    private fun loadArtworkInto(target: ImageView, url: String?, videoId: String? = null, targetSizePx: Int = 0) {
         if (LocalFilesStore.isLocalVideoId(videoId)) {
             // Local file: render its own embedded cover (music icon when absent).
             LocalArtworkResolver.loadInto(target, videoId)
@@ -2391,19 +2499,31 @@ class SearchFragment : Fragment() {
         val offlineOnly = !isNetworkAvailable() && !isLocalUri
 
         val density = target.context.resources.displayMetrics.density
-        val params = target.layoutParams
-        val rawW = if (target.width > 0) target.width else if (params != null && params.width > 0) params.width else 0
-        val rawH = if (target.height > 0) target.height else if (params != null && params.height > 0) params.height else 0
-        val side = if (rawW > 0 && rawH > 0) maxOf(rawW, rawH) else Math.round(160 * density)
-        val overrideSize = maxOf(side, 320)
+        // Prefer an explicit target size from the caller (stable across binds → one cache key per
+        // surface). Fall back to the measured view size only when none is given. The old
+        // maxOf(side, 320) path decoded ~4× the pixels a 50dp row needs and, for a not-yet-measured
+        // view, inflated to a 480px request — pure waste on a non-recycling list of ~150 rows.
+        val decodePx = if (targetSizePx > 0) {
+            targetSizePx
+        } else {
+            val params = target.layoutParams
+            val rawW = if (target.width > 0) target.width else if (params != null && params.width > 0) params.width else 0
+            val rawH = if (target.height > 0) target.height else if (params != null && params.height > 0) params.height else 0
+            val side = if (rawW > 0 && rawH > 0) maxOf(rawW, rawH) else Math.round(160 * density)
+            maxOf(side, 320)
+        }
 
         Glide.with(this)
-            .load(safeUrl)
+            // Request the CDN at the decode size (the trick YT Music clients use for smooth lists):
+            // googleusercontent/ggpht cover URLs are rewritten to ~decodePx, so a row thumbnail
+            // transfers a tiny image instead of the full-resolution cover. atSize no-ops on
+            // i.ytimg / file:// / content:// URLs, so offline and local art are untouched.
+            .load(ThumbnailUrls.atSize(safeUrl, decodePx))
             .transform(SHARED_YT_CROP)
             .format(com.bumptech.glide.load.DecodeFormat.PREFER_RGB_565)
             .diskCacheStrategy(DiskCacheStrategy.ALL)
             .onlyRetrieveFromCache(offlineOnly)
-            .override(overrideSize, overrideSize)
+            .override(decodePx, decodePx)
             .transition(com.bumptech.glide.load.resource.drawable.DrawableTransitionOptions.withCrossFade())
             .into(target)
     }
@@ -2415,13 +2535,19 @@ class SearchFragment : Fragment() {
         else -> "Resultado"
     }
 
+    /** Accent-strip + lowercase + trim. Pure (uncached) — used for one-time index precompute. */
+    private fun normalizeRaw(value: String?): String {
+        if (value.isNullOrEmpty()) return ""
+        val decomposed = Normalizer.normalize(value, Normalizer.Form.NFD)
+        return decomposed.filter { Character.getType(it) != Character.NON_SPACING_MARK.toInt() }.lowercase().trim()
+    }
+
     private fun normalizeForFilter(value: String?): String {
         if (value.isNullOrEmpty()) return ""
         normalizedFilterCache[value]?.let { return it }
-        val decomposed = Normalizer.normalize(value, Normalizer.Form.NFD)
-        val norm = decomposed.filter { Character.getType(it) != Character.NON_SPACING_MARK.toInt() }.lowercase().trim()
+        val norm = normalizeRaw(value)
         // Bounded eviction instead of wiping the whole cache once it grows large.
-        if (normalizedFilterCache.size >= 256) {
+        if (normalizedFilterCache.size >= 512) {
             normalizedFilterCache.clear()
         }
         normalizedFilterCache[value] = norm
@@ -2534,7 +2660,7 @@ class SearchFragment : Fragment() {
                 val clean = buildCleanSearchSubtitle(item)
                 holder.subtitle.text = if (clean.isEmpty()) typeLabel else "$typeLabel • $clean"
             }
-            loadArtworkInto(holder.thumb, item.thumbnailUrl, item.videoId)
+            loadArtworkInto(holder.thumb, item.thumbnailUrl, item.videoId, rowThumbPx)
 
             val vid = item.videoId ?: ""
             if (vid.isNotEmpty()) {
@@ -2597,9 +2723,14 @@ class SearchFragment : Fragment() {
         // the user is on Biblioteca or Principal.
         if (isHidden) return
         (activity as? MainActivity)?.hideTopAppBarForSearch()
-        // Clear input on every entry
-        etSearchQuery.setText("")
-        showSuggestionsMode()
+        // Clear input only on the FIRST entry. onResume also fires after any activity
+        // pause/resume (share chooser, screen off, permission dialogs) — clearing there wiped
+        // the user's active search results. Module re-entries are handled by onHiddenChanged,
+        // which already preserves an active search and resets otherwise.
+        if (!hasBeenVisible) {
+            etSearchQuery.setText("")
+            showSuggestionsMode()
+        }
         loadLocalTrackIndex()
         // Show overlay only on first creation; skip on re-entry to avoid delay
         if (!hasBeenVisible) {
@@ -2798,10 +2929,13 @@ class SearchFragment : Fragment() {
                         } else if (item.track.imageUrl.isNotEmpty()) {
                             LocalArtworkResolver.detach(thumb)
                             Glide.with(this@SearchFragment)
-                                .load(item.track.imageUrl)
+                                // Request the CDN at row size so a playlist song's cover loads fast
+                                // (and reuses the exact cache key Biblioteca/PlaylistDetail already
+                                // warmed) instead of downloading full-resolution album art.
+                                .load(ThumbnailUrls.atSize(item.track.imageUrl, rowThumbPx))
                                 .transform(SHARED_YT_CROP)
                                 .format(com.bumptech.glide.load.DecodeFormat.PREFER_RGB_565)
-                                .override(160, 160)
+                                .override(rowThumbPx, rowThumbPx)
                                 .diskCacheStrategy(DiskCacheStrategy.ALL)
                                 .placeholder(android.R.color.darker_gray)
                                 .into(thumb)
@@ -2937,7 +3071,9 @@ class SearchFragment : Fragment() {
             
             if (item.thumbnail.isNotEmpty()) {
                 Glide.with(this@SearchFragment)
-                    .load(item.thumbnail)
+                    // Request the CDN at the carousel cell size so recent-search covers load fast
+                    // instead of pulling full-resolution art.
+                    .load(ThumbnailUrls.atSize(item.thumbnail, 360))
                     .transform(SHARED_YT_CROP)
                     .format(com.bumptech.glide.load.DecodeFormat.PREFER_RGB_565)
                     .override(360, 360)

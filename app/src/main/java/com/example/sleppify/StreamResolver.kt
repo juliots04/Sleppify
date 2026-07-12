@@ -8,6 +8,7 @@ import org.schabi.newpipe.extractor.downloader.Downloader
 import org.schabi.newpipe.extractor.downloader.Request
 import org.schabi.newpipe.extractor.downloader.Response
 import org.schabi.newpipe.extractor.stream.AudioStream
+import org.schabi.newpipe.extractor.stream.DeliveryMethod
 import org.schabi.newpipe.extractor.stream.StreamExtractor
 import java.io.IOException
 import java.net.HttpURLConnection
@@ -18,20 +19,19 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * Single source of truth for YouTube stream resolution and auth cookies.
  *
- * Replaces InnertubeResolver and NewPipeHttpDownloader.
+ * Everything resolves through NewPipeExtractor to a direct googlevideo.com URL — no proxy:
+ *  - Audio (default): best AAC/opus audio stream (see [resolveStreamUrl]).
+ *  - Video (when "No reproducir videos musicales" is OFF): muxed mp4-360 / itag 18
+ *    ([resolveVideoViaNewPipe]) so the player can show the music video.
+ *  - Offline download: [resolveAudioDownloadSource] for SleppifyDownloaderResolver.
+ * Results are cached in memory (3.5h) and the last URL persisted to disk for warm start.
  *
- * Resolution order:
- *  1. In-memory cache (3.5h for direct URLs, 4h for proxy)
- *  2. NewPipeExtractor → direct googlevideo.com URL (primary)
- *  3. ProxyStreamResolver → /api/stream/<videoId> (fallback, sends X-Youtube-Cookie)
- *
- * Also manages auth cookies used by CommentsBottomSheet and proxy authentication.
+ * Also manages the auth cookies used by CommentsBottomSheet and SAPISIDHASH signing.
  */
 object StreamResolver {
 
     private const val TAG = "StreamResolver"
     private const val DIRECT_CACHE_TTL_MS = 3 * 60 * 60 * 1000L + 30 * 60 * 1000L // 3.5h
-    private const val PROXY_CACHE_TTL_MS = 4 * 60 * 60 * 1000L                    // 4h
     private const val DISK_CACHE_PREFS = "stream_resolver_cache"
     private const val DISK_KEY_VIDEO_ID = "last_video_id"
     private const val DISK_KEY_URL = "last_url"
@@ -48,7 +48,14 @@ object StreamResolver {
     @Volatile private var authCookieHeader: String = ""
     private val newPipeInitialized = AtomicBoolean(false)
 
-    private enum class SourceType { DIRECT, PROXY }
+    // Opus/WebM audio itags (everything else in PREFERRED_ITAGS is AAC/m4a).
+    private val OPUS_ITAGS = intArrayOf(249, 250, 251, 600, 774)
+
+    /** A directly-downloadable audio stream: the googlevideo CDN URL plus the container
+     *  (webm/opus vs m4a/AAC) so the offline file is saved with the right extension. */
+    data class AudioDownloadSource(val url: String, val isWebm: Boolean, val itag: Int)
+
+    private enum class SourceType { DIRECT, VIDEO }
     private data class CachedStream(val url: String, val type: SourceType, val timestamp: Long)
     private val urlCache = ConcurrentHashMap<String, CachedStream>()
     // Dedup: in-flight resolutions so parallel callers wait on the same result
@@ -175,7 +182,6 @@ object StreamResolver {
         authCookieHeader = cookieHeader?.trim() ?: ""
         if (authCookieHeader.isNotBlank()) {
             urlCache.clear()
-            ProxyStreamResolver.clearCache()
         }
     }
 
@@ -202,9 +208,23 @@ object StreamResolver {
 
     // ─── Stream resolution ────────────────────────────────────────────────
 
+    // ── Playback mode (Audio | Video pill in the player) ──────────────────
+    // Session-wide switch, default AUDIO. When VIDEO, resolveStreamUrl returns the muxed mp4-360
+    // (itag 18) so every path (playback, prefetch, gapless pre-buffer) transparently serves video.
+    @Volatile private var preferVideoMode = false
+
+    @JvmStatic
+    fun setPreferVideoMode(enabled: Boolean) {
+        preferVideoMode = enabled
+    }
+
+    @JvmStatic
+    fun isPreferVideoMode(): Boolean = preferVideoMode
+
     /**
-     * Resolves a playable stream URL for [videoId].
-     * Uses NewPipeExtractor only (no proxy for streaming).
+     * Resolves a playable stream URL for [videoId] via NewPipe — audio by default, or the muxed
+     * mp4-360 music video while the player's Audio|Video pill is on VIDEO ([setPreferVideoMode]).
+     * A track with no muxed video falls back to audio so it always plays.
      * Must be called from a background thread (network I/O).
      */
     @JvmStatic
@@ -213,16 +233,21 @@ object StreamResolver {
         if (videoId.isNullOrBlank()) return null
         if (videoId.startsWith("local_")) return null
 
-        // If "No reproducir videos musicales" is OFF → use proxy (streams video)
-        val prefs = context.getSharedPreferences(AppConstants.PREFS_SETTINGS, Context.MODE_PRIVATE)
-        val noMusicVideos = prefs.getBoolean(CloudSyncManager.KEY_NO_MUSIC_VIDEOS, true)
-        if (!noMusicVideos) {
-            val proxyUrl = ProxyStreamResolver.resolveStreamUrl(videoId)
-            if (!proxyUrl.isNullOrBlank()) {
-                urlCache[videoId] = CachedStream(proxyUrl, SourceType.PROXY, System.currentTimeMillis())
-                Log.d(TAG, "proxy_video[$videoId] ok (music videos enabled)")
-                return proxyUrl
+        if (preferVideoMode) {
+            urlCache[videoId]?.let { cached ->
+                if (cached.type == SourceType.VIDEO
+                    && System.currentTimeMillis() - cached.timestamp < DIRECT_CACHE_TTL_MS) {
+                    Log.d(TAG, "cache[$videoId] type=VIDEO")
+                    return cached.url
+                }
             }
+            val videoUrl = resolveVideoViaNewPipe(videoId)
+            if (!videoUrl.isNullOrBlank()) {
+                urlCache[videoId] = CachedStream(videoUrl, SourceType.VIDEO, System.currentTimeMillis())
+                Log.d(TAG, "newpipe_video[$videoId] ok (video mode)")
+                return videoUrl
+            }
+            // No muxed video available → fall through to audio.
         }
 
         // 1. Cache check (in-memory, seeded by warmUp or previous resolve)
@@ -303,44 +328,33 @@ object StreamResolver {
     }
 
     /**
-     * Returns HTTP headers to attach to the ExoPlayer/MediaPlayer data source.
-     * - Direct googlevideo.com: browser User-Agent + Origin/Referer
-     * - Proxy URL: User-Agent + X-Youtube-Cookie (proxy uses it to auth yt-dlp)
+     * Returns HTTP headers to attach to the ExoPlayer/MediaPlayer data source. Every source is now a
+     * direct googlevideo.com URL (audio or muxed video), so all get the browser User-Agent + Origin/
+     * Referer that googlevideo expects — no proxy, no cookies.
      */
     @JvmStatic
-    fun getHeadersFor(videoId: String?): Map<String, String> {
-        if (videoId.isNullOrBlank()) return buildProxyHeaders()
-        val cached = urlCache[videoId] ?: return buildProxyHeaders()
-        return if (cached.type == SourceType.DIRECT && cached.url.contains("googlevideo.com")) {
-            mapOf(
-                "User-Agent" to "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
-                "Origin" to "https://music.youtube.com",
-                "Referer" to "https://music.youtube.com/"
-            )
-        } else {
-            buildProxyHeaders()
-        }
+    fun getHeadersFor(@Suppress("UNUSED_PARAMETER") videoId: String?): Map<String, String> {
+        return mapOf(
+            "User-Agent" to "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+            "Origin" to "https://music.youtube.com",
+            "Referer" to "https://music.youtube.com/"
+        )
     }
 
     @JvmStatic
     fun invalidate(videoId: String?) {
         if (videoId.isNullOrBlank()) return
         urlCache.remove(videoId)
-        ProxyStreamResolver.invalidate(videoId)
     }
 
     @JvmStatic
     fun markSuccess(videoId: String?) {
-        if (videoId.isNullOrBlank()) return
-        val cached = urlCache[videoId] ?: return
-        if (cached.type == SourceType.PROXY) ProxyStreamResolver.markSuccess(videoId)
+        // No-op: direct CDN sources have no server whose success we need to record.
     }
 
     @JvmStatic
     fun markFailed(videoId: String?) {
         if (videoId.isNullOrBlank()) return
-        val cached = urlCache[videoId]
-        if (cached?.type == SourceType.PROXY) ProxyStreamResolver.markFailed(videoId)
         urlCache.remove(videoId)
     }
 
@@ -351,6 +365,94 @@ object StreamResolver {
             NewPipe.init(NewPipeDownloader)
             Log.d(TAG, "NewPipe initialized")
         }
+    }
+
+    /**
+     * Resolves the best directly-downloadable audio stream for [videoId] via NewPipe.
+     * Returns the raw googlevideo CDN URL (deciphered, throttle-free) + container so the
+     * offline downloader can pull the bytes straight from Google's CDN — no proxy.
+     *
+     * Prefers PROGRESSIVE_HTTP streams (a plain GET yields the whole file); m4a/AAC first for
+     * maximum Android compatibility (see [PREFERRED_ITAGS]). Must run on a background thread.
+     */
+    @JvmStatic
+    fun resolveAudioDownloadSource(videoId: String?): AudioDownloadSource? {
+        if (videoId.isNullOrBlank() || videoId.startsWith("local_")) return null
+        return try {
+            ensureNewPipeInitialized()
+            val extractor = ServiceList.YouTube.getStreamExtractor("https://www.youtube.com/watch?v=$videoId")
+            extractor.fetchPage()
+
+            val audioStreams: List<AudioStream> = extractor.audioStreams ?: emptyList()
+            if (audioStreams.isEmpty()) {
+                Log.w(TAG, "download[$videoId] no audio streams")
+                return null
+            }
+
+            // Only streams that expose a real, directly-fetchable URL. Prefer progressive
+            // (single-GET) delivery; fall back to any URL-bearing stream if none are progressive.
+            val downloadable = audioStreams.filter { !it.content.isNullOrBlank() }
+            val progressive = downloadable.filter { it.deliveryMethod == DeliveryMethod.PROGRESSIVE_HTTP }
+                .ifEmpty { downloadable }
+            if (progressive.isEmpty()) return null
+
+            val byItag = progressive.associateBy { it.itag }
+            val chosen = PREFERRED_ITAGS.firstOrNull { byItag.containsKey(it) }?.let { byItag[it] }
+                ?: progressive.first()
+
+            val suffix = chosen.format?.suffix
+            val isWebm = when {
+                suffix != null -> suffix.equals("webm", true) || suffix.equals("opus", true)
+                else -> chosen.itag in OPUS_ITAGS
+            }
+            Log.d(TAG, "download[$videoId] itag=${chosen.itag} webm=$isWebm")
+            AudioDownloadSource(chosen.content, isWebm, chosen.itag)
+        } catch (e: Exception) {
+            Log.w(TAG, "download[$videoId] resolve failed: ${e.javaClass.simpleName} — ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * Resolves a muxed (video+audio) mp4-360 progressive URL via NewPipe for music-video streaming.
+     * Prefers itag 18 (the classic 360p mp4); otherwise the lowest-resolution muxed mp4 (light and
+     * reliable). Returns null when the track has no directly-playable muxed stream — the caller then
+     * falls back to audio. Must run on a background thread.
+     */
+    private fun resolveVideoViaNewPipe(videoId: String): String? {
+        return try {
+            ensureNewPipeInitialized()
+            val extractor = ServiceList.YouTube.getStreamExtractor("https://www.youtube.com/watch?v=$videoId")
+            extractor.fetchPage()
+            // videoStreams are the MUXED (video+audio) streams — ExoPlayer plays them directly,
+            // no on-device muxing. videoOnlyStreams (DASH) are deliberately ignored here.
+            val muxed = extractor.videoStreams ?: emptyList()
+            val playable = muxed.filter { !it.content.isNullOrBlank() }
+            val progressive = playable.filter { it.deliveryMethod == DeliveryMethod.PROGRESSIVE_HTTP }
+                .ifEmpty { playable }
+            if (progressive.isEmpty()) return null
+            val byItag = progressive.associateBy { it.itag }
+            val chosen = byItag[18]
+                ?: progressive.minByOrNull { parseResolutionHeight(it.resolution) }
+                ?: return null
+            chosen.content
+        } catch (e: Exception) {
+            Log.w(TAG, "video[$videoId] resolve failed: ${e.javaClass.simpleName} — ${e.message}")
+            null
+        }
+    }
+
+    /** "360p" / "720p60" → 360 / 720; unknown resolutions sort last. */
+    private fun parseResolutionHeight(resolution: String?): Int {
+        if (resolution.isNullOrBlank()) return Int.MAX_VALUE
+        return resolution.takeWhile { it.isDigit() }.toIntOrNull() ?: Int.MAX_VALUE
+    }
+
+    /** True when the cached stream for [videoId] is the muxed music-video source (not audio). */
+    @JvmStatic
+    fun isVideoSource(videoId: String?): Boolean {
+        if (videoId.isNullOrBlank()) return false
+        return urlCache[videoId]?.type == SourceType.VIDEO
     }
 
     private fun resolveViaNewPipe(videoId: String, preferredItags: IntArray = PREFERRED_ITAGS): String? {
@@ -381,14 +483,6 @@ object StreamResolver {
     }
 
     // ─── Helpers ─────────────────────────────────────────────────────────
-
-    private fun buildProxyHeaders(): Map<String, String> {
-        val headers = mutableMapOf("User-Agent" to "Sleppify-Android/1.0")
-        if (authCookieHeader.isNotBlank()) {
-            headers["X-Youtube-Cookie"] = authCookieHeader
-        }
-        return headers
-    }
 
     private fun extractCookieValue(cookieName: String): String? {
         if (authCookieHeader.isBlank()) return null

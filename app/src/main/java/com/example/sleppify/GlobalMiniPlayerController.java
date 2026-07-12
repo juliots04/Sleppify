@@ -495,8 +495,16 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
         if (activity.isFinishing() || activity.isDestroyed()) return;
         if (loading) {
             playbackLoading = true;
-            miniPlaying = true;
-            btnPlayPause.setImageResource(R.drawable.ic_mini_pause);
+            // Only flip to the "playing" (pause-icon) state if the user actually intends to play.
+            // A paused cold-start restore ALSO buffers to STATE_READY; forcing the pause icon there
+            // made the restored track look like it was already playing/spinning when it was merely
+            // getting ready — so keep the play icon (what the user taps) while a paused track loads.
+            SongPlayerFragment sp = activity.findSongPlayerFragment();
+            boolean playIntent = sp != null && sp.isAdded() && sp.externalIsPlayingIntent();
+            if (playIntent) {
+                miniPlaying = true;
+                btnPlayPause.setImageResource(R.drawable.ic_mini_pause);
+            }
         } else {
             playbackLoading = false;
         }

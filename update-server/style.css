@@ -1,0 +1,261 @@
+/* ============================================================
+   Sleppify Updates — tema AMOLED (idéntico al de la app)
+   fondo #000000 · superficie #1B1D26 · borde #262935
+   texto #e2e2eb / #c3c6d5 · acento #AEC7FD
+   ============================================================ */
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+    --bg: #000000;
+    --surface: #0A0B0F;
+    --surface-2: #1B1D26;
+    --border: #1C1F29;
+    --border-2: #262935;
+    --text: #e2e2eb;
+    --text-dim: #c3c6d5;
+    --accent: #AEC7FD;
+    --accent-ink: #111319;
+}
+
+body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Segoe UI", system-ui, -apple-system, "Inter", sans-serif;
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.muted { color: var(--text-dim); opacity: .72; }
+.small { font-size: 12px; font-weight: normal; }
+.center { text-align: center; }
+
+.brand { font-size: 19px; font-weight: 800; letter-spacing: .3px; }
+.brand span { color: var(--accent); font-weight: 600; }
+
+.micro-label {
+    font-size: 11px;
+    letter-spacing: 1.4px;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    opacity: .65;
+    margin-bottom: 10px;
+}
+
+/* ---------- login ---------- */
+.auth-wrap { display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 20px; }
+.auth-card { width: 100%; max-width: 380px; }
+.auth-card h2 { margin: 18px 0 4px; font-size: 22px; }
+.auth-card .muted { margin-bottom: 16px; }
+
+/* ---------- estructura ---------- */
+.topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 24px;
+    background: rgba(0, 0, 0, .82);
+    backdrop-filter: blur(14px);
+    border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 5;
+}
+.topbar-right { display: flex; align-items: center; gap: 14px; }
+
+.panel-grid {
+    display: grid;
+    grid-template-columns: 1.2fr 1fr;
+    gap: 20px;
+    max-width: 1080px;
+    margin: 26px auto;
+    padding: 0 20px 48px;
+}
+.panel-grid .wide { grid-column: 1 / -1; }
+@media (max-width: 880px) { .panel-grid { grid-template-columns: 1fr; } }
+
+.card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 24px;
+}
+.card h2 { font-size: 16px; margin-bottom: 14px; letter-spacing: .2px; }
+
+/* ---------- formulario ---------- */
+label { display: block; font-size: 13px; color: var(--text-dim); margin: 14px 0 0; }
+input[type=text], input[type=number], input[type=password], textarea {
+    width: 100%;
+    margin-top: 6px;
+    padding: 11px 14px;
+    border-radius: 12px;
+    border: 1px solid var(--border-2);
+    background: #101218;
+    color: var(--text);
+    font-size: 14px;
+    font-family: inherit;
+    transition: border-color .15s ease;
+}
+input:focus, textarea:focus { outline: none; border-color: var(--accent); }
+textarea { resize: vertical; }
+.row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+
+.file-label input[type=file] { display: none; }
+.file-face {
+    display: block;
+    margin-top: 6px;
+    padding: 13px 14px;
+    border: 1px dashed #343947;
+    border-radius: 12px;
+    background: #101218;
+    color: var(--text-dim);
+    cursor: pointer;
+    transition: border-color .15s ease, color .15s ease;
+}
+.file-face:hover { border-color: var(--accent); color: var(--text); }
+
+.btn {
+    display: inline-block;
+    border: none;
+    border-radius: 24px;
+    padding: 11px 22px;
+    font-size: 14px;
+    font-weight: 700;
+    cursor: pointer;
+    font-family: inherit;
+    transition: filter .12s ease, transform .05s ease;
+}
+.btn:active { transform: scale(.985); }
+.btn-primary { background: var(--accent); color: var(--accent-ink); margin-top: 18px; }
+.btn-primary:hover { filter: brightness(1.08); }
+.btn-primary:disabled { opacity: .5; cursor: default; }
+.btn-big { width: 100%; padding: 14px; }
+.btn-ghost { background: transparent; color: var(--text-dim); border: 1px solid var(--border-2); padding: 8px 16px; }
+.btn-ghost:hover { color: var(--text); border-color: #343947; }
+
+.error, .success {
+    margin-top: 14px;
+    padding: 11px 14px;
+    border-radius: 12px;
+    font-size: 13px;
+}
+.error { background: #2a161b; color: #ff9ba6; border: 1px solid #4d2129; }
+.success { background: #14261c; color: #9bffbe; border: 1px solid #1f4630; }
+
+/* ---------- progreso (mismas métricas que la app: barra 8px, track #33FFFFFF) ---------- */
+.progress-track {
+    height: 8px;
+    border-radius: 6px;
+    background: rgba(255, 255, 255, .2);
+    overflow: hidden;
+}
+.progress-fill {
+    height: 100%;
+    width: 0;
+    border-radius: 6px;
+    background: var(--accent);
+    transition: width .15s linear;
+}
+.progress-label { margin-top: 6px; font-size: 13px; color: var(--text-dim); text-align: center; }
+.upload-zone { margin-top: 16px; }
+
+/* ============================================================
+   Vista previa — RÉPLICA de settings_update.xml (1dp = 1px)
+   ============================================================ */
+.preview-col { display: flex; flex-direction: column; align-items: center; }
+.phone {
+    width: 320px;
+    border: 2px solid #22252f;
+    border-radius: 30px;
+    padding: 10px;
+    background: #05060a;
+    margin: 4px auto 12px;
+}
+.phone-screen {
+    background: #000000;               /* settings_update.xml: #FF000000 */
+    border-radius: 22px;
+    padding: 28px 20px 40px;           /* paddingTop 28, paddingH 20, paddingBottom 40 */
+    min-height: 510px;
+}
+.app-hero { text-align: center; }
+.app-logo {
+    width: 72px; height: 72px;         /* ImageView 72dp, ic_launcher_round */
+    margin: 0 auto;
+    border-radius: 50%;
+    background: #141414;
+    border: 1px solid #333;
+    color: #ffffff;
+    font-size: 30px; font-weight: 900;
+    display: flex; align-items: center; justify-content: center;
+}
+.app-name { font-weight: 900; font-size: 18px; margin-top: 12px; }      /* 18sp, marginTop 12 */
+.app-installed { font-size: 13px; color: #c3c6d5; margin-top: 2px; }    /* 13sp, marginTop 2 */
+
+.update-card {                         /* bg_update_card: negro casi puro (AMOLED) */
+    background: #0A0A0A;
+    border: 1px solid #232323;
+    border-radius: 16px;
+    padding: 22px;
+    margin-top: 26px;
+    text-align: left;
+}
+.update-head { display: flex; align-items: center; justify-content: space-between; }
+.update-title { font-weight: 900; font-size: 16px; color: #ffffff; }   /* "🔥 Nueva versión" */
+
+.version-pill {                        /* bg_version_pill: pastilla a la derecha */
+    border: 1px solid #3A3A3A;
+    border-radius: 999px;
+    padding: 4px 12px;
+    font-size: 12px;
+    font-weight: 700;
+    color: #ffffff;
+    white-space: nowrap;
+    margin-left: 10px;
+    flex-shrink: 0;
+}
+
+.update-divider { height: 1px; background: #232323; margin: 20px 0 16px; }
+.update-notes-head {
+    font-size: 11px;                   /* 11sp letterSpacing .1 */
+    letter-spacing: 1.1px;
+    color: #8A8A8A;
+}
+.update-notes { list-style: none; font-size: 14px; color: #EDEDED; margin-top: 12px; }
+.update-notes li { padding: 5px 0 5px 18px; position: relative; line-height: 1.65; }
+.update-notes li::before { content: "•"; color: #ffffff; position: absolute; left: 2px; }
+.update-notes li.muted::before { content: ""; }
+.update-notes li.muted { color: #8A8A8A; opacity: .7; }
+.update-progress { margin-top: 18px; }
+
+.btn-accent {                          /* bg_update_button: blanco puro, texto negro */
+    display: block;
+    width: 100%;
+    height: 48px;
+    margin-top: 22px;
+    background: #ffffff;
+    color: #000000;
+    border: none;
+    border-radius: 24px;
+    font-size: 15px;
+    font-weight: 800;
+    cursor: pointer;
+    font-family: inherit;
+}
+.btn-accent:disabled { opacity: .55; cursor: default; }
+
+/* ---------- historial ---------- */
+.history { width: 100%; border-collapse: collapse; font-size: 13px; }
+.history th, .history td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+.history th {
+    color: var(--text-dim); font-weight: 600; font-size: 11px;
+    text-transform: uppercase; letter-spacing: 1px; opacity: .65;
+}
+.history tr:last-child td { border-bottom: none; }
+.badge-current {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 12px;
+    background: rgba(174, 199, 253, .12);
+    color: var(--accent);
+    font-size: 11px;
+    font-weight: 700;
+    margin-left: 8px;
+}

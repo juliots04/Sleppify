@@ -14,7 +14,6 @@ import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.text.TextUtils
 import android.util.Patterns
 import android.view.*
 import android.view.animation.OvershootInterpolator
@@ -727,44 +726,7 @@ class ScannerFragment : Fragment() {
         val cb = requireContext().getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return
         cb.setPrimaryClip(ClipData.newPlainText("escaneo", v))
 
-        val rootView = requireActivity().findViewById<android.view.ViewGroup>(android.R.id.content) ?: return
-        val density = resources.displayMetrics.density
-        val bar = android.widget.LinearLayout(requireContext()).apply {
-            tag = "saved_bar"
-            id = View.generateViewId()
-            orientation = android.widget.LinearLayout.HORIZONTAL
-            gravity = android.view.Gravity.CENTER_VERTICAL
-            setBackgroundColor(android.graphics.Color.parseColor("#FF1E1E1E"))
-            val hPad = (16 * density).toInt()
-            val vPad = (14 * density).toInt()
-            setPadding(hPad, vPad, hPad, vPad)
-            elevation = 8 * density
-        }
-        val tvMsg = android.widget.TextView(requireContext()).apply {
-            text = getString(R.string.scan_result_copied)
-            setTextColor(android.graphics.Color.WHITE)
-            textSize = 15f
-            setTypeface(null, android.graphics.Typeface.NORMAL)
-            maxLines = 1
-            ellipsize = android.text.TextUtils.TruncateAt.END
-            layoutParams = android.widget.LinearLayout.LayoutParams(0, android.view.ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        bar.addView(tvMsg)
-
-        var bottomMargin = (8 * density).toInt()
-        val bottomNav = requireActivity().findViewById<View>(R.id.bottomNavigation)
-        if (bottomNav != null && bottomNav.visibility == View.VISIBLE) bottomMargin += bottomNav.height
-        val miniPlayer = requireActivity().findViewById<View>(R.id.llGlobalMiniPlayer)
-        if (miniPlayer != null && miniPlayer.visibility == View.VISIBLE) bottomMargin += miniPlayer.height
-
-        val flp = android.widget.FrameLayout.LayoutParams(
-            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
-            android.view.ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply {
-            gravity = android.view.Gravity.BOTTOM
-            this.bottomMargin = bottomMargin
-        }
-        TransientBottomBarAnimator.show(rootView, bar, flp, "saved_bar", 2500L)
+        AppSnackbar.show(activity, getString(R.string.scan_result_copied), 2500L)
     }
 
     private fun describeBarcodeType(b: Barcode) = when (b.format) {
