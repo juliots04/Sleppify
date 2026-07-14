@@ -12,9 +12,11 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSource
+import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.cache.CacheDataSource
+import androidx.media3.datasource.cache.CacheWriter
 import androidx.media3.datasource.cache.NoOpCacheEvictor
 import androidx.media3.datasource.cache.SimpleCache
 import androidx.media3.exoplayer.DefaultLoadControl
@@ -75,6 +77,73 @@ class ExoMediaPlayer {
                         sharedCache = it
                     }
                 }
+            }
+        }
+
+        /**
+         * C2 — warms roughly the first [lengthBytes] of [url] into the SHARED exo_stream_cache on a
+         * background thread, best-effort and cancellable. Uses the SAME CacheDataSource factory +
+         * browser [headers] as playback ([prepareAsync]) so the cache key (= the URL) matches: when
+         * the mode swap later prepares this URL, ExoPlayer reads the head straight from disk instead
+         * of opening a cold googlevideo connection.
+         *
+         * The shared cache uses NoOpCacheEvictor by design (project rule: never cap/evict it); a
+         * ~1.5MB head per track is acceptable. All errors are swallowed (cancellation throws EOF/
+         * interrupted, network can 403, etc.). Returns a [WarmHandle] whose [WarmHandle.cancel]
+         * aborts the in-flight read.
+         */
+        @JvmStatic
+        fun warmStreamHead(
+            context: Context,
+            url: String?,
+            headers: Map<String, String>?,
+            lengthBytes: Long
+        ): WarmHandle {
+            val handle = WarmHandle()
+            if (url.isNullOrBlank()) return handle
+            val appContext = context.applicationContext
+            Thread({ runStreamHeadWarm(appContext, url, headers, lengthBytes, handle) }, "ExoWarm").start()
+            return handle
+        }
+
+        /** Blocking body of [warmStreamHead], run on the ExoWarm thread. Swallows all errors. */
+        private fun runStreamHeadWarm(
+            appContext: Context,
+            url: String,
+            headers: Map<String, String>?,
+            lengthBytes: Long,
+            handle: WarmHandle
+        ) {
+            if (handle.isCancelled()) return
+            try {
+                val httpFactory = DefaultHttpDataSource.Factory()
+                    .setConnectTimeoutMs(20_000)
+                    .setReadTimeoutMs(20_000)
+                    .setAllowCrossProtocolRedirects(true)
+                if (!headers.isNullOrEmpty()) {
+                    httpFactory.setDefaultRequestProperties(headers)
+                }
+                // Identical wrapping to prepareAsync() so cache keys line up.
+                val cacheDataSource = CacheDataSource.Factory()
+                    .setCache(getSharedCache(appContext))
+                    .setUpstreamDataSourceFactory(httpFactory)
+                    .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+                    .createDataSource()
+                val dataSpec = DataSpec.Builder()
+                    .setUri(Uri.parse(url))
+                    .setPosition(0)
+                    .setLength(lengthBytes)
+                    .build()
+                val writer = CacheWriter(cacheDataSource, dataSpec, null, null)
+                handle.attach(writer)
+                if (handle.isCancelled()) {
+                    try { writer.cancel() } catch (_: Throwable) { }
+                    return
+                }
+                writer.cache()
+                Log.d(TAG, "warmStreamHead: cached head (~$lengthBytes bytes)")
+            } catch (t: Throwable) {
+                // Best-effort warm — cancellation, EOF, 403, etc. are all non-fatal.
             }
         }
 
@@ -422,6 +491,11 @@ class ExoMediaPlayer {
         return (exoPlayer?.currentPosition?.coerceAtLeast(0L)?.toInt()) ?: 0
     }
 
+    fun getBufferedPosition(): Int {
+        if (released) return 0
+        return (exoPlayer?.bufferedPosition?.coerceAtLeast(0L)?.toInt()) ?: 0
+    }
+
     fun getDuration(): Int {
         if (released) return 0
         val d = exoPlayer?.duration ?: 0L
@@ -488,6 +562,30 @@ class ExoMediaPlayer {
                 Log.w(TAG, "release: exception", e)
             }
             exoPlayer = null
+        }
+    }
+
+    /**
+     * Cancellable handle for a [warmStreamHead] task. Thread-safe: the warm runs on its own thread
+     * while [cancel] may be called from the main thread. If cancel arrives before the CacheWriter is
+     * attached, the pending flag makes the worker bail out (or cancel the writer as soon as it exists).
+     */
+    class WarmHandle internal constructor() {
+        @Volatile private var cancelled = false
+        private var writer: CacheWriter? = null
+
+        internal fun isCancelled(): Boolean = cancelled
+
+        @Synchronized internal fun attach(w: CacheWriter) {
+            writer = w
+            if (cancelled) {
+                try { w.cancel() } catch (_: Throwable) { }
+            }
+        }
+
+        @Synchronized fun cancel() {
+            cancelled = true
+            try { writer?.cancel() } catch (_: Throwable) { }
         }
     }
 }

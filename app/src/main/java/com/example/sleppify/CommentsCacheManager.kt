@@ -51,6 +51,30 @@ object CommentsCacheManager {
     }
 
     /**
+     * True si existe un caché de primera página más joven que maxAgeMs. Permite saltarse el
+     * refresh de red al abrir el sheet y evitar prefetches redundantes.
+     */
+    fun isFresh(context: Context, videoId: String, maxAgeMs: Long): Boolean {
+        if (videoId.isEmpty()) return false
+        return try {
+            val file = getCacheFile(context, videoId)
+            file.exists() && (System.currentTimeMillis() - file.lastModified()) < maxAgeMs
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /** Borra el caché de un video (p. ej. cuando el JSON guardado quedó corrupto). */
+    fun deleteCache(context: Context, videoId: String) {
+        if (videoId.isEmpty()) return
+        try {
+            getCacheFile(context, videoId).delete()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    /**
      * Limpia la caché si es necesario (opcional)
      */
     fun clearCache(context: Context) {

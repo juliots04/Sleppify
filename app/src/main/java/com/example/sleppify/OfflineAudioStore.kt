@@ -325,6 +325,29 @@ object OfflineAudioStore {
         return removedCount
     }
 
+    /**
+     * Every downloaded track id currently on disk (normalized filename stem, extension stripped),
+     * across all volumes. For standard YouTube ids the normalized stem equals the original videoId,
+     * so callers can intersect this set directly against a playlist's videoIds to learn which
+     * playlists contain downloads — WITHOUT a per-row disk stat. Meant to be called ONCE off the
+     * main thread (e.g. when entering the "Descargas" view), not per scroll.
+     */
+    @JvmStatic
+    fun listDownloadedTrackIds(context: Context): Set<String> {
+        val ids = HashSet<String>()
+        for (dir in allOfflineAudioDirs(context)) {
+            val files = dir.listFiles() ?: continue
+            for (file in files) {
+                if (!file.isFile || file.length() < MIN_VALID_AUDIO_FILE_BYTES) continue
+                val name = file.name
+                val ext = LOOKUP_EXTENSIONS.firstOrNull { name.endsWith(it, ignoreCase = true) } ?: continue
+                val stem = name.substring(0, name.length - ext.length)
+                if (stem.isNotEmpty()) ids.add(stem)
+            }
+        }
+        return ids
+    }
+
     @JvmStatic
     fun normalizeTrackId(trackId: String): String {
         val raw = trackId.trim()

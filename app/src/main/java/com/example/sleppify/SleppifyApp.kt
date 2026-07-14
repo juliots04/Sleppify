@@ -80,6 +80,15 @@ class SleppifyApp : Application() {
             try { FavoritesPlaylistStore.loadFavorites(this) } catch (e: Exception) {
                 Log.w("SleppifyApp", "FavoritesPlaylistStore pre-warm failed", e)
             }
+            // Pre-warm the streaming-cache prefs XML (large: one entry per cached playlist) so
+            // PrincipalFragment's covers cache read is O(1) and cached covers render during
+            // startup instead of a skeleton flash + late swap.
+            try {
+                getSharedPreferences(AppConstants.PREFS_STREAMING_CACHE, MODE_PRIVATE)
+                    .getString("home_covers_data", "")
+            } catch (e: Exception) {
+                Log.w("SleppifyApp", "streaming_cache pre-warm failed", e)
+            }
             try {
                 com.google.android.gms.security.ProviderInstaller.installIfNeeded(this)
             } catch (e: Exception) {

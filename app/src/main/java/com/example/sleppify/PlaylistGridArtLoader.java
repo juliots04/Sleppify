@@ -123,11 +123,17 @@ public final class PlaylistGridArtLoader {
         List<String> urlsCopy = new ArrayList<>(urls);
         IO.execute(() -> {
             Bitmap bmp = getOrBuild(appCtx, signature, urlsCopy, sizePx);
-            if (bmp == null) return;
             MAIN.post(() -> {
-                // Guard against ViewHolder recycling: only set if this view still wants this grid.
-                if (signature.equals(target.getTag(R.id.tag_artwork_signature))) {
+                // Guard against ViewHolder recycling: only touch the view if it still wants this grid.
+                if (!signature.equals(target.getTag(R.id.tag_artwork_signature))) return;
+                if (bmp != null) {
                     target.setImageBitmap(bmp);
+                } else {
+                    // Build failed (offline / expired thumbs). The signature was stamped before the
+                    // async build, so leaving it in place would make every future rebind early-return
+                    // at the top of load() and the cover would never load. Clear it so the next bind
+                    // retries the composite.
+                    target.setTag(R.id.tag_artwork_signature, null);
                 }
             });
         });

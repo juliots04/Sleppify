@@ -7,7 +7,10 @@ import android.graphics.Color;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.text.TextUtils;
+import android.util.DisplayMetrics;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
@@ -27,9 +30,13 @@ import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
 import com.bumptech.glide.Glide;
+import com.bumptech.glide.load.DataSource;
 import com.bumptech.glide.load.DecodeFormat;
 import com.bumptech.glide.load.engine.DiskCacheStrategy;
+import com.bumptech.glide.load.engine.GlideException;
+import com.bumptech.glide.request.RequestListener;
 import com.bumptech.glide.request.target.CustomTarget;
+import com.bumptech.glide.request.target.Target;
 import com.bumptech.glide.request.transition.Transition;
 import com.google.android.material.imageview.ShapeableImageView;
 
@@ -66,6 +73,12 @@ public class ArtistDetailFragment extends Fragment {
     private static final int TYPE_HEADER = 0;
     private static final int TYPE_TRACK = 1;
     private static final int TYPE_ALBUMS = 2;
+    private static final int TYPE_SHOW_MORE = 3;
+
+    // Hero height must stay in sync with the FrameLayout height in item_artist_detail_header.xml.
+    private static final int HERO_HEIGHT_DP = 430;
+    // Never keep the module-loading overlay hostage to a stalled CDN: reveal after this anyway.
+    private static final long REVEAL_TIMEOUT_MS = 1200L;
 
     private String channelId = "";
     private String artistName = "";
@@ -76,6 +89,16 @@ public class ArtistDetailFragment extends Fragment {
     private final List<YouTubeMusicService.TrackResult> songs = new ArrayList<>();
     private final List<YouTubeMusicService.PlaylistResult> albums = new ArrayList<>();
 
+    // "Ver más" state: browseId of the artist's full songs playlist (from the songs shelf),
+    // whether that browse already ran, and the fetched-but-not-yet-shown remainder.
+    private String moreSongsBrowseId = "";
+    private boolean moreSongsFetched = false;
+    private boolean moreSongsLoading = false;
+    private final List<YouTubeMusicService.TrackResult> pendingMoreSongs = new ArrayList<>();
+    // When true the full remainder (pendingMoreSongs) is shown below the short list ("Ver menos");
+    // when false only the short `songs` list shows ("Ver más"). A single tap toggles between them.
+    private boolean songsExpanded = false;
+
     private YouTubeMusicService youTubeMusicService;
     private ArtistAdapter adapter;
     private boolean loaded = false;
@@ -83,6 +106,15 @@ public class ArtistDetailFragment extends Fragment {
 
     private int heroDominantColor = 0;
     private boolean paletteRequested = false;
+    private int albumCardWidthPx = 0;
+
+    // Overlay reveal is gated on BOTH the data load (revealRequested) and the hero image being
+    // decoded (heroReady), with REVEAL_TIMEOUT_MS as the fallback so the overlay never hangs.
+    private String lastHeroSizedUrl = "";
+    private boolean heroReady = false;
+    private boolean revealRequested = false;
+    private boolean revealDone = false;
+    private final Handler revealHandler = new Handler(Looper.getMainLooper());
 
     private TextView tvState;
     private TextView tvToolbarTitle;
@@ -103,6 +135,27 @@ public class ArtistDetailFragment extends Fragment {
         args.putString(ARG_THUMB, thumbnailUrl);
         f.setArguments(args);
         return f;
+    }
+
+    /**
+     * Warms Glide's caches with the artist hero BEFORE the fragment transaction so the header's
+     * first bind is a pure cache hit and the image is on screen when the overlay drops.
+     * CRITICAL: the URL, transforms and override here MUST exactly match the HeaderVH.bind()
+     * request — a mismatched key warms an entry the bind can never hit and Glide double-fetches
+     * (same caveat as PlaylistDetailFragment's track preloads).
+     */
+    public static void preloadHero(@NonNull Context context, @Nullable String thumbnailUrl) {
+        if (thumbnailUrl == null || thumbnailUrl.trim().isEmpty()) return;
+        DisplayMetrics dm = context.getResources().getDisplayMetrics();
+        int w = dm.widthPixels;
+        int h = (int) (HERO_HEIGHT_DP * dm.density);
+        Glide.with(context.getApplicationContext())
+                .load(ThumbnailUrls.atSize(thumbnailUrl.trim(), w))
+                .diskCacheStrategy(DiskCacheStrategy.ALL)
+                .format(DecodeFormat.PREFER_RGB_565)
+                .centerCrop()
+                .override(w, h)
+                .preload(w, h);
     }
 
     @Override
@@ -129,6 +182,13 @@ public class ArtistDetailFragment extends Fragment {
     @Override
     public void onViewCreated(@NonNull View view, @Nullable Bundle savedInstanceState) {
         super.onViewCreated(view, savedInstanceState);
+
+        // A recreated view means a fresh header ImageView: forget the last hero load so the
+        // rebind reloads (from cache), and re-arm the overlay reveal gate.
+        lastHeroSizedUrl = "";
+        heroReady = false;
+        revealRequested = false;
+        revealDone = false;
 
         tvState = view.findViewById(R.id.tvArtistState);
         tvToolbarTitle = view.findViewById(R.id.tvArtistToolbarTitle);
@@ -196,6 +256,8 @@ public class ArtistDetailFragment extends Fragment {
                         if (!isAdded()) return;
                         if (!TextUtils.isEmpty(page.subtitle)) monthlyListeners = page.subtitle;
                         if (!TextUtils.isEmpty(page.thumbnailUrl)) heroImageUrl = page.thumbnailUrl;
+                        moreSongsBrowseId = page.moreSongsBrowseId == null
+                                ? "" : page.moreSongsBrowseId.trim();
                         albums.clear();
                         for (YouTubeMusicService.PlaylistResult p : page.albums) {
                             if (p != null && !TextUtils.isEmpty(p.playlistId) && !TextUtils.isEmpty(p.title)) {
@@ -223,6 +285,9 @@ public class ArtistDetailFragment extends Fragment {
     }
 
     private void fetchViaSearch() {
+        // Search results aren't the artist's songs shelf — a "Ver más" browse over them would mix
+        // two different orderings, so the button only exists on the real browse path.
+        moreSongsBrowseId = "";
         String cookie = readCookie();
         String query = artistName == null ? "" : artistName.trim();
         if (query.isEmpty()) {
@@ -276,9 +341,37 @@ public class ArtistDetailFragment extends Fragment {
     }
 
     private void revealNow() {
+        // Gate the overlay reveal on the hero image being decoded (see onHeroImageSettled) so the
+        // screen never appears with a gray hero; the timeout keeps a stalled CDN from hanging it.
+        if (revealDone) return;
+        revealRequested = true;
+        if (heroReady) {
+            doRevealNow();
+            return;
+        }
+        revealHandler.postDelayed(this::doRevealNow, REVEAL_TIMEOUT_MS);
+    }
+
+    private void doRevealNow() {
+        if (revealDone) return;
+        revealDone = true;
         if (getActivity() instanceof MainActivity) {
             ((MainActivity) getActivity()).revealModuleContent();
         }
+    }
+
+    /** Hero Glide request finished (ready OR failed) — release the reveal gate. */
+    private void onHeroImageSettled() {
+        revealHandler.post(() -> {
+            heroReady = true;
+            if (revealRequested) doRevealNow();
+        });
+    }
+
+    @Override
+    public void onDestroyView() {
+        revealHandler.removeCallbacksAndMessages(null);
+        super.onDestroyView();
     }
 
     private void goBack() {
@@ -298,12 +391,15 @@ public class ArtistDetailFragment extends Fragment {
         ArrayList<String> artists = new ArrayList<>();
         ArrayList<String> durations = new ArrayList<>();
         ArrayList<String> images = new ArrayList<>();
-        for (YouTubeMusicService.TrackResult t : songs) {
+        // Build the queue from the same list the tapped row index refers to (short list, plus the
+        // expanded remainder when "Ver menos" is showing), so index maps to the right track.
+        for (YouTubeMusicService.TrackResult t : visibleSongs()) {
             if (TextUtils.isEmpty(t.videoId)) continue;
             ids.add(t.videoId);
             titles.add(t.title == null ? "" : t.title);
-            artists.add(t.subtitle == null ? "" : t.subtitle);
-            durations.add("--:--");
+            SongSubtitle.Parts p = SongSubtitle.parse(t.subtitle, t.title, t.duration);
+            artists.add(p.artist.isEmpty() ? artistName : p.artist);
+            durations.add(p.duration.isEmpty() ? "--:--" : p.duration);
             images.add(t.thumbnailUrl == null ? "" : t.thumbnailUrl);
         }
         if (ids.isEmpty()) return;
@@ -313,8 +409,9 @@ public class ArtistDetailFragment extends Fragment {
     }
 
     private void playShuffled() {
-        if (songs.isEmpty()) return;
-        int start = (int) (Math.random() * songs.size());
+        int size = visibleSongs().size();
+        if (size == 0) return;
+        int start = (int) (Math.random() * size);
         playFrom(start);
     }
 
@@ -322,17 +419,17 @@ public class ArtistDetailFragment extends Fragment {
         if (!isAdded() || TextUtils.isEmpty(album.playlistId)) return;
         FragmentManager fm = getParentFragmentManager();
         if (fm.isStateSaved()) return;
-        if (getActivity() instanceof MainActivity) {
-            ((MainActivity) getActivity()).showModuleLoadingOverlay();
-        }
-        // Pass the artist as the album subtitle so the detail header shows the artist and each
-        // track row can fall back to it when the album page omits a per-row artist.
-        PlaylistDetailFragment detail = PlaylistDetailFragment.newInstance(
-                album.playlistId, album.title, artistName == null ? "" : artistName, album.thumbnailUrl, "");
-        fm.beginTransaction().setReorderingAllowed(true)
-                .add(R.id.fragmentContainer, detail, "playlist_detail")
-                .addToBackStack("playlist_detail")
-                .commit();
+        // Shared launcher: adds the remove-existing step + the top-bar hide this path used to skip
+        // (stacking artist→album could leave two live detail instances under one tag). The artist
+        // name rides the subtitle slot so the header + track rows can fall back to it. Token dropped.
+        PlaylistDetailLauncher.open(
+                getActivity(),
+                fm,
+                album.playlistId,
+                album.title,
+                artistName == null ? "" : artistName,
+                album.thumbnailUrl
+        );
     }
 
     // ----- Follow (cloud-synced) -----
@@ -438,16 +535,29 @@ public class ArtistDetailFragment extends Fragment {
             return !albums.isEmpty();
         }
 
+        // The "Ver más" row shows while the browse id exists and there are still more songs to
+        // reveal (either not fetched yet, or fetched with a non-empty remainder).
+        private boolean hasShowMore() {
+            return !TextUtils.isEmpty(moreSongsBrowseId)
+                    && !songs.isEmpty()
+                    && (!moreSongsFetched || !pendingMoreSongs.isEmpty());
+        }
+
+        // Row order: header, tracks, [Ver más], [Álbumes]. The last two are optional and, when both
+        // present, "Ver más" precedes "Álbumes".
         @Override
         public int getItemViewType(int position) {
             if (position == 0) return TYPE_HEADER;
-            if (hasAlbums() && position == getItemCount() - 1) return TYPE_ALBUMS;
+            int albumsPos = hasAlbums() ? getItemCount() - 1 : -1;
+            if (position == albumsPos) return TYPE_ALBUMS;
+            int showMorePos = hasShowMore() ? 1 + visibleTrackCount() : -1;
+            if (position == showMorePos) return TYPE_SHOW_MORE;
             return TYPE_TRACK;
         }
 
         @Override
         public int getItemCount() {
-            return 1 + songs.size() + (hasAlbums() ? 1 : 0);
+            return 1 + visibleTrackCount() + (hasShowMore() ? 1 : 0) + (hasAlbums() ? 1 : 0);
         }
 
         @NonNull
@@ -460,6 +570,9 @@ public class ArtistDetailFragment extends Fragment {
             if (viewType == TYPE_ALBUMS) {
                 return new AlbumsVH(inflater.inflate(R.layout.item_artist_albums_section, parent, false));
             }
+            if (viewType == TYPE_SHOW_MORE) {
+                return new ShowMoreVH(inflater.inflate(R.layout.item_artist_show_more, parent, false));
+            }
             return new TrackVH(inflater.inflate(R.layout.item_artist_track, parent, false));
         }
 
@@ -469,10 +582,84 @@ public class ArtistDetailFragment extends Fragment {
                 ((HeaderVH) holder).bind();
             } else if (holder instanceof AlbumsVH) {
                 ((AlbumsVH) holder).bind();
+            } else if (holder instanceof ShowMoreVH) {
+                ((ShowMoreVH) holder).bind();
             } else if (holder instanceof TrackVH) {
-                ((TrackVH) holder).bind(songs.get(position - 1), position - 1);
+                ((TrackVH) holder).bind(trackAt(position - 1), position - 1);
             }
         }
+    }
+
+    /** Number of track rows currently shown: the short list, plus the full remainder when expanded. */
+    private int visibleTrackCount() {
+        return songs.size() + (songsExpanded ? pendingMoreSongs.size() : 0);
+    }
+
+    /** Track shown at the given 0-based row index across the short list + expanded remainder. */
+    private YouTubeMusicService.TrackResult trackAt(int index) {
+        if (index < songs.size()) return songs.get(index);
+        return pendingMoreSongs.get(index - songs.size());
+    }
+
+    /** The tracks currently on screen (short list, plus the remainder when expanded), for playback. */
+    private List<YouTubeMusicService.TrackResult> visibleSongs() {
+        List<YouTubeMusicService.TrackResult> out = new ArrayList<>(songs);
+        if (songsExpanded) out.addAll(pendingMoreSongs);
+        return out;
+    }
+
+    /**
+     * Single expand/collapse toggle for the artist's popular songs. The first tap browses the full
+     * songs playlist (the shelf's bottomEndpoint) once, keeps the WHOLE remainder in memory and
+     * expands ("Ver menos"); every later tap just flips between showing/hiding that remainder
+     * ("Ver más" / "Ver menos") with no further network.
+     */
+    private void onToggleSongs() {
+        if (moreSongsLoading) return;
+        if (moreSongsFetched) {
+            songsExpanded = !songsExpanded;
+            if (adapter != null) adapter.notifyDataSetChanged();
+            return;
+        }
+        if (TextUtils.isEmpty(moreSongsBrowseId)) return;
+        moreSongsLoading = true;
+        if (adapter != null) adapter.notifyDataSetChanged();
+        // The songs shelf's bottomEndpoint browseId is normally already the "VL"-prefixed browse
+        // form; prefix it defensively when a bare playlist id slipped through (InnerTube convention).
+        String browseId = moreSongsBrowseId.trim();
+        if (!browseId.startsWith("VL") && !browseId.startsWith("MPRE") && !browseId.startsWith("OLAK")) {
+            browseId = "VL" + browseId;
+        }
+        youTubeMusicService.fetchAlbumTracks(readCookie(), browseId,
+                new YouTubeMusicService.MixTracksCallback() {
+                    @Override
+                    public void onSuccess(@NonNull List<YouTubeMusicService.TrackResult> tracks) {
+                        if (!isAdded()) return;
+                        moreSongsLoading = false;
+                        moreSongsFetched = true;
+                        // Keep only songs we're not already showing.
+                        Set<String> known = new HashSet<>();
+                        for (YouTubeMusicService.TrackResult s : songs) {
+                            if (s != null && !TextUtils.isEmpty(s.videoId)) known.add(s.videoId);
+                        }
+                        pendingMoreSongs.clear();
+                        for (YouTubeMusicService.TrackResult t : dedupeSongs(tracks)) {
+                            if (known.add(t.videoId)) pendingMoreSongs.add(t);
+                        }
+                        // First tap reveals the whole remainder at once. If the browse added nothing,
+                        // hasShowMore() becomes false and the row disappears.
+                        songsExpanded = true;
+                        if (adapter != null) adapter.notifyDataSetChanged();
+                    }
+
+                    @Override
+                    public void onError(@NonNull String error) {
+                        if (!isAdded()) return;
+                        moreSongsLoading = false;
+                        moreSongsFetched = true; // don't hammer a failing browse; hide the button
+                        if (adapter != null) adapter.notifyDataSetChanged();
+                    }
+                });
     }
 
     private class HeaderVH extends RecyclerView.ViewHolder {
@@ -504,14 +691,7 @@ public class ArtistDetailFragment extends Fragment {
                 subtitle.setVisibility(View.VISIBLE);
                 subtitle.setText(sub);
             }
-            if (!TextUtils.isEmpty(heroImageUrl)) {
-                Glide.with(backdrop)
-                        .load(heroImageUrl.trim())
-                        .diskCacheStrategy(DiskCacheStrategy.ALL)
-                        .format(DecodeFormat.PREFER_RGB_565)
-                        .centerCrop()
-                        .into(backdrop);
-            }
+            loadHero();
             if (heroTint != null) applyHeroTint(heroTint);
             bindFollowButton(follow);
             follow.setOnClickListener(v -> {
@@ -520,6 +700,57 @@ public class ArtistDetailFragment extends Fragment {
             });
             play.setOnClickListener(v -> playFrom(0));
             shuffle.setOnClickListener(v -> playShuffled());
+        }
+
+        /**
+         * Loads the hero at display resolution. The URL/transforms/override match preloadHero() so
+         * a pre-warmed entry is a pure cache hit; a small low-res .thumbnail() paints instantly
+         * while the HD frame decodes; and the request listener releases the overlay reveal gate.
+         * When fetchArtistPage overwrites heroImageUrl with a URL that resolves to the SAME sized
+         * request, the reload is skipped so the header doesn't visibly re-load.
+         */
+        void loadHero() {
+            if (TextUtils.isEmpty(heroImageUrl)) return;
+            DisplayMetrics dm = getResources().getDisplayMetrics();
+            int w = dm.widthPixels;
+            int h = (int) (HERO_HEIGHT_DP * dm.density);
+            String raw = heroImageUrl.trim();
+            String sizedNullable = ThumbnailUrls.atSize(raw, w);
+            String sized = sizedNullable == null ? raw : sizedNullable;
+            if (sized.equals(lastHeroSizedUrl)) return; // already loaded this exact request
+            lastHeroSizedUrl = sized;
+
+            String lowNullable = ThumbnailUrls.atSize(raw, 120);
+            String low = lowNullable == null ? raw : lowNullable;
+
+            Glide.with(backdrop)
+                    .load(sized)
+                    .diskCacheStrategy(DiskCacheStrategy.ALL)
+                    .format(DecodeFormat.PREFER_RGB_565)
+                    .override(w, h)
+                    .centerCrop()
+                    .thumbnail(Glide.with(backdrop)
+                            .load(low)
+                            .diskCacheStrategy(DiskCacheStrategy.ALL)
+                            .format(DecodeFormat.PREFER_RGB_565)
+                            .centerCrop())
+                    .listener(new RequestListener<Drawable>() {
+                        @Override
+                        public boolean onLoadFailed(@Nullable GlideException e, Object model,
+                                                    Target<Drawable> target, boolean isFirstResource) {
+                            onHeroImageSettled();
+                            return false;
+                        }
+
+                        @Override
+                        public boolean onResourceReady(Drawable resource, Object model,
+                                                       Target<Drawable> target, DataSource dataSource,
+                                                       boolean isFirstResource) {
+                            onHeroImageSettled();
+                            return false;
+                        }
+                    })
+                    .into(backdrop);
         }
     }
 
@@ -545,6 +776,15 @@ public class ArtistDetailFragment extends Fragment {
         }
     }
 
+    /** Card width for artist albums: 46% of the SHORT screen axis, matching the home carousels. */
+    private int albumCardWidthPx() {
+        if (albumCardWidthPx <= 0) {
+            DisplayMetrics dm = getResources().getDisplayMetrics();
+            albumCardWidthPx = (int) (Math.min(dm.widthPixels, dm.heightPixels) * 0.46f);
+        }
+        return albumCardWidthPx;
+    }
+
     private class AlbumAdapter extends RecyclerView.Adapter<AlbumVH> {
         @Override
         public int getItemCount() {
@@ -554,8 +794,16 @@ public class ArtistDetailFragment extends Fragment {
         @NonNull
         @Override
         public AlbumVH onCreateViewHolder(@NonNull ViewGroup parent, int viewType) {
-            return new AlbumVH(LayoutInflater.from(parent.getContext())
-                    .inflate(R.layout.item_artist_album, parent, false));
+            View v = LayoutInflater.from(parent.getContext())
+                    .inflate(R.layout.item_artist_album, parent, false);
+            // Force each card to the home-carousel width with 6dp side margins (the layout is
+            // match_parent so the width is owned here, like PrincipalFragment's carousels).
+            RecyclerView.LayoutParams lp = new RecyclerView.LayoutParams(
+                    albumCardWidthPx(), ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.setMarginStart(dp(6));
+            lp.setMarginEnd(dp(6));
+            v.setLayoutParams(lp);
+            return new AlbumVH(v);
         }
 
         @Override
@@ -585,11 +833,13 @@ public class ArtistDetailFragment extends Fragment {
                 subtitle.setText(album.ownerName);
             }
             if (!TextUtils.isEmpty(album.thumbnailUrl)) {
+                int px = albumCardWidthPx();
+                String sized = ThumbnailUrls.atSize(album.thumbnailUrl.trim(), px);
                 Glide.with(cover)
-                        .load(album.thumbnailUrl.trim())
+                        .load(sized == null ? album.thumbnailUrl.trim() : sized)
                         .diskCacheStrategy(DiskCacheStrategy.ALL)
                         .format(DecodeFormat.PREFER_RGB_565)
-                        .override(300, 300)
+                        .override(px, px)
                         .centerCrop()
                         .into(cover);
             } else {
@@ -597,6 +847,22 @@ public class ArtistDetailFragment extends Fragment {
                         ContextCompat.getColor(cover.getContext(), R.color.surface_high)));
             }
             itemView.setOnClickListener(v -> openAlbum(album));
+        }
+    }
+
+    private class ShowMoreVH extends RecyclerView.ViewHolder {
+        private final TextView btn;
+
+        ShowMoreVH(@NonNull View itemView) {
+            super(itemView);
+            btn = itemView.findViewById(R.id.btnArtistShowMore);
+        }
+
+        void bind() {
+            btn.setText(moreSongsLoading ? "Cargando…" : (songsExpanded ? "Ver menos" : "Ver más"));
+            btn.setEnabled(!moreSongsLoading);
+            btn.setAlpha(moreSongsLoading ? 0.5f : 1f);
+            btn.setOnClickListener(v -> onToggleSongs());
         }
     }
 
@@ -614,7 +880,8 @@ public class ArtistDetailFragment extends Fragment {
 
         void bind(@NonNull YouTubeMusicService.TrackResult track, int index) {
             title.setText(track.title);
-            subtitle.setText(TextUtils.isEmpty(track.subtitle) ? artistName : track.subtitle);
+            String row = SongSubtitle.forRow(track.subtitle, track.title, track.duration);
+            subtitle.setText(TextUtils.isEmpty(row) ? artistName : row);
             if (!TextUtils.isEmpty(track.thumbnailUrl)) {
                 Glide.with(art)
                         .load(track.thumbnailUrl.trim())

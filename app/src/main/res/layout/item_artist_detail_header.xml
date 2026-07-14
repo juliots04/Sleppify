@@ -20,12 +20,12 @@
             android:scaleType="centerCrop" />
 
         <!-- Bottom fade tinted at runtime with the artwork's dominant color (Palette).
-             Anchored to the bottom and kept short (~25% of the hero) so the fade only covers the
-             lower quarter of the photo instead of washing over the middle. -->
+             Anchored to the bottom at ~45% of the 430dp hero so the name area melts into the
+             list without washing over the middle of the photo. -->
         <View
             android:id="@+id/vArtistHeroTint"
             android:layout_width="match_parent"
-            android:layout_height="150dp"
+            android:layout_height="194dp"
             android:layout_gravity="bottom"
             android:background="@drawable/bg_artist_hero_bottom_fade" />
 

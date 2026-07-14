@@ -201,9 +201,11 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
                     .start();
         }
 
-        // Title / Subtitle
+        // Title / Subtitle. The miniplayer shows ONLY the artist name — snapshots persisted by
+        // older versions may still carry a baked "Artista • 3:22 • 500 M..." string, so reduce
+        // it defensively at the last mile.
         if (title == null) title = "";
-        if (subtitle == null) subtitle = "";
+        subtitle = SongSubtitle.artistOnly(subtitle, title);
         if (!TextUtils.equals(tvTitle.getText(), title)) {
             tvTitle.setText(title);
         }

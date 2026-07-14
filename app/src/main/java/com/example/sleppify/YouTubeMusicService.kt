@@ -169,7 +169,11 @@ class YouTubeMusicService @JvmOverloads constructor(
         @JvmField val subtitle: String,
         @JvmField val thumbnailUrl: String,
         @JvmField val topSongs: List<TrackResult>,
-        @JvmField val albums: List<PlaylistResult>
+        @JvmField val albums: List<PlaylistResult>,
+        // browseId of the artist's full "songs" playlist (usually "VL<playlistId>"), taken from the
+        // songs shelf's bottomEndpoint. Empty when the shelf carries no "more" link — the artist
+        // page's "Ver más" button only shows when this is non-empty.
+        @JvmField val moreSongsBrowseId: String = ""
     )
 
     class PlaylistTrackResult(
@@ -187,7 +191,13 @@ class YouTubeMusicService @JvmOverloads constructor(
         @JvmField val playlistId: String,
         @JvmField val title: String,
         @JvmField val subtitle: String,
-        @JvmField val thumbnailUrl: String
+        @JvmField val thumbnailUrl: String,
+        // navigationEndpoint `params` token captured from the home card. YT-generated mixes/recaps
+        // (Replay/Archive/Recap) only return their tracks from the InnerTube /next (watch) — or a
+        // browse — request when this exact token accompanies the playlistId; without it the panel
+        // comes back empty (the "opens empty" / "No se pudo cargar la radio" bugs). Optional and
+        // defaulted so every existing 4-arg MixRes(...) call site and old cache JSON stay valid.
+        @JvmField val params: String = ""
     )
 
     class HomeBrowseResult(
@@ -721,7 +731,14 @@ class YouTubeMusicService @JvmOverloads constructor(
                     it.optJSONObject(it.length() - 1)?.optString("url", "") ?: ""
                 } ?: ""
 
-                results.add(TrackResult("video", videoId, title, artist, thumbUrl))
+                // Same as parseInnertubeSearchResults: the length lives in a fixedColumn, not the
+                // subtitle. Without this, scroll-loaded (page 2+) rows show "Artist" with no duration.
+                val duration = artistRunsToText(
+                    renderer.optJSONArray("fixedColumns")?.optJSONObject(0)
+                        ?.optJSONObject("musicResponsiveListItemFixedColumnRenderer")?.optJSONObject("text")
+                )
+
+                results.add(TrackResult("video", videoId, title, artist, thumbUrl, duration))
             }
         } catch (e: Exception) {
             Log.w("YouTubeMusicService", "parseInnertubeSearchContinuation error: ${e.message}")
@@ -807,6 +824,68 @@ class YouTubeMusicService @JvmOverloads constructor(
         }
     }
 
+    /**
+     * Fallback loader for playlists the OAuth Data API can't read (YTM server-generated RECAP /
+     * auto-mix lists): resolves them through the InnerTube browse endpoint with the web cookie,
+     * exactly as MPRE albums bypass OAuth. browseId is 'VL' + the bare playlist id; the response's
+     * musicPlaylistShelfRenderer is parsed by the same [parseAlbumTracks] path the albums use.
+     * No continuation paging — the initial shelf covers the small generated playlists this targets.
+     */
+    fun fetchPlaylistTracksViaBrowse(
+        cookieHeader: String,
+        playlistId: String,
+        callback: PlaylistTracksCallback
+    ) {
+        fetchPlaylistTracksViaBrowse(cookieHeader, playlistId, "", callback)
+    }
+
+    /**
+     * @param params navigationEndpoint token from the home card. A generated RECAP/auto-mix list is
+     *   browse-readable only with this token; it's added to the browse body when present. Empty for
+     *   ordinary auto-generated playlists (RDCLAK…), whose bare VL+id browse already returns tracks.
+     */
+    fun fetchPlaylistTracksViaBrowse(
+        cookieHeader: String,
+        playlistId: String,
+        params: String,
+        callback: PlaylistTracksCallback
+    ) {
+        val id = playlistId.trim()
+        if (id.isEmpty()) {
+            callback.onError("Playlist invalida.")
+            return
+        }
+        val browseParams = params.trim()
+        executor.execute {
+            try {
+                val browseId = if (id.startsWith("VL")) id else "VL$id"
+                val endpoint = "https://music.youtube.com/youtubei/v1/browse?prettyPrint=false"
+                val body = JSONObject().apply {
+                    put("context", JSONObject().apply {
+                        put("client", JSONObject().apply {
+                            put("clientName", "WEB_REMIX")
+                            put("clientVersion", buildClientVersion())
+                            put("hl", "es")
+                        })
+                    })
+                    put("browseId", browseId)
+                    if (browseParams.isNotEmpty()) put("params", browseParams)
+                }.toString().toByteArray(StandardCharsets.UTF_8)
+                val responseBody = postInnerTubeBrowse(endpoint, body, cookieHeader.trim())
+                val rows = parseAlbumTracks(JSONObject(responseBody))
+                val result = ArrayList<PlaylistTrackResult>()
+                for (t in rows) {
+                    if (t.videoId.isEmpty()) continue
+                    val duration = if (TextUtils.isEmpty(t.duration)) "--:--" else t.duration
+                    result.add(PlaylistTrackResult(t.videoId, t.title, t.subtitle, duration, t.thumbnailUrl))
+                }
+                mainHandler.post { callback.onSuccess(result) }
+            } catch (e: Exception) {
+                mainHandler.post { callback.onError(e.message ?: "No se pudo cargar la playlist.") }
+            }
+        }
+    }
+
     fun fetchPlaylistMeta(
         accessToken: String,
         playlistId: String,
@@ -853,13 +932,22 @@ class YouTubeMusicService @JvmOverloads constructor(
     }
 
     fun fetchMixTracks(cookieHeader: String, playlistId: String, callback: MixTracksCallback) {
+        fetchMixTracks(cookieHeader, playlistId, "", callback)
+    }
+
+    /**
+     * @param params navigationEndpoint token captured from the home card. Empty for a plain song
+     *   radio (RDAMVM…, which resolves off its seed videoId alone); non-empty for YT-generated
+     *   personal mixes (Replay/Archive/Recap) that /next only fills when the token is forwarded.
+     */
+    fun fetchMixTracks(cookieHeader: String, playlistId: String, params: String, callback: MixTracksCallback) {
         if (playlistId.isEmpty()) {
             callback.onError("Datos insuficientes para cargar tracks del mix.")
             return
         }
         executor.execute {
             try {
-                val tracks = performMixTracksRequest(cookieHeader.trim(), playlistId.trim())
+                val tracks = performMixTracksRequest(cookieHeader.trim(), playlistId.trim(), params.trim())
                 mainHandler.post { callback.onSuccess(tracks) }
             } catch (e: Exception) {
                 val error = e.message ?: "No se pudieron cargar tracks del mix."
@@ -1266,11 +1354,16 @@ class YouTubeMusicService @JvmOverloads constructor(
         val targetCount = maxOf(1, maxResults)
         var pageToken = ""
         val videoMap = LinkedHashMap<String, TrackTempData>()
+        // Defense in depth: /playlistItems wants the bare playlist id, but browse-derived ids arrive
+        // 'VL'-prefixed (VLPL…). Strip a leading 'VL' (never the bare 2-char "VL") so those resolve.
+        val apiPlaylistId = if (playlistId.length > 2 && playlistId.startsWith("VL")) {
+            playlistId.substring(2)
+        } else playlistId
 
         while (videoMap.size < targetCount) {
             val pageSize = minOf(YOUTUBE_PAGE_MAX_RESULTS, targetCount - videoMap.size)
             var endpoint = "$API_BASE_URL/playlistItems?part=snippet,contentDetails" +
-                    "&playlistId=" + safeUrlEncode(playlistId) +
+                    "&playlistId=" + safeUrlEncode(apiPlaylistId) +
                     "&maxResults=$pageSize"
             if (pageToken.isNotEmpty()) {
                 endpoint += "&pageToken=" + safeUrlEncode(pageToken)
@@ -1824,6 +1917,11 @@ class YouTubeMusicService @JvmOverloads constructor(
                     if (playlistId.isEmpty()) playlistId = watchEndpoint?.optString("playlistId", "") ?: ""
                     if (playlistId.isEmpty()) playlistId = browseEp?.optString("browseId", "") ?: ""
 
+                    // Same params capture as parseCarouselIntoResult (generated mixes need it for /next).
+                    var navParams = browseEndpoint?.optString("params", "") ?: ""
+                    if (navParams.isEmpty()) navParams = watchEndpoint?.optString("params", "") ?: ""
+                    if (navParams.isEmpty()) navParams = browseEp?.optString("params", "") ?: ""
+
                     val title = renderer.optJSONObject("title")
                         ?.optJSONArray("runs")
                         ?.optJSONObject(0)
@@ -1857,7 +1955,7 @@ class YouTubeMusicService @JvmOverloads constructor(
                             || playlistId.startsWith("RDTMAK")
 
                     if (isMix) {
-                        mixes.add(MixResult(playlistId, title, subtitle, thumbUrl))
+                        mixes.add(MixResult(playlistId, title, subtitle, thumbUrl, navParams))
                     }
                 }
             }
@@ -1867,12 +1965,16 @@ class YouTubeMusicService @JvmOverloads constructor(
         return mixes
     }
 
-    private fun performMixTracksRequest(cookieHeader: String, playlistId: String): List<TrackResult> {
+    private fun performMixTracksRequest(
+        cookieHeader: String,
+        playlistId: String,
+        params: String = ""
+    ): List<TrackResult> {
         val normalizedPlaylistId = playlistId.trim()
         if (normalizedPlaylistId.isEmpty()) return emptyList()
 
         val seedVideoId = extractRadioSeedVideoId(normalizedPlaylistId)
-        val watchResult = performWatchPlaylistRequest(cookieHeader, normalizedPlaylistId, seedVideoId)
+        val watchResult = performWatchPlaylistRequest(cookieHeader, normalizedPlaylistId, seedVideoId, params)
         if (watchResult.tracks.isEmpty()) {
             throw IllegalStateException("No se pudo cargar la radio. Inténtalo más tarde.")
         }
@@ -1883,7 +1985,8 @@ class YouTubeMusicService @JvmOverloads constructor(
     private fun performWatchPlaylistRequest(
         cookieHeader: String,
         playlistId: String,
-        seedVideoId: String
+        seedVideoId: String,
+        params: String = ""
     ): WatchPlaylistResult {
         val endpoint = "https://music.youtube.com/youtubei/v1/next?prettyPrint=false"
         val bodyJson = JSONObject().apply {
@@ -1901,7 +2004,10 @@ class YouTubeMusicService @JvmOverloads constructor(
             if (seedVideoId.isNotEmpty()) {
                 put("videoId", seedVideoId)
             }
-            put("params", "wAEB")
+            // The home card's own token wins: YT-generated personal mixes (Replay/Archive/Recap)
+            // return an empty panel under the generic "wAEB" radio param and only fill when their
+            // captured params ride along. Plain song radios (no card token) keep "wAEB".
+            put("params", if (params.isNotEmpty()) params else "wAEB")
         }.toString().toByteArray(StandardCharsets.UTF_8)
 
         val connection = URL(endpoint).openConnection() as HttpURLConnection
@@ -2165,7 +2271,7 @@ class YouTubeMusicService @JvmOverloads constructor(
         val duration = renderer.optJSONObject("lengthText")
             ?.optJSONArray("runs")?.optJSONObject(0)?.optString("text", "")
             ?: ""
-        tracks.add(TrackResult("video", videoId, title, artist, thumbUrl))
+        tracks.add(TrackResult("video", videoId, title, artist, thumbUrl, duration))
     }
 
     private fun extractWatchTabBrowseId(watchNextRenderer: JSONObject, tabIndex: Int): String {
@@ -2594,6 +2700,7 @@ class YouTubeMusicService @JvmOverloads constructor(
         var name = ""
         var subtitle = ""
         var thumb = ""
+        var moreSongsBrowseId = ""
         val songs = mutableListOf<TrackResult>()
         val albums = mutableListOf<PlaylistResult>()
         try {
@@ -2619,6 +2726,20 @@ class YouTubeMusicService @JvmOverloads constructor(
                 section.optJSONObject("musicShelfRenderer")?.let { shelf ->
                     if (songs.isEmpty()) {
                         shelf.optJSONArray("contents")?.let { songs.addAll(parseArtistTopSongs(it, 30)) }
+                        if (songs.isNotEmpty()) {
+                            // The songs shelf links the artist's full songs playlist. Newer layouts
+                            // put it in bottomEndpoint, older ones behind a moreContentButton.
+                            moreSongsBrowseId = shelf.optJSONObject("bottomEndpoint")
+                                ?.optJSONObject("browseEndpoint")
+                                ?.optString("browseId", "")?.trim() ?: ""
+                            if (moreSongsBrowseId.isEmpty()) {
+                                moreSongsBrowseId = shelf.optJSONObject("moreContentButton")
+                                    ?.optJSONObject("buttonRenderer")
+                                    ?.optJSONObject("navigationEndpoint")
+                                    ?.optJSONObject("browseEndpoint")
+                                    ?.optString("browseId", "")?.trim() ?: ""
+                            }
+                        }
                     }
                 }
                 section.optJSONObject("musicCarouselShelfRenderer")?.let { carousel ->
@@ -2628,7 +2749,7 @@ class YouTubeMusicService @JvmOverloads constructor(
         } catch (e: Exception) {
             Log.w(TAG, "parseArtistPage failed", e)
         }
-        return ArtistPage(name, subtitle, thumb, songs, albums)
+        return ArtistPage(name, subtitle, thumb, songs, albums, moreSongsBrowseId)
     }
 
     private fun parseArtistTopSongs(items: JSONArray, limit: Int): List<TrackResult> {
@@ -2658,7 +2779,13 @@ class YouTubeMusicService @JvmOverloads constructor(
                     ?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")?.optJSONObject("text")
             )
             val thumb = artistThumbUrl(r.optJSONObject("thumbnail")?.optJSONObject("musicThumbnailRenderer"))
-            out.add(TrackResult("video", videoId, title, artist, thumb))
+            // Top-songs rows carry their length in a fixedColumn like album rows do; without it
+            // the artist-page rows can never show a duration.
+            val duration = artistRunsToText(
+                r.optJSONArray("fixedColumns")?.optJSONObject(0)
+                    ?.optJSONObject("musicResponsiveListItemFixedColumnRenderer")?.optJSONObject("text")
+            )
+            out.add(TrackResult("video", videoId, title, artist, thumb, duration))
         }
         return out
     }
@@ -2845,6 +2972,132 @@ class YouTubeMusicService @JvmOverloads constructor(
         }
     }
 
+    /** Real YouTube/YT Music like state for a video, mirrored from the InnerTube likeStatus enum. */
+    enum class LikeStatus { LIKE, DISLIKE, INDIFFERENT }
+
+    interface RateCallback {
+        fun onSuccess(status: LikeStatus)
+        fun onError(error: String)
+    }
+
+    interface LikeStatusCallback {
+        fun onResult(status: LikeStatus)
+    }
+
+    /**
+     * Applies a REAL like/dislike on YouTube via the InnerTube like endpoints, authenticated with the
+     * user's YT Music web cookie + SAPISID (the same auth the home feed uses) — so it counts exactly
+     * like tapping like/dislike on youtube.com / music.youtube.com. [target] LIKE→/like/like,
+     * DISLIKE→/like/dislike, INDIFFERENT→/like/removelike (clears a prior like or dislike).
+     */
+    fun rateSong(cookieHeader: String, videoId: String, target: LikeStatus, callback: RateCallback) {
+        val cookie = cookieHeader.trim()
+        val id = videoId.trim()
+        if (cookie.isEmpty()) {
+            callback.onError("Inicia sesión en YouTube Music para dar me gusta.")
+            return
+        }
+        if (id.isEmpty()) {
+            callback.onError("Vídeo no válido.")
+            return
+        }
+        executor.execute {
+            try {
+                val action = when (target) {
+                    LikeStatus.LIKE -> "like"
+                    LikeStatus.DISLIKE -> "dislike"
+                    LikeStatus.INDIFFERENT -> "removelike"
+                }
+                val endpoint = "https://music.youtube.com/youtubei/v1/like/$action?prettyPrint=false"
+                val clientContext = JSONObject().apply {
+                    put("clientName", "WEB_REMIX")
+                    put("clientVersion", buildClientVersion())
+                    put("hl", "es")
+                }
+                val body = JSONObject().apply {
+                    put("context", JSONObject().put("client", clientContext))
+                    put("target", JSONObject().put("videoId", id))
+                }.toString().toByteArray(StandardCharsets.UTF_8)
+                // A 2xx with no exception means the action was applied.
+                postInnerTubeBrowse(endpoint, body, cookie)
+                mainHandler.post { callback.onSuccess(target) }
+            } catch (e: Exception) {
+                mainHandler.post { callback.onError(e.message ?: "No se pudo actualizar el me gusta.") }
+            }
+        }
+    }
+
+    /**
+     * Reads the REAL current like status of [videoId] from YouTube via the InnerTube watch (/next)
+     * endpoint, so the player can reflect what the user has on YT (liked / disliked / neither).
+     * Best-effort: on any parse/network issue it reports INDIFFERENT rather than failing the UI.
+     */
+    fun fetchLikeStatus(cookieHeader: String, videoId: String, callback: LikeStatusCallback) {
+        val cookie = cookieHeader.trim()
+        val id = videoId.trim()
+        if (cookie.isEmpty() || id.isEmpty()) {
+            callback.onResult(LikeStatus.INDIFFERENT)
+            return
+        }
+        executor.execute {
+            var result = LikeStatus.INDIFFERENT
+            try {
+                val endpoint = "https://music.youtube.com/youtubei/v1/next?prettyPrint=false"
+                val clientContext = JSONObject().apply {
+                    put("clientName", "WEB_REMIX")
+                    put("clientVersion", buildClientVersion())
+                    put("hl", "es")
+                }
+                val body = JSONObject().apply {
+                    put("context", JSONObject().put("client", clientContext))
+                    put("videoId", id)
+                }.toString().toByteArray(StandardCharsets.UTF_8)
+                val response = postInnerTubeBrowse(endpoint, body, cookie)
+                result = parseLikeStatusFromNext(JSONObject(response))
+            } catch (_: Exception) {
+                result = LikeStatus.INDIFFERENT
+            }
+            mainHandler.post { callback.onResult(result) }
+        }
+    }
+
+    /** Digs the likeButtonRenderer.likeStatus out of the /next watch response (deep, so defensive). */
+    private fun parseLikeStatusFromNext(root: JSONObject): LikeStatus {
+        try {
+            val panel = root.optJSONObject("contents")
+                ?.optJSONObject("singleColumnMusicWatchNextResultsRenderer")
+                ?.optJSONObject("tabbedRenderer")
+                ?.optJSONObject("watchNextTabbedResultsRenderer")
+                ?.optJSONArray("tabs")
+                ?.optJSONObject(0)
+                ?.optJSONObject("tabRenderer")
+                ?.optJSONObject("content")
+                ?.optJSONObject("musicQueueRenderer")
+                ?.optJSONObject("content")
+                ?.optJSONObject("playlistPanelRenderer")
+                ?.optJSONArray("contents")
+            if (panel != null) {
+                for (i in 0 until panel.length()) {
+                    val video = panel.optJSONObject(i)?.optJSONObject("playlistPanelVideoRenderer") ?: continue
+                    val buttons = video.optJSONObject("menu")
+                        ?.optJSONObject("menuRenderer")
+                        ?.optJSONArray("topLevelButtons") ?: continue
+                    for (b in 0 until buttons.length()) {
+                        val lb = buttons.optJSONObject(b)?.optJSONObject("likeButtonRenderer") ?: continue
+                        val raw = lb.optString("likeStatus", "")
+                        return when (raw) {
+                            "LIKE" -> LikeStatus.LIKE
+                            "DISLIKE" -> LikeStatus.DISLIKE
+                            else -> LikeStatus.INDIFFERENT
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return LikeStatus.INDIFFERENT
+    }
+
     private fun extractContinuationToken(root: JSONObject): String? {
         return root.optJSONObject("contents")
             ?.optJSONObject("singleColumnBrowseResultsRenderer")
@@ -2935,7 +3188,24 @@ class YouTubeMusicService @JvmOverloads constructor(
 
             var playlistId = browseEndpoint?.optString("playlistId", "") ?: ""
             if (playlistId.isEmpty()) playlistId = watchEndpoint?.optString("playlistId", "") ?: ""
-            if (playlistId.isEmpty()) playlistId = browseEp?.optString("browseId", "") ?: ""
+            if (playlistId.isEmpty()) {
+                playlistId = browseEp?.optString("browseId", "") ?: ""
+                // browseIds are the 'VL'-prefixed browse form of the playlist id (VLPL…→PL…,
+                // VLRDTMAK…→RDTMAK…, VLLM→LM). Downstream consumers (Data API playlistItems,
+                // the RD… mix router in PlaylistDetail) all expect the bare id — a leaked 'VL'
+                // id reaches the Data API verbatim and returns an empty tracklist (the
+                // RECAP-opens-empty bug).
+                if (playlistId.startsWith("VL") && playlistId.length > 2) {
+                    playlistId = playlistId.substring(2)
+                }
+            }
+
+            // Capture the endpoint's `params` token: YT-generated mixes/recaps only resolve their
+            // tracks from /next (or browse) when this exact token rides along with the playlistId.
+            // Whichever endpoint supplied the id owns the token, so read them in the same priority.
+            var navParams = browseEndpoint?.optString("params", "") ?: ""
+            if (navParams.isEmpty()) navParams = watchEndpoint?.optString("params", "") ?: ""
+            if (navParams.isEmpty()) navParams = browseEp?.optString("params", "") ?: ""
 
             val title = renderer.optJSONObject("title")
                 ?.optJSONArray("runs")
@@ -2960,7 +3230,7 @@ class YouTubeMusicService @JvmOverloads constructor(
             } ?: ""
 
             if (playlistId.isEmpty() && title.isEmpty()) continue
-            sectionItems.add(MixResult(playlistId, title, subtitle, thumbUrl))
+            sectionItems.add(MixResult(playlistId, title, subtitle, thumbUrl, navParams))
         }
 
         if (sectionItems.isNotEmpty()) {
@@ -3153,8 +3423,12 @@ class YouTubeMusicService @JvmOverloads constructor(
                                     val thumbUrl2 = thumbs2?.let {
                                         it.optJSONObject(it.length() - 1)?.optString("url", "") ?: ""
                                     } ?: ""
+                                    val trackDuration = artistRunsToText(
+                                        renderer.optJSONArray("fixedColumns")?.optJSONObject(0)
+                                            ?.optJSONObject("musicResponsiveListItemFixedColumnRenderer")?.optJSONObject("text")
+                                    )
                                     if (trackTitle.isNotEmpty() && results.none { it.videoId == vid }) {
-                                        results.add(TrackResult("video", vid, trackTitle, trackArtist, thumbUrl2))
+                                        results.add(TrackResult("video", vid, trackTitle, trackArtist, thumbUrl2, trackDuration))
                                     }
                                 }
                             }
@@ -3218,9 +3492,18 @@ class YouTubeMusicService @JvmOverloads constructor(
                         val thumbUrl = thumbs?.let {
                             it.optJSONObject(it.length() - 1)?.optString("url", "") ?: ""
                         } ?: ""
- 
+
+                        // Song rows carry their length in a fixedColumn ("3:20"), not the subtitle.
+                        // Pull it into the dedicated duration field so the UI can render
+                        // "Artist • 3:20" instead of dropping the duration (or, for solo tracks
+                        // whose subtitle IS just the length, rendering "3:20 • 3:20").
+                        val duration = artistRunsToText(
+                            renderer.optJSONArray("fixedColumns")?.optJSONObject(0)
+                                ?.optJSONObject("musicResponsiveListItemFixedColumnRenderer")?.optJSONObject("text")
+                        )
+
                         if (results.none { it.videoId == videoId }) {
-                            results.add(TrackResult("video", videoId, title, artist, thumbUrl))
+                            results.add(TrackResult("video", videoId, title, artist, thumbUrl, duration))
                         }
                     }
                 }

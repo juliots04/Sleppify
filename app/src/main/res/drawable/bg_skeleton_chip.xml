@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Skeleton placeholder for the library filter chips: same 10dp corner radius as
+     bg_library_filter_chip so the loading state mirrors the real pills. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="@color/surface_high" />
+    <corners android:radius="10dp" />
+</shape>

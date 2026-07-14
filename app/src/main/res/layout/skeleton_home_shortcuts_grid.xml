@@ -1,45 +1,52 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Cold-start placeholder for the 3x3 shortcuts grid (vpShortcuts). Three weighted rows of three
      weighted square blocks fill the square grid area (host height is set to screenWidth in code so
-     each cell is square, matching item_shortcut_cell's 1:1 + 2.5dp padding). No id on the root so
-     the <include> tag can assign one. Pulsed via startHomeSkeletonPulse(). -->
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+     each cell is square, matching item_shortcut_cell's 1:1 ratio, 8dp corner radius and 2.5dp
+     padding). The 16dp horizontal padding matches the real pager's page padding (set in code).
+     Wrapped in ShimmerFrameLayout for the sweeping highlight. -->
+<com.example.sleppify.widget.ShimmerFrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:orientation="vertical"
-    android:padding="2.5dp"
     android:importantForAccessibility="no">
 
     <LinearLayout
         android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1"
-        android:orientation="horizontal">
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:paddingHorizontal="16dp"
+        android:paddingVertical="2.5dp">
 
-        <View android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1" android:layout_margin="2.5dp" android:background="@drawable/bg_skeleton_block" />
-        <View android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1" android:layout_margin="2.5dp" android:background="@drawable/bg_skeleton_block" />
-        <View android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1" android:layout_margin="2.5dp" android:background="@drawable/bg_skeleton_block" />
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:orientation="horizontal">
+
+            <View android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1" android:layout_margin="2.5dp" android:background="@drawable/bg_skeleton_block" />
+            <View android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1" android:layout_margin="2.5dp" android:background="@drawable/bg_skeleton_block" />
+            <View android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1" android:layout_margin="2.5dp" android:background="@drawable/bg_skeleton_block" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:orientation="horizontal">
+
+            <View android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1" android:layout_margin="2.5dp" android:background="@drawable/bg_skeleton_block" />
+            <View android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1" android:layout_margin="2.5dp" android:background="@drawable/bg_skeleton_block" />
+            <View android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1" android:layout_margin="2.5dp" android:background="@drawable/bg_skeleton_block" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:orientation="horizontal">
+
+            <View android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1" android:layout_margin="2.5dp" android:background="@drawable/bg_skeleton_block" />
+            <View android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1" android:layout_margin="2.5dp" android:background="@drawable/bg_skeleton_block" />
+            <View android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1" android:layout_margin="2.5dp" android:background="@drawable/bg_skeleton_block" />
+        </LinearLayout>
     </LinearLayout>
-
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1"
-        android:orientation="horizontal">
-
-        <View android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1" android:layout_margin="2.5dp" android:background="@drawable/bg_skeleton_block" />
-        <View android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1" android:layout_margin="2.5dp" android:background="@drawable/bg_skeleton_block" />
-        <View android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1" android:layout_margin="2.5dp" android:background="@drawable/bg_skeleton_block" />
-    </LinearLayout>
-
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1"
-        android:orientation="horizontal">
-
-        <View android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1" android:layout_margin="2.5dp" android:background="@drawable/bg_skeleton_block" />
-        <View android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1" android:layout_margin="2.5dp" android:background="@drawable/bg_skeleton_block" />
-        <View android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1" android:layout_margin="2.5dp" android:background="@drawable/bg_skeleton_block" />
-    </LinearLayout>
-</LinearLayout>
+</com.example.sleppify.widget.ShimmerFrameLayout>

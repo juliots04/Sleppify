@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Skeleton placeholder for 50dp square row thumbnails (covers/library rows): the real art is
+     square-edged, so only a subtle 4dp rounding to read softly while loading. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="@color/surface_high" />
+    <corners android:radius="4dp" />
+</shape>

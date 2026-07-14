@@ -209,7 +209,7 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="4dp"
-                    android:text="Ecualiza todo el audio del sistema. Desactívalo para ecualizar solo Sleppify (más rápido)"
+                    android:text="Equaliza todo el audio del SO. Desactívalo para ecualizar solo esta aplicación"
                     android:textColor="@color/text_secondary"
                     android:textSize="13sp" />
             </LinearLayout>

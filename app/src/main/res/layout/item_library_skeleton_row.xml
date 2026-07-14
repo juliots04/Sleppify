@@ -15,7 +15,7 @@
     <View
         android:layout_width="50dp"
         android:layout_height="50dp"
-        android:background="@drawable/bg_skeleton_block" />
+        android:background="@drawable/bg_skeleton_thumb" />
 
     <LinearLayout
         android:layout_width="0dp"

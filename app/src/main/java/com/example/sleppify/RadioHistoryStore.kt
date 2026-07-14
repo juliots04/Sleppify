@@ -13,12 +13,21 @@ object RadioHistoryStore {
     private const val KEY_PINNED = "pinned_radio_ids"
     private const val MAX_UNPINNED = 10
 
+    /** Mínimo de reproducciones para que una estación aparezca en "Estaciones más escuchadas".
+     *  Con valor 1, cualquier radio aparece en cuanto se crea (saveRadio la deja con playCount=1),
+     *  y la sección se ordena por reproducciones desc para que las más escuchadas queden primero.
+     *  Radios previos a esta versión (sin contador guardado) se "heredan" como visibles (parseEntry
+     *  usa este valor por defecto) para no hacerlas desaparecer de golpe en la actualización. */
+    const val MIN_PLAYS_FOR_TOP = 1
+
     data class RadioEntry(
         val radioPlaylistId: String,
         val songTitle: String,
         val songThumbnail: String,
         val tracks: List<RadioTrack>,
-        val createdAt: Long
+        val createdAt: Long,
+        /** Veces que se ha iniciado esta radio (se incrementa en cada saveRadio). */
+        val playCount: Int = 1
     )
 
     data class RadioTrack(
@@ -50,6 +59,14 @@ object RadioHistoryStore {
         val prefs = getPrefs(context)
         val existing = loadRadiosInternal(prefs)
 
+        // Contador de reproducciones: parte del que ya tuviera esta radio (+1). Radio nueva → 1.
+        // Un radio previo sin campo "playCount" cuenta como MIN_PLAYS_FOR_TOP (heredado visible), así
+        // que reproducirlo lo sube por encima del umbral en vez de resetearlo por debajo.
+        val priorCount = existing
+            .firstOrNull { it.optString("radioPlaylistId") == radioPlaylistId }
+            ?.optInt("playCount", MIN_PLAYS_FOR_TOP) ?: 0
+        val newPlayCount = priorCount + 1
+
         // Remove existing entry with same id (to update / move to front)
         val filtered = existing.filter { it.getString("radioPlaylistId") != radioPlaylistId }
 
@@ -58,6 +75,7 @@ object RadioHistoryStore {
             put("songTitle", songTitle)
             put("songThumbnail", songThumbnail)
             put("createdAt", System.currentTimeMillis())
+            put("playCount", newPlayCount)
             val arr = JSONArray()
             for (t in tracks) {
                 arr.put(JSONObject().apply {
@@ -292,6 +310,9 @@ object RadioHistoryStore {
         val title = obj.optString("songTitle", "")
         val thumb = obj.optString("songThumbnail", "")
         val createdAt = obj.optLong("createdAt", 0L)
+        // Radios previos a esta versión no tienen "playCount": por defecto MIN_PLAYS_FOR_TOP para que
+        // sigan visibles tras la actualización (no desaparecen de golpe).
+        val playCount = obj.optInt("playCount", MIN_PLAYS_FOR_TOP)
         val tracksArr = obj.optJSONArray("tracks") ?: return null
         val tracks = mutableListOf<RadioTrack>()
         for (i in 0 until tracksArr.length()) {
@@ -303,6 +324,6 @@ object RadioHistoryStore {
                 t.optString("thumbnailUrl", "")
             ))
         }
-        return RadioEntry(id, title, thumb, tracks, createdAt)
+        return RadioEntry(id, title, thumb, tracks, createdAt, playCount)
     }
 }

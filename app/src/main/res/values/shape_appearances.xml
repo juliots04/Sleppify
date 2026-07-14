@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!--
+      Rounded corner shape for the playlist-detail header cover (ivPlaylistCover, a
+      ShapeableImageView). A small ~14dp radius so opaque covers (normal HD image / 2x2 grid
+      composite) read as a softly rounded card. Radio composites and the gradient/icon covers use
+      a background fill, which ShapeableImageView does NOT clip, so those visually stay square —
+      only real image content is rounded, which is the intent. Kept in its own file so it doesn't
+      collide with the app theme definitions.
+    -->
+    <style name="ShapeAppearance.Sleppify.PlaylistCover" parent="">
+        <item name="cornerFamily">rounded</item>
+        <item name="cornerSize">14dp</item>
+    </style>
+
+</resources>

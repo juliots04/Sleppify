@@ -11,13 +11,17 @@ import android.widget.TextView
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.bumptech.glide.Glide
+import com.bumptech.glide.load.engine.DiskCacheStrategy
 import com.bumptech.glide.load.resource.bitmap.CircleCrop
 import com.google.android.material.bottomsheet.BottomSheetBehavior
 import com.google.android.material.bottomsheet.BottomSheetDialog
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
-import java.net.HttpURLConnection
-import java.net.URL
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 class CommentsBottomSheet(
     private val context: Context,
@@ -67,6 +71,26 @@ class CommentsBottomSheet(
         private const val CLIENT_NAME = "WEB"
         private const val CLIENT_VERSION = "2.20241111.01.00"
 
+        // A first-page cache younger than this renders as-is with NO network refresh.
+        private const val CACHE_FRESH_MS = 15 * 60 * 1000L
+
+        // Shared client: connection/TLS reuse across first page, pagination, replies and
+        // prefetch (a fresh HttpURLConnection handshake per call cost ~200-500ms each).
+        private val httpClient: OkHttpClient by lazy {
+            OkHttpClient.Builder()
+                .connectTimeout(6, TimeUnit.SECONDS)
+                .readTimeout(10, TimeUnit.SECONDS)
+                .build()
+        }
+
+        // Prefetch + cache writes live on a shared executor: the per-sheet executor is
+        // shutdownNow()'d on dismiss, which would kill an in-flight disk write mid-file.
+        private val sharedIo = Executors.newSingleThreadExecutor { r ->
+            Thread(r, "comments-io").apply { isDaemon = true }
+        }
+
+        @Volatile private var prefetchingVideoId: String? = null
+
         @JvmStatic
         fun newInstance(videoId: String, commentCount: String): CommentsBottomSheet {
             throw UnsupportedOperationException("Use CommentsBottomSheet(context, videoId, commentCount) directly")
@@ -75,6 +99,125 @@ class CommentsBottomSheet(
         @JvmStatic
         fun show(context: Context, videoId: String, commentCountLabel: String) {
             CommentsBottomSheet(context, videoId, commentCountLabel).show()
+        }
+
+        /**
+         * Warms the first-page comments cache in the background so opening the sheet later
+         * hits the instant cache path. Safe to call on every track bind: no-ops when a fresh
+         * cache exists or a prefetch for this video is already in flight.
+         */
+        @JvmStatic
+        fun prefetch(context: Context, videoId: String) {
+            if (videoId.isEmpty()) return
+            val appCtx = context.applicationContext
+            if (prefetchingVideoId == videoId) return
+            sharedIo.execute {
+                if (prefetchingVideoId == videoId) return@execute
+                prefetchingVideoId = videoId
+                try {
+                    if (CommentsCacheManager.isFresh(appCtx, videoId, CACHE_FRESH_MS)) return@execute
+                    val payload = JSONObject().apply {
+                        put("context", buildInnertubeContext())
+                        put("continuation", buildCommentsToken(videoId))
+                    }
+                    val body = postInnertube(INNERTUBE_NEXT, payload) ?: return@execute
+                    // Only cache bodies that actually carry comment data; anything else would
+                    // just make the sheet parse-and-discard on open.
+                    if (body.contains("commentThreadRenderer") || body.contains("commentEntityPayload")) {
+                        CommentsCacheManager.saveFirstPageCache(appCtx, videoId, body)
+                    }
+                } catch (_: Throwable) {
+                } finally {
+                    prefetchingVideoId = null
+                }
+            }
+        }
+
+        /**
+         * Synthesizes the first-page comments continuation token locally (yt-dlp's
+         * _generate_comment_continuation byte layout). This skips the watch-next round trip
+         * that only existed to discover this token — that call downloads and parses
+         * 300KB-1.5MB of JSON and was the single biggest cold-load cost.
+         */
+        private fun buildCommentsToken(videoId: String): String {
+            val raw = StringBuilder()
+                .append(0x12.toChar()).append(0x0D.toChar()).append(0x12.toChar()).append(0x0B.toChar())
+                .append(videoId)
+                .append(0x18.toChar()).append(0x06.toChar()).append('2').append(0x27.toChar()).append('"')
+                .append(0x11.toChar()).append('"').append(0x0B.toChar())
+                .append(videoId)
+                .append('0').append(0x00.toChar()).append('x').append(0x02.toChar())
+                .append('0').append(0x00.toChar()).append('B').append(0x10.toChar())
+                .append("comments-section")
+                .toString()
+            val bytes = raw.toByteArray(Charsets.ISO_8859_1)
+            return android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
+        }
+
+        private fun buildInnertubeContext(): JSONObject {
+            return JSONObject().apply {
+                put("client", JSONObject().apply {
+                    put("clientName", CLIENT_NAME)
+                    put("clientVersion", CLIENT_VERSION)
+                    put("hl", "es")
+                    put("gl", "US")
+                })
+            }
+        }
+
+        private fun postInnertube(endpoint: String, payload: JSONObject): String? {
+            return try {
+                val builder = Request.Builder()
+                    .url(endpoint)
+                    .post(payload.toString().toRequestBody("application/json".toMediaType()))
+                    .header("Accept", "application/json")
+                    .header("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36")
+                    .header("Origin", "https://www.youtube.com")
+                    .header("Referer", "https://www.youtube.com/")
+                val cookie = StreamResolver.getAuthCookieHeader()
+                if (cookie.isNotBlank()) {
+                    builder.header("Cookie", cookie)
+                    val sapisidHash = generateSapisidHash(cookie)
+                    if (sapisidHash.isNotBlank()) {
+                        builder.header("Authorization", sapisidHash)
+                    }
+                }
+                httpClient.newCall(builder.build()).execute().use { resp ->
+                    if (!resp.isSuccessful) {
+                        val err = try { resp.body?.string()?.take(500) ?: "" } catch (_: Exception) { "" }
+                        android.util.Log.w("CommentsSheet", "InnerTube ${resp.code}: $err")
+                        return null
+                    }
+                    resp.body?.string()
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("CommentsSheet", "postInnertube network error", e)
+                null
+            }
+        }
+
+        private fun generateSapisidHash(cookieHeader: String): String {
+            val sapisid = extractCookieValue(cookieHeader, "SAPISID")
+                ?: extractCookieValue(cookieHeader, "__Secure-3PAPISID")
+                ?: return ""
+            val timestamp = System.currentTimeMillis() / 1000
+            val origin = "https://www.youtube.com"
+            val input = "$timestamp $sapisid $origin"
+            return try {
+                val digest = java.security.MessageDigest.getInstance("SHA-1")
+                val hash = digest.digest(input.toByteArray(Charsets.UTF_8))
+                    .joinToString("") { "%02x".format(it) }
+                "SAPISIDHASH ${timestamp}_${hash}"
+            } catch (_: Exception) { "" }
+        }
+
+        private fun extractCookieValue(cookieHeader: String, name: String): String? {
+            if (cookieHeader.isBlank()) return null
+            return cookieHeader.split(";")
+                .map { it.trim() }
+                .firstOrNull { it.startsWith("$name=") }
+                ?.substringAfter("=")
+                ?.trim()
         }
     }
 
@@ -93,6 +236,25 @@ class CommentsBottomSheet(
             behavior.halfExpandedRatio = 0.55f
             behavior.skipCollapsed = true
             behavior.state = BottomSheetBehavior.STATE_HALF_EXPANDED
+
+            // Symmetric collapse: opening goes half → full, so swiping down from full must
+            // first settle at half (and only dismiss from half). With skipCollapsed=true a
+            // fling from EXPANDED targets STATE_HIDDEN directly, so while EXPANDED we make
+            // the sheet non-hideable; the release then settles at HALF_EXPANDED instead.
+            behavior.addBottomSheetCallback(object : BottomSheetBehavior.BottomSheetCallback() {
+                override fun onStateChanged(bottomSheet: View, newState: Int) {
+                    when (newState) {
+                        BottomSheetBehavior.STATE_EXPANDED -> behavior.isHideable = false
+                        BottomSheetBehavior.STATE_HALF_EXPANDED -> behavior.isHideable = true
+                        // Non-hideable drags can settle on the tiny default peek sliver;
+                        // bounce back to half so the sheet never strands down there.
+                        BottomSheetBehavior.STATE_COLLAPSED ->
+                            behavior.state = BottomSheetBehavior.STATE_HALF_EXPANDED
+                    }
+                }
+
+                override fun onSlide(bottomSheet: View, slideOffset: Float) {}
+            })
         }
 
         if (commentCountLabel.isNotEmpty() && commentCountLabel != "0") {
@@ -132,8 +294,14 @@ class CommentsBottomSheet(
             if (pageToken == null && comments.isEmpty()) {
                 val cachedBody = CommentsCacheManager.getFirstPageCache(context, videoId)
                 if (cachedBody != null) {
-                    val parsed = parseInnertubeComments(cachedBody)
-                    if (parsed.first.isNotEmpty()) {
+                    // A truncated/corrupted cache file must not kill the whole load.
+                    val parsed = try {
+                        parseInnertubeComments(cachedBody)
+                    } catch (e: Exception) {
+                        CommentsCacheManager.deleteCache(context, videoId)
+                        null
+                    }
+                    if (parsed != null && parsed.first.isNotEmpty()) {
                         bsv.post {
                             if (!dialog.isShowing) return@post
                             nextPageToken = parsed.second
@@ -143,6 +311,11 @@ class CommentsBottomSheet(
                             showLoading(false)
                         }
                         cacheLoaded = true
+                        // Fresh cache (e.g. just prefetched): render it and skip the refresh.
+                        if (CommentsCacheManager.isFresh(context, videoId, CACHE_FRESH_MS)) {
+                            bsv.post { isLoading = false }
+                            return@execute
+                        }
                     }
                 }
             }
@@ -150,20 +323,27 @@ class CommentsBottomSheet(
             val result: Pair<List<CommentItem>, String?>?
             val rawBody: String?
             if (pageToken == null) {
-                // First load: get continuation token from /next, then fetch comments
-                val contToken = fetchCommentsContinuationToken(videoId)
-                if (contToken != null) {
-                    val fetched = fetchInnertubeComments(contToken)
-                    result = fetched?.first
-                    rawBody = fetched?.second
-                } else {
-                    result = null
-                    rawBody = null
+                // Fast path: locally synthesized first-page token — ONE round trip. Falls back
+                // to the old watch-next token discovery when YouTube rejects the synthesized
+                // format or the page comes back empty (the fallback is also what distinguishes
+                // "no comments" from "comments disabled" via messageRenderer).
+                var fetched = fetchInnertubeComments(buildCommentsToken(videoId))
+                if (fetched == null || fetched.first.first.isEmpty()) {
+                    val contToken = fetchCommentsContinuationToken(videoId)
+                    if (contToken != null) fetched = fetchInnertubeComments(contToken)
                 }
+                result = fetched?.first
+                rawBody = fetched?.second
             } else {
                 val fetched = fetchInnertubeComments(pageToken)
                 result = fetched?.first
                 rawBody = fetched?.second
+            }
+
+            // Persist the first page here, off-main — this used to write hundreds of KB to
+            // disk on the UI thread inside the render post.
+            if (pageToken == null && rawBody != null && result != null && result.first.isNotEmpty()) {
+                CommentsCacheManager.saveFirstPageCache(context, videoId, rawBody)
             }
 
             bsv.post {
@@ -183,16 +363,30 @@ class CommentsBottomSheet(
                     }
                 } else {
                     showLoading(false)
-                    if (pageToken == null && rawBody != null) {
-                        CommentsCacheManager.saveFirstPageCache(context, videoId, rawBody)
-                        if (cacheLoaded) comments.clear()
-                    }
-                    if (!cacheLoaded || pageToken == null) {
+                    if (pageToken == null && cacheLoaded) {
+                        // The cached page is already on screen. Repaint only if the fresh page
+                        // actually differs — repainting identical content reset the scroll and
+                        // re-fired every visible avatar load (the flicker on every open).
+                        nextPageToken = result.second
+                        if (result.first != comments) {
+                            comments.clear()
+                            comments.addAll(result.first)
+                            adapter.rebuildRows()
+                            adapter.notifyDataSetChanged()
+                        }
+                    } else if (pageToken == null) {
                         nextPageToken = result.second
                         comments.addAll(result.first)
-                        preloadAvatars(result.first)
                         adapter.rebuildRows()
                         adapter.notifyDataSetChanged()
+                    } else {
+                        // Pagination appends rows strictly at the end: range-notify instead of
+                        // notifyDataSetChanged so visible rows don't rebind/reload avatars.
+                        nextPageToken = result.second
+                        val oldRowCount = adapter.itemCount
+                        comments.addAll(result.first)
+                        adapter.rebuildRows()
+                        adapter.notifyItemRangeInserted(oldRowCount, adapter.itemCount - oldRowCount)
                     }
                     if (comments.isEmpty()) showEmpty()
                 }
@@ -201,52 +395,7 @@ class CommentsBottomSheet(
     }
 
     // ── InnerTube helpers ──────────────────────────────────────────────
-
-    private fun buildInnertubeContext(): JSONObject {
-        return JSONObject().apply {
-            put("client", JSONObject().apply {
-                put("clientName", CLIENT_NAME)
-                put("clientVersion", CLIENT_VERSION)
-                put("hl", "es")
-                put("gl", "US")
-            })
-        }
-    }
-
-    private fun postInnertube(endpoint: String, payload: JSONObject): String? {
-        val conn = URL(endpoint).openConnection() as HttpURLConnection
-        conn.requestMethod = "POST"
-        conn.connectTimeout = 12000
-        conn.readTimeout = 15000
-        conn.doOutput = true
-        conn.setRequestProperty("Content-Type", "application/json")
-        conn.setRequestProperty("Accept", "application/json")
-        conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36")
-        conn.setRequestProperty("Origin", "https://www.youtube.com")
-        conn.setRequestProperty("Referer", "https://www.youtube.com/")
-        val cookie = StreamResolver.getAuthCookieHeader()
-        if (cookie.isNotBlank()) {
-            conn.setRequestProperty("Cookie", cookie)
-            val sapisidHash = generateSapisidHash(cookie)
-            if (sapisidHash.isNotBlank()) {
-                conn.setRequestProperty("Authorization", sapisidHash)
-            }
-        }
-        try {
-            conn.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
-            val code = conn.responseCode
-            if (code != HttpURLConnection.HTTP_OK) {
-                val err = try { conn.errorStream?.bufferedReader()?.readText()?.take(500) ?: "" } catch (_: Exception) { "" }
-                android.util.Log.w("CommentsSheet", "InnerTube $code: $err")
-                return null
-            }
-            val body = conn.inputStream.bufferedReader().readText()
-            return body
-        } catch (e: Exception) {
-            android.util.Log.e("CommentsSheet", "postInnertube network error", e)
-            return null
-        } finally { conn.disconnect() }
-    }
+    // (network + context/auth helpers live in the companion so prefetch can use them)
 
     private fun fetchCommentsContinuationToken(videoId: String): String? {
         return try {
@@ -693,50 +842,17 @@ class CommentsBottomSheet(
         tvEmpty.visibility = View.VISIBLE
     }
 
-    private fun generateSapisidHash(cookieHeader: String): String {
-        val sapisid = extractCookieValue(cookieHeader, "SAPISID")
-            ?: extractCookieValue(cookieHeader, "__Secure-3PAPISID")
-            ?: return ""
-        val timestamp = System.currentTimeMillis() / 1000
-        val origin = "https://www.youtube.com"
-        val input = "$timestamp $sapisid $origin"
-        return try {
-            val digest = java.security.MessageDigest.getInstance("SHA-1")
-            val hash = digest.digest(input.toByteArray(Charsets.UTF_8))
-                .joinToString("") { "%02x".format(it) }
-            "SAPISIDHASH ${timestamp}_${hash}"
-        } catch (_: Exception) { "" }
-    }
-
-    private fun extractCookieValue(cookieHeader: String, name: String): String? {
-        if (cookieHeader.isBlank()) return null
-        return cookieHeader.split(";")
-            .map { it.trim() }
-            .firstOrNull { it.startsWith("$name=") }
-            ?.substringAfter("=")
-            ?.trim()
-    }
-
-    private fun preloadAvatars(items: List<CommentItem>) {
-        for (item in items) {
-            if (item.authorProfileUrl.isNotEmpty()) {
-                try { Glide.with(context).load(item.authorProfileUrl).transform(CircleCrop()).preload() } catch (_: Exception) {}
-            }
-            for (reply in item.replies) {
-                if (reply.authorProfileUrl.isNotEmpty()) {
-                    try { Glide.with(context).load(reply.authorProfileUrl).transform(CircleCrop()).preload() } catch (_: Exception) {}
-                }
-            }
-        }
-    }
-
     private fun loadAvatarInto(profileUrl: String, ivAvatar: ImageView) {
         if (profileUrl.isNotEmpty()) {
             ivAvatar.visibility = View.VISIBLE
             try {
+                // Avatars render at 36dp: decoding at a bounded size + caching the transformed
+                // result makes scrolling through pages dramatically cheaper.
                 Glide.with(context)
                     .load(profileUrl)
                     .transform(CircleCrop())
+                    .override(96, 96)
+                    .diskCacheStrategy(DiskCacheStrategy.ALL)
                     .into(ivAvatar)
             } catch (_: Exception) {
                 ivAvatar.visibility = View.GONE
@@ -778,6 +894,33 @@ class CommentsBottomSheet(
 
         override fun getItemCount() = rows.size
         override fun getItemViewType(position: Int) = rows[position].type
+
+        /**
+         * Range-notify one comment's reply expand/collapse (rows must already be rebuilt).
+         * notifyDataSetChanged here rebound every visible row and re-fired all avatar loads.
+         */
+        fun notifyRepliesToggled(commentIdx: Int, replyCount: Int) {
+            var togglePos = -1
+            for (i in rows.indices) {
+                if (rows[i].type == TYPE_TOGGLE && rows[i].commentIdx == commentIdx) {
+                    togglePos = i
+                    break
+                }
+            }
+            if (togglePos < 0 || replyCount <= 0) {
+                notifyDataSetChanged()
+                return
+            }
+            if (data[commentIdx].repliesExpanded) {
+                // New rows sit right above the toggle; the toggle itself changed text/chevron.
+                notifyItemRangeInserted(togglePos - replyCount, replyCount)
+                notifyItemChanged(togglePos)
+            } else {
+                // The removed rows occupied [togglePos, togglePos+replyCount-1] pre-rebuild.
+                notifyItemRangeRemoved(togglePos, replyCount)
+                notifyItemChanged(togglePos)
+            }
+        }
 
         override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecyclerView.ViewHolder {
             val inf = LayoutInflater.from(parent.context)
@@ -852,13 +995,13 @@ class CommentsBottomSheet(
                                 item.replies = fetched
                                 item.repliesExpanded = true
                                 rebuildRows()
-                                notifyDataSetChanged()
+                                notifyRepliesToggled(commentIdx, fetched.size)
                             }
                         }
                     } else {
                         item.repliesExpanded = !item.repliesExpanded
                         rebuildRows()
-                        notifyDataSetChanged()
+                        notifyRepliesToggled(commentIdx, item.replies.size)
                     }
                 }
             }

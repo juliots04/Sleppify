@@ -87,7 +87,7 @@ class TrackReplacementSheet : BottomSheetDialogFragment() {
 
         val args = arguments ?: return
         val title = args.getString(ARG_TITLE, "")
-        val artist = args.getString(ARG_ARTIST, "")
+        val artist = SongSubtitle.artistOnly(args.getString(ARG_ARTIST, ""), title)
         val originalVideoId = args.getString(ARG_VIDEO_ID, "")
         val imageUrl = args.getString(ARG_IMAGE_URL, "")
         val hasOverride = args.getBoolean(ARG_HAS_OVERRIDE, false)
@@ -139,7 +139,8 @@ class TrackReplacementSheet : BottomSheetDialogFragment() {
         showLoading()
         val args = arguments ?: return
         val title = args.getString(ARG_TITLE, "").trim()
-        val artist = args.getString(ARG_ARTIST, "").trim()
+        // A polluted artist ("Artista • 3:22 • 500 M...") would poison the search query.
+        val artist = SongSubtitle.artistOnly(args.getString(ARG_ARTIST, ""), title)
         val originalVideoId = args.getString(ARG_VIDEO_ID, "").trim()
 
         val query = buildString {
@@ -231,7 +232,7 @@ class TrackReplacementSheet : BottomSheetDialogFragment() {
         override fun onBindViewHolder(holder: VH, position: Int) {
             val item = items[position]
             holder.tvTitle.text = item.title
-            holder.tvArtist.text = item.artist
+            holder.tvArtist.text = SongSubtitle.artistOnly(item.artist, item.title)
             holder.tvDuration.text = item.duration
 
             try {

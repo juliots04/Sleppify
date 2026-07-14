@@ -3,8 +3,7 @@
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
-    android:orientation="vertical"
-    android:paddingHorizontal="6dp">
+    android:orientation="vertical">
 
     <com.google.android.material.card.MaterialCardView
         android:id="@+id/cardRadio"
@@ -20,12 +19,13 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content">
 
-            <!-- Colored background forced to 1:1 -->
+            <!-- Colored background forced to 1:1. Neutral default until the Palette-derived
+                 fluorescent field lands (RadioArtComposer.cardBackgroundColor). -->
             <View
                 android:id="@+id/vRadioBg"
                 android:layout_width="0dp"
                 android:layout_height="0dp"
-                android:background="#333333"
+                android:background="#A2A7AE"
                 app:layout_constraintDimensionRatio="1:1"
                 app:layout_constraintTop_toTopOf="parent"
                 app:layout_constraintStart_toStartOf="parent"
@@ -46,40 +46,39 @@
                 app:layout_constraintStart_toStartOf="@id/vRadioBg"
                 app:layout_constraintEnd_toEndOf="@id/vRadioBg" />
 
-            <!-- "RADIO" badge top-right -->
-            <TextView
-                android:id="@+id/tvRadioBadge"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="RADIO"
-                android:textColor="#FFFFFF"
-                android:textSize="10sp"
-                android:textStyle="bold"
-                android:textFontWeight="900"
-                android:fontFamily="@font/inter_variable"
-                android:letterSpacing="0.15"
-                android:layout_marginTop="10dp"
-                android:layout_marginEnd="10dp"
-                app:layout_constraintTop_toTopOf="@id/vRadioBg"
-                app:layout_constraintEnd_toEndOf="@id/vRadioBg" />
-
-            <!-- Radio song title inside card, bottom -->
+            <!-- Seed title, bottom-left under the images. Fixed size, ellipsized. -->
             <TextView
                 android:id="@+id/tvRadioTitle"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_marginHorizontal="12dp"
                 android:layout_marginBottom="10dp"
-                android:singleLine="true"
-                android:ellipsize="none"
+                android:maxLines="1"
+                android:ellipsize="end"
+                android:gravity="start"
+                android:includeFontPadding="false"
                 android:text="Canción"
                 android:textColor="#FFFFFF"
-                android:textSize="14sp"
-                android:textStyle="bold"
+                android:textSize="15sp"
                 android:fontFamily="sans-serif-black"
-                android:letterSpacing="0.04"
                 app:layout_constraintBottom_toBottomOf="@id/vRadioBg"
                 app:layout_constraintStart_toStartOf="@id/vRadioBg"
+                app:layout_constraintEnd_toEndOf="@id/vRadioBg" />
+
+            <!-- Tracked-out "RADIO" label, top-right corner of the square -->
+            <TextView
+                android:id="@+id/tvRadioBadge"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:layout_marginEnd="10dp"
+                android:text="RADIO"
+                android:textColor="#FFFFFF"
+                android:textSize="10sp"
+                android:textStyle="bold"
+                android:fontFamily="@font/inter_variable"
+                android:letterSpacing="0.32"
+                app:layout_constraintTop_toTopOf="@id/vRadioBg"
                 app:layout_constraintEnd_toEndOf="@id/vRadioBg" />
 
         </androidx.constraintlayout.widget.ConstraintLayout>

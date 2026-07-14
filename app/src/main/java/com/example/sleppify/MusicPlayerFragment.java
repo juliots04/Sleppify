@@ -362,6 +362,9 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         if (LIBRARY_CHIP_FILTER_FILES.equals(libraryChipFilter)) {
             return buildLocalFilesDisplay();
         }
+        if (LIBRARY_CHIP_FILTER_DOWNLOADS.equals(libraryChipFilter)) {
+            return new ArrayList<>(cachedDownloadsDisplay);
+        }
         return applyLibraryChipFilter(buildDisplayLibraryUnfiltered());
     }
 
@@ -567,7 +570,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         chipLibraryArtists = root.findViewById(R.id.chipLibraryArtists);
         chipLibraryRadios = root.findViewById(R.id.chipLibraryRadios);
         chipLibraryFiles = root.findViewById(R.id.chipLibraryFiles);
-        chipLibraryPodcast = root.findViewById(R.id.chipLibraryPodcast);
+        chipLibraryDownloads = root.findViewById(R.id.chipLibraryDownloads);
         if (chipLibraryPlaylists != null) {
             chipLibraryPlaylists.setOnClickListener(v ->
                     toggleLibraryChipFilter(LIBRARY_CHIP_FILTER_PLAYLISTS));
@@ -583,7 +586,9 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         if (chipLibraryFiles != null) {
             chipLibraryFiles.setOnClickListener(v -> onFilesChipClicked());
         }
-        // "Podcast" is intentionally decorative only (no filter / no content), per request.
+        if (chipLibraryDownloads != null) {
+            chipLibraryDownloads.setOnClickListener(v -> onDownloadsChipClicked());
+        }
         refreshLibraryChipStyles();
     }
 
@@ -668,7 +673,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         styleLibraryChip(chipLibraryArtists, LIBRARY_CHIP_FILTER_ARTISTS.equals(libraryChipFilter));
         styleLibraryChip(chipLibraryRadios, LIBRARY_CHIP_FILTER_RADIOS.equals(libraryChipFilter));
         styleLibraryChip(chipLibraryFiles, LIBRARY_CHIP_FILTER_FILES.equals(libraryChipFilter));
-        // Podcast chip stays in its default (unselected) style — decorative only.
+        styleLibraryChip(chipLibraryDownloads, LIBRARY_CHIP_FILTER_DOWNLOADS.equals(libraryChipFilter));
     }
 
     private void styleLibraryChip(@Nullable TextView chip, boolean selected) {
@@ -781,10 +786,11 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     private ImageView btnFragHeaderSearch;
     private com.google.android.material.button.MaterialButton btnFragSignIn;
     private com.google.android.material.imageview.ShapeableImageView btnFragProfilePhoto;
-    // Floating quick-return header (pinned clone of the brand header; slides in on scroll-up)
-    @Nullable private View llFloatingBrandHeader;
-    @Nullable private com.google.android.material.imageview.ShapeableImageView btnFloatProfilePhoto;
-    private boolean floatingHeaderShown = false;
+    // Single pinned header (brand row + filter chips): fixed and floating at once. It rests in its
+    // natural top position and quick-returns via translationY while scrolled (updateHeaderOnScroll).
+    @Nullable private View llLibraryHeaderContainer;
+    // Mutated on scroll: transparent at rest over the backdrop, solid while the header floats.
+    @Nullable private android.graphics.drawable.ColorDrawable headerBgDrawable;
     private View tvLibraryTitle;
     private View llMusicState;
     private MaterialButton btnYoutubeLogin;
@@ -797,8 +803,13 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     private static final String LIBRARY_CHIP_FILTER_ARTISTS = "artists";
     private static final String LIBRARY_CHIP_FILTER_RADIOS = "radios";
     private static final String LIBRARY_CHIP_FILTER_FILES = "files";
+    private static final String LIBRARY_CHIP_FILTER_DOWNLOADS = "downloads";
     @NonNull
     private String libraryChipFilter = LIBRARY_CHIP_FILTER_NONE;
+    /** Result of the last "Descargas" scan (playlists with ≥1 downloaded song). Computed off the
+     *  main thread when the chip is tapped; {@link #buildDownloadsDisplay()} just returns it. */
+    @NonNull
+    private List<YouTubeMusicService.TrackResult> cachedDownloadsDisplay = new ArrayList<>();
     @Nullable
     private TextView chipLibraryPlaylists;
     @Nullable
@@ -808,7 +819,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     @Nullable
     private TextView chipLibraryFiles;
     @Nullable
-    private TextView chipLibraryPodcast;
+    private TextView chipLibraryDownloads;
     @Nullable
     private androidx.activity.result.ActivityResultLauncher<String> audioPermissionLauncher;
     private RecyclerView rvMusicResults;
@@ -821,7 +832,6 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     private SwipeRefreshLayout swipeLibraryRefresh;
     private View flLibraryLoadingOverlay;
     @Nullable private View llLibrarySkeletonContent;
-    @Nullable private android.animation.ObjectAnimator skeletonPulseAnimator;
     @Nullable private ImageView ivLibraryBackdrop;
     @Nullable private View vStatusBarOverlay;
     private boolean libraryGridOverlayActive;
@@ -832,6 +842,10 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     // the cold parses on the main thread (which froze the module's first seconds).
     private boolean libraryStoresWarmed;
     private boolean libraryWarmupInFlight;
+    // The fragment is pre-created HIDDEN at app start (login auto-launch); the entry skeleton
+    // used to run its whole lifecycle invisibly there. When hidden, we set this flag instead
+    // and show the skeleton on the first visible entry (onHiddenChanged).
+    private boolean entrySkeletonPendingWhenShown;
     // Stable runnable for the overlay safety-timeout: the old `this::dismissLibraryGridOverlay`
     // passed to removeCallbacks created a NEW lambda each call, so the timeout was never actually
     // cancelled and could dismiss a later overlay early.
@@ -1057,8 +1071,13 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                         float fraction = endY <= startY ? 1f : Math.min(1f, Math.max(0f, (scrollY - startY) / (endY - startY)));
                         vStatusBarOverlay.setAlpha(fraction);
                     }
-                    updateFloatingHeaderOnScroll(scrollY, scrollY - oldScrollY);
+                    updateHeaderOnScroll(scrollY, scrollY - oldScrollY);
                 });
+            // Seed the header/background state once laid out (covers a restored scroll position).
+            final androidx.core.widget.NestedScrollView nsvRef = nsvLib;
+            nsvLib.post(() -> {
+                if (isAdded()) updateHeaderOnScroll(nsvRef.getScrollY(), 0);
+            });
         }
         adapter = new MusicResultsAdapter(this::openTrack, this::onMusicResultMoreClicked);
         musicResultsLayoutManager = new LinearLayoutManager(requireContext());
@@ -1198,6 +1217,16 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         if (hidden) {
             return;
         }
+        // Primera entrada VISIBLE a Biblioteca: el skeleton de entrada pudo haberse consumido
+        // mientras el fragment estaba pre-creado oculto (auto-launch del login). Si la biblioteca
+        // sigue vacía con una carga pendiente, mostrarlo ahora — este es el fix de "no aparece
+        // el skeleton la primera vez que entro al módulo".
+        if (activeScreen == ScreenMode.LIBRARY
+                && (adapter == null || adapter.dataSize() == 0)
+                && (entrySkeletonPendingWhenShown || loadingLibrary || libraryFetchInFlight || !libraryStoresWarmed)) {
+            entrySkeletonPendingWhenShown = false;
+            showLibraryEntrySkeleton();
+        }
         // Re-entering Biblioteca from another module always resets to no chip selected (the full
         // library), per request. Only re-render if we actually cleared an active filter.
         resetLibraryChipFilterToNone();
@@ -1244,40 +1273,47 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         btnFragSignIn = root.findViewById(R.id.btnFragSignIn);
         btnFragProfilePhoto = root.findViewById(R.id.btnFragProfilePhoto);
 
-        // Floating quick-return clone (same slide behavior as PrincipalFragment).
-        llFloatingBrandHeader = root.findViewById(R.id.llFloatingBrandHeader);
-        btnFloatProfilePhoto = root.findViewById(R.id.btnFloatProfilePhoto);
-        ImageView btnFloatHeaderHistory = root.findViewById(R.id.btnFloatHeaderHistory);
-        ImageView btnFloatHeaderSearch = root.findViewById(R.id.btnFloatHeaderSearch);
+        // Single pinned header container (brand row + chips).
+        llLibraryHeaderContainer = root.findViewById(R.id.llLibraryHeaderContainer);
 
-        // Apply status bar inset as top padding so the headers don't render under the status bar
-        for (View header : new View[]{llFragBrandHeader, llFloatingBrandHeader}) {
-            if (header == null) continue;
-            androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(header, (v, insets) -> {
+        // Apply status bar inset as top padding so the header doesn't render under the status bar
+        if (llFragBrandHeader != null) {
+            androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(llFragBrandHeader, (v, insets) -> {
                 int statusBarHeight = insets.getInsets(androidx.core.view.WindowInsetsCompat.Type.systemBars()).top;
                 v.setPadding(v.getPaddingLeft(), statusBarHeight, v.getPaddingRight(), v.getPaddingBottom());
                 return insets;
             });
-            header.requestApplyInsets();
+            llFragBrandHeader.requestApplyInsets();
         }
-        // Park the floating clone above the top edge so its first appearance slides down into view.
-        if (llFloatingBrandHeader != null) {
-            final View fh = llFloatingBrandHeader;
-            fh.post(() -> fh.setTranslationY(-fh.getHeight()));
-        }
-        if (btnFloatHeaderHistory != null) {
-            btnFloatHeaderHistory.setOnClickListener(v -> {
-                if (getActivity() instanceof MainActivity) ((MainActivity) getActivity()).enterSettingsAtHistory();
-            });
-        }
-        if (btnFloatHeaderSearch != null) {
-            btnFloatHeaderSearch.setOnClickListener(v -> {
-                if (getActivity() instanceof MainActivity) ((MainActivity) getActivity()).openSearchFragment();
-            });
-        }
-        if (btnFloatProfilePhoto != null) {
-            btnFloatProfilePhoto.setOnClickListener(v -> {
-                if (getActivity() instanceof MainActivity) ((MainActivity) getActivity()).enterSettings();
+        if (llLibraryHeaderContainer != null) {
+            // Background starts fully transparent (header rests over the backdrop) and turns solid
+            // via updateHeaderOnScroll() as content scrolls underneath.
+            headerBgDrawable = new android.graphics.drawable.ColorDrawable(
+                    ContextCompat.getColor(requireContext(), R.color.surface_dark));
+            headerBgDrawable.setAlpha(0);
+            llLibraryHeaderContainer.setBackground(headerBgDrawable);
+
+            // The header is out of the scroll flow: a spacer reserves its height at the top of the
+            // content column, the loading-skeleton overlay is padded below it, and the
+            // pull-to-refresh spinner is pushed under it. All synced to the measured height.
+            final View spacer = root.findViewById(R.id.vHeaderSpacer);
+            llLibraryHeaderContainer.addOnLayoutChangeListener(
+                    (v, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom) -> {
+                int h = bottom - top;
+                if (h <= 0) return;
+                if (spacer != null && spacer.getLayoutParams().height != h) {
+                    spacer.getLayoutParams().height = h;
+                    spacer.setLayoutParams(spacer.getLayoutParams());
+                }
+                if (llLibrarySkeletonContent != null && llLibrarySkeletonContent.getPaddingTop() != h) {
+                    llLibrarySkeletonContent.setPadding(
+                            llLibrarySkeletonContent.getPaddingLeft(), h,
+                            llLibrarySkeletonContent.getPaddingRight(),
+                            llLibrarySkeletonContent.getPaddingBottom());
+                }
+                if (swipeLibraryRefresh != null) {
+                    swipeLibraryRefresh.setProgressViewOffset(false, h - dpToPx(40), h + dpToPx(40));
+                }
             });
         }
 
@@ -1335,36 +1371,32 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     }
 
     /**
-     * Quick-return floating header (identical to PrincipalFragment): the pinned clone of the brand
-     * header TRACKS the scroll via translationY — scroll up slides it down into view from the top
-     * edge, scroll down slides it back up. No fade. Near the top it's driven fully off-screen so it
-     * never overlaps the real in-flow header / status bar.
+     * Single pinned header (identical mechanism to PrincipalFragment): fixed and floating at once,
+     * chips included. The offset TRACKS the scroll delta 1:1 — scrolling down slides it up out of
+     * view, scrolling up slides it back down, following the finger. Near the top an in-flow bound
+     * (offset >= -scrollY) makes it behave exactly like an in-flow header: it settles into its
+     * natural top position with NO show/hide animation or view swap. Correct under programmatic
+     * scrollTo(0,0) jumps too (dy is huge, the bound forces offset to 0 instantly).
      */
-    private void updateFloatingHeaderOnScroll(int scrollY, int dy) {
-        View header = llFloatingBrandHeader;
+    private void updateHeaderOnScroll(int scrollY, int dy) {
+        View header = llLibraryHeaderContainer;
         if (header == null) return;
         int h = header.getHeight();
         if (h <= 0) return;
         float hf = h;
 
         float offset = header.getTranslationY() - dy;
-
-        float revealPoint = (llFragBrandHeader != null) ? llFragBrandHeader.getBottom() : 0f;
-        float topCap;
-        if (scrollY <= revealPoint) {
-            topCap = -hf;
-        } else if (scrollY >= revealPoint + hf) {
-            topCap = 0f;
-        } else {
-            topCap = -(revealPoint + hf - scrollY);
-        }
-
         offset = Math.max(-hf, Math.min(0f, offset));
-        offset = Math.min(offset, topCap);
+        offset = Math.max(offset, -scrollY);
         header.setTranslationY(offset);
-        boolean shown = offset > -hf + 0.5f;
-        header.setVisibility(shown ? View.VISIBLE : View.INVISIBLE);
-        floatingHeaderShown = offset > -hf / 2f;
+
+        // Transparent at rest (over the backdrop), solid while detached/floating. The ramp spans
+        // the first header-height of scroll — while the header is still "attached" — so by the
+        // time it can float over content it is already opaque.
+        if (headerBgDrawable != null) {
+            float fraction = Math.min(1f, Math.max(0f, scrollY / hf));
+            headerBgDrawable.setAlpha((int) (fraction * 255f));
+        }
     }
 
     void refreshFragHeaderProfilePhoto() {
@@ -1382,28 +1414,20 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         if (signedIn) {
             btnFragSignIn.setVisibility(View.GONE);
             btnFragProfilePhoto.setVisibility(View.VISIBLE);
-            if (btnFloatProfilePhoto != null) btnFloatProfilePhoto.setVisibility(View.VISIBLE);
-            for (com.google.android.material.imageview.ShapeableImageView iv :
-                    new com.google.android.material.imageview.ShapeableImageView[]{btnFragProfilePhoto, btnFloatProfilePhoto}) {
-                if (iv == null) continue;
-                if (photoUri != null) {
-                    Glide.with(this)
-                            .load(photoUri)
-                            .diskCacheStrategy(DiskCacheStrategy.ALL)
-                            .circleCrop()
-                            .into(iv);
-                } else {
-                    iv.setImageResource(android.R.drawable.ic_menu_myplaces);
-                }
+            if (photoUri != null) {
+                Glide.with(this)
+                        .load(photoUri)
+                        .diskCacheStrategy(DiskCacheStrategy.ALL)
+                        .circleCrop()
+                        .into(btnFragProfilePhoto);
+            } else {
+                // Sin foto aún: vacío, nunca un placeholder.
+                btnFragProfilePhoto.setImageDrawable(null);
             }
         } else {
             btnFragProfilePhoto.setVisibility(View.GONE);
             btnFragProfilePhoto.setImageDrawable(null);
             btnFragSignIn.setVisibility(View.VISIBLE);
-            if (btnFloatProfilePhoto != null) {
-                btnFloatProfilePhoto.setVisibility(View.GONE);
-                btnFloatProfilePhoto.setImageDrawable(null);
-            }
         }
     }
 
@@ -2139,6 +2163,12 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         }
         if (!backgroundRefresh) {
             setLibraryLoading(true, "Cargando playlists de tu biblioteca...");
+            // Primera carga real (post-login) sin nada renderizado: skeleton en vez del
+            // texto de progreso pelado. Solo si el módulo está visible.
+            if (!isHidden() && activeScreen == ScreenMode.LIBRARY
+                    && (adapter == null || adapter.dataSize() == 0)) {
+                showLibraryEntrySkeleton();
+            }
         }
         Log.i(TAG_STREAMING, "playlist_fetch start limit=" + LIBRARY_PLAYLIST_FETCH_LIMIT);
         youTubeMusicService.fetchMyPlaylists(youtubeAccessToken, LIBRARY_PLAYLIST_FETCH_LIMIT, new YouTubeMusicService.PlaylistsCallback() {
@@ -2333,13 +2363,23 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         tvMusicState.setText("");
         // The login empty-state only applies to a genuinely empty library — an empty FILTERED
         // view (e.g. Artistas with no artists yet) must not drop the user onto the login overlay.
-        if (visibleLibraryTracks.isEmpty() && LIBRARY_CHIP_FILTER_NONE.equals(libraryChipFilter)) {
-            showLibraryEmptyState();
+        boolean emptyUnfiltered = visibleLibraryTracks.isEmpty()
+                && LIBRARY_CHIP_FILTER_NONE.equals(libraryChipFilter);
+        boolean fetchStillPending = emptyUnfiltered && !isHidden()
+                && (loadingLibrary || libraryFetchInFlight);
+        if (emptyUnfiltered) {
+            if (fetchStillPending) {
+                // Carga inicial (post-login) en vuelo: mantener el skeleton pulsando en vez de
+                // flashear el empty-state de login a mitad de la carga.
+                showLibraryEntrySkeleton();
+            } else {
+                showLibraryEmptyState();
+            }
         }
         // A real render landed — drop the entry/scan skeleton. The grid-prefetch overlay
         // (pendingCount > 0) manages its own dismissal via onLibraryGridPrefetchComplete.
         // resubmit=false: we just submitted this exact list above.
-        if (libraryGridOverlayActive && libraryGridPendingCount <= 0) {
+        if (!fetchStillPending && libraryGridOverlayActive && libraryGridPendingCount <= 0) {
             dismissLibraryGridOverlay(false);
         }
         if (rvMusicResults != null) {
@@ -2697,15 +2737,18 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                     continue;
                 }
                 String displayTitle = TextUtils.isEmpty(cachedTrack.title) ? "Cancion" : cachedTrack.title;
+                // Standard row subtitle is "artist \u2022 duration" \u2014 the playlist name is no longer
+                // folded in (it used to read like "artist \u2022 songtitle" on ambiguous titles).
                 String subtitle = TextUtils.isEmpty(cachedTrack.artist)
                         ? "Playlist: " + playlistTitle
-                        : cachedTrack.artist + " \u2022 " + playlistTitle;
+                        : cachedTrack.artist;
                 result.add(new YouTubeMusicService.TrackResult(
                         "video",
                         cachedTrack.videoId,
                         displayTitle,
                         subtitle,
-                        cachedTrack.imageUrl
+                        cachedTrack.imageUrl,
+                        cachedTrack.duration == null ? "" : cachedTrack.duration
                 ));
                 if (result.size() >= LIBRARY_INLINE_SEARCH_MAX_RESULTS) {
                     return result;
@@ -2771,7 +2814,6 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         libraryGridOverlayActive = true;
         flLibraryLoadingOverlay.setAlpha(1f);
         flLibraryLoadingOverlay.setVisibility(View.VISIBLE);
-        startSkeletonPulse();
         // Safety timeout: dismiss after 5 seconds even if prefetches haven't finished
         mainHandler.removeCallbacks(libraryOverlayTimeout);
         mainHandler.postDelayed(libraryOverlayTimeout, 5000L);
@@ -2780,46 +2822,25 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     /**
      * Entry/loading skeleton: the same overlay as the grid-prefetch path, but not driven by a
      * prefetch count. Shown while the off-main library warmup runs on module entry and while a
-     * Files-chip device scan is in flight, so those windows show a pulsing skeleton instead of an
-     * empty screen. Dismissed by the next successful warm render (renderLibraryResults).
+     * Files-chip device scan is in flight, so those windows show a shimmering skeleton instead of
+     * an empty screen (the ShimmerFrameLayout skeleton root animates itself while visible).
+     * Dismissed by the next successful warm render (renderLibraryResults).
      */
     private void showLibraryEntrySkeleton() {
         if (flLibraryLoadingOverlay == null || libraryGridOverlayActive) return;
+        if (isHidden()) {
+            // No consumir el skeleton invisible (fragment pre-creado oculto al arrancar):
+            // recordarlo y mostrarlo en la primera entrada real al módulo.
+            entrySkeletonPendingWhenShown = true;
+            return;
+        }
+        entrySkeletonPendingWhenShown = false;
         libraryGridOverlayActive = true;
         libraryGridPendingCount = 0;
         flLibraryLoadingOverlay.setAlpha(1f);
         flLibraryLoadingOverlay.setVisibility(View.VISIBLE);
-        startSkeletonPulse();
         mainHandler.removeCallbacks(libraryOverlayTimeout);
         mainHandler.postDelayed(libraryOverlayTimeout, 6000L);
-    }
-    /** Gently pulses the skeleton placeholders' alpha while the library loads. */
-    private void startSkeletonPulse() {
-        if (llLibrarySkeletonContent == null) return;
-        stopSkeletonPulse();
-        // Promote the static skeleton subtree to a hardware layer while its alpha animates: without
-        // it, the ~20-view group re-draws its whole subtree every vsync (alpha < 1 forces a redraw),
-        // right during the entry window we're smoothing. The cached texture is valid because the
-        // content is static while pulsing.
-        llLibrarySkeletonContent.setLayerType(View.LAYER_TYPE_HARDWARE, null);
-        android.animation.ObjectAnimator pulse = android.animation.ObjectAnimator.ofFloat(
-                llLibrarySkeletonContent, "alpha", 1f, 0.4f);
-        pulse.setDuration(650L);
-        pulse.setRepeatMode(android.animation.ValueAnimator.REVERSE);
-        pulse.setRepeatCount(android.animation.ValueAnimator.INFINITE);
-        pulse.setInterpolator(new android.view.animation.AccelerateDecelerateInterpolator());
-        skeletonPulseAnimator = pulse;
-        pulse.start();
-    }
-    private void stopSkeletonPulse() {
-        if (skeletonPulseAnimator != null) {
-            skeletonPulseAnimator.cancel();
-            skeletonPulseAnimator = null;
-        }
-        if (llLibrarySkeletonContent != null) {
-            llLibrarySkeletonContent.setAlpha(1f);
-            llLibrarySkeletonContent.setLayerType(View.LAYER_TYPE_NONE, null);
-        }
     }
     private void onLibraryGridPrefetchComplete() {
         if (!libraryGridOverlayActive) return;
@@ -2836,7 +2857,6 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         libraryGridOverlayActive = false;
         libraryGridPendingCount = 0;
         mainHandler.removeCallbacks(libraryOverlayTimeout);
-        stopSkeletonPulse();
         mainHandler.post(() -> {
             if (!isAdded()) return;
             // Refresh adapter so grids appear with fade. Skipped when the caller (a warm render)
@@ -3641,9 +3661,15 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     private void bindFeaturedTrack(@NonNull YouTubeMusicService.TrackResult track) {
         tvFeaturedTitle.setText(track.title);
         String typeLabel = searchTypeLabel(track);
-        String subtitle = TextUtils.isEmpty(track.subtitle)
-            ? typeLabel
-            : typeLabel + " â€¢ " + track.subtitle;
+        String clean = SongSubtitle.forRow(track.subtitle, track.title, track.duration);
+        String subtitle;
+        if (TextUtils.isEmpty(clean)) {
+            subtitle = typeLabel;
+        } else if (TextUtils.isEmpty(typeLabel)) {
+            subtitle = clean;
+        } else {
+            subtitle = typeLabel + SongSubtitle.SEPARATOR + clean;
+        }
         tvFeaturedSubtitle.setText(subtitle);
         loadArtworkInto(ivFeaturedThumb, track.thumbnailUrl);
     }
@@ -3796,13 +3822,14 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             .setItems(array, (dialog, which) -> {
                 if (which < localNames.size()) {
                     String selected = localNames.get(which);
+                    SongSubtitle.Parts p = SongSubtitle.parse(track.subtitle, track.title, track.duration);
                     CustomPlaylistsStore.INSTANCE.addTrackToPlaylist(
                         requireContext(),
                         selected,
                         track.videoId,
                         TextUtils.isEmpty(track.title) ? "Tema" : track.title,
-                        track.subtitle == null ? "" : track.subtitle,
-                        "",
+                        p.artist,
+                        p.duration,
                         track.thumbnailUrl == null ? "" : track.thumbnailUrl
                     );
                     AppSnackbar.show(getActivity(), "Añadida a local: " + selected);
@@ -3855,12 +3882,13 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         if (!isAdded() || !track.isVideo()) {
             return;
         }
+        SongSubtitle.Parts favParts = SongSubtitle.parse(track.subtitle, track.title, track.duration);
         FavoritesPlaylistStore.upsertFavorite(
                 requireContext(),
                 track.videoId,
                 TextUtils.isEmpty(track.title) ? "Tema" : track.title,
-                track.subtitle == null ? "" : track.subtitle,
-                "--:--",
+                favParts.artist,
+                favParts.duration.isEmpty() ? "--:--" : favParts.duration,
                 track.thumbnailUrl == null ? "" : track.thumbnailUrl
         );
         if (activeScreen == ScreenMode.LIBRARY) {
@@ -3999,43 +4027,16 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         String playlistSubtitle = prefs.getString(PREF_LAST_PLAYLIST_SUBTITLE, "Playlist");
         String playlistThumbnail = prefs.getString(PREF_LAST_PLAYLIST_THUMBNAIL, "");
 
-        // Show loading overlay immediately for snappier perceived transition
-        if (getActivity() instanceof MainActivity) {
-            ((MainActivity) getActivity()).showModuleLoadingOverlay();
-            ((MainActivity) getActivity()).hideTopAppBarForPlaylistDetail();
-        }
-
-        // ID-only normalization — consistent with mapPlaylistsToLibraryTracks
-        String rawId = playlistId == null ? "" : playlistId.trim();
-        String normalizedPlaylistId;
-        if (YouTubeMusicService.SPECIAL_LIKED_VIDEOS_ID.equals(rawId)
-                || "LL".equals(rawId)
-                || "LM".equals(rawId)
-                || rawId.startsWith("VLLL")) {
-            normalizedPlaylistId = YouTubeMusicService.SPECIAL_LIKED_VIDEOS_ID;
-        } else {
-            normalizedPlaylistId = playlistId;
-        }
-        String accessTokenForDetail = resolveAccessTokenForPlaylistDetail();
-        PlaylistDetailFragment detailFragment = PlaylistDetailFragment.newInstance(
-                normalizedPlaylistId,
+        // Shared launcher: id normalization (liked collapse + VL-strip, superset of the old inline
+        // rule), overlay + top-bar hide, remove-existing + add + addToBackStack. Token dropped.
+        PlaylistDetailLauncher.open(
+                getActivity(),
+                getParentFragmentManager(),
+                playlistId,
                 TextUtils.isEmpty(playlistTitle) ? "Lista" : playlistTitle,
                 TextUtils.isEmpty(playlistSubtitle) ? "Playlist" : playlistSubtitle,
-                playlistThumbnail == null ? "" : playlistThumbnail,
-            accessTokenForDetail
+                playlistThumbnail == null ? "" : playlistThumbnail
         );
-        androidx.fragment.app.Fragment existingDetail = getParentFragmentManager().findFragmentByTag("playlist_detail");
-        androidx.fragment.app.FragmentTransaction transaction = getParentFragmentManager()
-            .beginTransaction()
-                .setReorderingAllowed(true)
-            ;
-        if (existingDetail != null && existingDetail.isAdded() && existingDetail != this) {
-            transaction.remove(existingDetail);
-        }
-        transaction
-            .add(R.id.fragmentContainer, detailFragment, "playlist_detail")
-            .addToBackStack("playlist_detail")
-            .commit();
         return true;
     }
     private boolean openPlayerFromSnapshot(
@@ -4186,6 +4187,8 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             ivArt.setBackgroundResource(R.drawable.bg_music_liked_gradient);
             ivArt.setImageResource(R.drawable.ic_thumb_up_liked);
             ivArt.setColorFilter(android.graphics.Color.WHITE);
+        } else if (FavoritesPlaylistStore.PLAYLIST_ID.equals(playlistId)) {
+            FavoritesArt.bindCover(ivArt);
         } else if (isRadioItem && !TextUtils.isEmpty(track.thumbnailUrl)) {
             ivArt.setScaleType(android.widget.ImageView.ScaleType.CENTER_CROP);
             loadArtworkInto(ivArt, track.thumbnailUrl);
@@ -4391,7 +4394,9 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         TextView tvSubtitle = view.findViewById(R.id.tvBsTrackSubtitle);
         ImageView ivArt = view.findViewById(R.id.ivBsTrackArt);
         tvTitle.setText(TextUtils.isEmpty(track.title) ? "Tema" : track.title);
-        tvSubtitle.setText(track.subtitle == null ? "" : track.subtitle);
+        tvSubtitle.setText(track.isVideo()
+                ? SongSubtitle.forRow(track.subtitle, track.title, track.duration)
+                : (track.subtitle == null ? "" : track.subtitle));
         loadArtworkInto(ivArt, track.thumbnailUrl);
         // Top row slot 1: Reproducir
         View btnPlayNext = view.findViewById(R.id.btnBsPlayNext);
@@ -5939,15 +5944,17 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                     ArrayList<String> images = new ArrayList<>();
                     ids.add(selectedVideoId);
                     titles.add(TextUtils.isEmpty(selectedTrack.title) ? "Tema" : selectedTrack.title);
-                    artists.add(selectedTrack.subtitle == null ? "" : selectedTrack.subtitle);
-                    durations.add("--:--");
+                    SongSubtitle.Parts selectedParts = SongSubtitle.parse(selectedTrack.subtitle, selectedTrack.title, selectedTrack.duration);
+                    artists.add(selectedParts.artist);
+                    durations.add(selectedParts.duration.isEmpty() ? "--:--" : selectedParts.duration);
                     images.add(selectedTrack.thumbnailUrl == null ? "" : selectedTrack.thumbnailUrl);
                     for (YouTubeMusicService.TrackResult t : radioTracks) {
                         if (TextUtils.isEmpty(t.videoId) || TextUtils.equals(t.videoId, selectedVideoId)) continue;
                         ids.add(t.videoId);
                         titles.add(TextUtils.isEmpty(t.title) ? "" : t.title);
-                        artists.add(t.subtitle == null ? "" : t.subtitle);
-                        durations.add("--:--");
+                        SongSubtitle.Parts p = SongSubtitle.parse(t.subtitle, t.title, t.duration);
+                        artists.add(p.artist);
+                        durations.add(p.duration.isEmpty() ? "--:--" : p.duration);
                         images.add(t.thumbnailUrl == null ? "" : t.thumbnailUrl);
                     }
                     SongPlayerFragment sp = findSongPlayerFragment();
@@ -5956,10 +5963,12 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                     }
                     // Save radio to history for library display
                     List<RadioHistoryStore.RadioTrack> radioStoreTracks = new ArrayList<>();
+                    // Persist a clean artist, not the raw baked subtitle: this field resurfaces
+                    // in radio rows, the local track index and the "Con X, Y..." radio labels.
                     radioStoreTracks.add(new RadioHistoryStore.RadioTrack(
                             selectedVideoId,
                             TextUtils.isEmpty(selectedTrack.title) ? "Tema" : selectedTrack.title,
-                            selectedTrack.subtitle == null ? "" : selectedTrack.subtitle,
+                            SongSubtitle.artistOnly(selectedTrack.subtitle, selectedTrack.title),
                             selectedTrack.thumbnailUrl == null ? "" : selectedTrack.thumbnailUrl
                     ));
                     for (YouTubeMusicService.TrackResult t : radioTracks) {
@@ -5967,7 +5976,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                         radioStoreTracks.add(new RadioHistoryStore.RadioTrack(
                                 t.videoId,
                                 TextUtils.isEmpty(t.title) ? "" : t.title,
-                                t.subtitle == null ? "" : t.subtitle,
+                                SongSubtitle.artistOnly(t.subtitle, t.title),
                                 t.thumbnailUrl == null ? "" : t.thumbnailUrl
                         ));
                     }
@@ -6143,8 +6152,9 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         for (YouTubeMusicService.TrackResult item : queueCandidates) {
             ids.add(item.videoId);
             titles.add(TextUtils.isEmpty(item.title) ? "Tema" : item.title);
-            artists.add(item.subtitle == null ? "" : item.subtitle);
-            durations.add("--:--");
+            SongSubtitle.Parts p = SongSubtitle.parse(item.subtitle, item.title, item.duration);
+            artists.add(p.artist);
+            durations.add(p.duration.isEmpty() ? "--:--" : p.duration);
             images.add(item.thumbnailUrl == null ? "" : item.thumbnailUrl);
             if (selectedIndex < 0 && TextUtils.equals(item.videoId, selectedTrack.videoId)) {
                 selectedIndex = ids.size() - 1;
@@ -6155,8 +6165,9 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             // por eso lo inyectamos al inicio para reproducir exactamente ese.
             ids.add(0, selectedTrack.videoId);
             titles.add(0, TextUtils.isEmpty(selectedTrack.title) ? "Tema" : selectedTrack.title);
-            artists.add(0, selectedTrack.subtitle == null ? "" : selectedTrack.subtitle);
-            durations.add(0, "--:--");
+            SongSubtitle.Parts selectedParts = SongSubtitle.parse(selectedTrack.subtitle, selectedTrack.title, selectedTrack.duration);
+            artists.add(0, selectedParts.artist);
+            durations.add(0, selectedParts.duration.isEmpty() ? "--:--" : selectedParts.duration);
             images.add(0, selectedTrack.thumbnailUrl == null ? "" : selectedTrack.thumbnailUrl);
             selectedIndex = 0;
         }
@@ -6226,33 +6237,16 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         if (getParentFragmentManager().isStateSaved()) {
             return;
         }
-
-        // Show loading overlay and hide top bar immediately for snappier perceived transition
-        if (getActivity() instanceof MainActivity) {
-            ((MainActivity) getActivity()).showModuleLoadingOverlay();
-            ((MainActivity) getActivity()).hideTopAppBarForPlaylistDetail();
-        }
-
-        String accessTokenForDetail = resolveAccessTokenForPlaylistDetail();
-        PlaylistDetailFragment detailFragment = PlaylistDetailFragment.newInstance(
+        // Shared launcher: id normalization (liked collapse + VL-strip), overlay + top-bar hide,
+        // and the remove-existing + add + addToBackStack transaction. Token dropped (prefs fallback).
+        PlaylistDetailLauncher.open(
+                getActivity(),
+                getParentFragmentManager(),
                 track.contentId,
                 track.title,
                 track.subtitle,
-                track.thumbnailUrl,
-            accessTokenForDetail
+                track.thumbnailUrl
         );
-        androidx.fragment.app.Fragment existingDetail = getParentFragmentManager().findFragmentByTag("playlist_detail");
-        androidx.fragment.app.FragmentTransaction transaction = getParentFragmentManager()
-            .beginTransaction()
-                .setReorderingAllowed(true)
-            ;
-        if (existingDetail != null && existingDetail.isAdded() && existingDetail != this) {
-            transaction.remove(existingDetail);
-        }
-        transaction
-            .add(R.id.fragmentContainer, detailFragment, "playlist_detail")
-            .addToBackStack("playlist_detail")
-            .commit();
     }
 
     /** Open the Spotify-style artist page for a tapped artist row (mirrors openPlaylistDetail). */
@@ -6267,6 +6261,9 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             ((MainActivity) getActivity()).showModuleLoadingOverlay();
             ((MainActivity) getActivity()).hideTopAppBarForPlaylistDetail();
         }
+        // Warm the hero into Glide's cache BEFORE the transaction so the header paints from cache
+        // and the loading overlay drops onto an already-decoded image.
+        ArtistDetailFragment.preloadHero(requireContext(), artist.thumbnailUrl);
         ArtistDetailFragment detailFragment = ArtistDetailFragment.newInstance(
                 artist.contentId, artist.title, artist.subtitle, artist.thumbnailUrl);
         androidx.fragment.app.Fragment existingDetail = getParentFragmentManager().findFragmentByTag("artist_detail");
@@ -6390,17 +6387,14 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         cancelPendingLibraryInlineSearch();
         lastLibraryInlineDispatchedQuery = "";
         dismissPlaylistActionTooltip();
-        stopSkeletonPulse();
         stopObservingOfflineQueue();
         normalizedFilterCache.evictAll();
         // Cancel ALL pending mainHandler callbacks to prevent leaks and stale UI updates
         mainHandler.removeCallbacksAndMessages(null);
         ivLibraryBackdrop = null;
         vStatusBarOverlay = null;
-        if (llFloatingBrandHeader != null) llFloatingBrandHeader.animate().cancel();
-        llFloatingBrandHeader = null;
-        btnFloatProfilePhoto = null;
-        floatingHeaderShown = false;
+        llLibraryHeaderContainer = null;
+        headerBgDrawable = null;
         PlaybackEventBus.removeListener(this);
         super.onDestroyView();
     }
@@ -6808,6 +6802,9 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             RecyclerView.ViewHolder vh = rvMusicResults != null
                     ? rvMusicResults.findViewHolderForAdapterPosition(pos) : null;
             YouTubeMusicService.TrackResult item = data.get(pos);
+            // Favoritos usa portada fija (degradado+gato): una resolución tardía del grid 2x2
+            // no debe repintarla nunca.
+            if (isFavoritesPlaylistStyle(item)) return;
             if (vh instanceof TrackViewHolder && !isLikedPlaylistStyle(item)) {
                 bindPlaylistThumb((TrackViewHolder) vh, item);
             } else {
@@ -7124,15 +7121,23 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             if (TextUtils.isEmpty(item.subtitle) && !isLikedPlaylistStyle) {
                 holder.tvTrackSubtitle.setText("Playlist");
             }
-            // Only "Música que te gustó" uses the special icon style
-            holder.vLikedBackground.setVisibility(isLikedPlaylistStyle ? View.VISIBLE : View.GONE);
-            holder.ivLikedIcon.setVisibility(isLikedPlaylistStyle ? View.VISIBLE : View.GONE);
-            holder.ivTrackThumb.setVisibility(isLikedPlaylistStyle ? View.GONE : View.VISIBLE);
-            if (isLikedPlaylistStyle) {
+            // "Música que te gustó" y Favoritos usan portada especial (degradado + icono).
+            // Ambas ramas fijan fondo+icono explícitamente: los holders se rebindan y el
+            // default del layout solo aplica al inflar.
+            boolean useSpecialCover = isLikedPlaylistStyle || isFavoritesPlaylistStyle;
+            holder.vLikedBackground.setVisibility(useSpecialCover ? View.VISIBLE : View.GONE);
+            holder.ivLikedIcon.setVisibility(useSpecialCover ? View.VISIBLE : View.GONE);
+            holder.ivTrackThumb.setVisibility(useSpecialCover ? View.GONE : View.VISIBLE);
+            if (isFavoritesPlaylistStyle) {
+                holder.vLikedBackground.setBackgroundResource(R.drawable.bg_music_favorites_gradient);
+                holder.ivLikedIcon.setImageResource(R.drawable.ic_cat_white);
+                holder.ivLikedIcon.setColorFilter(Color.WHITE);
+            } else if (isLikedPlaylistStyle) {
+                holder.vLikedBackground.setBackgroundResource(R.drawable.bg_music_liked_gradient);
                 holder.ivLikedIcon.setImageResource(R.drawable.ic_thumb_up_liked);
                 holder.ivLikedIcon.setColorFilter(Color.WHITE);
             }
-            if (!isLikedPlaylistStyle) {
+            if (!useSpecialCover) {
                 bindPlaylistThumb(holder, item);
             }
             boolean isPlaylistItem = "playlist".equals(item.resultType);
@@ -7391,7 +7396,14 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             String title = TextUtils.isEmpty(item.title) ? "Resultado" : item.title;
             holder.tvTrackTitle.setText(title);
             String typeLabel = searchTypeLabel(item);
-            String subtitle = TextUtils.isEmpty(item.subtitle) ? typeLabel : item.subtitle;
+            String subtitle;
+            if (item.isVideo()) {
+                // Song row: standard "artist • album • duration • views" subtitle.
+                String clean = SongSubtitle.forRow(item.subtitle, item.title, item.duration);
+                subtitle = TextUtils.isEmpty(clean) ? typeLabel : clean;
+            } else {
+                subtitle = TextUtils.isEmpty(item.subtitle) ? typeLabel : item.subtitle;
+            }
             holder.tvTrackSubtitle.setText(subtitle);
             loadArtworkInto(holder.ivTrackThumb, item.thumbnailUrl);
             holder.ivTrackMore.setVisibility(View.VISIBLE);

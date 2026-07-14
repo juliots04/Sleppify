@@ -92,7 +92,7 @@ function fmt_size(int $bytes): string
                 </div>
                 <div class="update-card">
                     <div class="update-head">
-                        <div class="update-title">🔥 Nueva versión</div>
+                        <div class="update-title">🔥 NUEVA VERSIÓN DISPONIBLE</div>
                         <div class="version-pill" id="pvVersion"><?= htmlspecialchars($suggestName) ?></div>
                     </div>
                     <div class="update-divider"></div>

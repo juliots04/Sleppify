@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Skeleton placeholder for carousel cards: same 16dp corner radius as the real
+     MaterialCardView in item_playlist_carousel / item_radio_carousel. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="@color/surface_high" />
+    <corners android:radius="16dp" />
+</shape>

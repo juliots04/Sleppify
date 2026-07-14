@@ -174,6 +174,7 @@ class MainActivity : AppCompatActivity() {
     private var searchFragment: Fragment? = null
     private var playlistDetailFragment: Fragment? = null
     private var songPlayerFragment: Fragment? = null
+    private var artistDetailFragment: Fragment? = null
 
     // Resolves "Ir a artista" (name → channelId) for openArtistDetailByName
     private val artistLookupService by lazy { YouTubeMusicService() }
@@ -978,7 +979,8 @@ class MainActivity : AppCompatActivity() {
                     .circleCrop()
                     .into(btnProfilePhoto)
             } else {
-                btnProfilePhoto.setImageResource(android.R.drawable.ic_menu_myplaces)
+                // Sin foto aún: vacío, nunca un placeholder.
+                btnProfilePhoto.setImageDrawable(null)
             }
         } else {
             btnProfilePhoto.visibility = View.GONE
@@ -1066,9 +1068,38 @@ class MainActivity : AppCompatActivity() {
             setOnDismissListener { if (updateDialog === this) updateDialog = null }
         }
         updateDialog = dialog
-        view.findViewById<View>(R.id.btnUpdateDialogGo).setOnClickListener {
-            dialog.dismiss()
-            enterSettingsAtUpdate(update)
+
+        val btnGo = view.findViewById<TextView>(R.id.btnUpdateDialogGo)
+        val llProgress = view.findViewById<View>(R.id.llUpdateDialogProgress)
+        val pbDownload = view.findViewById<android.widget.ProgressBar>(R.id.pbUpdateDialog)
+        val tvPercent = view.findViewById<TextView>(R.id.tvUpdateDialogPercent)
+
+        btnGo.setOnClickListener {
+            // Sin el permiso de "instalar apps desconocidas" el instalador no abre: pedirlo primero.
+            if (!AppUpdateManager.canInstallUnknownApps(this)) {
+                AppSnackbar.show(this, "Permite instalar apps de Sleppify y vuelve a tocar Actualizar")
+                try { startActivity(AppUpdateManager.buildUnknownSourcesIntent(this)) } catch (_: Exception) {}
+                return@setOnClickListener
+            }
+            // Descarga in-situ: el botón se cambia por la barra de progreso, mismo proceso que la
+            // antigua sección Actualizar (AppUpdateManager descarga y lanza el instalador al 100%).
+            btnGo.visibility = View.GONE
+            llProgress.visibility = View.VISIBLE
+            pbDownload.progress = 0
+            tvPercent.text = "0%"
+            AppUpdateManager.downloadAndInstall(
+                applicationContext, update,
+                onProgress = { percent ->
+                    pbDownload.progress = percent
+                    tvPercent.text = "$percent%"
+                },
+                onInstallStarted = { tvPercent.text = "Instalando…" },
+                onError = { message ->
+                    AppSnackbar.show(this, "Error al descargar: $message")
+                    llProgress.visibility = View.GONE
+                    btnGo.visibility = View.VISIBLE
+                }
+            )
         }
         dialog.show()
     }
@@ -1077,15 +1108,8 @@ class MainActivity : AppCompatActivity() {
 
     fun enterSettingsAtHistory() = enterSettingsForSection(SettingsEntry.HISTORY)
 
-    /** Abre Configuración directo en "Actualizar"; si viene del popup ya trae el UpdateInfo. */
-    fun enterSettingsAtUpdate(update: AppUpdateManager.UpdateInfo?) {
-        pendingSettingsUpdateInfo = update
-        enterSettingsForSection(SettingsEntry.UPDATE)
-    }
+    private enum class SettingsEntry { ROOT, HISTORY }
 
-    private enum class SettingsEntry { ROOT, HISTORY, UPDATE }
-
-    private var pendingSettingsUpdateInfo: AppUpdateManager.UpdateInfo? = null
     // Ventana emergente de nueva versión (referencia para descartarla y no filtrarla al destruir).
     private var updateDialog: android.app.Dialog? = null
 
@@ -1100,7 +1124,6 @@ class MainActivity : AppCompatActivity() {
         when (entry) {
             SettingsEntry.ROOT -> target.navigateToRoot()
             SettingsEntry.HISTORY -> target.navigateToHistory()
-            SettingsEntry.UPDATE -> target.navigateToUpdate(pendingSettingsUpdateInfo.also { pendingSettingsUpdateInfo = null })
         }
         if (inSettings) return
         // Capture the origin module AFTER the re-entrancy guard, so a second enter-Settings call
@@ -1376,7 +1399,7 @@ class MainActivity : AppCompatActivity() {
      */
     fun openArtistDetailByName(artistName: String) {
         // Subtitles often decorate the artist ("Artista • Álbum • 3:45") — keep only the name part.
-        val name = artistName.substringBefore("•").trim()
+        val name = SongSubtitle.artistOnly(artistName)
         if (name.isEmpty() || isFinishing || isDestroyed) return
         dismissSavedBar()
         showModuleLoadingOverlay()
@@ -1401,6 +1424,9 @@ class MainActivity : AppCompatActivity() {
             return
         }
         hideTopAppBarForPlaylistDetail()
+        // Warm the hero into Glide's cache before the transaction so the header is ready when the
+        // overlay drops (the artist search hop already gave us the thumbnail URL).
+        ArtistDetailFragment.preloadHero(this, artist.thumbnailUrl)
         val detail = ArtistDetailFragment.newInstance(
             artist.channelId, artist.name, artist.subtitle, artist.thumbnailUrl
         )
@@ -1518,6 +1544,7 @@ class MainActivity : AppCompatActivity() {
         searchFragment = supportFragmentManager.findFragmentByTag(TAG_MODULE_SEARCH)
         playlistDetailFragment = supportFragmentManager.findFragmentByTag(TAG_PLAYLIST_DETAIL)
         songPlayerFragment = supportFragmentManager.findFragmentByTag(TAG_SONG_PLAYER)
+        artistDetailFragment = supportFragmentManager.findFragmentByTag(TAG_ARTIST_DETAIL)
     }
 
     private fun isAnyOverlayModuleVisible(): Boolean {
@@ -1644,7 +1671,15 @@ class MainActivity : AppCompatActivity() {
 
         syncBottomNavSelection(itemId)
 
-        val isTrulySwitching = currentMainNavItemId != itemId || !target.isAdded || target.isHidden
+        // ArtistDetailFragment is added ON TOP of the main module without hiding it (no addToBackStack
+        // reveal of what's underneath), so its own visibility must also force a "truly switching" pass
+        // — otherwise tapping the footer item for the module already underneath (currentMainNavItemId
+        // unchanged, target never hidden) short-circuited below and left the artist screen covering it,
+        // making every footer tap look like a no-op. A fresh lookup (not the cached field, which
+        // openArtistDetail() never refreshes) so this is correct right after the artist screen opens.
+        val artistDetailVisible = supportFragmentManager.findFragmentByTag(TAG_ARTIST_DETAIL)
+            ?.let { it.isAdded && !it.isHidden } == true
+        val isTrulySwitching = currentMainNavItemId != itemId || !target.isAdded || target.isHidden || artistDetailVisible
         if (!isTrulySwitching && !inSettings) {
             updateHeaderTitleForModule(itemId)
             if (itemId == R.id.nav_music) {
@@ -1729,6 +1764,7 @@ class MainActivity : AppCompatActivity() {
                 hideIfVisible(this, equalizerFragment, resolvedTarget)
                 hideIfVisible(this, scannerFragment, resolvedTarget)
                 hideIfVisible(this, searchFragment, resolvedTarget)
+                hideIfVisible(this, artistDetailFragment, resolvedTarget)
 
                 if (songPlayerFragment != null && songPlayerFragment!!.isAdded && !songPlayerFragment!!.isHidden) {
                     hide(songPlayerFragment!!)

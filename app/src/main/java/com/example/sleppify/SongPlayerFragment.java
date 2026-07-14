@@ -127,6 +127,7 @@ public class SongPlayerFragment extends Fragment {
     private static final int READ_TIMEOUT_MS = 15000;
     private static final long SOURCE_PREPARE_TIMEOUT_MS = 30000L;
     private static final long SOCIAL_STATS_FETCH_DEFER_MS = 1800L;
+    private static final long COMMENTS_PREFETCH_DEFER_MS = 2200L;
     private static final long PLAYBACK_BOOTSTRAP_GRACE_MS = 1800L;
     private static final int MAX_PLAYBACK_SOURCE_RETRY = 2;
     private static final long PLAYBACK_SOURCE_RETRY_DELAY_MS = 350L;
@@ -151,7 +152,30 @@ public class SongPlayerFragment extends Fragment {
     private FrameLayout flPlayerHero;
     @Nullable
     private android.widget.ProgressBar pbVideoLoading;
+    // Authoritative "the CURRENTLY loaded player is presenting video" flag. Captured at each
+    // player-commit point from isVideoTrack(track) — NOT re-read live from the global, videoId-keyed
+    // StreamResolver.isVideoSource() cache, which can flip (mode toggle / next-track prefetch / a
+    // reverted swap) while a different source is actually loaded. isVideoPresentation() reads THIS
+    // for network sources so the cover/surface never disagree with what is really playing.
     private boolean currentSourceIsVideo = false;
+    // True while flPlayerHero is shaped for VIDEO (full-bleed 16:9, no side margins). The song-cover
+    // shaping (applyHeroShapeForAspect) insets the hero 20dp per side for square art; that inset is
+    // what left the video narrow after a swap. Tracks which shape is applied so a Video→Canción swap
+    // can restore the cover shape without a full artwork re-bind.
+    private boolean heroShapedForVideo = false;
+    // Deterministic source of truth for restoring the SONG presentation after a Video→Canción swap
+    // (which does NOT re-bind the artwork): the last song cover bitmap + its dominant color, cached
+    // every time a music cover/palette is computed. Lets return-to-song restore cover+color instantly
+    // with no Glide/Palette recompute and no dependency on the live ImageView drawable (which a
+    // runaway fade-out animator could otherwise have left blank).
+    @Nullable
+    private Bitmap lastSongCoverBitmap = null;
+    private int lastSongDominantColor = 0xFF121212;
+    private boolean lastSongColorValid = false;
+    // True while a switch-to-video swap has committed but the first video frame has not rendered yet.
+    // Keeps the song cover up as a poster over the (still-black) PlayerView so there is no black flash;
+    // the swap player's first-frame listener clears it and fades the cover out.
+    private boolean swapAwaitingFirstFrame = false;
     @Nullable
     private String currentVideoFilePath = null;
     @NonNull
@@ -187,6 +211,12 @@ public class SongPlayerFragment extends Fragment {
     private View actionFavorite;
     private ImageView ivActionFavoriteIcon;
     private ImageView ivActionLikeIcon;
+    private ImageView ivActionDislikeIcon;
+    // Prefs key (in PREFS_PLAYER_STATE) for the set of videoIds the user has disliked. LIKE state
+    // comes from "Música que te gustó" membership; DISLIKE from this local set — both reliable and
+    // read synchronously, so a liked song never shows un-liked on re-entry.
+    private static final String PREF_DISLIKED_VIDEO_IDS = "player_disliked_video_ids";
+    private final YouTubeMusicService likeMusicService = new YouTubeMusicService();
     private View actionRadio;
     private View actionShare;
     private View actionDownloadTrack;
@@ -207,6 +237,22 @@ public class SongPlayerFragment extends Fragment {
     private static final int HOT_SWAP_SEEK_LEAD_MS = 450;
     private static final long HOT_SWAP_COMMIT_DELAY_MS = 400L;
     private static final long HOT_SWAP_TIMEOUT_MS = 12000L;
+    /** Fallback: if the first video frame never renders after a switch-to-video commit (a stalled
+     *  stream), stop holding the song cover as a poster after this and fade to the video anyway. A
+     *  pre-buffered committed video renders its first frame well within this window. */
+    private static final long SWAP_VIDEO_POSTER_TIMEOUT_MS = 3000L;
+    /** Ruta rápida (C1+C2): URL de video ya conocida y cabecera precalentada → el player del
+     *  swap prepara casi desde disco, así que basta con un adelanto/commit mucho menores. */
+    private static final int HOT_SWAP_SEEK_LEAD_FAST_MS = 200;
+    private static final long HOT_SWAP_COMMIT_DELAY_FAST_MS = 150L;
+    /** ~1.5MB de cabecera del stream de video a precalentar en el exo_stream_cache compartido. */
+    private static final long VIDEO_WARM_HEAD_BYTES = 1_500_000L;
+    /** Tarea de precalentado (C2) de la cabecera del video en curso; cancelable. */
+    @Nullable
+    private ExoMediaPlayer.WarmHandle videoWarmHandle;
+    /** videoId cuya cabecera de video se precalentó — habilita la ruta rápida del hot-swap. */
+    @Nullable
+    private String warmedVideoId;
 
     private NextUpAdapter nextUpAdapter;
     @Nullable
@@ -311,6 +357,10 @@ public class SongPlayerFragment extends Fragment {
     // Direct streaming & pre-fetching
     private volatile String prefetchedNextVideoId = null;
     private volatile String prefetchedNextUrl = null;
+    // Mode the prefetched/pre-buffered next-track source was resolved FOR (video vs canción). A
+    // pre-resolved source is only valid to adopt while it matches the CURRENT preferVideoMode —
+    // otherwise switching Canción<->Video mid-track would carry the stale mode into the next track.
+    private volatile boolean prefetchedNextIsVideo = false;
 
     // Stream-as-download: background-save the currently streaming track for offline
     private volatile String streamDownloadingVideoId = null;
@@ -324,6 +374,9 @@ public class SongPlayerFragment extends Fragment {
     private ExoMediaPlayer gaplessPreBufferedPlayer = null;
     @NonNull
     private String gaplessPreBufferedVideoId = "";
+    // Mode the ready/in-flight gapless pre-buffer was resolved FOR (see prefetchedNextIsVideo).
+    private boolean gaplessPreBufferedIsVideo = false;
+    private boolean gaplessPreBufferingIsVideo = false;
     private boolean gaplessPreBufferTriggered = false;
     @NonNull
     private String gaplessPreBufferingVideoId = "";
@@ -419,6 +472,8 @@ public class SongPlayerFragment extends Fragment {
     private String pendingSocialStatsVideoId = "";
     @Nullable
     private Runnable pendingSocialStatsFetchRunnable;
+    @Nullable
+    private Runnable pendingCommentsPrefetchRunnable;
 
     private View playerBackgroundContainer;
     /** Bumped on every cover bind. Async artwork deliveries (Glide CustomTarget, Palette)
@@ -456,6 +511,7 @@ public class SongPlayerFragment extends Fragment {
     private int lastRenderedCurrentSeconds = -1;
     private int lastRenderedTotalSeconds = -1;
     private int lastRenderedProgress = -1;
+    private int lastRenderedBuffered = -1;
 
     private final Runnable localProgressTicker = new Runnable() {
         @Override
@@ -471,21 +527,29 @@ public class SongPlayerFragment extends Fragment {
 
                 accumulatedListenMs += PROGRESS_TICK_MS;
                 maybeStartGaplessPreBuffer(positionMs, durationMs);
-                crossfadeManager.onProgressTick(
-                        positionMs, durationMs,
-                        localExoMediaPlayer,
-                        isPlaying,
-                        localSourcePreparing,
-                        userSeeking,
-                        tracks,
-                        currentIndex,
-                        repeatMode,
-                        isNetworkAvailable(),
-                        gaplessPreBufferedPlayer,
-                        gaplessPreBufferedVideoId,
-                        prefetchedNextVideoId,
-                        prefetchedNextUrl
-                );
+                // Crossfade only in Canción mode: it overlaps two players, but the video surface can
+                // attach to only ONE, so a crossfade in Video mode would drop the picture on the
+                // incoming track. In Video mode the gapless/completion path does a clean video->video
+                // cut instead (the pre-buffer is already resolved for video). Keep ticking an
+                // ALREADY-running crossfade (e.g. mode flipped mid-fade) so it finishes instead of
+                // freezing at partial volume; only STARTING a new crossfade is gated.
+                if (!StreamResolver.isPreferVideoMode() || crossfadeManager.isInProgress()) {
+                    crossfadeManager.onProgressTick(
+                            positionMs, durationMs,
+                            localExoMediaPlayer,
+                            isPlaying,
+                            localSourcePreparing,
+                            userSeeking,
+                            tracks,
+                            currentIndex,
+                            repeatMode,
+                            isNetworkAvailable(),
+                            gaplessPreBufferedPlayer,
+                            gaplessPreBufferedVideoId,
+                            prefetchedNextVideoId,
+                            prefetchedNextUrl
+                    );
+                }
                 // If a crossfade started, resolve the fate of the pre-buffered player.
                 if (crossfadeManager.isInProgress() && gaplessPreBufferedPlayer != null) {
                     if (!crossfadeManager.isUsingPlayer(gaplessPreBufferedPlayer)) {
@@ -538,6 +602,15 @@ public class SongPlayerFragment extends Fragment {
                     if (progress != lastRenderedProgress) {
                         lastRenderedProgress = progress;
                         sbPlaybackProgress.setProgress(progress);
+                    }
+                    // Buffered line (secondaryProgress), YT-style. Offline/local sources are
+                    // fully on disk, so the line goes straight to the end.
+                    int buffered = usingOfflineSource ? 1000
+                            : Math.round(localExoMediaPlayer.getBufferedPosition() / (float) durationMs * 1000f);
+                    buffered = Math.max(progress, Math.min(1000, buffered));
+                    if (buffered != lastRenderedBuffered) {
+                        lastRenderedBuffered = buffered;
+                        sbPlaybackProgress.setSecondaryProgress(buffered);
                     }
                 }
 
@@ -700,6 +773,7 @@ public class SongPlayerFragment extends Fragment {
         tvActionLikeCount = view.findViewById(R.id.tvActionLikeCount);
         tvActionCommentCount = view.findViewById(R.id.tvActionCommentCount);
         ivActionLikeIcon = view.findViewById(R.id.ivActionLikeIcon);
+        ivActionDislikeIcon = view.findViewById(R.id.ivActionDislikeIcon);
         tvActionFavoriteLabel = view.findViewById(R.id.tvActionFavoriteLabel);
         ivActionFavoriteIcon = view.findViewById(R.id.ivActionFavoriteIcon);
         tvCurrentTime = view.findViewById(R.id.tvCurrentTime);
@@ -1036,6 +1110,8 @@ public class SongPlayerFragment extends Fragment {
             pendingModeSwapPlayer = null;
             modeSwapInProgress = false;
         }
+        // Abortar cualquier precalentado de cabecera de video en vuelo (C2).
+        cancelVideoStreamWarm();
         // Release video surface before destroying view
         videoRouter.onPlayerReleased();
         stopLocalProgressTicker();
@@ -1063,6 +1139,11 @@ public class SongPlayerFragment extends Fragment {
         }
         crossfadeManager.destroy();
         settingsPrefs = null;
+        // Release the cached song cover reference (Glide owns the bitmap; do NOT recycle it). The
+        // view is recreated on the same retained instance, so a fresh bind repopulates the cache.
+        lastSongCoverBitmap = null;
+        lastSongColorValid = false;
+        swapAwaitingFirstFrame = false;
         flPlayerHero = null;
         if (seekThumbAnimator != null) { seekThumbAnimator.cancel(); seekThumbAnimator = null; }
         sbPlaybackProgress = null;
@@ -1749,9 +1830,20 @@ public class SongPlayerFragment extends Fragment {
         // its cancelGaplessPreBuffer() releases gaplessPreBufferedPlayer, which made the
         // gapless fast-path below dead code: every non-crossfade advance threw away the
         // fully buffered next track and re-resolved it from scratch.
+        // Only adopt the pre-buffered player if it was resolved for the CURRENT mode: a swap to
+        // Video (or back to Canción) mid-track invalidates a stale-mode pre-buffer, otherwise the
+        // next track would keep playing in the previous mode.
+        final boolean wantVideoNow = StreamResolver.isPreferVideoMode();
         ExoMediaPlayer adoptablePreBuffered = null;
-        if (gaplessPreBufferedPlayer != null && TextUtils.equals(gaplessPreBufferedVideoId, track.videoId)) {
+        if (gaplessPreBufferedPlayer != null && TextUtils.equals(gaplessPreBufferedVideoId, track.videoId)
+                && gaplessPreBufferedIsVideo == wantVideoNow) {
             adoptablePreBuffered = gaplessPreBufferedPlayer;
+            gaplessPreBufferedPlayer = null;
+            gaplessPreBufferedVideoId = "";
+            gaplessPreBufferTriggered = false;
+        } else if (gaplessPreBufferedPlayer != null && TextUtils.equals(gaplessPreBufferedVideoId, track.videoId)) {
+            // Same track but wrong mode: drop the stale pre-buffer so it is re-resolved below.
+            releaseSingleExoMediaPlayer(gaplessPreBufferedPlayer);
             gaplessPreBufferedPlayer = null;
             gaplessPreBufferedVideoId = "";
             gaplessPreBufferTriggered = false;
@@ -1766,6 +1858,11 @@ public class SongPlayerFragment extends Fragment {
         }
         loadedVideoId = track.videoId;
         loadedTrackIsVideo = isVideoTrackId(track.videoId);
+        // New track: default the committed-source flag to music until a real source commits
+        // (startMediaPlaybackFromSource / adoptGaplessPlayer / commitHotSwap set the true value).
+        // Without this reset the just-bound new track would inherit the previous track's video/music
+        // presentation for the brief window before its own source resolves.
+        currentSourceIsVideo = false;
         playCountRecordedForCurrentTrack = false;
         currentSeconds = 0;
         lastSeekTargetSeconds = -1;
@@ -1854,7 +1951,9 @@ public class SongPlayerFragment extends Fragment {
         }
 
         // Not offline — check prefetch (main-thread fields), then resolve online via executor.
-        if (TextUtils.equals(track.videoId, prefetchedNextVideoId) && !TextUtils.isEmpty(prefetchedNextUrl)) {
+        // Only reuse the prefetched URL when it was resolved for the current mode.
+        if (TextUtils.equals(track.videoId, prefetchedNextVideoId) && !TextUtils.isEmpty(prefetchedNextUrl)
+                && prefetchedNextIsVideo == wantVideoNow) {
             String url = prefetchedNextUrl;
             prefetchedNextVideoId = null;
             prefetchedNextUrl = null;
@@ -1901,8 +2000,11 @@ public class SongPlayerFragment extends Fragment {
 
         isPlaying = true;
 
-        // Attach video surface and update UI for the adopted gapless track
-        videoRouter.onTrackStarted(preBuffered, track.videoId, isVideoTrack(track));
+        // Attach video surface and update UI for the adopted gapless track. Capture the committed
+        // source type with the SAME isVideoTrack(track) the surface attach uses, so presentation and
+        // surface never diverge.
+        currentSourceIsVideo = isVideoTrack(track);
+        videoRouter.onTrackStarted(preBuffered, track.videoId, currentSourceIsVideo);
         updatePlayerSurfaceForSource();
 
         updatePlayPauseIcon();
@@ -1912,6 +2014,8 @@ public class SongPlayerFragment extends Fragment {
         syncMiniStateWithPlaylist();
         persistPlaybackSnapshot(false);
         prefetchNextTrackStream();
+        // C2: precalienta la cabecera del video de la pista adoptada (modo audio) si ya se conoce.
+        maybeWarmVideoStreamHead(track.videoId);
 
         // Stream-as-download: gapless players are always network sources
         maybeSaveStreamedTrackOffline(track.videoId);
@@ -1998,6 +2102,9 @@ public class SongPlayerFragment extends Fragment {
         // Capture the app context now: requireContext() inside the executor lambda throws
         // if the fragment detaches mid-flight, silently killing the prefetch.
         final Context appCtx = requireContext().getApplicationContext();
+        // Prefetch FOR the current mode; a source resolved for the wrong mode is useless (and
+        // adopting it would break Canción<->Video stickiness).
+        final boolean wantVideo = StreamResolver.isPreferVideoMode();
 
         // Prefetch next 2 tracks in parallel for instant transitions
         for (int offset = 1; offset <= Math.min(2, tracks.size() - 1); offset++) {
@@ -2005,29 +2112,34 @@ public class SongPlayerFragment extends Fragment {
             PlayerTrack track = tracks.get(idx);
             if (track == null || TextUtils.isEmpty(track.videoId)) continue;
 
-            // Skip local files and offline tracks
+            // Skip local files always. Skip DOWNLOADED tracks only in Canción mode — in Video mode a
+            // downloaded track still streams its music video, so it must be prefetched from network.
             if (LocalFilesStore.isLocalVideoId(track.videoId)) continue;
-            if (OfflineAudioStore.hasOfflineAudio(appCtx, track.videoId)) continue;
+            if (!wantVideo && OfflineAudioStore.hasOfflineAudio(appCtx, track.videoId)) continue;
 
             // Only resolve the immediate next into prefetchedNext fields
             final boolean isImmediate = (offset == 1);
-            if (isImmediate && TextUtils.equals(track.videoId, prefetchedNextVideoId)) continue;
+            if (isImmediate && TextUtils.equals(track.videoId, prefetchedNextVideoId)
+                    && prefetchedNextIsVideo == wantVideo) continue;
 
             final String videoId = track.videoId;
             streamResolverExecutor.submit(() -> {
                 String url = StreamResolver.resolveStreamUrl(appCtx, videoId);
                 if (TextUtils.isEmpty(url) || !isImmediate) return;
-                // Commit on the main thread and re-validate: the user may have skipped or
-                // toggled shuffle while this resolve was in flight (invalidateNextTrackPreparations
-                // cleared/re-prefetched but cannot cancel this task). Writing a now-stale pair
-                // would overwrite the correct prefetch and defeat the instant transition.
+                // resolveStreamUrl reads the LIVE mode on this bg thread, so the source it produced
+                // may not match the mode captured at submit time (user toggled and toggled back
+                // during the resolve). Tag from the ACTUAL resolved source type, not the captured
+                // intent, and commit only if that actual type matches the current live mode.
+                final boolean resolvedIsVideo = StreamResolver.isVideoSource(videoId);
                 localProgressHandler.post(() -> {
                     if (!isAdded() || tracks.size() <= 1) return;
+                    if (StreamResolver.isPreferVideoMode() != resolvedIsVideo) return;
                     int immediateIdx = (currentIndex + 1) % tracks.size();
                     PlayerTrack immediate = tracks.get(immediateIdx);
                     if (immediate == null || !TextUtils.equals(immediate.videoId, videoId)) return;
                     prefetchedNextVideoId = videoId;
                     prefetchedNextUrl = url;
+                    prefetchedNextIsVideo = resolvedIsVideo;
                 });
             });
         }
@@ -2146,6 +2258,10 @@ public class SongPlayerFragment extends Fragment {
 
         gaplessPreBufferingVideoId = nextTrack.videoId;
         gaplessPreBufferTriggered = true;
+        // Pre-buffer FOR the current mode. In Video mode a downloaded track streams its music
+        // video (never the offline audio file), mirroring playCurrentTrack's offline gate.
+        final boolean wantVideo = StreamResolver.isPreferVideoMode();
+        gaplessPreBufferingIsVideo = wantVideo;
 
         String url = null;
         boolean isLocalOrOffline = false;
@@ -2153,7 +2269,7 @@ public class SongPlayerFragment extends Fragment {
         if (LocalFilesStore.isLocalVideoId(nextTrack.videoId)) {
             url = LocalFilesStore.getContentUriForVideoId(requireContext(), nextTrack.videoId);
             isLocalOrOffline = true;
-        } else if (OfflineAudioStore.hasOfflineAudio(requireContext(), nextTrack.videoId)) {
+        } else if (!wantVideo && OfflineAudioStore.hasOfflineAudio(requireContext(), nextTrack.videoId)) {
             java.io.File offlineFile = OfflineAudioStore.getExistingOfflineAudioFile(requireContext(), nextTrack.videoId);
             if (offlineFile != null && offlineFile.isFile() && offlineFile.length() > 0L) {
                 url = offlineFile.getAbsolutePath();
@@ -2162,24 +2278,32 @@ public class SongPlayerFragment extends Fragment {
         }
 
         if (!isLocalOrOffline) {
-            // Find a URL: use prefetched if available, otherwise resolve in background
-            if (TextUtils.equals(nextTrack.videoId, prefetchedNextVideoId) && !TextUtils.isEmpty(prefetchedNextUrl)) {
+            // Find a URL: use prefetched if available AND resolved for this mode, otherwise resolve.
+            if (TextUtils.equals(nextTrack.videoId, prefetchedNextVideoId) && !TextUtils.isEmpty(prefetchedNextUrl)
+                    && prefetchedNextIsVideo == wantVideo) {
                 url = prefetchedNextUrl;
             }
         }
 
         if (!TextUtils.isEmpty(url)) {
-            prepareGaplessPlayer(nextTrack, url);
+            prepareGaplessPlayer(nextTrack, url, wantVideo);
         } else {
             // Capture the app context now: requireContext() inside the executor lambda
             // throws if the fragment detaches mid-flight, silently killing the prebuffer.
             final Context appCtx = requireContext().getApplicationContext();
             streamResolverExecutor.submit(() -> {
                 String resolved = StreamResolver.resolveStreamUrl(appCtx, nextTrack.videoId);
+                // Tag from the ACTUAL resolved source type (resolveStreamUrl read the live mode on
+                // this bg thread), not the mode captured at submit time.
+                final boolean resolvedIsVideo = StreamResolver.isVideoSource(nextTrack.videoId);
                 localProgressHandler.post(() -> {
                     if (!isAdded()) return;
-                    // Cancelled (track change / pause) while resolving — don't prebuffer.
+                    // Cancelled (track change / pause) or mode no longer matches the resolved source.
                     if (!TextUtils.equals(gaplessPreBufferingVideoId, nextTrack.videoId)) return;
+                    if (StreamResolver.isPreferVideoMode() != resolvedIsVideo) {
+                        gaplessPreBufferingVideoId = "";
+                        return;
+                    }
                     if (TextUtils.isEmpty(resolved)) {
                         gaplessPreBufferingVideoId = "";
                         return;
@@ -2193,13 +2317,13 @@ public class SongPlayerFragment extends Fragment {
                         gaplessPreBufferingVideoId = "";
                         return;
                     }
-                    prepareGaplessPlayer(nextTrack, resolved);
+                    prepareGaplessPlayer(nextTrack, resolved, resolvedIsVideo);
                 });
             });
         }
     }
 
-    private void prepareGaplessPlayer(@NonNull PlayerTrack nextTrack, @NonNull String url) {
+    private void prepareGaplessPlayer(@NonNull PlayerTrack nextTrack, @NonNull String url, boolean isVideo) {
         if (!isAdded()) return;
 
         // Release any existing pre-buffer player
@@ -2245,6 +2369,7 @@ public class SongPlayerFragment extends Fragment {
                 }
                 gaplessPreBufferedPlayer = mp;
                 gaplessPreBufferedVideoId = nextTrack.videoId;
+                gaplessPreBufferedIsVideo = isVideo;
             });
 
             player.setOnErrorListener((mp, what, extra) -> {
@@ -2277,6 +2402,7 @@ public class SongPlayerFragment extends Fragment {
     private void cancelGaplessPreBuffer() {
         gaplessPreBufferTriggered = false;
         gaplessPreBufferingVideoId = "";
+        gaplessPreBufferingIsVideo = false;
         if (gaplessPreBufferingPlayer != null) {
             releaseSingleExoMediaPlayer(gaplessPreBufferingPlayer);
             gaplessPreBufferingPlayer = null;
@@ -2285,11 +2411,13 @@ public class SongPlayerFragment extends Fragment {
             releaseSingleExoMediaPlayer(gaplessPreBufferedPlayer);
             gaplessPreBufferedPlayer = null;
             gaplessPreBufferedVideoId = "";
+            gaplessPreBufferedIsVideo = false;
         }
     }
 
     private void invalidateNextTrackPreparations() {
         cancelGaplessPreBuffer();
+        cancelVideoStreamWarm();
         prefetchedNextVideoId = null;
         prefetchedNextUrl = null;
         prefetchNextTrackStream();
@@ -2366,7 +2494,10 @@ public class SongPlayerFragment extends Fragment {
         stopLocalProgressTicker();
         releaseLocalExoMediaPlayer();
         usingOfflineSource = !networkSource;
-        currentSourceIsVideo = true;
+        // Committed-source flag captured with the SAME predicate the surface attach (below) uses,
+        // so the cover/surface presentation follows what is really loaded — not the mutable global
+        // StreamResolver cache.
+        currentSourceIsVideo = isVideoTrack(track);
         currentVideoFilePath = (!networkSource) ? source : null;
         localSourcePreparing = true;
         updateSeekBarLoadingState();
@@ -2551,6 +2682,10 @@ public class SongPlayerFragment extends Fragment {
                 PlaybackLoadingBus.notifyAudioConfirmed(track.videoId);
             }
 
+            // C2: en modo AUDIO, precalienta la cabecera del video de esta pista si ya se conoce
+            // su URL (side-cache C1) — deja el swap a «Video» casi instantáneo.
+            maybeWarmVideoStreamHead(track.videoId);
+
             setPlaybackUiForPreparedSource();
         });
 
@@ -2733,8 +2868,12 @@ public class SongPlayerFragment extends Fragment {
         accumulatedListenMs = 0;
         if (tvCurrentTime != null) tvCurrentTime.setText("00:00");
         if (tvTotalTime != null) tvTotalTime.setText("--:--");
-        if (sbPlaybackProgress != null) sbPlaybackProgress.setProgress(0);
-        
+        if (sbPlaybackProgress != null) {
+            sbPlaybackProgress.setProgress(0);
+            sbPlaybackProgress.setSecondaryProgress(0);
+        }
+        lastRenderedBuffered = -1;
+
         notifyPlaybackStateChanged();
     }
 
@@ -3321,10 +3460,11 @@ public class SongPlayerFragment extends Fragment {
         }
         loadedTrackIsVideo = isVideoTrackId(loadedVideoId);
 
-        // All playback is video. Resolve the offline .mp4 across BOTH volumes (internal + SD):
-        // building the path with the write-dir API pointed at a nonexistent file whenever the
-        // download lived on the other volume (e.g. after flipping "Usar tarjeta SD").
-        currentSourceIsVideo = true;
+        // Resolve the offline .mp4 across BOTH volumes (internal + SD): building the path with the
+        // write-dir API pointed at a nonexistent file whenever the download lived on the other
+        // volume (e.g. after flipping "Usar tarjeta SD"). Committed-source flag captured with the
+        // same isVideoTrack(track) the surface attach uses (usingOfflineSource already set above).
+        currentSourceIsVideo = isVideoTrack(track);
         java.io.File existingVideo = (!wasNetwork && isAdded())
                 ? OfflineAudioStore.findExistingOfflineVideoFile(requireContext(), track.videoId)
                 : null;
@@ -3518,6 +3658,37 @@ public class SongPlayerFragment extends Fragment {
         transition.startTransition(400); // 400ms fade transition
     }
 
+    /** Builds the player's vertical background gradient from a dominant color: the color at the top
+     *  fading to a soft dark end (22% brightness) at the bottom. Single source for every backdrop so
+     *  the artwork bind, the applyDominantColorBackdrop path, and the return-to-song restore all match. */
+    private GradientDrawable buildDominantGradient(int dominantColor) {
+        int r = Color.red(dominantColor);
+        int g = Color.green(dominantColor);
+        int b = Color.blue(dominantColor);
+        int colorEnd = Color.rgb((int) (r * 0.22f), (int) (g * 0.22f), (int) (b * 0.22f));
+        return new GradientDrawable(
+                GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[] { dominantColor, colorEnd });
+    }
+
+    /** Extrae el color dominante de {@code bitmap} y aplica el gradiente vertical de fondo, igual
+     *  que el onResourceReady de la carátula. Se salta por completo si la presentación actual es
+     *  VIDEO (BUG 1: el fondo del video debe ser negro puro, nunca el color dominante), tanto antes
+     *  de lanzar Palette como dentro de su callback async por si el modo cambia entre medias. */
+    private void applyDominantColorBackdrop(@Nullable android.graphics.Bitmap bitmap) {
+        if (bitmap == null || playerBackgroundContainer == null) return;
+        if (currentSourceIsVideo) return;
+        Palette.from(bitmap).generate(palette -> {
+            if (palette == null || !isAdded() || playerBackgroundContainer == null) return;
+            if (currentSourceIsVideo) return; // se entró a video mientras se generaba → dejar negro
+            int dominantColor = palette.getDominantColor(0xFF121212);
+            // Cache so a later Video→Canción swap can restore this exact color instantly (no recompute).
+            lastSongDominantColor = dominantColor;
+            lastSongColorValid = true;
+            animateBackgroundTransition(buildDominantGradient(dominantColor));
+        });
+    }
+
     private void bindCurrentTrack(boolean allowResume) {
         bindCurrentTrackInternal(allowResume, false);
     }
@@ -3548,6 +3719,7 @@ public class SongPlayerFragment extends Fragment {
         refreshSocialActionsForCurrentTrack(track);
         refreshFavoriteActionForCurrentTrack();
         if (!isLocalFile) refreshDownloadChipState();
+        scheduleCommentsPrefetch(track, isLocalFile);
 
         totalSeconds = Math.max(1, parseDurationSeconds(track.duration));
         currentSeconds = 0;
@@ -3557,11 +3729,13 @@ public class SongPlayerFragment extends Fragment {
         lastRenderedCurrentSeconds = -1;
         lastRenderedTotalSeconds = -1;
         lastRenderedProgress = -1;
+        lastRenderedBuffered = -1;
         tvCurrentTime.setText(formatSeconds(currentSeconds));
         tvTotalTime.setText(TextUtils.isEmpty(track.duration) ? formatSeconds(totalSeconds) : track.duration);
 
         int progress = Math.round((currentSeconds / (float) Math.max(1, totalSeconds)) * 1000f);
         sbPlaybackProgress.setProgress(Math.max(0, Math.min(1000, progress)));
+        sbPlaybackProgress.setSecondaryProgress(0);
         updatePlayPauseIcon();
 
         boolean bootstrapArtwork = playerArtworkBootstrapPending;
@@ -3583,7 +3757,9 @@ public class SongPlayerFragment extends Fragment {
             }
 
             if (isLocalVideo) {
-                // VIDEO: no backdrop, no cover — just the video surface on black.
+                // VIDEO: no backdrop, no cover — just the video surface on black. Shape the hero
+                // full-width (16:9) so the surface is not boxed into the song cover's inset square.
+                applyHeroShapeForVideo();
                 if (ivPlayerCover.getVisibility() == View.VISIBLE) {
                     ivPlayerCover.animate().cancel();
                     ivPlayerCover.animate().alpha(0f).setDuration(250).withEndAction(() -> {
@@ -3619,6 +3795,16 @@ public class SongPlayerFragment extends Fragment {
                         public void onResourceReady(@NonNull Bitmap resource, @Nullable Transition<? super Bitmap> transition) {
                             if (!isAdded() || artworkGen != playerArtworkGeneration) return;
 
+                            // BUG 1 + BUG 2: si para cuando la carátula llegó (Glide es async) la
+                            // presentación YA se comprometió como VIDEO —el commit de la fuente ocurrió
+                            // mientras la imagen cargaba, típico al avanzar de un video al siguiente— NO
+                            // aplicar la presentación de música. Reformaría el hero a cuadrado sobre el
+                            // video (se ve como «canción»/audio, BUG 2) y el Palette de abajo repintaría
+                            // el fondo con el color dominante en vez de negro (BUG 1).
+                            // updatePlayerSurfaceForSource ya dejó el video (16:9, fondo negro, carátula
+                            // oculta); una entrega tardía de carátula NO debe corromperlo.
+                            if (currentSourceIsVideo) return;
+
                             // Shape the hero to match THIS artwork during the alpha-0 swap below.
                             // Reshaping while the previous bitmap is still visible re-crops that
                             // bitmap (centerCrop) into the new aspect — that re-crop is the
@@ -3644,6 +3830,9 @@ public class SongPlayerFragment extends Fragment {
                             ivPlayerCover.setAlpha(0f);
                             applyHeroShapeForAspect(aspect, srcW, srcH, artworkGen);
                             ivPlayerCover.setImageBitmap(resource);
+                            // Cache the song cover so a later Video→Canción swap (which does not
+                            // re-bind artwork) can restore it instantly and deterministically.
+                            lastSongCoverBitmap = resource;
                             ivPlayerCover.animate().alpha(1f).setDuration(coverHasContent ? 240 : 260).start();
                             if (pbVideoLoading != null) {
                                 pbVideoLoading.setVisibility(View.GONE);
@@ -3653,20 +3842,17 @@ public class SongPlayerFragment extends Fragment {
                             // dominant swatch is used as-is per design preference).
                             Palette.from(resource).generate(palette -> {
                                 if (palette == null || !isAdded() || artworkGen != playerArtworkGeneration) return;
+                                // BUG 1: Palette.generate es async; si entre tanto se entró a VIDEO
+                                // (swap de modo), el fondo debe quedar negro puro — no repintar con el
+                                // color dominante.
+                                if (currentSourceIsVideo) return;
                                 int dominantColor = palette.getDominantColor(0xFF121212);
+                                // Cache so a later Video→Canción swap restores this exact color instantly.
+                                lastSongDominantColor = dominantColor;
+                                lastSongColorValid = true;
 
                                 if (playerBackgroundContainer != null) {
-                                    int r = Color.red(dominantColor);
-                                    int g = Color.green(dominantColor);
-                                    int b = Color.blue(dominantColor);
-                                    // Soft dark end color for vertical gradient
-                                    int colorEnd = Color.rgb((int)(r * 0.22f), (int)(g * 0.22f), (int)(b * 0.22f));
-
-                                    GradientDrawable gd = new GradientDrawable(
-                                        GradientDrawable.Orientation.TOP_BOTTOM,
-                                        new int[] { dominantColor, colorEnd }
-                                    );
-                                    animateBackgroundTransition(gd);
+                                    animateBackgroundTransition(buildDominantGradient(dominantColor));
                                 }
                             });
                         }
@@ -3674,6 +3860,10 @@ public class SongPlayerFragment extends Fragment {
                         @Override
                         public void onLoadFailed(@Nullable Drawable errorDrawable) {
                             if (!isAdded() || artworkGen != playerArtworkGeneration) return;
+                            // BUG 1 + BUG 2: mismo motivo que onResourceReady — si la presentación ya
+                            // se comprometió como VIDEO, no aplicar el hero cuadrado + icono + fondo
+                            // gris de música sobre el video.
+                            if (currentSourceIsVideo) return;
                             // No artwork available (e.g. local file without album art): neutral
                             // music icon on a square hero + dark backdrop, instead of inheriting
                             // the previous track's shape or leaving the cover stuck at alpha 0.
@@ -3681,6 +3871,10 @@ public class SongPlayerFragment extends Fragment {
                             applyHeroShapeForAspect(1f, 1, 1, artworkGen);
                             ivPlayerCover.setImageResource(R.drawable.ic_music);
                             ivPlayerCover.setAlpha(1f);
+                            // No artwork for this track: drop any cached song bitmap/color so a later
+                            // return-to-song restore never resurrects the PREVIOUS track's cover/color.
+                            lastSongCoverBitmap = null;
+                            lastSongColorValid = false;
                             if (playerBackgroundContainer != null) {
                                 animateBackgroundTransition(new android.graphics.drawable.ColorDrawable(0xFF161616));
                             }
@@ -3804,18 +3998,68 @@ public class SongPlayerFragment extends Fragment {
         }
         flPlayerHero.setLayoutParams(p);
         heroRatioAppliedGeneration = gen;
+        heroShapedForVideo = false; // this is a music (cover) shape
+    }
+
+    /** Shapes the hero as a FULL-WIDTH video box: no side margins and a landscape 16:9 ratio, flat
+     *  chrome. The song-cover shaping insets square art by 20dp per side and forces a 1:1 box — left
+     *  in place across a swap, that inset is exactly why the video rendered narrow and cropped. The
+     *  single reused PlayerView (RESIZE_MODE_FIXED_WIDTH) then fills the full width regardless of the
+     *  clip's own aspect. Analogous to the wide-art (aspect>1.2) branch of applyHeroShapeForAspect. */
+    private void applyHeroShapeForVideo() {
+        if (flPlayerHero == null || getContext() == null) return;
+        androidx.constraintlayout.widget.ConstraintLayout.LayoutParams p =
+                (androidx.constraintlayout.widget.ConstraintLayout.LayoutParams) flPlayerHero.getLayoutParams();
+        if (p == null) return;
+        if (heroShapedForVideo && "H,16:9".equals(p.dimensionRatio)
+                && p.leftMargin == 0 && p.rightMargin == 0) {
+            return; // ya está en forma de video: no re-disparar layout
+        }
+        p.height = 0; // MATCH_CONSTRAINT — el ancho lo llena start↔end, alto por el ratio
+        p.leftMargin = 0;
+        p.rightMargin = 0;
+        p.dimensionRatio = "H,16:9";
+        flPlayerHero.setBackground(androidx.core.content.ContextCompat.getDrawable(getContext(), R.drawable.bg_player_cover_flat));
+        flPlayerHero.setLayoutParams(p);
+        heroShapedForVideo = true;
+    }
+
+    /** Restores the song-cover hero shape after a Video→Canción swap (which does NOT re-bind the
+     *  artwork, so the cover shaping never re-runs on its own). Derives the aspect from the cover
+     *  bitmap still held by ivPlayerCover; defaults to a 1:1 square when none is available. */
+    private void restoreMusicHeroShape() {
+        if (!heroShapedForVideo) return; // ya tiene forma de canción
+        // Solo restaurar cuando la pastilla está en Canción. Al AVANZAR entre videos (modo Video) la
+        // presentación pasa un instante por «música» antes de resolver el siguiente video; reformar a
+        // cuadrado ahí haría parpadear el hero. En ese caso bindCurrentTrack ya reajusta la forma.
+        if (StreamResolver.isPreferVideoMode()) return;
+        // Prefer the live cover bitmap; fall back to the cached song bitmap so the shape still
+        // restores if the live drawable was cleared/rejected during video mode; else a 1:1 square.
+        Bitmap b = null;
+        if (ivPlayerCover != null
+                && ivPlayerCover.getDrawable() instanceof android.graphics.drawable.BitmapDrawable) {
+            b = ((android.graphics.drawable.BitmapDrawable) ivPlayerCover.getDrawable()).getBitmap();
+        }
+        if ((b == null || b.isRecycled())
+                && lastSongCoverBitmap != null && !lastSongCoverBitmap.isRecycled()) {
+            b = lastSongCoverBitmap;
+        }
+        if (b != null && !b.isRecycled()) {
+            float aspect = (float) b.getWidth() / Math.max(1, b.getHeight());
+            applyHeroShapeForAspect(aspect, b.getWidth(), b.getHeight(), heroRatioAppliedGeneration);
+        } else {
+            applyHeroShapeForAspect(1f, 1, 1, heroRatioAppliedGeneration);
+        }
     }
 
     private void setupSocialActions() {
         applySocialStatsToUi(SocialStats.unavailable());
 
         if (actionLike != null) {
-            actionLike.setOnClickListener(v -> toggleCurrentTrackLiked());
+            actionLike.setOnClickListener(v -> onLikeTapped());
         }
         if (actionDislike != null) {
-            actionDislike.setOnClickListener(v -> {
-                // Visual only for now.
-            });
+            actionDislike.setOnClickListener(v -> onDislikeTapped());
         }
         if (actionComments != null) {
             actionComments.setOnClickListener(v -> showCommentsSheet());
@@ -4046,12 +4290,15 @@ public class SongPlayerFragment extends Fragment {
         String radioPlaylistId = "RDAMVM" + track.videoId;
         String radioTitle = TextUtils.isEmpty(track.title) ? "Radio" : track.title;
         SharedPreferences prefs = requireContext().getSharedPreferences(PREFS_PLAYER_STATE, Activity.MODE_PRIVATE);
-        String accessToken = safeValue(prefs.getString(PREF_LAST_YOUTUBE_ACCESS_TOKEN, ""));
 
         // Close player with animation
         collapseToMiniMode(true);
 
-        // Open radio PlaylistDetail after a short delay for animation
+        // Open radio PlaylistDetail after a short delay for animation. The launcher derives the
+        // RDAMVM id + canonical title from the seed videoId and owns the transaction/chrome.
+        final String seedVideoId = track.videoId;
+        final String seedArtist = TextUtils.isEmpty(track.artist) ? "" : track.artist;
+        final String seedThumb = TextUtils.isEmpty(track.imageUrl) ? "" : track.imageUrl;
         View view = getView();
         if (view != null) {
             view.postDelayed(() -> {
@@ -4059,23 +4306,10 @@ public class SongPlayerFragment extends Fragment {
                 androidx.fragment.app.FragmentManager fm;
                 try { fm = getParentFragmentManager(); } catch (Exception e) { return; }
                 if (fm.isStateSaved()) return;
-                PlaylistDetailFragment detailFragment = PlaylistDetailFragment.newInstance(
-                        radioPlaylistId,
-                        radioTitle,
-                        TextUtils.isEmpty(track.artist) ? "" : track.artist,
-                        TextUtils.isEmpty(track.imageUrl) ? "" : track.imageUrl,
-                        accessToken
-                );
-                Fragment existingDetail = fm.findFragmentByTag(TAG_PLAYLIST_DETAIL);
-                androidx.fragment.app.FragmentTransaction transaction = fm.beginTransaction()
-                        .setReorderingAllowed(true);
-                if (existingDetail != null && existingDetail.isAdded() && existingDetail != this) {
-                    transaction.remove(existingDetail);
-                }
-                transaction
-                        .add(R.id.fragmentContainer, detailFragment, TAG_PLAYLIST_DETAIL)
-                        .addToBackStack(TAG_PLAYLIST_DETAIL)
-                        .commit();
+                PlaylistDetailLauncher.open(
+                        getActivity(), fm,
+                        /* id */ null, radioTitle, seedArtist, seedThumb,
+                        /* seedVideoId */ seedVideoId);
             }, 350L);
         }
 
@@ -4097,7 +4331,7 @@ public class SongPlayerFragment extends Fragment {
                     radioStoreTracks.add(new RadioHistoryStore.RadioTrack(
                             t.videoId,
                             TextUtils.isEmpty(t.title) ? "" : t.title,
-                            t.subtitle == null ? "" : t.subtitle,
+                            SongSubtitle.artistOnly(t.subtitle, t.title),
                             t.thumbnailUrl == null ? "" : t.thumbnailUrl));
                 }
                 Context ctx = persistentAppContext;
@@ -4239,6 +4473,9 @@ public class SongPlayerFragment extends Fragment {
             return;
         }
 
+        // Reflect the like/dislike state from local stores (synchronous, instant).
+        refreshLikeIconState();
+
         pendingSocialStatsVideoId = track.videoId;
         SocialStats cached = socialStatsCache.get(track.videoId);
         if (cached != null) {
@@ -4326,6 +4563,31 @@ public class SongPlayerFragment extends Fragment {
         if (pendingSocialStatsFetchRunnable != null) {
             localProgressHandler.removeCallbacks(pendingSocialStatsFetchRunnable);
             pendingSocialStatsFetchRunnable = null;
+        }
+    }
+
+    /**
+     * Warms the comments first-page cache shortly after a track binds, so opening the
+     * comments sheet later hits the instant cache path. Deferred + cancelled on track change
+     * so rapid skipping never fires one request per skip (mirrors the social-stats pattern).
+     */
+    private void scheduleCommentsPrefetch(@NonNull PlayerTrack track, boolean isLocalFile) {
+        cancelPendingCommentsPrefetch();
+        if (isLocalFile || TextUtils.isEmpty(track.videoId)) return;
+        final String requestVideoId = track.videoId;
+        pendingCommentsPrefetchRunnable = () -> {
+            pendingCommentsPrefetchRunnable = null;
+            if (!isAdded() || currentIndex < 0 || currentIndex >= tracks.size()) return;
+            if (!TextUtils.equals(tracks.get(currentIndex).videoId, requestVideoId)) return;
+            CommentsBottomSheet.prefetch(requireContext(), requestVideoId);
+        };
+        localProgressHandler.postDelayed(pendingCommentsPrefetchRunnable, COMMENTS_PREFETCH_DEFER_MS);
+    }
+
+    private void cancelPendingCommentsPrefetch() {
+        if (pendingCommentsPrefetchRunnable != null) {
+            localProgressHandler.removeCallbacks(pendingCommentsPrefetchRunnable);
+            pendingCommentsPrefetchRunnable = null;
         }
     }
 
@@ -4422,20 +4684,76 @@ public class SongPlayerFragment extends Fragment {
     private void refreshLikeIconState() {
         if (ivActionLikeIcon == null || !isAdded()) return;
         if (tracks.isEmpty() || currentIndex < 0 || currentIndex >= tracks.size()) {
-            ivActionLikeIcon.setImageResource(R.drawable.ic_social_thumb_up);
-            ivActionLikeIcon.setColorFilter(ContextCompat.getColor(requireContext(), R.color.text_primary));
+            paintLikeDislikeIcons(YouTubeMusicService.LikeStatus.INDIFFERENT);
             return;
         }
-        String videoId = tracks.get(currentIndex).videoId;
-        boolean isFavorite = !TextUtils.isEmpty(videoId) && isTrackInLikedMusic(videoId);
-        if (isFavorite) {
-            ivActionLikeIcon.setImageResource(R.drawable.ic_thumb_up_liked);
-            ivActionLikeIcon.clearColorFilter();
-        } else {
-            ivActionLikeIcon.setImageResource(R.drawable.ic_social_thumb_up);
-            ivActionLikeIcon.setColorFilter(ContextCompat.getColor(requireContext(), R.color.text_primary));
+        paintLikeDislikeIcons(effectiveLikeStatus(tracks.get(currentIndex).videoId));
+    }
+
+    /**
+     * Like/dislike state derived from LOCAL stores — the reliable, synchronous source. LIKE comes
+     * from "Música que te gustó" membership (synced from YouTube's liked playlist); DISLIKE from a
+     * local set. We intentionally do NOT read it back from a per-play network call: that was slow
+     * and unreliable and would momentarily show a liked song as un-liked on re-entry.
+     */
+    @NonNull
+    private YouTubeMusicService.LikeStatus effectiveLikeStatus(@Nullable String videoId) {
+        if (TextUtils.isEmpty(videoId)) return YouTubeMusicService.LikeStatus.INDIFFERENT;
+        if (isTrackInLikedMusic(videoId)) return YouTubeMusicService.LikeStatus.LIKE;
+        if (isTrackDisliked(videoId)) return YouTubeMusicService.LikeStatus.DISLIKE;
+        return YouTubeMusicService.LikeStatus.INDIFFERENT;
+    }
+
+    private boolean isTrackDisliked(@NonNull String videoId) {
+        if (!isAdded()) return false;
+        Set<String> set = requireContext()
+                .getSharedPreferences(PREFS_PLAYER_STATE, Activity.MODE_PRIVATE)
+                .getStringSet(PREF_DISLIKED_VIDEO_IDS, null);
+        return set != null && set.contains(videoId);
+    }
+
+    private void setTrackDisliked(@NonNull String videoId, boolean disliked) {
+        if (!isAdded() || TextUtils.isEmpty(videoId)) return;
+        SharedPreferences prefs = requireContext()
+                .getSharedPreferences(PREFS_PLAYER_STATE, Activity.MODE_PRIVATE);
+        Set<String> current = prefs.getStringSet(PREF_DISLIKED_VIDEO_IDS, null);
+        // Never mutate the set returned by getStringSet — copy it (Android reuses the instance).
+        Set<String> updated = new HashSet<>(current == null ? java.util.Collections.emptySet() : current);
+        boolean changed = disliked ? updated.add(videoId) : updated.remove(videoId);
+        if (changed) prefs.edit().putStringSet(PREF_DISLIKED_VIDEO_IDS, updated).apply();
+    }
+
+    private void paintLikeDislikeIcons(@NonNull YouTubeMusicService.LikeStatus status) {
+        int neutral = ContextCompat.getColor(requireContext(), R.color.text_primary);
+        if (ivActionLikeIcon != null) {
+            if (status == YouTubeMusicService.LikeStatus.LIKE) {
+                ivActionLikeIcon.setImageResource(R.drawable.ic_thumb_up_liked);
+                ivActionLikeIcon.clearColorFilter();
+            } else {
+                ivActionLikeIcon.setImageResource(R.drawable.ic_social_thumb_up);
+                ivActionLikeIcon.setColorFilter(neutral);
+            }
+        }
+        if (ivActionDislikeIcon != null) {
+            if (status == YouTubeMusicService.LikeStatus.DISLIKE) {
+                ivActionDislikeIcon.setImageResource(R.drawable.ic_social_thumb_down);
+                ivActionDislikeIcon.setColorFilter(neutral);
+            } else {
+                ivActionDislikeIcon.setImageResource(R.drawable.ic_social_thumb_down_outline);
+                ivActionDislikeIcon.setColorFilter(neutral);
+            }
         }
     }
+
+    /** YT Music web cookie for authenticated InnerTube calls (like/dislike). */
+    @NonNull
+    private String getWebCookie() {
+        if (!isAdded()) return "";
+        SharedPreferences prefs = requireContext()
+                .getSharedPreferences(PREFS_PLAYER_STATE, Activity.MODE_PRIVATE);
+        return safeValue(prefs.getString(AppConstants.PREF_LAST_YOUTUBE_WEB_COOKIE, ""));
+    }
+
 
     /**
      * "Música que te gustó" membership is the union of the server-synced cache and the local
@@ -4451,23 +4769,101 @@ public class SongPlayerFragment extends Fragment {
     }
 
     /**
-     * Like tap = toggle membership in "Música que te gustó". Adding mirrors exactly what the
-     * save-to-playlist sheet's liked row does (local yt_mirror, insert at top, cloud-synced).
-     * Removing clears BOTH stores — the fill state is a union, so a mirror-only remove would
-     * leave server-cache-only songs permanently filled.
+     * Like tap = REAL YouTube like. Toggles LIKE<->INDIFFERENT on YouTube via InnerTube (counts like
+     * tapping like on youtube.com) and keeps the local "Música que te gustó" playlist + icon in sync
+     * INSTANTLY from local stores; the network rate runs in the background and only reverts on error.
      */
-    private void toggleCurrentTrackLiked() {
-        if (!isAdded() || tracks.isEmpty() || currentIndex < 0 || currentIndex >= tracks.size()) return;
+    private void onLikeTapped() {
+        PlayerTrack current = currentTrackForRating();
+        if (current == null) return;
+        YouTubeMusicService.LikeStatus previous = effectiveLikeStatus(current.videoId);
+        YouTubeMusicService.LikeStatus target = (previous == YouTubeMusicService.LikeStatus.LIKE)
+                ? YouTubeMusicService.LikeStatus.INDIFFERENT
+                : YouTubeMusicService.LikeStatus.LIKE;
+        applyLikeStatusLocally(current, target);
+        refreshLikeIconState();
+        animateLikeIconPop();
+        if (target == YouTubeMusicService.LikeStatus.LIKE) {
+            AppSnackbar.showInView(getPlayerToastRoot(), "Agregado a Música que te gustó",
+                    null, null, playerToastBottomMarginPx());
+        }
+        sendRealRating(current, target, previous);
+    }
+
+    /**
+     * Dislike tap = REAL YouTube dislike. Toggles DISLIKE<->INDIFFERENT on YouTube; a dislike also
+     * clears any prior like (mutually exclusive), matching YouTube's own behavior.
+     */
+    private void onDislikeTapped() {
+        PlayerTrack current = currentTrackForRating();
+        if (current == null) return;
+        YouTubeMusicService.LikeStatus previous = effectiveLikeStatus(current.videoId);
+        YouTubeMusicService.LikeStatus target = (previous == YouTubeMusicService.LikeStatus.DISLIKE)
+                ? YouTubeMusicService.LikeStatus.INDIFFERENT
+                : YouTubeMusicService.LikeStatus.DISLIKE;
+        applyLikeStatusLocally(current, target);
+        refreshLikeIconState();
+        sendRealRating(current, target, previous);
+    }
+
+    @Nullable
+    private PlayerTrack currentTrackForRating() {
+        if (!isAdded() || tracks.isEmpty() || currentIndex < 0 || currentIndex >= tracks.size()) return null;
         PlayerTrack current = tracks.get(currentIndex);
-        if (TextUtils.isEmpty(current.videoId)) return;
+        if (current == null || TextUtils.isEmpty(current.videoId)) return null;
+        return current;
+    }
+
+    /** Writes the like/dislike state into the local stores (like and dislike are mutually exclusive). */
+    private void applyLikeStatusLocally(@NonNull PlayerTrack current, @NonNull YouTubeMusicService.LikeStatus status) {
+        if (!isAdded() || TextUtils.isEmpty(current.videoId)) return;
+        applyLocalLikedMirror(current, status == YouTubeMusicService.LikeStatus.LIKE);
+        setTrackDisliked(current.videoId, status == YouTubeMusicService.LikeStatus.DISLIKE);
+    }
+
+    /** Fires the real InnerTube rate in the background; reverts the local stores on failure. */
+    private void sendRealRating(@NonNull PlayerTrack current,
+                                @NonNull YouTubeMusicService.LikeStatus target,
+                                @NonNull YouTubeMusicService.LikeStatus previous) {
+        String cookie = getWebCookie();
+        if (cookie.isEmpty()) {
+            // No YT session: undo the optimistic local change and ask the user to sign in.
+            applyLikeStatusLocally(current, previous);
+            refreshLikeIconState();
+            AppSnackbar.showInView(getPlayerToastRoot(),
+                    "Inicia sesión en YouTube Music para dar me gusta",
+                    null, null, playerToastBottomMarginPx());
+            return;
+        }
+        likeMusicService.rateSong(cookie, current.videoId, target, new YouTubeMusicService.RateCallback() {
+            @Override
+            public void onSuccess(@NonNull YouTubeMusicService.LikeStatus status) {
+                // Local stores already reflect the choice; nothing more to do.
+            }
+
+            @Override
+            public void onError(@NonNull String error) {
+                if (!isAdded()) return;
+                // Stores are keyed by videoId (independent of the displayed track): always undo.
+                applyLikeStatusLocally(current, previous);
+                refreshLikeIconState();
+                AppSnackbar.showInView(getPlayerToastRoot(),
+                        "No se pudo actualizar en YouTube",
+                        null, null, playerToastBottomMarginPx());
+            }
+        });
+    }
+
+    /**
+     * Keeps the local "Música que te gustó" playlist mirror consistent with the like state, so a
+     * liked song shows there and reads instantly/offline. Adding mirrors the save-to-playlist sheet's
+     * liked row; removing clears BOTH stores (the fill state is a union of server cache + mirror).
+     */
+    private void applyLocalLikedMirror(@NonNull PlayerTrack current, boolean liked) {
+        if (!isAdded() || TextUtils.isEmpty(current.videoId)) return;
         Context ctx = requireContext();
         String likedPid = YouTubeMusicService.SPECIAL_LIKED_VIDEOS_ID;
-
-        boolean wasLiked = isTrackInLikedMusic(current.videoId);
-        if (wasLiked) {
-            CustomPlaylistsStore.INSTANCE.removeTrackFromYtMirror(ctx, likedPid, current.videoId);
-            FavoritesPlaylistStore.removeFromLikedMusic(ctx, current.videoId);
-        } else {
+        if (liked) {
             String tTitle = TextUtils.isEmpty(current.title) ? "Tema" : current.title;
             String tArtist = current.artist == null ? "" : current.artist;
             String tDuration = current.duration == null ? "" : current.duration;
@@ -4475,20 +4871,12 @@ public class SongPlayerFragment extends Fragment {
             CustomPlaylistsStore.INSTANCE.addTrackToYtMirror(
                     ctx, likedPid, current.videoId, tTitle, tArtist, tDuration, tImage, true);
             FavoritesPlaylistStore.clearLikedTombstone(ctx, current.videoId);
+        } else {
+            CustomPlaylistsStore.INSTANCE.removeTrackFromYtMirror(ctx, likedPid, current.videoId);
+            FavoritesPlaylistStore.removeFromLikedMusic(ctx, current.videoId);
         }
         FavoritesPlaylistStore.invalidateLikedMusicCache();
-
-        refreshLikeIconState();
-        animateLikeIconPop();
         notifyFavoritesPlaylistIfVisible();
-
-        if (wasLiked) {
-            AppSnackbar.showInView(getPlayerToastRoot(), "Se eliminó de Música que te gustó",
-                    null, null, playerToastBottomMarginPx());
-        } else {
-            AppSnackbar.showInView(getPlayerToastRoot(), "Se guardó en Música que te gustó",
-                    null, null, playerToastBottomMarginPx());
-        }
     }
 
     private void animateLikeIconPop() {
@@ -5071,8 +5459,13 @@ public class SongPlayerFragment extends Fragment {
         if (TextUtils.isEmpty(loadedVideoId) || !TextUtils.equals(loadedVideoId, track.videoId)) {
             return false;
         }
+        // Offline: probe the actual file (also triggers the async probe + a re-sync on completion).
         if (usingOfflineSource) return offlineFileHasVideoTrack(track.videoId);
-        return StreamResolver.isVideoSource(track.videoId);
+        // Network: follow the CURRENTLY-loaded player's committed source (captured at the last
+        // commit), NOT the live StreamResolver.isVideoSource() cache. That global cache is keyed only
+        // by videoId and flips on a mode toggle, a next-track prefetch, or a reverted swap — reading
+        // it here is exactly what made the cover/surface disagree with what was really playing.
+        return currentSourceIsVideo;
     }
 
     /** Probes the offline file for a real video track (cached). Returns false for online-only or
@@ -5156,14 +5549,17 @@ public class SongPlayerFragment extends Fragment {
 
     private void updatePlaybackModePillUi() {
         if (tvModeAudio == null || tvModeVideo == null) return;
-        // Ambas letras en blanco puro; el segmento activo llena TODA su mitad (drawable con la
-        // esquina exterior redondeada según el lado).
-        tvModeAudio.setTextColor(0xFFFFFFFF);
-        tvModeVideo.setTextColor(0xFFFFFFFF);
+        // El lado activo va en blanco puro; el inactivo, blanco al 70% (0xB3) para atenuarlo
+        // ligeramente. El segmento activo llena TODA su mitad (drawable con la esquina exterior
+        // redondeada según el lado).
         if (playerVideoMode) {
+            tvModeVideo.setTextColor(0xFFFFFFFF);
+            tvModeAudio.setTextColor(0xB3FFFFFF);
             tvModeVideo.setBackgroundResource(R.drawable.bg_player_mode_segment_active_right);
             tvModeAudio.setBackground(null);
         } else {
+            tvModeAudio.setTextColor(0xFFFFFFFF);
+            tvModeVideo.setTextColor(0xB3FFFFFF);
             tvModeAudio.setBackgroundResource(R.drawable.bg_player_mode_segment_active_left);
             tvModeVideo.setBackground(null);
         }
@@ -5183,6 +5579,65 @@ public class SongPlayerFragment extends Fragment {
     }
 
     /**
+     * Deja listo el swap a «Video» mientras una pista suena en modo AUDIO. Dos etapas:
+     *  • C1 (toda red): asegura que la URL del video muxed (itag 18) esté en el side-cache de
+     *    StreamResolver. Normalmente ya se extrae GRATIS durante la resolución de audio, pero si la
+     *    pista se sirvió de cache (disco/memoria) esa extracción NO ocurrió y la URL quedaba
+     *    desconocida → el tap a «Video» hacía un fetch de red completo (lento). Aquí la resolvemos
+     *    de fondo (metadata liviana, como el prefetch de audio) para que resolveStreamUrl NO toque
+     *    la red al tocar «Video».
+     *  • C2 (solo WiFi): precalienta ~1.5MB de la cabecera del stream en el exo_stream_cache para que
+     *    el player del swap prepare casi desde disco. El warm pesado queda en WiFi para no gastar
+     *    datos móviles con un stream que el usuario quizá nunca mire (respeta data-saver).
+     * Con C1 asegurado en toda red, el swap es rápido también con datos móviles (sin fetch en el tap).
+     */
+    private void maybeWarmVideoStreamHead(@Nullable String videoId) {
+        // Reinicia siempre el estado del precalentado previo (cambio de pista) — en el hilo principal.
+        cancelVideoStreamWarm();
+        warmedVideoId = null;
+        if (TextUtils.isEmpty(videoId) || LocalFilesStore.isLocalVideoId(videoId)) return;
+        // Ya estamos en modo Video: el stream de video se cachea al reproducirlo, no hay que forzar.
+        if (StreamResolver.isPreferVideoMode()) return;
+        Context ctx = getContext();
+        if (ctx == null) return;
+        final Context appCtx = ctx.getApplicationContext();
+        final String targetId = videoId;
+        // Pool de resolución (no el backgroundExecutor de 1 hilo que usan el probe offline y el swap):
+        // así este fetch corre en paralelo y nunca serializa detrás del resolve del hot-swap.
+        streamResolverExecutor.submit(() -> {
+            // C1: URL del video conocida sin red si ya estaba en el side-cache; si no, una resolución
+            // de metadata (no descarga el media). NO toca urlCache (el audio sigue siendo DIRECT).
+            String url = StreamResolver.getPrefetchedVideoUrl(targetId);
+            if (TextUtils.isEmpty(url)) {
+                url = StreamResolver.prefetchVideoUrl(appCtx, targetId);
+            }
+            if (TextUtils.isEmpty(url)) return; // la pista no tiene video muxed
+            final boolean warmHead = StreamResolver.isOnWifi(appCtx); // ~1.5MB → solo WiFi
+            final String resolvedUrl = url;
+            localProgressHandler.post(() -> {
+                // Sigue siendo la pista actual y no cambiamos a Video mientras resolvíamos.
+                if (!isAdded() || !TextUtils.equals(loadedVideoId, targetId)) return;
+                if (StreamResolver.isPreferVideoMode()) return;
+                if (!warmHead) return; // C1 ya dejó la URL lista; el warm de cabecera solo en WiFi
+                cancelVideoStreamWarm();
+                videoWarmHandle = ExoMediaPlayer.warmStreamHead(
+                        appCtx, resolvedUrl, StreamResolver.getHeadersFor(targetId), VIDEO_WARM_HEAD_BYTES);
+                warmedVideoId = targetId;
+            });
+        });
+    }
+
+    /** Cancela (sin liberar el cache) el precalentado de la cabecera de video en curso. NO borra
+     *  warmedVideoId: al tocar «Video» la cabecera ya está en cache y la ruta rápida sigue válida;
+     *  el flag se reinicia solo en la siguiente pista (maybeWarmVideoStreamHead). */
+    private void cancelVideoStreamWarm() {
+        if (videoWarmHandle != null) {
+            try { videoWarmHandle.cancel(); } catch (Exception ignored) { }
+            videoWarmHandle = null;
+        }
+    }
+
+    /**
      * Cambia la fuente Audio↔Video EN CALIENTE: resuelve la fuente nueva en background,
      * prepara un SEGUNDO player en silencio sincronizado a la posición actual, y solo
      * entonces intercambia — la música nunca se pausa (ver commitHotSwap).
@@ -5192,7 +5647,17 @@ public class SongPlayerFragment extends Fragment {
         final Context appCtx = requireContext().getApplicationContext();
         modeSwapInProgress = true;
 
-        backgroundExecutor.execute(() -> {
+        // Ruta rápida (C1+C2): solo al ir a VIDEO, cuando la URL de video ya se conoce (side-cache
+        // → resolveStreamUrl NO hará red) y su cabecera ya se precalentó en el cache. Entonces el
+        // player del swap prepara casi desde disco → adelanto de seek y delay de commit reducidos.
+        final boolean fastSwap = videoMode
+                && StreamResolver.getPrefetchedVideoUrl(swapVideoId) != null
+                && TextUtils.equals(warmedVideoId, swapVideoId);
+
+        // Resolve on the 3-thread resolver pool, NOT the single-thread backgroundExecutor: switching
+        // to video used to queue behind the offline MediaExtractor probe and other serial work, which
+        // is a big part of why the swap felt heavy. Same lifecycle (both shutdownNow in onDestroy).
+        streamResolverExecutor.execute(() -> {
             String source = null;
             if (!videoMode) {
                 // Modo audio: preferir el archivo offline si existe (sin red, instantáneo).
@@ -5218,7 +5683,7 @@ public class SongPlayerFragment extends Fragment {
                     revertPlaybackModeAfterFailure(videoMode);
                     return;
                 }
-                prepareHotSwapPlayer(track, resolved, videoMode, appCtx);
+                prepareHotSwapPlayer(track, resolved, videoMode, appCtx, fastSwap);
             });
         });
     }
@@ -5227,7 +5692,8 @@ public class SongPlayerFragment extends Fragment {
             @NonNull PlayerTrack track,
             @NonNull String source,
             boolean videoMode,
-            @NonNull Context appCtx
+            @NonNull Context appCtx,
+            boolean fastSwap
     ) {
         final String swapVideoId = track.videoId;
         final boolean networkSource = isHttpStreamSource(source);
@@ -5285,14 +5751,17 @@ public class SongPlayerFragment extends Fragment {
                 return;
             }
             // Sincronizar por delante de la posición actual (compensa el delay del commit)
-            // y comprometer el intercambio tras un pequeño margen de re-buffer.
+            // y comprometer el intercambio tras un pequeño margen de re-buffer. En la ruta rápida
+            // (cabecera precalentada) el re-buffer es casi inmediato → adelanto/commit menores.
+            int seekLead = fastSwap ? HOT_SWAP_SEEK_LEAD_FAST_MS : HOT_SWAP_SEEK_LEAD_MS;
+            long commitDelay = fastSwap ? HOT_SWAP_COMMIT_DELAY_FAST_MS : HOT_SWAP_COMMIT_DELAY_MS;
             int pos = localExoMediaPlayer.getCurrentPosition();
-            mp.seekTo(pos + HOT_SWAP_SEEK_LEAD_MS);
+            mp.seekTo(pos + seekLead);
             localProgressHandler.postDelayed(() -> {
                 if (!settled.compareAndSet(false, true)) return;
                 localProgressHandler.removeCallbacks(swapTimeout);
                 commitHotSwap(mp, track, videoMode, networkSource, source);
-            }, HOT_SWAP_COMMIT_DELAY_MS);
+            }, commitDelay);
         });
 
         try {
@@ -5348,7 +5817,12 @@ public class SongPlayerFragment extends Fragment {
         localExoMediaPlayer = next;
         next.isCrossfadeComponent = false;
         usingOfflineSource = !networkSource;
-        currentSourceIsVideo = true;
+        // Capture the committed source type BEFORE we tell the router / refresh presentation, using
+        // the SAME isVideoTrack(track) the surface attach (below) uses. This is what makes a reverted
+        // or aborted swap safe: if this commit runs, presentation and surface agree; if it never runs
+        // (timeout/revert), the flag keeps the previous track's value and the global VIDEO cache set
+        // during the resolve can no longer flip the cover to a black, surface-less "video".
+        currentSourceIsVideo = isVideoTrack(track);
         currentVideoFilePath = networkSource ? null : source;
 
         next.setOnCompletionListener(mp -> {
@@ -5377,13 +5851,55 @@ public class SongPlayerFragment extends Fragment {
             totalSeconds = Math.max(1, next.getDuration() / 1000);
         } catch (Exception ignored) { }
 
-        videoRouter.onTrackStarted(next, track.videoId, isVideoTrack(track));
+        // Switch-to-video: keep the song cover as a POSTER over the still-black PlayerView until the
+        // first video frame actually renders, so there is no black flash and the switch feels instant.
+        // updatePlayerSurfaceForSource() below honours swapAwaitingFirstFrame and does NOT fade the
+        // cover; this first-frame listener clears the flag and fades it out once the video paints.
+        if (currentSourceIsVideo) {
+            swapAwaitingFirstFrame = true;
+            if (pbVideoLoading != null) pbVideoLoading.setVisibility(View.VISIBLE);
+            final ExoMediaPlayer swapPlayer = next;
+            next.setOnRenderedFirstFrameListener(mp -> {
+                if (!isAdded() || localExoMediaPlayer != mp || !swapAwaitingFirstFrame) return;
+                swapAwaitingFirstFrame = false;
+                if (pbVideoLoading != null) pbVideoLoading.setVisibility(View.GONE);
+                fadeOutCoverForVideo();
+            });
+            // Fallback so a stalled stream never leaves the poster (or spinner) up forever.
+            localProgressHandler.postDelayed(() -> {
+                if (swapAwaitingFirstFrame && localExoMediaPlayer == swapPlayer) {
+                    swapAwaitingFirstFrame = false;
+                    if (pbVideoLoading != null) pbVideoLoading.setVisibility(View.GONE);
+                    fadeOutCoverForVideo();
+                }
+            }, SWAP_VIDEO_POSTER_TIMEOUT_MS);
+        } else {
+            swapAwaitingFirstFrame = false;
+        }
+
+        // Attach the surface FIRST, then refresh presentation — so the cover only hides once the
+        // video surface is actually in place (never a black, surface-less hero mid-swap).
+        videoRouter.onTrackStarted(next, track.videoId, currentSourceIsVideo);
         updatePlayerSurfaceForSource();
         updatePlayPauseIcon();
         updateMediaSessionState();
         if (keepPlaying) startLocalProgressTicker();
         modeSwapInProgress = false;
         Log.d(TAG, "modeSwap: committed videoMode=" + videoMode + " videoId=" + track.videoId);
+    }
+
+    /** Fades the song cover out and hides it, revealing the video surface underneath. Used by the
+     *  normal video-start path and by the switch-to-video swap's first-frame listener (poster mode). */
+    private void fadeOutCoverForVideo() {
+        if (ivPlayerCover == null) return;
+        if (ivPlayerCover.getVisibility() == View.VISIBLE) {
+            ivPlayerCover.animate().cancel();
+            ivPlayerCover.animate().alpha(0f).setDuration(250).withEndAction(() -> {
+                ivPlayerCover.setVisibility(View.GONE);
+            }).start();
+        } else {
+            ivPlayerCover.setVisibility(View.GONE);
+        }
     }
 
     private void updatePlayerSurfaceForSource() {
@@ -5399,31 +5915,62 @@ public class SongPlayerFragment extends Fragment {
 
         if (ivPlayerCover != null) {
             if (isLocalVideo) {
-                if (ivPlayerCover.getVisibility() == View.VISIBLE) {
+                // VIDEO: the hero must be FULL-WIDTH (16:9, no side margins) or the video keeps the
+                // song cover's 20dp inset + 1:1 square box and renders narrow. Reshape BEFORE touching
+                // the cover so the surface lands full-width in one step.
+                applyHeroShapeForVideo();
+                if (swapAwaitingFirstFrame) {
+                    // Poster mode (switch-to-video swap): keep the song cover fully visible ON TOP of
+                    // the not-yet-rendered (black) PlayerView so there is no black flash. commitHotSwap's
+                    // first-frame listener fades it out once the video actually paints.
                     ivPlayerCover.animate().cancel();
-                    ivPlayerCover.animate().alpha(0f).setDuration(250).withEndAction(() -> {
-                        ivPlayerCover.setVisibility(View.GONE);
-                    }).start();
+                    ivPlayerCover.setVisibility(View.VISIBLE);
+                    ivPlayerCover.setAlpha(1f);
+                    ivPlayerCover.bringToFront();
+                    if (pbVideoLoading != null) pbVideoLoading.bringToFront();
                 } else {
-                    ivPlayerCover.setVisibility(View.GONE);
+                    fadeOutCoverForVideo();
                 }
             } else {
-                ivPlayerCover.setVisibility(View.VISIBLE);
-                // Only force full opacity when the cover actually holds artwork. After a
-                // video→music switch the bind path deliberately keeps it transparent (with
-                // a null drawable) until the new artwork lands — forcing alpha 1 here would
-                // flash the previous track's art over the new song.
-                if (ivPlayerCover.getDrawable() != null) {
-                    ivPlayerCover.setAlpha(1f);
+                boolean wasVideoShape = heroShapedForVideo; // ¿venimos saliendo de una presentación de video?
+                if (wasVideoShape) {
+                    // Returning from a video shape to a music presentation. Cancel any in-flight
+                    // fade-out FIRST — otherwise its withEndAction keeps driving alpha→0 and re-hides
+                    // the cover, which is exactly the "todo negro, no sale la portada ni el color"
+                    // bug when returning to Canción.
+                    ivPlayerCover.animate().cancel();
+                    swapAwaitingFirstFrame = false;
+                    restoreMusicHeroShape();
+                    ivPlayerCover.setVisibility(View.VISIBLE);
+                    // Restore the cover + its dominant-color gradient instantly ONLY when the cover
+                    // still holds this song's bitmap — i.e. a same-track Video→Canción swap. If it was
+                    // cleared, a track-change bind is loading new artwork; leave it transparent so
+                    // onResourceReady fades the correct cover/color in (forcing the cached previous-song
+                    // color here would flash the wrong backdrop).
+                    if (ivPlayerCover.getDrawable() != null) {
+                        ivPlayerCover.setAlpha(1f);
+                        if (!StreamResolver.isPreferVideoMode()
+                                && lastSongColorValid && playerBackgroundContainer != null) {
+                            animateBackgroundTransition(buildDominantGradient(lastSongDominantColor));
+                        }
+                    }
+                } else {
+                    // Normal music playback-start with the shape already correct. Leave the cover as
+                    // the bind path set it: after a video→music TRACK CHANGE it is deliberately
+                    // transparent (null drawable) until the new artwork lands — forcing alpha 1 here
+                    // would flash the previous track's art over the new song.
+                    ivPlayerCover.setVisibility(View.VISIBLE);
+                    if (ivPlayerCover.getDrawable() != null) {
+                        ivPlayerCover.setAlpha(1f);
+                    }
                 }
             }
         }
 
-        // Hero aspect/shape is owned entirely by the cover artwork (bindCurrentTrack's
-        // onResourceReady → applyHeroShapeForAspect). We intentionally do NOT set a default
-        // ratio on every playback-start here: doing so stomped the previous cover's shape
-        // mid-swap and made the image jump/distort when changing tracks. Until the first
-        // artwork lands the hero keeps its 0dp fill from XML.
+        // Music hero aspect/shape is otherwise owned by the cover artwork (bindCurrentTrack's
+        // onResourceReady → applyHeroShapeForAspect). We still do NOT set a default ratio on every
+        // music playback-start here (that stomped the previous cover's shape mid-swap and made the
+        // image jump). restoreMusicHeroShape() above only fires when leaving the video shape.
 
         // Hide spinner for audio tracks; only show for local video
         if (pbVideoLoading != null && !isLocalVideo) {
@@ -5524,13 +6071,16 @@ public class SongPlayerFragment extends Fragment {
     private Fragment resolveReturnTarget(@NonNull FragmentManager fm) {
         if (!TextUtils.isEmpty(returnTargetTag)) {
             Fragment preferred = fm.findFragmentByTag(returnTargetTag);
-            if (preferred != null && preferred.isAdded()) {
+            // A HIDDEN fragment is one the user navigated away from (e.g. a playlist_detail left
+            // behind after switching modules). It must NOT be resurrected as the return target,
+            // otherwise closing the player would pop a screen "out of nowhere" that was never open.
+            if (preferred != null && preferred.isAdded() && !preferred.isHidden()) {
                 return preferred;
             }
         }
 
         Fragment playlist = fm.findFragmentByTag(TAG_PLAYLIST_DETAIL);
-        if (playlist != null && playlist.isAdded()) {
+        if (playlist != null && playlist.isAdded() && !playlist.isHidden()) {
             return playlist;
         }
 
@@ -6232,7 +6782,11 @@ public class SongPlayerFragment extends Fragment {
         PlayerTrack(@NonNull String videoId, @NonNull String title, @NonNull String artist, @NonNull String duration, @NonNull String imageUrl) {
             this.videoId = videoId;
             this.title = title;
-            this.artist = artist;
+            // Choke point for every queue-ingestion path (newInstance args, externalReplaceQueue,
+            // externalEnqueue, snapshots): callers historically packed the raw baked YTM subtitle
+            // ("Artista • Álbum • 3:22 • 500 M...") into the artist slot. The player, MediaSession,
+            // notification and miniplayer must only ever show the artist name.
+            this.artist = SongSubtitle.artistOnly(artist, title);
             this.duration = duration;
             this.imageUrl = imageUrl;
         }
@@ -6378,7 +6932,7 @@ public class SongPlayerFragment extends Fragment {
                 holder.tvNextUpArtist.setText("Reproduciendo ahora");
                 holder.tvNextUpArtist.setTextColor(ContextCompat.getColor(holder.itemView.getContext(), R.color.stitch_blue)); // Primary color
             } else {
-                holder.tvNextUpArtist.setText(item.artist);
+                holder.tvNextUpArtist.setText(SongSubtitle.forRowParts(item.artist, item.duration));
                 holder.tvNextUpArtist.setTextColor(Color.parseColor("#A0A0A0")); // Default gray
             }
 
@@ -6486,7 +7040,7 @@ public class SongPlayerFragment extends Fragment {
         // Cap scroll area so footer buttons remain visible
         View svScroll = sheet.findViewById(R.id.svSavePlaylistScroll);
         if (svScroll != null) {
-            int maxH = (int) (320 * density);
+            int maxH = (int) (ctx.getResources().getDisplayMetrics().heightPixels * 0.55f);
             svScroll.getLayoutParams().height = android.view.ViewGroup.LayoutParams.WRAP_CONTENT;
             svScroll.post(() -> {
                 if (svScroll.getHeight() > maxH) {
@@ -6499,13 +7053,6 @@ public class SongPlayerFragment extends Fragment {
 
         // Favoritos
         java.util.List<FavoritesPlaylistStore.FavoriteTrack> favs = FavoritesPlaylistStore.loadFavorites(ctx);
-        java.util.List<String> favUrls = new ArrayList<>();
-        for (FavoritesPlaylistStore.FavoriteTrack f : favs) {
-            if (f != null && !TextUtils.isEmpty(f.imageUrl)) {
-                if (!favUrls.contains(f.imageUrl)) favUrls.add(f.imageUrl);
-                if (favUrls.size() >= 4) break;
-            }
-        }
 
         {
             View row = LayoutInflater.from(ctx).inflate(R.layout.item_save_playlist_row, llList, false);
@@ -6515,13 +7062,7 @@ public class SongPlayerFragment extends Fragment {
             ImageView ivCheck = row.findViewById(R.id.ivSaveCheck);
             tvName.setText(FavoritesPlaylistStore.PLAYLIST_TITLE);
             tvCount.setText(favs.size() + " pistas");
-            if (favUrls.size() >= 4) {
-                PlaylistGridArtLoader.load(ivThumb, favUrls, thumbSizePx);
-            } else if (!favUrls.isEmpty()) {
-                Glide.with(this).load(favUrls.get(0))
-                        .format(com.bumptech.glide.load.DecodeFormat.PREFER_RGB_565)
-                        .override(200, 200).centerCrop().into(ivThumb);
-            }
+            FavoritesArt.bindCover(ivThumb);
             boolean isIn = isTrackInPlaylist(ctx, track.videoId, FavoritesPlaylistStore.PLAYLIST_ID);
             if (ivCheck != null) ivCheck.setVisibility(isIn ? View.VISIBLE : View.GONE);
             final boolean[] checked = {isIn};
@@ -6597,7 +7138,8 @@ public class SongPlayerFragment extends Fragment {
                 }
                 refreshLikeIconState();
             });
-            llList.addView(row);
+            // "Música que te gustó" always first, Favoritos second.
+            llList.addView(row, 0);
         }
 
         // Custom playlists

@@ -123,10 +123,17 @@ public class PlaylistDetailFragment extends Fragment
     private static final String STREAM_SCREEN_PLAYLIST_DETAIL = "playlist_detail";
     private static final long TRACKS_TOKEN_RETRY_DELAY_MS = 1200L;
     private static final int MAX_TRACKS_TOKEN_RETRY = 3;
-    private static final int PLAYLIST_TRACKS_INITIAL_FETCH_LIMIT = 280;
+    // Effectively "load all": the fetch pages through every YouTube continuation until the playlist
+    // ends (the service loop stops when there is no nextPageToken), so a playlist with N songs shows
+    // all N — no 280-song cap. INITIAL == MAX so canLoadMore stays false after the single full fetch
+    // and the result is cached as complete. Any realistic playlist is far below this ceiling.
+    private static final int PLAYLIST_TRACKS_INITIAL_FETCH_LIMIT = 100000;
     private static final int PLAYLIST_TRACKS_FETCH_STEP = 220;
-    private static final int PLAYLIST_TRACKS_FETCH_MAX_LIMIT = 1800;
+    private static final int PLAYLIST_TRACKS_FETCH_MAX_LIMIT = 100000;
     private static final int PLAYLIST_TRACKS_LOAD_MORE_THRESHOLD = 12;
+    // Bound for the offline-state-lookup debounce map, decoupled from the fetch ceiling above so the
+    // large limit never preallocates/holds a huge map.
+    private static final int OFFLINE_STATE_LOOKUP_CACHE_MAX = 4096;
     private static final String OFFLINE_DOWNLOAD_UNIQUE_PREFIX = "offline_playlist_";
     private static final String OFFLINE_DOWNLOAD_QUEUE_UNIQUE_NAME = "offline_playlist_queue";
     private static final String OFFLINE_DOWNLOAD_MANUAL_TRACK_QUEUE_UNIQUE_NAME = "offline_manual_track_queue";
@@ -162,6 +169,16 @@ public class PlaylistDetailFragment extends Fragment
     public static final String ARG_PLAYLIST_SUBTITLE = "arg_playlist_subtitle";
     public static final String ARG_PLAYLIST_THUMBNAIL = "arg_playlist_thumbnail";
     public static final String ARG_YOUTUBE_ACCESS_TOKEN = "arg_youtube_access_token";
+    /** navigationEndpoint `params` token captured from the opening home card. Forwarded to the
+     *  InnerTube /next (mix) or browse (recap) request so YT-generated personal mixes actually
+     *  return their tracks instead of an empty panel. Empty for every non-generated entry point. */
+    public static final String ARG_PLAYLIST_PARAMS = "arg_playlist_params";
+    /** Art-rendering hint from the opening card. When {@link #ART_HINT_SINGLE} the header must
+     *  CLONE the card's single cover (foreground + blurred backdrop) and never synthesize a 2x2
+     *  mosaic or a 3-circle radio composite — used by the "recomendadas"/"Recaps" carousels and any
+     *  recap in "recientes", whose cards always show ONE YT thumbnail. Empty = id-based auto art. */
+    public static final String ARG_ART_HINT = "arg_art_hint";
+    public static final String ART_HINT_SINGLE = "single";
 
     private RecyclerView rvPlaylistContent;
     private View playlistLoadingOverlay;
@@ -202,6 +219,15 @@ public class PlaylistDetailFragment extends Fragment
     private String currentPlaylistSubtitle = "";
     @NonNull
     private String currentPlaylistThumbnail = "";
+    /** Home card's navigationEndpoint params token; "" for non-generated entry points. Forwarded to
+     *  the mix (/next) and browse fetches so YT-generated mixes/recaps return their tracks. */
+    @NonNull
+    private String currentPlaylistParams = "";
+    /** True when the opening card passed {@link #ART_HINT_SINGLE}: the header clones the card's one
+     *  cover and skips the 2x2 grid + radio composite (decoupled from {@link #isRadioContext}, which
+     *  still drives how the tracklist is FETCHED — a mix keeps loading via /next even when shown as a
+     *  single cover). */
+    private boolean forceSingleCoverArt = false;
     @NonNull
     private String lastPersistedVideoId = "";
     private String lastPersistedPlaylistId = "";
@@ -277,17 +303,19 @@ public class PlaylistDetailFragment extends Fragment
     private int cachedTrackArtPlaceholderColor = 0;
     /** How many rows past the viewport to warm in the scroll direction. Kept small so off-screen
      *  decodes never steal CPU/decode-thread slots from the rows actually on screen during a fling
-     *  — the visible rows must win the cores so the scroll stays fluid. ~half a screen of buffer. */
-    private static final int ART_PREFETCH_AHEAD = 6;
+     *  — the visible rows must win the cores so the scroll stays fluid. ~a full screen of buffer, so
+     *  more rows are already memory-warm before they enter the viewport (fewer rows then need the
+     *  idle-batch reload, which is what makes thumbnails appear to load "in blocks"). */
+    private static final int ART_PREFETCH_AHEAD = 12;
     /** Last (anchor, direction) pair the artwork prefetcher ran for; prevents re-issuing
      *  the same prefetch batch on every onScrolled frame while the anchor row is unchanged. */
     private int lastArtPrefetchKey = Integer.MIN_VALUE;
     private boolean pendingOfflineToggle = false;
     private final Map<String, Long> lastOfflineStateLookupTimeByTrack = new LinkedHashMap<String, Long>(
-            PLAYLIST_TRACKS_FETCH_MAX_LIMIT / 4 + 1, 0.75f, true) {
+            256, 0.75f, true) {
         @Override
         protected boolean removeEldestEntry(Map.Entry<String, Long> eldest) {
-            return size() > PLAYLIST_TRACKS_FETCH_MAX_LIMIT / 2;
+            return size() > OFFLINE_STATE_LOOKUP_CACHE_MAX;
         }
     };
     private SongPlayerFragment cachedSongPlayer = null;
@@ -304,6 +332,36 @@ public class PlaylistDetailFragment extends Fragment
             @NonNull String playlistThumbnail,
             @NonNull String accessToken
     ) {
+        return newInstance(playlistId, playlistTitle, playlistSubtitle, playlistThumbnail, accessToken, "");
+    }
+
+    /** Overload that also carries the home card's navigationEndpoint {@code params} token
+     *  ({@link #ARG_PLAYLIST_PARAMS}) so YT-generated mixes/recaps can be loaded. */
+    @NonNull
+    public static PlaylistDetailFragment newInstance(
+            @NonNull String playlistId,
+            @NonNull String playlistTitle,
+            @NonNull String playlistSubtitle,
+            @NonNull String playlistThumbnail,
+            @NonNull String accessToken,
+            @NonNull String playlistParams
+    ) {
+        return newInstance(playlistId, playlistTitle, playlistSubtitle, playlistThumbnail,
+                accessToken, playlistParams, "");
+    }
+
+    /** Overload that also carries the art hint ({@link #ARG_ART_HINT}, e.g. {@link #ART_HINT_SINGLE})
+     *  so single-cover carousels (recomendadas/Recaps) force the header to clone their one cover. */
+    @NonNull
+    public static PlaylistDetailFragment newInstance(
+            @NonNull String playlistId,
+            @NonNull String playlistTitle,
+            @NonNull String playlistSubtitle,
+            @NonNull String playlistThumbnail,
+            @NonNull String accessToken,
+            @NonNull String playlistParams,
+            @NonNull String artHint
+    ) {
         PlaylistDetailFragment fragment = new PlaylistDetailFragment();
         Bundle args = new Bundle();
         args.putString(ARG_PLAYLIST_ID, playlistId);
@@ -311,6 +369,8 @@ public class PlaylistDetailFragment extends Fragment
         args.putString(ARG_PLAYLIST_SUBTITLE, playlistSubtitle);
         args.putString(ARG_PLAYLIST_THUMBNAIL, playlistThumbnail);
         args.putString(ARG_YOUTUBE_ACCESS_TOKEN, accessToken);
+        args.putString(ARG_PLAYLIST_PARAMS, playlistParams);
+        args.putString(ARG_ART_HINT, artHint);
         fragment.setArguments(args);
         return fragment;
     }
@@ -420,6 +480,10 @@ public class PlaylistDetailFragment extends Fragment
         currentPlaylistTitle = playlistTitle;
         currentPlaylistSubtitle = playlistSubtitle;
         currentPlaylistThumbnail = playlistThumbnail;
+        currentPlaylistParams = safeArg(ARG_PLAYLIST_PARAMS);
+        // Single-cover carousels (recomendadas/Recaps + recaps in recientes) ask the header to clone
+        // their one YT cover instead of guessing art from the id: no 2x2, no 3-circle radio composite.
+        forceSingleCoverArt = ART_HINT_SINGLE.equals(safeArg(ARG_ART_HINT));
         persistStreamingScreen(STREAM_SCREEN_PLAYLIST_DETAIL);
 
         if (playlistTitle.isEmpty()) {
@@ -472,7 +536,9 @@ public class PlaylistDetailFragment extends Fragment
                             int firstVisible = Math.max(0, lm.findFirstVisibleItemPosition() - 1);
                             int lastVisible  = lm.findLastVisibleItemPosition()  - 1;
                             if (lastVisible >= 0) {
-                                trackAdapter.loadStateForVisibleRange(firstVisible, lastVisible);
+                                // Download state is NO LONGER scanned per-scroll — that per-row disk I/O
+                                // was the first-scroll jank. Downloaded status now lives in the
+                                // "Descargas" library view; here we only settle the artwork.
                                 trackAdapter.reloadImagesForRange(firstVisible, lastVisible);
                             }
                         }
@@ -840,6 +906,45 @@ public class PlaylistDetailFragment extends Fragment
         refreshVisibleTrackRows();
     }
 
+    // Silent-on-enter revalidation: throttle repeat entries and defer slightly so the cache paints
+    // first (the fresh network result is folded in a moment later, only if it changed).
+    private static final long ENTER_REVALIDATE_THROTTLE_MS = 60_000L;
+    private static final long ENTER_REVALIDATE_DELAY_MS = 600L;
+    private long lastEnterRevalidateAtMs = 0L;
+    private String lastEnterRevalidatePlaylistId = "";
+
+    /**
+     * After a playlist renders from cache on entry, silently re-fetch it from YouTube so edits made
+     * in YT Music show up WITHOUT a manual pull-to-refresh. Skips locally-authoritative lists
+     * (favorites/custom/local files — they have no YT source to reconcile against) and throttles
+     * quick re-entries so back-and-forth navigation doesn't spam the network.
+     */
+    private void maybeRevalidateOnEnter(@NonNull String playlistId, @NonNull String accessToken) {
+        if (!isAdded() || playlistId.isEmpty()) return;
+        if (isFavoritesPlaylistContext(playlistId)
+                || isCustomPlaylistContext(playlistId)
+                || isLocalFilesContext(playlistId)) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (TextUtils.equals(playlistId, lastEnterRevalidatePlaylistId)
+                && now - lastEnterRevalidateAtMs < ENTER_REVALIDATE_THROTTLE_MS) {
+            return;
+        }
+        lastEnterRevalidatePlaylistId = playlistId;
+        lastEnterRevalidateAtMs = now;
+        mainHandler.postDelayed(() -> {
+            if (!isAdded() || !TextUtils.equals(currentPlaylistId, playlistId)) return;
+            if (playlistTracksLoadMoreInFlight) return;
+            String token = TextUtils.isEmpty(accessToken) ? resolveYoutubeAccessToken("") : accessToken;
+            playlistTracksRequestedLimit = PLAYLIST_TRACKS_INITIAL_FETCH_LIMIT;
+            playlistTracksCanLoadMore = false;
+            // forceRefresh=true re-fetches and re-renders only the final list (no skeleton/clear),
+            // so a same-content result is a visual no-op and a changed one updates in place.
+            bindTrackList(playlistId, token, true);
+        }, ENTER_REVALIDATE_DELAY_MS);
+    }
+
     public void externalForceRefresh() {
         if (!isAdded() || TextUtils.isEmpty(currentPlaylistId)) return;
         playlistTracksRequestedLimit = PLAYLIST_TRACKS_INITIAL_FETCH_LIMIT;
@@ -943,13 +1048,9 @@ public class PlaylistDetailFragment extends Fragment
             return;
         }
 
-        // Invalidate cache for visible range so lookups re-run after app return.
-        // Do NOT call notifyItemRangeChanged here — that would immediately rebind
-        // with an empty cache (showing icons as not-downloaded) before the async
-        // disk check completes. The lookup callbacks call immediateNotifyStateChanged
-        // themselves once the real result is available.
-        trackAdapter.invalidateVisibleTrackStateCache(currentTracks, start, end);
-        trackAdapter.loadStateForVisibleRange(start, end);
+        // Per-row downloaded-state is no longer scanned from disk (that work moved to the
+        // "Descargas" view). Nothing to refresh here beyond what the download observer already
+        // pushes via setOfflineDownloadState; kept as a no-op so existing callers stay valid.
     }
 
     private void setOfflineDownloadVisualState(boolean running, @Nullable String currentTrackId) {
@@ -1163,6 +1264,26 @@ public class PlaylistDetailFragment extends Fragment
         headerPlaylistInfo = buildPlaylistInfoLine(meta, currentTracks.isEmpty() ? 0 : currentTracks.size());
         headerPlaylistThumbnail = playlistThumbnail;
         headerGridUrls = new ArrayList<>();
+        // Kill the single-thumbnail → 2x2 "flash": if this playlist already has a persisted grid
+        // from a previous visit, adopt it BEFORE this first header bind so the cover chain lands on
+        // the grid branch straight away (PlaylistGridArtLoader then hits its disk cache and paints
+        // the composite at reveal) instead of drawing the single arg thumbnail and swapping to the
+        // grid a few frames later. Icon/radio headers never use a grid, so skip them — their
+        // branches win the cover chain regardless and a stale persisted grid must not hijack them.
+        if (isAdded()
+                && !isLikedPlaylistContext(currentPlaylistId)
+                && !isFavoritesPlaylistContext(currentPlaylistId)
+                && !isLocalFilesContext(currentPlaylistId)
+                && !isRadioContext
+                && !forceSingleCoverArt
+                // Auto-generated playlists (RDCLAK…) keep their single static cover, never a grid —
+                // so a stale persisted grid must not hijack the single-image header either.
+                && !isAutoGeneratedPlaylistId(currentPlaylistId)) {
+            List<String> persistedGrid = loadPersistedGridUrls(currentPlaylistId);
+            if (persistedGrid != null && persistedGrid.size() >= 4) {
+                headerGridUrls = persistedGrid;
+            }
+        }
         bindGoogleProfile(meta.ownerLabel);
         if (tvToolbarPlaylistTitle != null) {
             tvToolbarPlaylistTitle.setText(headerPlaylistTitle);
@@ -1578,11 +1699,25 @@ public class PlaylistDetailFragment extends Fragment
         return isAdded() && cachedHasValidatedInternet(requireContext());
     }
 
-    /** True for YouTube Music radio/mix playlists. Every radio/mix id ("Mixes para ti", "My Mix",
-     *  song radios, etc.) starts with "RD". These must be loaded via the InnerTube watch endpoint
-     *  (cookie) — the playlist endpoint returns empty for them. */
+    /** True for YouTube Music radio/mix playlists. Genuine radios/mixes ("Mixes para ti", "My Mix",
+     *  song radios, Replay/Archive mixes, etc.) start with "RD" and must be loaded via the InnerTube
+     *  watch endpoint (cookie) — the playlist endpoint returns empty for them.
+     *  <p>EXCEPTION — {@code RDCLAK5uy_…} are YT Music AUTO-GENERATED PLAYLISTS, not radios: they
+     *  have a fixed tracklist and a single static cover, appear as a plain single-image card in the
+     *  home/library carousels (never a 3-circle radio card), and are browse-readable. Treating them
+     *  as radios forced the header into the radio composite and diverted loading to /next (the
+     *  "single-image playlist opens as a 3-circle radio" bug). Excluding them here routes them down
+     *  the normal playlist/browse path AND makes the header render the single rounded HD cover. */
     private static boolean isRadioOrMixPlaylistId(@Nullable String playlistId) {
-        return playlistId != null && playlistId.startsWith("RD");
+        return playlistId != null
+                && playlistId.startsWith("RD")
+                && !isAutoGeneratedPlaylistId(playlistId);
+    }
+
+    /** YT Music auto-generated PLAYLIST ids ({@code RDCLAK5uy_…}): static cover + fixed tracklist,
+     *  rendered as single-image cards everywhere. Not a radio despite the leading "RD". */
+    private static boolean isAutoGeneratedPlaylistId(@Nullable String playlistId) {
+        return playlistId != null && playlistId.startsWith("RDCLAK");
     }
 
     /** True for an album/single opened from an artist page. These carry an album BROWSE id ("MPRE…"),
@@ -1858,6 +1993,9 @@ public class PlaylistDetailFragment extends Fragment
             if (!forceRefresh && !loadMore) {
                 playlistTracksLoadMoreInFlight = false;
                 playlistTracksCanLoadMore = !hasCompleteCache;
+                // Cache shown instantly; now silently re-fetch from YouTube so changes made in YT
+                // Music (added/removed/reordered songs) appear without a manual pull-to-refresh.
+                maybeRevalidateOnEnter(playlistId, effectiveAccessToken);
                 return;
             }
         }
@@ -1890,9 +2028,11 @@ public class PlaylistDetailFragment extends Fragment
                         // Album pages omit per-row artist/cover (they're in the header) and expose
                         // the duration in a fixedColumn. Fall back to the album's artist + cover so
                         // the row isn't blank, and use the real per-track duration.
-                        String rowArtist = t.subtitle == null ? "" : t.subtitle;
+                        // The playlist-subtitle fallback is a baked string ("Artista • Álbum • 2020"),
+                        // so reduce either source to just the artist name.
+                        String rowArtist = SongSubtitle.artistOnly(t.subtitle, t.title);
                         if (TextUtils.isEmpty(rowArtist)) {
-                            rowArtist = currentPlaylistSubtitle == null ? "" : currentPlaylistSubtitle;
+                            rowArtist = SongSubtitle.artistOnly(currentPlaylistSubtitle);
                         }
                         String rowThumb = (t.thumbnailUrl == null || t.thumbnailUrl.isEmpty())
                                 ? (currentPlaylistThumbnail == null ? "" : currentPlaylistThumbnail)
@@ -1928,6 +2068,60 @@ public class PlaylistDetailFragment extends Fragment
                     }
                     showNoConnectionState(playlistId, effectiveAccessToken, forceRefresh, loadMore,
                             "No se pudo cargar el álbum. Inténtalo más tarde.");
+                }
+            });
+            return;
+        }
+
+        // YT auto-generated playlists (RDCLAK…): fixed-tracklist, single-cover lists the OAuth Data
+        // API can't read. Resolve them through InnerTube browse (VL+id + the card's params) with the
+        // web cookie — the same bypass MPRE albums use — so they load even without an OAuth token.
+        // Handled before the token gate below (which would otherwise leave them empty). The header
+        // already renders them as a single rounded HD cover (they're excluded from isRadioContext).
+        if (isAutoGeneratedPlaylistId(playlistId)) {
+            if (!hasValidatedInternet(requireContext())) {
+                playlistTracksLoadMoreInFlight = false;
+                if (cachedTracks.isEmpty()) {
+                    showNoConnectionState(playlistId, effectiveAccessToken, forceRefresh, loadMore,
+                            "No se pudo cargar la playlist. Inténtalo más tarde.");
+                }
+                return;
+            }
+            notifyHeaderChanged();
+            String genCookie = requireContext().getSharedPreferences(PREFS_PLAYER_STATE, Activity.MODE_PRIVATE)
+                    .getString(AppConstants.PREF_LAST_YOUTUBE_WEB_COOKIE, "");
+            if (genCookie == null) genCookie = "";
+            youTubeMusicService.fetchPlaylistTracksViaBrowse(genCookie.trim(), playlistId, currentPlaylistParams,
+                    new YouTubeMusicService.PlaylistTracksCallback() {
+                @Override
+                public void onSuccess(@NonNull List<YouTubeMusicService.PlaylistTrackResult> browseTracks) {
+                    if (!isAdded()) return;
+                    playlistTracksLoadMoreInFlight = false;
+                    playlistTracksCanLoadMore = false;
+                    if (browseTracks.isEmpty()) {
+                        if (!cachedTracks.isEmpty()) {
+                            renderTracks(cachedTracks, playlistId, true);
+                            return;
+                        }
+                        renderTracks(sanitizeTracksForPlaylist(playlistId, new ArrayList<>()), playlistId, false);
+                        return;
+                    }
+                    hideNoConnectionState();
+                    List<PlaylistTrack> raw = mergeTrackMetadataFromCache(playlistId, mapTracks(browseTracks));
+                    cacheTracks(playlistId, raw, true);
+                    renderTracks(sanitizeTracksForPlaylist(playlistId, raw), playlistId, false);
+                }
+
+                @Override
+                public void onError(@NonNull String error) {
+                    if (!isAdded()) return;
+                    playlistTracksLoadMoreInFlight = false;
+                    if (!cachedTracks.isEmpty()) {
+                        renderTracks(cachedTracks, playlistId, true);
+                        return;
+                    }
+                    showNoConnectionState(playlistId, effectiveAccessToken, forceRefresh, loadMore,
+                            "No se pudo cargar la playlist. Inténtalo más tarde.");
                 }
             });
             return;
@@ -1971,7 +2165,11 @@ public class PlaylistDetailFragment extends Fragment
             String cookie = requireContext().getSharedPreferences(PREFS_PLAYER_STATE, Activity.MODE_PRIVATE)
                     .getString(AppConstants.PREF_LAST_YOUTUBE_WEB_COOKIE, "");
             if (cookie == null) cookie = "";
-            youTubeMusicService.fetchMixTracks(cookie.trim(), playlistId, new YouTubeMusicService.MixTracksCallback() {
+            final String mixCookie = cookie.trim();
+            // Forward the home card's params token: YT-generated personal mixes (Replay/Archive/Recap)
+            // return an empty /next panel under the generic "wAEB" param and only fill with their own
+            // token. Empty currentPlaylistParams (song radios opened from a track) keeps "wAEB".
+            youTubeMusicService.fetchMixTracks(mixCookie, playlistId, currentPlaylistParams, new YouTubeMusicService.MixTracksCallback() {
                 @Override
                 public void onSuccess(@NonNull List<YouTubeMusicService.TrackResult> tracks) {
                     if (!isAdded()) return;
@@ -1980,10 +2178,11 @@ public class PlaylistDetailFragment extends Fragment
                     List<PlaylistTrack> mapped = new ArrayList<>();
                     for (YouTubeMusicService.TrackResult t : tracks) {
                         if (TextUtils.isEmpty(t.videoId)) continue;
-                        // Subtitle may contain artist\tduration from parseMixTracks
+                        // Legacy caches may still carry artist\tduration in the subtitle; live
+                        // fetches now deliver the duration in the dedicated t.duration field.
                         String rawSub = t.subtitle == null ? "" : t.subtitle;
                         String artist = rawSub;
-                        String duration = "--:--";
+                        String duration = TextUtils.isEmpty(t.duration) ? "--:--" : t.duration;
                         int tabIdx = rawSub.indexOf('\t');
                         if (tabIdx >= 0) {
                             artist = rawSub.substring(0, tabIdx);
@@ -1998,8 +2197,10 @@ public class PlaylistDetailFragment extends Fragment
                         ));
                     }
                     if (mapped.isEmpty()) {
-                        showNoConnectionState(playlistId, effectiveAccessToken, forceRefresh, loadMore,
-                                "No se pudo cargar la radio. Inténtalo más tarde.");
+                        // /next vino vacío: los mixes personales de YT (Replay/Archivo/Descubrir) sólo
+                        // resuelven por el endpoint BROWSE con el token del card. Reintenta por ahí.
+                        loadMixViaBrowseFallback(playlistId, mixCookie, effectiveAccessToken, forceRefresh,
+                                loadMore, "No se pudo cargar la radio. Inténtalo más tarde.");
                         return;
                     }
                     // Prepend the source track that generated the radio at position 0
@@ -2013,7 +2214,7 @@ public class PlaylistDetailFragment extends Fragment
                             mapped.add(0, new PlaylistTrack(
                                     sourceVideoId,
                                     currentPlaylistTitle != null ? currentPlaylistTitle : "",
-                                    currentPlaylistSubtitle != null ? currentPlaylistSubtitle : "",
+                                    SongSubtitle.artistOnly(currentPlaylistSubtitle, currentPlaylistTitle),
                                     "--:--",
                                     currentPlaylistThumbnail != null ? currentPlaylistThumbnail : ""
                             ));
@@ -2028,8 +2229,9 @@ public class PlaylistDetailFragment extends Fragment
                 public void onError(@NonNull String error) {
                     if (!isAdded()) return;
                     playlistTracksLoadMoreInFlight = false;
-                    showNoConnectionState(playlistId, effectiveAccessToken, forceRefresh, loadMore,
-                            "No se pudo cargar la radio. Inténtalo más tarde.");
+                    // /next falló: intenta el endpoint BROWSE con el token del card (mixes personales).
+                    loadMixViaBrowseFallback(playlistId, mixCookie, effectiveAccessToken, forceRefresh,
+                            loadMore, "No se pudo cargar la radio. Inténtalo más tarde.");
                 }
             });
             return;
@@ -2046,6 +2248,15 @@ public class PlaylistDetailFragment extends Fragment
                 playlistTracksLoadMoreInFlight = false;
                 playlistTracksCanLoadMore = tracks.size() >= requestedLimit
                         && requestedLimit < PLAYLIST_TRACKS_FETCH_MAX_LIMIT;
+
+                // The OAuth Data API returns 0 items WITHOUT an error for YTM server-generated
+                // playlists (RECAP / auto-mixes) it can't read. Before giving up (and rendering an
+                // empty list), retry through the InnerTube browse endpoint with the web cookie —
+                // the same bypass MPRE albums use. Only on the initial fetch of a normal playlist id.
+                if (tracks.isEmpty() && !loadMore && shouldTryBrowsePlaylistFallback(playlistId)) {
+                    tryBrowsePlaylistFallback(playlistId);
+                    return;
+                }
 
                 List<PlaylistTrack> raw = mergeTrackMetadataFromCache(playlistId, mapTracks(tracks));
                 cacheTracks(playlistId, raw, isFetchResultComplete(tracks.size(), requestedLimit));
@@ -2209,6 +2420,21 @@ public class PlaylistDetailFragment extends Fragment
         return getCachePrefs().getBoolean(PREF_PLAYLIST_OFFLINE_COMPLETE_PREFIX + currentPlaylistId, false);
     }
 
+    /**
+     * Records THIS playlist into the downloaded-playlists index (name + cover) so the "Descargas"
+     * library view can list it later. Called whenever a download is enqueued from this screen —
+     * the one moment a playlist gains downloads AND its real display name/cover are on screen. This
+     * covers every source type (album MPRE…, radio RD…, YouTube playlist, custom list) uniformly.
+     */
+    private void recordDownloadedPlaylistMeta() {
+        if (!isAdded() || TextUtils.isEmpty(currentPlaylistId)) return;
+        String name = PlaylistNameOverrideStore.getDisplayName(requireContext(), currentPlaylistId);
+        if (TextUtils.isEmpty(name)) name = headerPlaylistTitle;
+        if (TextUtils.isEmpty(name)) name = currentPlaylistTitle;
+        PlaylistMetaStore.save(requireContext().getApplicationContext(),
+                currentPlaylistId, name, headerPlaylistThumbnail);
+    }
+
     private void startOfflinePlaylistDownload(boolean userInitiated) {
         if (!isAdded()) {
             return;
@@ -2219,10 +2445,11 @@ public class PlaylistDetailFragment extends Fragment
         }
         if (currentTracks.isEmpty()) {
             if (userInitiated) {
-                
+
             }
             return;
         }
+        recordDownloadedPlaylistMeta();
 
         // Snapshot track data on main thread, then offload disk I/O to background
         final List<PlaylistTrack> tracksSnapshot = new ArrayList<>(currentTracks);
@@ -2730,6 +2957,18 @@ public class PlaylistDetailFragment extends Fragment
                     refreshVisibleTrackRows();
                     maybeUpdateOfflineReadyState();
                     return;
+                }
+
+                // Notify ONCE that the download finished — the only per-track feedback now that the
+                // rows no longer carry a persistent downloaded indicator. Only for user-initiated
+                // downloads (offlineObserverNotifyTerminalToasts); freshTerminal blocks replayed
+                // historical SUCCEEDED infos from re-toasting.
+                if (freshTerminal && downloadedOut > 0
+                        && OfflinePlaylistDownloadWorker.OUTPUT_REASON_NONE.equals(reason)) {
+                    AppSnackbar.show(getActivity(),
+                            (manualJob || downloadedOut == 1)
+                                    ? "Descarga completada"
+                                    : "Descarga completada • " + downloadedOut + " canciones");
                 }
 
                 if (currentMeta != null) {
@@ -3296,13 +3535,21 @@ public class PlaylistDetailFragment extends Fragment
             return;
         }
 
+        // Auto-generated playlists (RDCLAK…) are single-static-cover lists shown as one image in
+        // their home/library card — they must NOT build a 2x2 track grid (that was the "single-image
+        // playlist opens looking different" half of the bug). Keep headerGridUrls empty + preserve the
+        // card cover thumbnail so the header lands on the single rounded HD-cover branch.
+        // forceSingleCoverArt (recomendadas/Recaps/recap-in-recientes) shares this exact treatment: no
+        // synthesized grid, clone the card cover.
+        boolean autoGeneratedPlaylist = isAutoGeneratedPlaylistId(playlistId) || forceSingleCoverArt;
+
         // For YouTube playlists, use persisted grid URLs so the 2x2 never changes
         List<String> gridUrls = null;
-        if (isYouTubePlaylist && isAdded()) {
+        if (isYouTubePlaylist && !autoGeneratedPlaylist && isAdded()) {
             gridUrls = loadPersistedGridUrls(playlistId);
         }
 
-        if (gridUrls == null || gridUrls.isEmpty()) {
+        if (!autoGeneratedPlaylist && (gridUrls == null || gridUrls.isEmpty())) {
             gridUrls = new ArrayList<>(4);
             Set<String> seenUrls = new HashSet<>();
             for (PlaylistTrack track : currentTracks) {
@@ -3319,8 +3566,9 @@ public class PlaylistDetailFragment extends Fragment
                 persistGridUrls(playlistId, gridUrls);
             }
         }
-        headerGridUrls = gridUrls.size() >= 4 ? gridUrls : new ArrayList<>();
-        if (currentTracks.size() < 4) {
+        headerGridUrls = (!autoGeneratedPlaylist && gridUrls != null && gridUrls.size() >= 4)
+                ? gridUrls : new ArrayList<>();
+        if (!autoGeneratedPlaylist && currentTracks.size() < 4) {
             for (PlaylistTrack track : currentTracks) {
                 if (track != null && !TextUtils.isEmpty(track.imageUrl)) {
                     headerPlaylistThumbnail = track.imageUrl.trim();
@@ -3763,6 +4011,13 @@ public class PlaylistDetailFragment extends Fragment
         if (!isAdded() || playlistId.isEmpty()) {
             return;
         }
+        // NEVER persist an empty result — least of all as "complete". A YT-generated playlist the
+        // OAuth Data API can't read (RECAP / auto-mixes) returns 0 items WITHOUT an error, and a
+        // complete-empty cache would then serve that empty list forever. Skipping the write entirely
+        // keeps any earlier good cache and lets every open re-attempt the network + browse fallback.
+        if (tracks.isEmpty()) {
+            return;
+        }
         try {
             JSONArray array = new JSONArray();
             for (PlaylistTrack track : tracks) {
@@ -3792,6 +4047,154 @@ public class PlaylistDetailFragment extends Fragment
     @NonNull
     private SharedPreferences getCachePrefs() {
         return requireContext().getSharedPreferences(PREFS_STREAMING_CACHE, Activity.MODE_PRIVATE);
+    }
+
+    /** Fallback for RD-mix ids whose {@code /next} (watch) panel came back empty/errored: the YT
+     *  personal mixes (Replay / Archivo / Descubrir) are readable via the BROWSE endpoint with the
+     *  home card's params token (the same route recaps take). Renders the tracks, or the error state
+     *  if browse also yields nothing (or there's no token / cookie). No re-loop back to /next. */
+    private void loadMixViaBrowseFallback(@NonNull String playlistId, @NonNull String cookie,
+            @NonNull String effectiveAccessToken, boolean forceRefresh, boolean loadMore,
+            @NonNull String errorMessage) {
+        if (!isAdded()) return;
+        if (TextUtils.isEmpty(cookie) || TextUtils.isEmpty(currentPlaylistParams)) {
+            showNoConnectionState(playlistId, effectiveAccessToken, forceRefresh, loadMore, errorMessage);
+            return;
+        }
+        youTubeMusicService.fetchPlaylistTracksViaBrowse(cookie, playlistId, currentPlaylistParams,
+                new YouTubeMusicService.PlaylistTracksCallback() {
+            @Override
+            public void onSuccess(@NonNull List<YouTubeMusicService.PlaylistTrackResult> browseTracks) {
+                if (!isAdded()) return;
+                playlistTracksLoadMoreInFlight = false;
+                playlistTracksCanLoadMore = false;
+                if (browseTracks.isEmpty()) {
+                    showNoConnectionState(playlistId, effectiveAccessToken, forceRefresh, loadMore, errorMessage);
+                    return;
+                }
+                hideNoConnectionState();
+                List<PlaylistTrack> raw = mergeTrackMetadataFromCache(playlistId, mapTracks(browseTracks));
+                cacheTracks(playlistId, raw, true);
+                renderTracks(sanitizeTracksForPlaylist(playlistId, raw), playlistId, false);
+            }
+
+            @Override
+            public void onError(@NonNull String error) {
+                if (!isAdded()) return;
+                playlistTracksLoadMoreInFlight = false;
+                showNoConnectionState(playlistId, effectiveAccessToken, forceRefresh, loadMore, errorMessage);
+            }
+        });
+    }
+
+    /** True for a plain OAuth YouTube playlist id — the only kind where an empty Data-API result
+     *  warrants the InnerTube browse fallback (radios/albums/local/favorites/custom/liked have their
+     *  own dedicated network paths and must not be re-routed through browse). */
+    private boolean shouldTryBrowsePlaylistFallback(@NonNull String playlistId) {
+        return !isRadioOrMixPlaylistId(playlistId)
+                && !isAlbumBrowseId(playlistId)
+                && !isFavoritesPlaylistContext(playlistId)
+                && !isCustomPlaylistContext(playlistId)
+                && !isLocalFilesContext(playlistId)
+                && !YouTubeMusicService.SPECIAL_LIKED_VIDEOS_ID.equals(playlistId);
+    }
+
+    /** Retries a Data-API-empty playlist through the InnerTube browse endpoint (VL+id, web cookie),
+     *  forwarding the home card's params token so YT-generated RECAP lists resolve. If browse still
+     *  comes back empty and we have a params token, falls through to the /next (watch) endpoint —
+     *  some generated recaps are ONLY readable there. On any final failure/empty it renders the empty
+     *  state exactly like the plain empty case. */
+    private void tryBrowsePlaylistFallback(@NonNull String playlistId) {
+        if (!isAdded()) return;
+        String cookie = requireContext().getSharedPreferences(PREFS_PLAYER_STATE, Activity.MODE_PRIVATE)
+                .getString(AppConstants.PREF_LAST_YOUTUBE_WEB_COOKIE, "");
+        if (cookie == null) cookie = "";
+        final String bgCookie = cookie.trim();
+        if (TextUtils.isEmpty(bgCookie)) {
+            renderTracks(sanitizeTracksForPlaylist(playlistId, new ArrayList<>()), playlistId, false);
+            return;
+        }
+        youTubeMusicService.fetchPlaylistTracksViaBrowse(bgCookie, playlistId, currentPlaylistParams,
+                new YouTubeMusicService.PlaylistTracksCallback() {
+            @Override
+            public void onSuccess(@NonNull List<YouTubeMusicService.PlaylistTrackResult> browseTracks) {
+                if (!isAdded()) return;
+                playlistTracksLoadMoreInFlight = false;
+                playlistTracksCanLoadMore = false;
+                if (browseTracks.isEmpty()) {
+                    // Browse returned nothing — a generated recap only /next can build. Try that with
+                    // the card's params before giving up (needs a token; otherwise render empty).
+                    if (!TextUtils.isEmpty(currentPlaylistParams)) {
+                        tryNextMixFallback(playlistId, bgCookie);
+                        return;
+                    }
+                    renderTracks(sanitizeTracksForPlaylist(playlistId, new ArrayList<>()), playlistId, false);
+                    return;
+                }
+                List<PlaylistTrack> raw = mergeTrackMetadataFromCache(playlistId, mapTracks(browseTracks));
+                cacheTracks(playlistId, raw, true);
+                renderTracks(sanitizeTracksForPlaylist(playlistId, raw), playlistId, false);
+            }
+
+            @Override
+            public void onError(@NonNull String error) {
+                if (!isAdded()) return;
+                playlistTracksLoadMoreInFlight = false;
+                if (!TextUtils.isEmpty(currentPlaylistParams)) {
+                    tryNextMixFallback(playlistId, bgCookie);
+                    return;
+                }
+                renderTracks(sanitizeTracksForPlaylist(playlistId, new ArrayList<>()), playlistId, false);
+            }
+        });
+    }
+
+    /** Last-resort loader for a YT-generated list that neither the OAuth Data API nor browse could
+     *  read: the InnerTube /next (watch) endpoint with the card's params token. Maps the mix panel
+     *  rows the same way the radio path does. Only invoked when a params token exists. */
+    private void tryNextMixFallback(@NonNull String playlistId, @NonNull String cookie) {
+        youTubeMusicService.fetchMixTracks(cookie, playlistId, currentPlaylistParams,
+                new YouTubeMusicService.MixTracksCallback() {
+            @Override
+            public void onSuccess(@NonNull List<YouTubeMusicService.TrackResult> tracks) {
+                if (!isAdded()) return;
+                playlistTracksLoadMoreInFlight = false;
+                playlistTracksCanLoadMore = false;
+                List<PlaylistTrack> mapped = new ArrayList<>();
+                for (YouTubeMusicService.TrackResult t : tracks) {
+                    if (TextUtils.isEmpty(t.videoId)) continue;
+                    String rawSub = t.subtitle == null ? "" : t.subtitle;
+                    String artist = rawSub;
+                    String duration = TextUtils.isEmpty(t.duration) ? "--:--" : t.duration;
+                    int tabIdx = rawSub.indexOf('\t');
+                    if (tabIdx >= 0) {
+                        artist = rawSub.substring(0, tabIdx);
+                        duration = rawSub.substring(tabIdx + 1);
+                    }
+                    mapped.add(new PlaylistTrack(
+                            t.videoId,
+                            t.title == null ? "" : t.title,
+                            artist,
+                            duration,
+                            t.thumbnailUrl == null ? "" : t.thumbnailUrl
+                    ));
+                }
+                if (mapped.isEmpty()) {
+                    renderTracks(sanitizeTracksForPlaylist(playlistId, new ArrayList<>()), playlistId, false);
+                    return;
+                }
+                hideNoConnectionState();
+                cacheTracks(playlistId, mapped, true);
+                renderTracks(mapped, playlistId, false);
+            }
+
+            @Override
+            public void onError(@NonNull String error) {
+                if (!isAdded()) return;
+                playlistTracksLoadMoreInFlight = false;
+                renderTracks(sanitizeTracksForPlaylist(playlistId, new ArrayList<>()), playlistId, false);
+            }
+        });
     }
 
     private void persistGridUrls(@NonNull String playlistId, @NonNull List<String> urls) {
@@ -3951,7 +4354,7 @@ public class PlaylistDetailFragment extends Fragment
         ImageView ivArt = view.findViewById(R.id.ivBsTrackArt);
         
         tvTitle.setText(TextUtils.isEmpty(selectedTrack.title) ? "Tema" : selectedTrack.title);
-        tvSubtitle.setText(TextUtils.isEmpty(selectedTrack.artist) ? "Artista" : selectedTrack.artist);
+        tvSubtitle.setText(TextUtils.isEmpty(selectedTrack.normalizedSubtitle) ? "Artista" : selectedTrack.normalizedSubtitle);
         if (LocalFilesStore.isLocalVideoId(selectedTrack.videoId)) {
             // Show the file's own embedded cover (falls back to the music icon when absent).
             LocalArtworkResolver.loadInto(ivArt, selectedTrack.videoId);
@@ -4180,7 +4583,7 @@ public class PlaylistDetailFragment extends Fragment
         // Cap scroll area so footer buttons remain visible
         View svScroll = sheet.findViewById(R.id.svSavePlaylistScroll);
         if (svScroll != null) {
-            int maxH = (int) (320 * density);
+            int maxH = (int) (ctx.getResources().getDisplayMetrics().heightPixels * 0.55f);
             svScroll.getLayoutParams().height = android.view.ViewGroup.LayoutParams.WRAP_CONTENT;
             svScroll.post(() -> {
                 if (svScroll.getHeight() > maxH) {
@@ -4191,15 +4594,8 @@ public class PlaylistDetailFragment extends Fragment
             });
         }
 
-        // Build playlist entries: Favoritos first, then custom playlists
+        // Build playlist entries: liked first, then Favoritos, then custom playlists
         List<FavoritesPlaylistStore.FavoriteTrack> favs = FavoritesPlaylistStore.loadFavorites(ctx);
-        List<String> favUrls = new ArrayList<>();
-        for (FavoritesPlaylistStore.FavoriteTrack f : favs) {
-            if (f != null && !TextUtils.isEmpty(f.imageUrl)) {
-                if (!favUrls.contains(f.imageUrl)) favUrls.add(f.imageUrl);
-                if (favUrls.size() >= 4) break;
-            }
-        }
 
         // Inflate favorites row
         {
@@ -4210,11 +4606,7 @@ public class PlaylistDetailFragment extends Fragment
             ImageView ivCheck = row.findViewById(R.id.ivSaveCheck);
             tvName.setText(FavoritesPlaylistStore.PLAYLIST_TITLE);
             tvCount.setText(favs.size() + " pistas");
-            if (favUrls.size() >= 4) {
-                PlaylistGridArtLoader.load(ivThumb, favUrls, thumbSizePx);
-            } else if (!favUrls.isEmpty()) {
-                loadArtworkInto(ivThumb, favUrls.get(0));
-            }
+            FavoritesArt.bindCover(ivThumb);
             boolean isIn = isTrackInPlaylist(ctx, track.videoId, FavoritesPlaylistStore.PLAYLIST_ID);
             if (ivCheck != null) ivCheck.setVisibility(isIn ? View.VISIBLE : View.GONE);
             final boolean[] checked = {isIn};
@@ -4288,7 +4680,8 @@ public class PlaylistDetailFragment extends Fragment
                     lastAddedName[0] = "Música que te gustó";
                 }
             });
-            llList.addView(row);
+            // "Música que te gustó" always first, Favoritos second.
+            llList.addView(row, 0);
         }
 
         // Custom playlists
@@ -4636,26 +5029,21 @@ public class PlaylistDetailFragment extends Fragment
         if (!isAdded() || TextUtils.isEmpty(track.videoId)) return;
         if (getParentFragmentManager().isStateSaved()) return;
         String radioPlaylistId = "RDAMVM" + track.videoId;
-        String radioTitle = "Radio: " + (TextUtils.isEmpty(track.title) ? "Tema" : track.title);
-        String accessToken = resolveYoutubeAccessToken("");
-        PlaylistDetailFragment detailFragment = PlaylistDetailFragment.newInstance(
+        // Shared launcher for the radio id/title canonicalization + overlay/top-bar chrome this path
+        // used to skip. removeExisting=false: THIS detail is the caller and must stay alive — the
+        // radio-save callback below still uses its context, and back should return to this live
+        // screen. The new radio detail is added on top (matches the pre-refactor transaction).
+        PlaylistDetailLauncher.open(
+                getActivity(),
+                getParentFragmentManager(),
                 radioPlaylistId,
-                radioTitle,
+                TextUtils.isEmpty(track.title) ? "Tema" : track.title,
                 track.artist == null ? "" : track.artist,
                 track.imageUrl == null ? "" : track.imageUrl,
-                accessToken
+                track.videoId,
+                false,
+                false
         );
-        androidx.fragment.app.Fragment existingDetail = getParentFragmentManager().findFragmentByTag("playlist_detail");
-        androidx.fragment.app.FragmentTransaction transaction = getParentFragmentManager()
-                .beginTransaction()
-                .setReorderingAllowed(true);
-        if (existingDetail != null && existingDetail.isAdded() && existingDetail != this) {
-            transaction.remove(existingDetail);
-        }
-        transaction
-                .add(R.id.fragmentContainer, detailFragment, "playlist_detail")
-                .addToBackStack("playlist_detail")
-                .commit();
 
         // Fetch radio tracks and save to RadioHistoryStore for library display
         String cookie = requireContext().getSharedPreferences(PREFS_PLAYER_STATE, Activity.MODE_PRIVATE)
@@ -4678,7 +5066,7 @@ public class PlaylistDetailFragment extends Fragment
                     radioStoreTracks.add(new RadioHistoryStore.RadioTrack(
                             t.videoId,
                             TextUtils.isEmpty(t.title) ? "" : t.title,
-                            t.subtitle == null ? "" : t.subtitle,
+                            SongSubtitle.artistOnly(t.subtitle, t.title),
                             t.thumbnailUrl == null ? "" : t.thumbnailUrl));
                 }
                 Context ctx = getContext();
@@ -4850,9 +5238,12 @@ public class PlaylistDetailFragment extends Fragment
 
         // Use adapter's in-memory cache to avoid main-thread disk I/O
         if (trackAdapter != null && trackAdapter.isOfflineAvailable(requireContext(), track.videoId, track.duration, position)) {
-            
+
             return;
         }
+
+        // Record the parent playlist so a single-song download still surfaces it in "Descargas".
+        recordDownloadedPlaylistMeta();
 
         String uniqueName = OFFLINE_DOWNLOAD_MANUAL_TRACK_QUEUE_UNIQUE_NAME;
         Data input = new Data.Builder()
@@ -5718,7 +6109,19 @@ public class PlaylistDetailFragment extends Fragment
         return seconds > 0 && seconds < 70;
     }
 
-    private void applyHeaderBackdropVisualState(@NonNull ImageView backdrop) {
+    private void applyHeaderBackdropVisualState(@NonNull ImageView backdrop, boolean flatGradient) {
+        if (flatGradient) {
+            // Liked/Favorites: the backdrop IS the same flat gradient as the cover, so it must render
+            // at FULL opacity and UNBLURRED — one seamless gradient field. The default 0.68 alpha +
+            // blur turned it into a dimmed, mismatched purple wash behind a bright cover square.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                backdrop.setRenderEffect(null);
+            }
+            backdrop.setTag(null);
+            backdrop.setAlpha(1f);
+            backdrop.clearColorFilter();
+            return;
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             String blurTag = "header-blur-44";
             Object currentTag = backdrop.getTag();
@@ -5744,6 +6147,269 @@ public class PlaylistDetailFragment extends Fragment
             return String.format(Locale.US, "%dh %02dm", hours, minutes);
         }
         return String.format(Locale.US, "%dm", minutes);
+    }
+
+    // ===== Header cover HD / radio helpers =====
+
+    private static final String PREFS_RADIO_UI_CACHE = "sleppify_radio_ui_cache";
+    /** Fallback raw Palette color for a radio header opened before any home render has cached one
+     *  (e.g. straight from the player). Violet so cardBackgroundColor lands on the liked-violet
+     *  field instead of a jarring grey; replaced in-place once the async Palette resolves. */
+    private static final int DEFAULT_RADIO_RAW_COLOR = 0xFF6C4CF5;
+    /** Raw Palette color driving the radio header's fluorescent field, resolved once per opened
+     *  radio (0 = not yet resolved). Filled from prefs synchronously or via an async Palette pass. */
+    private int radioHeaderRawColor = 0;
+    /** Guards the single async Palette request kicked when no persisted color exists. */
+    private boolean radioHeaderColorRequested = false;
+
+    private static boolean isYtImgThumb(@Nullable String url) {
+        return url != null && (url.contains("i.ytimg.com/vi/") || url.contains("img.youtube.com/vi/"));
+    }
+
+    /**
+     * Highest-resolution variant of a header cover URL. googleusercontent/ggpht '=wW-hH' CDN thumbs
+     * are rewritten to {@code sizePx} via {@link ThumbnailUrls#atSize}; i.ytimg '*default.jpg' video
+     * thumbs (on which atSize is a no-op) are promoted to maxresdefault. Callers keep an .error()
+     * fallback to the raw URL because maxresdefault 404s for some videos and old disk-cache entries
+     * are keyed by the raw URL.
+     */
+    @NonNull
+    private static String hdHeaderCoverUrl(@NonNull String raw, int sizePx) {
+        if (raw.isEmpty()) return raw;
+        if (isYtImgThumb(raw)) {
+            // default.jpg / mqdefault.jpg / hqdefault.jpg / sddefault.jpg / maxresdefault.jpg → maxres
+            return raw.replaceFirst("/[a-z0-9]*default\\.jpg", "/maxresdefault.jpg");
+        }
+        String sized = ThumbnailUrls.atSize(raw, sizePx);
+        return sized == null ? raw : sized;
+    }
+
+    /**
+     * Renders the radio/mix header: the SAME 3-circle composite the home carousel builds
+     * ({@link RadioArtComposer}) over the SAME flat fluorescent field
+     * ({@link RadioArtComposer#cardBackgroundColor}), so a radio looks identical wherever it appears.
+     * Center = the seed cover; the two grayscale side circles = other tracks from the saved radio.
+     */
+    private void bindRadioHeaderCover(@NonNull PlaylistHeaderAdapter.HeaderViewHolder holder) {
+        ImageView cover = holder.ivPlaylistCover;
+        ImageView backdrop = holder.ivPlaylistBackdrop;
+        cover.setPadding(0, 0, 0, 0);
+        cover.setColorFilter(null);
+        // The composite is a full-bleed square with transparent gaps; fitXY fills the square cover
+        // (matches item_radio_carousel's ivRadioComposite) and the field shows through the gaps.
+        cover.setScaleType(ImageView.ScaleType.FIT_XY);
+        backdrop.setScaleType(ImageView.ScaleType.CENTER_CROP);
+
+        String seedVideoId = currentPlaylistId.startsWith("RDAMVM") && currentPlaylistId.length() > 6
+                ? currentPlaylistId.substring(6) : "";
+        String seedHd = !seedVideoId.isEmpty()
+                ? "https://i.ytimg.com/vi/" + android.net.Uri.encode(seedVideoId) + "/maxresdefault.jpg"
+                : headerPlaylistThumbnail.trim();
+
+        RadioHistoryStore.RadioEntry entry = findRadioEntry(currentPlaylistId);
+        // Match home's cache key (it composes from entry.songThumbnail) so a radio already shown on
+        // home hits RadioArtComposer's disk cache; only a player-opened radio with no saved entry
+        // falls back to the HD seed image.
+        String centerUrl = entry != null && entry.getSongThumbnail() != null
+                && !entry.getSongThumbnail().isEmpty()
+                ? entry.getSongThumbnail()
+                : (!seedHd.isEmpty() ? seedHd : headerPlaylistThumbnail.trim());
+        String[] sides = resolveRadioHeaderSides(entry, centerUrl);
+        int cardBg = RadioArtComposer.cardBackgroundColor(resolveRadioHeaderColor(centerUrl));
+
+        cover.setBackground(null);
+        cover.setBackgroundColor(cardBg);
+        int coverPx = isAdded() ? ThumbnailUrls.dpToPx(requireContext(), 260) : 0;
+        RadioArtComposer.INSTANCE.load(
+                cover,
+                currentPlaylistId,
+                centerUrl == null ? "" : centerUrl,
+                sides[0],
+                sides[1],
+                coverPx > 0 ? coverPx : 720
+        );
+
+        // Backdrop: the SAME composed radio art as the foreground cover (was the low-res seed image
+        // behind a crisp composite), over the same tinted field. Reusing coverPx hits the composer's
+        // cache for the bitmap already built for the cover — no extra compose work, identical HD copy.
+        backdrop.setBackground(null);
+        backdrop.setBackgroundColor(cardBg);
+        RadioArtComposer.INSTANCE.load(
+                backdrop,
+                currentPlaylistId,
+                centerUrl == null ? "" : centerUrl,
+                sides[0],
+                sides[1],
+                coverPx > 0 ? coverPx : 720
+        );
+
+        // Overlay the "RADIO" badge (top-right) and the station name (bottom-left) ON the composite,
+        // so the detail cover reads like the home carousel card (which draws both over the same art).
+        if (holder.tvRadioHeaderTitle != null) {
+            String stationName = entry != null && !TextUtils.isEmpty(entry.getSongTitle())
+                    ? entry.getSongTitle()
+                    : (!TextUtils.isEmpty(headerPlaylistTitle) ? headerPlaylistTitle : currentPlaylistTitle);
+            holder.tvRadioHeaderTitle.setText(stationName == null ? "" : stationName);
+            holder.tvRadioHeaderTitle.setVisibility(View.VISIBLE);
+        }
+        if (holder.tvRadioHeaderBadge != null) {
+            holder.tvRadioHeaderBadge.setVisibility(View.VISIBLE);
+        }
+    }
+
+    /**
+     * Renders a liked/favorites-style header where a single flat gradient fills BOTH the cover and
+     * the full-width backdrop as one continuous field, with a centered white icon on the cover. Any
+     * in-flight/stale Glide load on either view is cleared first so a recycled ViewHolder's previous
+     * playlist thumbnail can't bleed through the gradient (that stale image was the "mismatched purple
+     * backdrop" symptom). The backdrop's full-opacity, unblurred rendering is finished by
+     * {@link #applyHeaderBackdropVisualState} on its flatGradient path.
+     *
+     * @param iconInsetPx padding on all sides of the cover icon — larger inset = smaller icon.
+     */
+    private void bindFlatGradientHeaderCover(@NonNull PlaylistHeaderAdapter.HeaderViewHolder holder,
+            int gradientRes, int iconRes, int iconInsetPx) {
+        try { Glide.with(holder.itemView).clear(holder.ivPlaylistCover); } catch (Exception ignored) {}
+        try { Glide.with(holder.itemView).clear(holder.ivPlaylistBackdrop); } catch (Exception ignored) {}
+
+        android.content.Context ctx = holder.itemView.getContext();
+        // Cover: the gradient is the IMAGE (not a background) so the ShapeableImageView CLIPS it to the
+        // same rounded 14dp corners as every other cover, and CENTER_CROP makes it fill the whole 260dp
+        // square edge-to-edge (a background fill stayed rectangular AND didn't fill the container — the
+        // bug the user reported). The thumb/cat icon rides on top as an inset foreground so it reads as
+        // a smaller centered mark over a full gradient field, matching the home cards.
+        holder.ivPlaylistCover.setTag(R.id.tag_artwork_signature, null);
+        holder.ivPlaylistCover.setPadding(0, 0, 0, 0);
+        holder.ivPlaylistCover.setBackground(null);
+        holder.ivPlaylistCover.setColorFilter(null);
+        holder.ivPlaylistCover.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        holder.ivPlaylistCover.setImageDrawable(ContextCompat.getDrawable(ctx, gradientRes));
+        android.graphics.drawable.Drawable icon = ContextCompat.getDrawable(ctx, iconRes);
+        if (icon != null) {
+            icon = icon.mutate();
+            icon.setColorFilter(Color.WHITE, android.graphics.PorterDuff.Mode.SRC_IN);
+            holder.ivPlaylistCover.setForeground(
+                    new android.graphics.drawable.InsetDrawable(icon, iconInsetPx));
+            holder.ivPlaylistCover.setForegroundGravity(android.view.Gravity.FILL);
+        } else {
+            holder.ivPlaylistCover.setForeground(null);
+        }
+
+        // Backdrop: same flat gradient field (rendered full-opacity + unblurred by
+        // applyHeaderBackdropVisualState's flatGradient path) so cover + backdrop read as one gradient
+        // — the "backdrop de antes" the user asked to keep.
+        holder.ivPlaylistBackdrop.setTag(R.id.tag_artwork_signature, null);
+        holder.ivPlaylistBackdrop.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        holder.ivPlaylistBackdrop.setImageDrawable(null);
+        holder.ivPlaylistBackdrop.setColorFilter(null);
+        holder.ivPlaylistBackdrop.setForeground(null);
+        holder.ivPlaylistBackdrop.setBackgroundResource(gradientRes);
+    }
+
+    @Nullable
+    private RadioHistoryStore.RadioEntry findRadioEntry(@NonNull String radioId) {
+        if (!isAdded()) return null;
+        try {
+            for (RadioHistoryStore.RadioEntry e : RadioHistoryStore.INSTANCE.getRadios(requireContext())) {
+                if (radioId.equals(e.getRadioPlaylistId())) return e;
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
+    }
+
+    /**
+     * Two side-thumbnail URLs for the radio composite. Prefers the pair the home carousel already
+     * computed + persisted (so the header and the home card show the same faces); otherwise picks
+     * the first two other tracks of the saved radio.
+     */
+    @NonNull
+    private String[] resolveRadioHeaderSides(@Nullable RadioHistoryStore.RadioEntry entry, @Nullable String centerUrl) {
+        if (isAdded()) {
+            String raw = requireContext()
+                    .getSharedPreferences(PREFS_RADIO_UI_CACHE, Activity.MODE_PRIVATE)
+                    .getString("sides_" + currentPlaylistId, "");
+            if (!TextUtils.isEmpty(raw)) {
+                String[] parts = raw.split("\\n", -1);
+                String left = parts.length > 0 ? parts[0].trim() : "";
+                String right = parts.length > 1 ? parts[1].trim() : "";
+                if (!left.isEmpty()) return new String[]{left, right};
+            }
+        }
+        String left = "";
+        String right = "";
+        if (entry != null) {
+            for (RadioHistoryStore.RadioTrack t : entry.getTracks()) {
+                String u = t.getThumbnailUrl();
+                if (TextUtils.isEmpty(u) || u.equals(centerUrl)) continue;
+                if (left.isEmpty()) {
+                    left = u;
+                } else if (right.isEmpty()) {
+                    right = u;
+                    break;
+                }
+            }
+        }
+        return new String[]{left, right};
+    }
+
+    /** Raw Palette color for the radio field: persisted color first (shared with home), else a
+     *  violet default while an async Palette pass computes + persists the real one. */
+    private int resolveRadioHeaderColor(@Nullable String centerUrl) {
+        if (radioHeaderRawColor != 0) return radioHeaderRawColor;
+        if (isAdded()) {
+            int cached = requireContext()
+                    .getSharedPreferences(PREFS_RADIO_UI_CACHE, Activity.MODE_PRIVATE)
+                    .getInt("color_" + currentPlaylistId, 0);
+            if (cached != 0) {
+                radioHeaderRawColor = cached;
+                return cached;
+            }
+        }
+        kickRadioHeaderColorPalette(centerUrl);
+        return DEFAULT_RADIO_RAW_COLOR;
+    }
+
+    private void kickRadioHeaderColorPalette(@Nullable String url) {
+        if (radioHeaderColorRequested || TextUtils.isEmpty(url) || !isAdded()) return;
+        radioHeaderColorRequested = true;
+        final String radioId = currentPlaylistId;
+        Glide.with(this)
+                .asBitmap()
+                .load(url)
+                .diskCacheStrategy(DiskCacheStrategy.ALL)
+                .override(64, 64)
+                .centerCrop()
+                .into(new com.bumptech.glide.request.target.CustomTarget<android.graphics.Bitmap>() {
+                    @Override
+                    public void onResourceReady(@NonNull android.graphics.Bitmap resource,
+                            @Nullable com.bumptech.glide.request.transition.Transition<? super android.graphics.Bitmap> transition) {
+                        androidx.palette.graphics.Palette.from(resource).generate(palette -> {
+                            if (!isAdded() || !radioId.equals(currentPlaylistId)) return;
+                            int dominant = palette != null
+                                    ? palette.getDarkMutedColor(palette.getMutedColor(0xFF333333))
+                                    : 0xFF333333;
+                            radioHeaderRawColor = dominant;
+                            persistRadioHeaderColor(radioId, url, dominant);
+                            notifyHeaderChanged();
+                        });
+                    }
+
+                    @Override
+                    public void onLoadCleared(@Nullable android.graphics.drawable.Drawable placeholder) {
+                    }
+                });
+    }
+
+    /** Persists the resolved radio color into the SAME prefs the home carousel reads, so both
+     *  surfaces render the identical fluorescent field. */
+    private void persistRadioHeaderColor(@NonNull String radioId, @NonNull String url, int color) {
+        if (!isAdded()) return;
+        requireContext().getSharedPreferences(PREFS_RADIO_UI_CACHE, Activity.MODE_PRIVATE)
+                .edit()
+                .putInt("color_" + radioId, color)
+                .putString("colorurl_" + radioId, url)
+                .apply();
     }
 
     private final class PlaylistHeaderAdapter extends RecyclerView.Adapter<PlaylistHeaderAdapter.HeaderViewHolder> {
@@ -5785,48 +6451,99 @@ public class PlaylistDetailFragment extends Fragment
             
             bindOfflineState(holder);
 
+            // Only the liked/favorites branch draws an icon foreground over the cover; clear it here so
+            // a normal cover (single/2x2/radio) never keeps a stale thumb/cat mark from a prior bind.
+            holder.ivPlaylistCover.setForeground(null);
+
+            // The "RADIO" badge + station-name overlays are radio-only; hide them for every other
+            // header type. The radio branch (bindRadioHeaderCover) re-shows them with the name.
+            if (holder.tvRadioHeaderTitle != null) holder.tvRadioHeaderTitle.setVisibility(View.GONE);
+            if (holder.tvRadioHeaderBadge != null) holder.tvRadioHeaderBadge.setVisibility(View.GONE);
+
             if (isLikedPlaylistContext(currentPlaylistId)) {
-                // Liked playlist: gradient background + thumb-up icon scaled to ~50% of cover
+                // Liked: the gradient fills the ENTIRE header — both the cover AND the full-width
+                // backdrop use bg_music_liked_gradient so they read as ONE continuous field (not a
+                // bright cover square floating over a dimmed/mismatched purple wash). The centered
+                // thumb-up icon is a bit smaller than before (~40% of the cover). applyHeaderBackdrop-
+                // VisualState() renders this backdrop flat + full-opacity (see its flatGradient path).
                 float density = holder.itemView.getContext().getResources().getDisplayMetrics().density;
-                int padPx = Math.round(65 * density);
-                holder.ivPlaylistCover.setPadding(padPx, padPx, padPx, padPx);
-                holder.ivPlaylistCover.setTag(R.id.tag_artwork_signature, null);
-                holder.ivPlaylistCover.setScaleType(ImageView.ScaleType.FIT_CENTER);
-                holder.ivPlaylistCover.setBackgroundResource(R.drawable.bg_music_liked_gradient);
-                holder.ivPlaylistCover.setImageResource(R.drawable.ic_thumb_up_liked);
-                holder.ivPlaylistCover.setColorFilter(Color.WHITE);
-                // Backdrop: same gradient so header looks cohesive
-                holder.ivPlaylistBackdrop.setTag(R.id.tag_artwork_signature, null);
-                holder.ivPlaylistBackdrop.setScaleType(ImageView.ScaleType.CENTER_CROP);
-                holder.ivPlaylistBackdrop.setBackgroundResource(R.drawable.bg_music_liked_gradient);
-                holder.ivPlaylistBackdrop.setImageDrawable(null);
-            } else if (!headerGridUrls.isEmpty()) {
+                int padPx = Math.round(78 * density);
+                bindFlatGradientHeaderCover(holder, R.drawable.bg_music_liked_gradient,
+                        R.drawable.ic_thumb_up_liked, padPx);
+            } else if (isFavoritesPlaylistContext(currentPlaylistId)) {
+                // Favoritos: degradado cálido que llena TODO el header (portada + backdrop), gato
+                // blanco centrado (un poco más pequeño). Misma receta que liked. Debe ir ANTES de la
+                // rama del grid 2x2.
+                float density = holder.itemView.getContext().getResources().getDisplayMetrics().density;
+                int padPx = Math.round(78 * density);
+                bindFlatGradientHeaderCover(holder, R.drawable.bg_music_favorites_gradient,
+                        R.drawable.ic_cat_white, padPx);
+            } else if (isRadioContext && !forceSingleCoverArt) {
+                // Radio/mix: render the SAME 3-circle Spotify-style composite the home carousel builds
+                // (center seed + two grayscale "similar artists"), over the same flat fluorescent field.
+                // Must sit ABOVE the grid + generic-thumbnail branches: those matched first before, so
+                // the intended radio art was dead code and radios showed the low-res launching thumbnail.
+                // forceSingleCoverArt skips this so a "recomendadas"/recap card that opened here clones
+                // its single YT cover instead of a composite (the mix still FETCHES via /next).
+                bindRadioHeaderCover(holder);
+            } else if (!headerGridUrls.isEmpty() && !forceSingleCoverArt) {
                 holder.ivPlaylistCover.setPadding(0, 0, 0, 0);
                 holder.ivPlaylistCover.setScaleType(ImageView.ScaleType.CENTER_CROP);
                 holder.ivPlaylistCover.setBackground(null);
                 holder.ivPlaylistCover.setColorFilter(null);
                 holder.ivPlaylistBackdrop.setBackground(null);
                 PlaylistGridArtLoader.load(holder.ivPlaylistCover, headerGridUrls, 800);
-                PlaylistGridArtLoader.load(holder.ivPlaylistBackdrop, headerGridUrls, 320);
+                // Backdrop shares the SAME 800px composite as the cover (was 320px, so the blurred
+                // backdrop read as low-res behind the crisp grid cover).
+                PlaylistGridArtLoader.load(holder.ivPlaylistBackdrop, headerGridUrls, 800);
             } else if (!TextUtils.isEmpty(headerPlaylistThumbnail)) {
                 holder.ivPlaylistCover.setPadding(0, 0, 0, 0);
                 holder.ivPlaylistCover.setScaleType(ImageView.ScaleType.CENTER_CROP);
                 holder.ivPlaylistCover.setBackground(null);
                 holder.ivPlaylistCover.setColorFilter(null);
                 holder.ivPlaylistBackdrop.setBackground(null);
-                Glide.with(holder.itemView)
-                        .load(headerPlaylistThumbnail.trim())
-                        .diskCacheStrategy(DiskCacheStrategy.ALL)
-                        .priority(com.bumptech.glide.Priority.HIGH)
-                        .override(800, 800)
-                        .transition(DrawableTransitionOptions.withCrossFade(200))
-                        .into(holder.ivPlaylistCover);
-                Glide.with(holder.itemView)
-                        .load(headerPlaylistThumbnail.trim())
-                        .diskCacheStrategy(DiskCacheStrategy.ALL)
-                        .override(320, 320)
-                        .transition(DrawableTransitionOptions.withCrossFade(200))
-                        .into(holder.ivPlaylistBackdrop);
+                // Force HD on low-res launch thumbnails: rewrite googleusercontent/ggpht '=wW-hH'
+                // CDN URLs up to 800px (ThumbnailUrls.atSize) and i.ytimg '*default.jpg' to
+                // maxresdefault, keeping an .error() fallback to the RAW url so old disk-cache
+                // entries (keyed by the raw URL) and videos without a maxres variant still resolve.
+                String rawCover = headerPlaylistThumbnail.trim();
+                boolean ytImg = isYtImgThumb(rawCover);
+                String hdCover = hdHeaderCoverUrl(rawCover, 800);
+                // The blurred backdrop shares the EXACT same HD copy as the foreground cover (same
+                // url + same 800px decode), so Glide serves one decoded bitmap for both and the
+                // backdrop is no longer the old low-res 320px thumbnail behind a crisp cover.
+                String hdBackdrop = hdCover;
+                com.bumptech.glide.RequestBuilder<android.graphics.drawable.Drawable> coverReq =
+                        Glide.with(holder.itemView)
+                                .load(hdCover)
+                                .diskCacheStrategy(DiskCacheStrategy.ALL)
+                                .priority(com.bumptech.glide.Priority.HIGH)
+                                .override(800, 800)
+                                .transition(DrawableTransitionOptions.withCrossFade(200));
+                com.bumptech.glide.RequestBuilder<android.graphics.drawable.Drawable> backdropReq =
+                        Glide.with(holder.itemView)
+                                .load(hdBackdrop)
+                                .diskCacheStrategy(DiskCacheStrategy.ALL)
+                                .override(800, 800)
+                                .transition(DrawableTransitionOptions.withCrossFade(200));
+                if (ytImg) {
+                    // i.ytimg video thumbs carry 16:9 letterbox bars; the rows already crop them via
+                    // SHARED_YT_CROP, the header did not — crop here too so covers match the rows.
+                    coverReq = coverReq.transform(SHARED_YT_CROP);
+                    backdropReq = backdropReq.transform(SHARED_YT_CROP);
+                }
+                if (!hdCover.equals(rawCover)) {
+                    coverReq = coverReq.error(Glide.with(holder.itemView).load(rawCover)
+                            .diskCacheStrategy(DiskCacheStrategy.ALL).override(800, 800)
+                            .transition(DrawableTransitionOptions.withCrossFade(200)));
+                }
+                if (!hdBackdrop.equals(rawCover)) {
+                    backdropReq = backdropReq.error(Glide.with(holder.itemView).load(rawCover)
+                            .diskCacheStrategy(DiskCacheStrategy.ALL).override(800, 800)
+                            .transition(DrawableTransitionOptions.withCrossFade(200)));
+                }
+                coverReq.into(holder.ivPlaylistCover);
+                backdropReq.into(holder.ivPlaylistBackdrop);
             } else if (isLocalFilesContext(currentPlaylistId)) {
                 // Local files: white folder icon on black background, scaled to ~50% of cover
                 float density = holder.itemView.getContext().getResources().getDisplayMetrics().density;
@@ -5838,31 +6555,6 @@ public class PlaylistDetailFragment extends Fragment
                 holder.ivPlaylistCover.setImageResource(R.drawable.ic_folder_white);
                 holder.ivPlaylistBackdrop.setBackground(null);
                 holder.ivPlaylistBackdrop.setImageDrawable(new android.graphics.drawable.ColorDrawable(android.graphics.Color.BLACK));
-            } else if (isRadioContext && !TextUtils.isEmpty(headerPlaylistThumbnail)) {
-                // Radio context: HD image from the originating track's videoId
-                holder.ivPlaylistCover.setPadding(0, 0, 0, 0);
-                holder.ivPlaylistCover.setScaleType(ImageView.ScaleType.CENTER_CROP);
-                holder.ivPlaylistCover.setBackground(null);
-                holder.ivPlaylistCover.setColorFilter(null);
-                holder.ivPlaylistBackdrop.setBackground(null);
-                String radioVideoId = currentPlaylistId.startsWith("RDAMVM") ? currentPlaylistId.substring(6) : "";
-                String hdUrl = !radioVideoId.isEmpty()
-                        ? "https://i.ytimg.com/vi/" + android.net.Uri.encode(radioVideoId) + "/maxresdefault.jpg"
-                        : headerPlaylistThumbnail.trim();
-                Glide.with(holder.itemView)
-                        .load(hdUrl)
-                        .error(Glide.with(holder.itemView).load(headerPlaylistThumbnail.trim()))
-                        .diskCacheStrategy(DiskCacheStrategy.ALL)
-                        .priority(com.bumptech.glide.Priority.HIGH)
-                        .override(800, 800)
-                        .into(holder.ivPlaylistCover);
-                Glide.with(holder.itemView)
-                        .load(hdUrl)
-                        .error(Glide.with(holder.itemView).load(headerPlaylistThumbnail.trim()))
-                        .diskCacheStrategy(DiskCacheStrategy.ALL)
-                        .override(320, 320)
-                        .transition(DrawableTransitionOptions.withCrossFade(200))
-                        .into(holder.ivPlaylistBackdrop);
             } else {
                 // Grey placeholder until track data arrives and grid can be built
                 holder.ivPlaylistCover.setPadding(0, 0, 0, 0);
@@ -5877,7 +6569,11 @@ public class PlaylistDetailFragment extends Fragment
                 holder.ivPlaylistBackdrop.setImageDrawable(new android.graphics.drawable.ColorDrawable(placeholderColor));
             }
 
-            applyHeaderBackdropVisualState(holder.ivPlaylistBackdrop);
+            // Liked/Favoritos: el backdrop se trata IGUAL que el de cualquier playlist (atenuado +
+            // degradado a negro abajo vía scrim/bottom-fade), NO como un campo plano a opacidad total
+            // — ese campo plano no fundía a negro y cortaba brusco contra la lista. El degradado vivo
+            // se queda en la PORTADA redondeada (la imagen), no en el backdrop.
+            applyHeaderBackdropVisualState(holder.ivPlaylistBackdrop, false);
 
             if (headerProfilePhoto != null) {
                 Glide.with(holder.itemView)
@@ -5886,11 +6582,10 @@ public class PlaylistDetailFragment extends Fragment
                         .onlyRetrieveFromCache(!isInternetAvailable())
                         .circleCrop()
                         .transition(DrawableTransitionOptions.withCrossFade(200))
-                        .placeholder(android.R.drawable.ic_menu_myplaces)
-                        .error(android.R.drawable.ic_menu_myplaces)
                         .into(holder.ivGoogleProfile);
             } else {
-                holder.ivGoogleProfile.setImageResource(android.R.drawable.ic_menu_myplaces);
+                // Sin foto: vacío, nunca un placeholder.
+                holder.ivGoogleProfile.setImageDrawable(null);
             }
 
         }
@@ -5939,6 +6634,8 @@ public class PlaylistDetailFragment extends Fragment
             final ConstraintLayout flPlaylistHeaderContainer;
             final ImageView ivPlaylistCover;
             final ImageView ivPlaylistBackdrop;
+            final TextView tvRadioHeaderTitle;
+            final TextView tvRadioHeaderBadge;
             final View vPlaylistBackdropScrim;
             final View vPlaylistBackdropBottomFade;
             final View vPlaylistBackdropAmoledFade;
@@ -5958,6 +6655,8 @@ public class PlaylistDetailFragment extends Fragment
                 flPlaylistHeaderContainer = itemView.findViewById(R.id.flPlaylistHeaderContainer);
                 ivPlaylistCover = itemView.findViewById(R.id.ivPlaylistCover);
                 ivPlaylistBackdrop = itemView.findViewById(R.id.ivPlaylistBackdrop);
+                tvRadioHeaderTitle = itemView.findViewById(R.id.tvRadioHeaderTitle);
+                tvRadioHeaderBadge = itemView.findViewById(R.id.tvRadioHeaderBadge);
                 vPlaylistBackdropScrim = itemView.findViewById(R.id.vPlaylistBackdropScrim);
                 vPlaylistBackdropBottomFade = itemView.findViewById(R.id.vPlaylistBackdropBottomFade);
                 vPlaylistBackdropAmoledFade = itemView.findViewById(R.id.vPlaylistBackdropAmoledFade);
@@ -6123,12 +6822,9 @@ public class PlaylistDetailFragment extends Fragment
             this.artist = artist;
             this.duration = duration;
             this.imageUrl = imageUrl;
-            String sub = artist.trim();
-            String dur = normalizeDurationLabel(duration);
-            if (!dur.isEmpty()) {
-                sub = sub.isEmpty() ? dur : sub + " \u2022 " + dur;
-            }
-            this.normalizedSubtitle = sub;
+            // App-wide row standard ("artist \u2022 album \u2022 duration \u2022 views") via the shared
+            // formatter, which also re-parses artist fields polluted by older persisted data.
+            this.normalizedSubtitle = SongSubtitle.forRowParts(artist, normalizeDurationLabel(duration));
         }
     }
 
@@ -6137,7 +6833,10 @@ public class PlaylistDetailFragment extends Fragment
         void onMoreTap(int position, @NonNull View anchor);
     }
 
-    private static final int TRACK_STATE_CACHE_MAX_SIZE = 200;
+    // Sized to hold a full max-length playlist (1800 tracks) so far scroll-returns hit the cache
+    // instead of re-stat'ing on disk. Booleans in a LinkedHashMap are cheap (~a few hundred KB at
+    // this size), so oversizing slightly past the max playlist length is a safe trade.
+    private static final int TRACK_STATE_CACHE_MAX_SIZE = 2048;
 
     /** Offline indicator visual states tracked per ViewHolder to skip redundant per-bind work. */
     private static final int OFFLINE_STATE_NONE = 0;
@@ -6258,9 +6957,8 @@ public class PlaylistDetailFragment extends Fragment
 
                     diffResult.dispatchUpdatesTo(this);
 
-                    // Trigger offline state lookup for the initial visible range.
-                    // Use a one-shot OnLayoutChangeListener: fires exactly after the RV
-                    // completes its first layout pass, guaranteeing valid item positions.
+                    // Settle artwork for the initial visible range once the RV finishes its first
+                    // layout pass. (Downloaded-state is no longer scanned here — see "Descargas".)
                     if (rvPlaylistContent != null) {
                         rvPlaylistContent.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
                             @Override
@@ -6276,7 +6974,6 @@ public class PlaylistDetailFragment extends Fragment
                                     int first = Math.max(0, llm.findFirstVisibleItemPosition() - 1);
                                     int last = llm.findLastVisibleItemPosition() - 1;
                                     if (last >= 0) {
-                                        trackAdapter.loadStateForVisibleRange(first, last);
                                         trackAdapter.reloadImagesForRange(first, last);
                                     }
                                 }
@@ -6484,69 +7181,10 @@ public class PlaylistDetailFragment extends Fragment
             }
             String normalized = trackId.trim();
             Boolean cached = offlineAvailabilityCache.get(normalized);
-            // Solo devolver valor cacheado; NO iniciar lookup aquí
-            // Los lookups se inician desde loadStateForVisibleRange() en el scroll listener
+            // Only the download OBSERVER seeds this cache now (a track that just finished). Scrolling
+            // never triggers a disk lookup — the "escaneo de descargas" that made the first scroll
+            // lag was removed; the "Descargas" library view owns downloaded-state discovery.
             return cached != null ? cached : false;
-        }
-
-        /**
-         * Inicia lookup de estado offline para items visibles.
-         * Llamado desde scroll listener para cargar estado solo de items en pantalla.
-         */
-        void triggerOfflineStateLookup(int position, @NonNull PlaylistTrack track) {
-            if (position < 0 || position >= items.size()) return;
-            String normalized = track.videoId == null ? "" : track.videoId.trim();
-            if (normalized.isEmpty()) return;
-            
-            Boolean cached = offlineAvailabilityCache.get(normalized);
-            if (cached != null) return; // Ya está en cache
-            if (pendingOfflineLookups.contains(normalized)) return; // Ya hay lookup en progreso
-            
-            long now = System.currentTimeMillis();
-            Long lastLookup = lastOfflineStateLookupTimeByTrack.get(normalized);
-            if (lastLookup != null && now - lastLookup < OFFLINE_STATE_LOOKUP_DEBOUNCE_MS) return;
-            
-            lastOfflineStateLookupTimeByTrack.put(normalized, now);
-            pendingOfflineLookups.add(normalized);
-            
-            Context context = requireContext();
-            trackStateLookupExecutor.execute(() -> {
-                // Row indicator uses the CHEAP existence check (cached boolean + a file-size stat),
-                // NOT hasValidatedOfflineAudio — that opens a MediaMetadataRetriever per row and was
-                // the "escaneo de descargas" jank on every scroll/bind. The worker already validates
-                // duration+playability at download time and deletes bad files, and the passive save
-                // checks isPlayable, so a present file is a good file; no per-scroll re-validation.
-                boolean available = OfflineAudioStore.hasOfflineAudio(context, normalized);
-                mainHandler.post(() -> {
-                    pendingOfflineLookups.remove(normalized);
-                    Boolean current = offlineAvailabilityCache.get(normalized);
-                    if (current == null || current != available) {
-                        offlineAvailabilityCache.put(normalized, available);
-                        // Only notify if this position still shows the same track
-                        // (ViewHolder may have been recycled and rebound to a different track)
-                        if (position >= 0 && position < items.size()
-                                && TextUtils.equals(items.get(position).videoId, track.videoId)) {
-                            immediateNotifyStateChanged(position);
-                        }
-                    }
-                });
-            });
-        }
-
-        /**
-         * Carga el estado offline solo para items visibles en pantalla.
-         * Llamado desde el scroll listener del RecyclerView.
-         */
-        void loadStateForVisibleRange(int firstVisible, int lastVisible) {
-            if (items.isEmpty()) return;
-            int safeStart = Math.max(0, firstVisible);
-            int safeEnd = Math.min(items.size() - 1, lastVisible);
-            for (int i = safeStart; i <= safeEnd; i++) {
-                PlaylistTrack track = items.get(i);
-                if (track != null && !TextUtils.isEmpty(track.videoId)) {
-                    triggerOfflineStateLookup(i, track);
-                }
-            }
         }
 
         /**
@@ -6561,36 +7199,56 @@ public class PlaylistDetailFragment extends Fragment
             if (rvPlaylistContent == null) return;
             int safeStart = Math.max(0, firstVisible);
             int safeEnd = Math.min(items.size() - 1, lastVisible);
+            if (safeEnd < safeStart) return;
+            // Center of the visible range: the reloads are ordered outward from it and their Glide
+            // priority is tiered by distance, so the decode threads don't finish the whole visible
+            // batch at the same instant (the "images load in one block" symptom). The middle of the
+            // screen — where the eye is — fills first.
+            final int center = (safeStart + safeEnd) / 2;
+
+            // Pass 1: gather only the rows still showing the placeholder (a load that never landed —
+            // fired while offline, or skipped mid-fling). Rows already showing the correct art are
+            // left untouched: re-issuing into() rebuilds the whole Glide request graph (request
+            // teardown + new SingleRequest + EngineKey hashing + memory probe), which for every
+            // visible row on EVERY settle was the confirmed per-re-scroll main-thread burst.
+            // Compare against the SIZED url — loadTrackArt stores the CDN-sized URL as the signature,
+            // so comparing the raw imageUrl would never match and the guard would silently die.
+            List<Integer> toReload = new ArrayList<>();
             for (int i = safeStart; i <= safeEnd; i++) {
                 RecyclerView.ViewHolder vh = rvPlaylistContent.findViewHolderForAdapterPosition(i + 1);
-                if (vh instanceof TrackViewHolder) {
-                    PlaylistTrack track = items.get(i);
-                    if (track != null && !TextUtils.isEmpty(track.imageUrl)
-                            && !LocalFilesStore.isLocalVideoId(track.videoId)) {
-                        ImageView iv = ((TrackViewHolder) vh).ivTrackArt;
-                        Object sig = iv.getTag(R.id.tag_artwork_signature);
-                        android.graphics.drawable.Drawable current = iv.getDrawable();
-                        // A row is "resolved" when it shows a real drawable, not the shared grey
-                        // placeholder (identity compare against the cached placeholder instance).
-                        boolean placeholderShowing =
-                                current == null || current == cachedTrackArtPlaceholder;
-                        // If this row already shows the correct, successfully-loaded art, leave it.
-                        // Re-issuing into() here rebuilds the whole Glide request graph (request
-                        // teardown + new SingleRequest + EngineKey hashing + memory probe) for every
-                        // visible row on EVERY scroll-settle — the confirmed source of the per-
-                        // re-scroll main-thread burst. Only rows still on the placeholder (a load
-                        // that never landed — fired while offline, or was skipped mid-fling) retry.
-                        // Compare against the SIZED url — loadTrackArt stores the CDN-sized URL
-                        // as the signature now, so comparing the raw imageUrl would never match
-                        // and this guard would silently die (re-issuing every row per settle).
-                        String expectedSig = sizedTrackArtUrl(iv.getContext(), track.imageUrl.trim());
-                        if (expectedSig != null && expectedSig.equals(sig) && !placeholderShowing) {
-                            continue;
-                        }
-                        iv.setTag(R.id.tag_artwork_signature, null);
-                        loadTrackArt(iv, track.imageUrl, com.bumptech.glide.Priority.HIGH);
-                    }
+                if (!(vh instanceof TrackViewHolder)) continue;
+                PlaylistTrack track = items.get(i);
+                if (track == null || TextUtils.isEmpty(track.imageUrl)
+                        || LocalFilesStore.isLocalVideoId(track.videoId)) {
+                    continue;
                 }
+                ImageView iv = ((TrackViewHolder) vh).ivTrackArt;
+                Object sig = iv.getTag(R.id.tag_artwork_signature);
+                android.graphics.drawable.Drawable current = iv.getDrawable();
+                boolean placeholderShowing = current == null || current == cachedTrackArtPlaceholder;
+                String expectedSig = sizedTrackArtUrl(iv.getContext(), track.imageUrl.trim());
+                if (expectedSig != null && expectedSig.equals(sig) && !placeholderShowing) {
+                    continue;
+                }
+                toReload.add(i);
+            }
+            if (toReload.isEmpty()) return;
+
+            // Pass 2: issue center-first, priority tiered by distance from the viewport center.
+            java.util.Collections.sort(toReload, (a, b) ->
+                    Integer.compare(Math.abs(a - center), Math.abs(b - center)));
+            for (int idx : toReload) {
+                RecyclerView.ViewHolder vh = rvPlaylistContent.findViewHolderForAdapterPosition(idx + 1);
+                if (!(vh instanceof TrackViewHolder)) continue;
+                PlaylistTrack track = items.get(idx);
+                if (track == null || TextUtils.isEmpty(track.imageUrl)) continue;
+                ImageView iv = ((TrackViewHolder) vh).ivTrackArt;
+                int dist = Math.abs(idx - center);
+                com.bumptech.glide.Priority priority = dist <= 2
+                        ? com.bumptech.glide.Priority.HIGH
+                        : (dist <= 5 ? com.bumptech.glide.Priority.NORMAL : com.bumptech.glide.Priority.LOW);
+                iv.setTag(R.id.tag_artwork_signature, null);
+                loadTrackArt(iv, track.imageUrl, priority);
             }
         }
 
@@ -6638,9 +7296,6 @@ public class PlaylistDetailFragment extends Fragment
             if (holder.flOfflineProgress != null) {
                 holder.flOfflineProgress.setVisibility(View.GONE);
             }
-            if (holder.ivOfflineState != null) {
-                holder.ivOfflineState.setVisibility(View.INVISIBLE);
-            }
             // The views above were force-reset, so the memoized state no longer matches them.
             // Without this, a rebind that computes the SAME state as before recycling hits the
             // appliedOfflineState no-op guard and leaves the check INVISIBLE on a downloaded row.
@@ -6675,21 +7330,10 @@ public class PlaylistDetailFragment extends Fragment
             if (prevOfflineState != offlineState) {
                 holder.appliedOfflineState = offlineState;
 
-                // ── Offline indicator icon ──────────────────────────────────────────
-                if (offlineState == OFFLINE_STATE_NONE) {
-                    holder.ivOfflineState.setVisibility(View.INVISIBLE);
-                } else if (offlineState == OFFLINE_STATE_AVAILABLE) {
-                    holder.ivOfflineState.setVisibility(View.VISIBLE);
-                    holder.ivOfflineState.setImageResource(R.drawable.ic_check_small);
-                    holder.ivOfflineState.setBackgroundResource(R.drawable.bg_offline_state_filled_primary);
-                    holder.ivOfflineState.setColorFilter(colorSurface);
-                } else { // OFFLINE_STATE_DOWNLOADING — a download glyph, NOT a check. A checkmark while
-                         // the track is still downloading read as "already saved"; the bar carries the %.
-                    holder.ivOfflineState.setVisibility(View.VISIBLE);
-                    holder.ivOfflineState.setImageResource(R.drawable.ic_download_bold);
-                    holder.ivOfflineState.setBackgroundResource(R.drawable.bg_offline_state_outline_primary);
-                    holder.ivOfflineState.setColorFilter(colorPrimary);
-                }
+                // No persistent per-row "downloaded" indicator anymore (no check circle). While a
+                // track is actively downloading we show ONLY the thin progress bar; once it finishes
+                // the bar sweeps to 100% and disappears, leaving the row clean. This keeps scrolling
+                // free of any per-row download-state work — "solo la barra de progreso, después nada".
 
                 // ── Progress bar show/hide ──────────────────────────────────────────
                 if (offlineState == OFFLINE_STATE_DOWNLOADING) {
@@ -6818,12 +7462,10 @@ public class PlaylistDetailFragment extends Fragment
                 }
             }
 
-            // Trigger the disk-based offline state lookup on bind, but never during a fling —
-            // flooding the executor with MediaMetadataRetriever reads while binding dozens of
-            // rows is a primary jank source. loadStateForVisibleRange() covers it on idle.
-            if (!isFlinging && !TextUtils.isEmpty(track.videoId)) {
-                triggerOfflineStateLookup(position, track);
-            }
+            // NO per-row offline-state disk lookup on bind anymore. Checking each row's downloaded
+            // status against disk (even the cheap file-stat) was the source of the first-scroll lag.
+            // The "Descargas" library view owns that work now; rows here only reflect an ACTIVE
+            // download's progress bar, driven by the WorkManager observer (not by disk scans).
 
             bindTrackState(holder, position, track);
         }
@@ -6835,7 +7477,6 @@ public class PlaylistDetailFragment extends Fragment
             final AnimatedEqualizerView animatedEq;
             final TextView tvTrackTitle;
             final TextView tvTrackSubtitle;
-            final ImageView ivOfflineState;
             final ImageView ivMore;
             final FrameLayout flOfflineProgress;
             final View vOfflineProgressFill;
@@ -6853,7 +7494,6 @@ public class PlaylistDetailFragment extends Fragment
                 animatedEq = itemView.findViewById(R.id.animatedEq);
                 tvTrackTitle = itemView.findViewById(R.id.tvTrackTitle);
                 tvTrackSubtitle = itemView.findViewById(R.id.tvTrackSubtitle);
-                ivOfflineState = itemView.findViewById(R.id.ivOfflineState);
                 ivMore = itemView.findViewById(R.id.ivMore);
                 flOfflineProgress = itemView.findViewById(R.id.flOfflineProgress);
                 vOfflineProgressFill = itemView.findViewById(R.id.vOfflineProgressFill);

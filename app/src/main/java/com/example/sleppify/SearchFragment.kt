@@ -86,7 +86,8 @@ class SearchFragment : Fragment() {
 
         // Compiled once and reused. These were previously re-compiled on every call while sorting
         // search results (once per track), which is pure allocation/CPU churn.
-        private val DURATION_REGEX = Regex("\\d{1,2}:\\d{2}(:\\d{2})?")
+        // (Subtitle segment classification now lives in SongSubtitle; only the numeric
+        // play-count extraction for ranking keeps its regexes here.)
         private val PLAY_COUNT_MIL_M_REGEX = Regex("([\\d,.]+)\\s*mil\\s+m", RegexOption.IGNORE_CASE)
         private val PLAY_COUNT_REPRO_REGEX = Regex("([\\d,.]+)\\s*(m|k|b|mil)?\\s*reproducciones", RegexOption.IGNORE_CASE)
         private val PLAY_COUNT_PLAYS_REGEX = Regex("([\\d,.]+)\\s*(m|k|b|mil)?\\s*(plays|views)", RegexOption.IGNORE_CASE)
@@ -179,6 +180,14 @@ class SearchFragment : Fragment() {
     private var autoPlayOnFirstResult = false
     private var backPressedCallback: OnBackPressedCallback? = null
 
+    // Recent searches live under the Firebase UID. On a fresh install the user is often still
+    // picking their Google account when this fragment is first created, so the initial
+    // loadRecentSearchesFromFirebase() no-ops (not signed in yet) and — with no auth listener —
+    // recents/images never hydrated until a lucky module re-entry. This listener re-runs the load
+    // the moment auth resolves. loadedRecentsForUid stops token-refresh callbacks re-loading.
+    private var recentSearchAuthListener: com.google.firebase.auth.FirebaseAuth.AuthStateListener? = null
+    private var loadedRecentsForUid: String? = null
+
     override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View? {
         return inflater.inflate(R.layout.fragment_search, container, false)
     }
@@ -192,7 +201,10 @@ class SearchFragment : Fragment() {
         setupBackButton()
 
         restoreRecentSearchQueries()
-        loadRecentSearchesFromFirebase()
+        // The auth listener fires immediately with the current user (and again once a delayed sign-in
+        // resolves), so registering it IS the initial cloud hydrate — no separate eager load, which
+        // would just double the Firestore read on every open.
+        registerRecentSearchAuthListener()
         refreshSearchSuggestions("")
 
         setupBackNavigation()
@@ -647,6 +659,7 @@ class SearchFragment : Fragment() {
                     setSearchLoadingState(false, "No encontré resultados para: $query")
                 } else if (!append) {
                     setSearchLoadingState(false, "")
+                    attachTopResultArtworkToRecent(query)
                     allTracks.firstOrNull()?.videoId?.let { id ->
                         lifecycleScope.launch(Dispatchers.IO) {
                             try {
@@ -709,6 +722,7 @@ class SearchFragment : Fragment() {
                             setSearchLoadingState(false, "No encontré resultados para: $query")
                         } else if (!append) {
                             setSearchLoadingState(false, "")
+                            attachTopResultArtworkToRecent(query)
                             revealModuleContent()
                             hideKeyboard()
                         }
@@ -857,43 +871,17 @@ class SearchFragment : Fragment() {
 
     /** Extract the artist name from a YTM subtitle like "Song • Artist • Album • 3:22 • 500 M reproducciones" */
     private fun extractArtistFromSubtitle(subtitle: String?): String {
-        if (subtitle.isNullOrEmpty()) return ""
-        val parts = subtitle.split(" \u2022 ").map { it.trim() }
-        if (parts.isEmpty()) return ""
-        // YTM subtitle format with filter: "Song • Artist • Album • Duration" or "Video • Artist • Duration"
-        // Without filter or Topic channels: "Artist • Album • Duration"
-        val typeLabels = setOf("song", "video", "album", "playlist", "single", "ep", "canción", "cancion", "álbum")
-        val firstLower = parts[0].lowercase(Locale.ROOT)
-        return if (firstLower in typeLabels && parts.size > 1) {
-            parts[1]
-        } else {
-            // Subtitle starts with artist directly (e.g. "Bad Bunny - Topic" or "The Weeknd • Album • ...")
-            // Also handle "Artist - Topic" format
-            val raw = parts[0]
-            if (raw.endsWith(" - Topic")) raw.removeSuffix(" - Topic") else raw
-        }
+        return SongSubtitle.artistOnly(subtitle)
     }
 
     /** Extract duration string (e.g. "1:58") from a YTM subtitle like "Artist • ny2mia • 1:58" */
     private fun extractDurationFromSubtitle(subtitle: String?): String {
-        if (subtitle.isNullOrEmpty()) return ""
-        val parts = subtitle.split(" \u2022 ").map { it.trim() }
-        for (part in parts.asReversed()) {
-            if (part.matches(DURATION_REGEX))
-                return part
-        }
-        return ""
+        return SongSubtitle.parse(subtitle).duration
     }
 
-    /** Build a clean subtitle for search display: artist + duration only (no repeated song name) */
+    /** Standard row subtitle: "artist • album • duration • views" (never the song title). */
     private fun buildCleanSearchSubtitle(track: YouTubeMusicService.TrackResult): String {
-        val artist = extractArtistFromSubtitle(track.subtitle)
-        val duration = extractDurationFromSubtitle(track.subtitle)
-        return when {
-            artist.isNotEmpty() && duration.isNotEmpty() -> "$artist \u2022 $duration"
-            artist.isNotEmpty() -> artist
-            else -> track.subtitle ?: ""
-        }
+        return SongSubtitle.forRow(track.subtitle, track.title, track.duration)
     }
 
     /** Extract play count as a numeric value from subtitle for popularity tiebreaking */
@@ -1583,7 +1571,7 @@ class SearchFragment : Fragment() {
         // Cap scroll area so footer buttons remain visible
         val svScroll = sheet.findViewById<View>(R.id.svSavePlaylistScroll)
         if (svScroll != null) {
-            val maxH = (320 * density).toInt()
+            val maxH = (ctx.resources.displayMetrics.heightPixels * 0.55f).toInt()
             svScroll.layoutParams.height = android.view.ViewGroup.LayoutParams.WRAP_CONTENT
             svScroll.post {
                 if (svScroll.height > maxH) {
@@ -1595,13 +1583,6 @@ class SearchFragment : Fragment() {
         }
 
         val favs = FavoritesPlaylistStore.loadFavorites(ctx)
-        val favUrls = mutableListOf<String>()
-        for (f in favs) {
-            if (!f.imageUrl.isNullOrEmpty() && f.imageUrl !in favUrls) {
-                favUrls.add(f.imageUrl)
-                if (favUrls.size >= 4) break
-            }
-        }
 
         // Favorites row
         run {
@@ -1612,11 +1593,7 @@ class SearchFragment : Fragment() {
             val ivCheck = row.findViewById<ImageView>(R.id.ivSaveCheck)
             tvName.text = FavoritesPlaylistStore.PLAYLIST_TITLE
             tvCount.text = "${favs.size} pistas"
-            if (favUrls.size >= 4) {
-                PlaylistGridArtLoader.load(ivThumb, favUrls, thumbSizePx)
-            } else if (favUrls.isNotEmpty()) {
-                loadArtworkInto(ivThumb, favUrls[0])
-            }
+            FavoritesArt.bindCover(ivThumb)
             val isIn = isTrackInPlaylist(ctx, track.videoId ?: "", FavoritesPlaylistStore.PLAYLIST_ID)
             ivCheck?.visibility = if (isIn) View.VISIBLE else View.GONE
             var checked = isIn
@@ -1689,7 +1666,8 @@ class SearchFragment : Fragment() {
                     lastAddedName = "Música que te gustó"
                 }
             }
-            llList.addView(row)
+            // "Música que te gustó" always first, Favoritos second.
+            llList.addView(row, 0)
         }
 
         // Custom playlists
@@ -1906,7 +1884,9 @@ class SearchFragment : Fragment() {
         val ctx = requireContext()
         val title = track.title?.takeIf { it.isNotEmpty() } ?: "Tema"
         val artist = extractArtistFromSubtitle(track.subtitle)
-        val duration = extractDurationFromSubtitle(track.subtitle).ifEmpty { "--:--" }
+        // Prefer the dedicated duration field (song rows carry it in a fixedColumn); the subtitle
+        // often has no length. Matches extractSearchQueueData so saved favorites keep their duration.
+        val duration = track.duration.ifEmpty { extractDurationFromSubtitle(track.subtitle) }.ifEmpty { "--:--" }
         val imageUrl = track.thumbnailUrl ?: ""
         if (playlistKey == FavoritesPlaylistStore.PLAYLIST_ID) {
             FavoritesPlaylistStore.upsertFavorite(ctx, track.videoId, title, artist, duration, imageUrl)
@@ -2115,6 +2095,33 @@ class SearchFragment : Fragment() {
         rememberRecentSearchQuery(query, track)
     }
 
+    /**
+     * After a search returns, stamp the top result's artwork (and artist) onto this query's recent
+     * entry so it surfaces in — and persists to — the recent-search images carousel. A plain text
+     * search otherwise saves a thumbnail-less entry, leaving the carousel empty even after a
+     * successful cloud hydrate. videoId is intentionally left blank so tapping the image re-runs
+     * the search (recent-search semantics) rather than jumping straight into playback.
+     */
+    private fun attachTopResultArtworkToRecent(query: String) {
+        val top = featuredTrack ?: return
+        val norm = query.trim()
+        if (norm.isEmpty()) return
+        val idx = recentSearchData.indexOfFirst { it.query.equals(norm, ignoreCase = true) }
+        if (idx < 0) return
+        val cur = recentSearchData[idx]
+        // Don't stamp the top result's cover onto an entry that already points at a DIFFERENT played
+        // track (it carries that track's videoId + title). Doing so would show the top-result cover on
+        // a tile that still plays the older track — cover/title/playback all mismatch. Only stamp
+        // query-only entries (no videoId) or the same track.
+        if (cur.videoId.isNotEmpty() && cur.videoId != top.videoId) return
+        val newThumb = top.thumbnailUrl.takeIf { it.isNotEmpty() } ?: cur.thumbnail
+        val newArtist = extractArtistFromSubtitle(top.subtitle).takeIf { it.isNotEmpty() } ?: cur.artist
+        if (newThumb != cur.thumbnail || newArtist != cur.artist) {
+            recentSearchData[idx] = cur.copy(thumbnail = newThumb, artist = newArtist)
+            saveRecentSearchQueries()
+        }
+    }
+
     private fun saveRecentSearchQueries() {
         val array = JSONArray()
         recentSearchData.forEach { search ->
@@ -2152,6 +2159,33 @@ class SearchFragment : Fragment() {
             .addOnFailureListener { Log.e("SearchFragment", "Failed to save recent searches to Firebase", it) }
     }
 
+    /**
+     * Re-runs [loadRecentSearchesFromFirebase] as soon as Firebase auth resolves. On a fresh
+     * install the account picker often outlives this fragment's onViewCreated, so the eager load
+     * bails (not signed in) and recents/images stay empty. This closes that gap without a restart.
+     */
+    private fun registerRecentSearchAuthListener() {
+        if (recentSearchAuthListener != null) return
+        val listener = com.google.firebase.auth.FirebaseAuth.AuthStateListener { auth ->
+            val uid = auth.currentUser?.uid
+            if (uid != null && uid != loadedRecentsForUid && isAdded) {
+                // Account switch: a DIFFERENT account was already loaded. Drop account A's recents
+                // (memory + local pref) BEFORE loading B, so the merge in loadRecentSearchesFromFirebase
+                // doesn't graft A's history onto B and re-upload the mix to B's Firestore. Clear the pref
+                // directly — NOT via saveRecentSearchQueries, which would upload the empty list to B.
+                if (loadedRecentsForUid != null) {
+                    recentSearchData.clear()
+                    context?.getSharedPreferences(PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)?.edit()
+                        ?.remove(PREF_RECENT_SEARCH_DATA)?.apply()
+                    refreshSearchSuggestions(etSearchQuery.text?.toString()?.trim() ?: "")
+                }
+                loadRecentSearchesFromFirebase()
+            }
+        }
+        recentSearchAuthListener = listener
+        com.google.firebase.auth.FirebaseAuth.getInstance().addAuthStateListener(listener)
+    }
+
     private fun loadRecentSearchesFromFirebase() {
         val ctx = context ?: return
         if (!AuthManager.getInstance(ctx).isSignedIn()) return
@@ -2161,6 +2195,9 @@ class SearchFragment : Fragment() {
             .collection("sleppify").document("recent_searches")
             .get()
             .addOnSuccessListener { doc ->
+                // The GET resolved for this uid — don't let the auth listener re-fire it on every
+                // token refresh. (A failed GET leaves this null so the next auth callback retries.)
+                loadedRecentsForUid = uid
                 if (!isAdded || doc == null || !doc.exists()) return@addOnSuccessListener
                 val list = doc.get("searches") as? List<*> ?: return@addOnSuccessListener
                 val parsed = list.mapNotNull { item ->
@@ -2754,6 +2791,10 @@ class SearchFragment : Fragment() {
         suggestionsDebounceRunnable?.let { suggestionsDebounceHandler.removeCallbacks(it) }
         suggestionsJob?.cancel()
         adapter?.shutdown()
+        recentSearchAuthListener?.let {
+            com.google.firebase.auth.FirebaseAuth.getInstance().removeAuthStateListener(it)
+        }
+        recentSearchAuthListener = null
         super.onDestroyView()
     }
 
@@ -2922,7 +2963,7 @@ class SearchFragment : Fragment() {
                 is SuggestionItem.Track -> {
                     (h as TrackViewHolder).apply {
                         title.text = item.track.title
-                        artist.text = item.track.artist
+                        artist.text = SongSubtitle.forRowParts(item.track.artist, item.track.duration)
                         if (LocalFilesStore.isLocalVideoId(item.track.videoId)) {
                             LocalArtworkResolver.loadInto(thumb, item.track.videoId)
                             thumb.visibility = View.VISIBLE
@@ -3141,8 +3182,11 @@ class SearchFragment : Fragment() {
             if (t.videoId.isNullOrEmpty()) continue
             data.ids.add(t.videoId)
             data.titles.add(t.title)
-            data.artists.add(t.subtitle ?: "")
-            data.durations.add("--:--")
+            // Pass the CLEAN artist, not the raw subtitle. The subtitle is a decorated string
+            // ("Canción • Artista • Álbum • 3:20 • 500 M reproducciones") or sometimes just a
+            // duration — feeding it verbatim is why the player showed a garbled artist line.
+            data.artists.add(extractArtistFromSubtitle(t.subtitle))
+            data.durations.add(t.duration.ifEmpty { extractDurationFromSubtitle(t.subtitle) }.ifEmpty { "--:--" })
             data.images.add(t.thumbnailUrl ?: "")
         }
         return data
@@ -3194,15 +3238,17 @@ class SearchFragment : Fragment() {
                     }
 
                     val radioStoreTracks = mutableListOf<RadioHistoryStore.RadioTrack>()
+                    // Persist a clean artist, not the raw baked subtitle: this field resurfaces
+                    // in radio rows, the local track index and the "Con X, Y..." radio labels.
                     radioStoreTracks.add(RadioHistoryStore.RadioTrack(
                         selectedVideoId,
                         track.title.ifEmpty { "Tema" },
-                        track.subtitle ?: "",
+                        SongSubtitle.artistOnly(track.subtitle, track.title),
                         track.thumbnailUrl ?: ""
                     ))
                     for (t in tracks) {
                         if (t.videoId.isNullOrEmpty() || t.videoId == selectedVideoId) continue
-                        radioStoreTracks.add(RadioHistoryStore.RadioTrack(t.videoId, t.title ?: "", t.subtitle ?: "", t.thumbnailUrl ?: ""))
+                        radioStoreTracks.add(RadioHistoryStore.RadioTrack(t.videoId, t.title ?: "", SongSubtitle.artistOnly(t.subtitle, t.title), t.thumbnailUrl ?: ""))
                     }
                     RadioHistoryStore.saveRadio(requireContext(), radioPlaylistId, track.title.ifEmpty { "Tema" }, track.thumbnailUrl ?: "", radioStoreTracks)
                 }

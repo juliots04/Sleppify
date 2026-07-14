@@ -90,53 +90,112 @@ object PlayCountStore {
     }
 
     /**
-     * Aggregates play counts by playlistId and returns top playlists.
+     * Aggregates play counts by playlistId and returns top playlists (most played first).
      * Each returned entry uses the playlist's first track image, the playlist name as title,
      * total play count across all tracks, and the most recent lastPlayedAtMs.
      */
     @JvmStatic
     fun getTopPlaylists(context: Context, limit: Int): List<PlayCountEntry> {
+        val result = aggregatePlaylists(context)
+        result.sortWith(compareByDescending<PlayCountEntry> { it.count }
+            .thenByDescending { it.lastPlayedAtMs })
+        return result.take(limit)
+    }
+
+    /**
+     * Same aggregation as [getTopPlaylists] but ordered by recency (lastPlayedAtMs desc, count as
+     * tiebreak) — "Playlist recientes" means recently played, not most played.
+     */
+    @JvmStatic
+    fun getRecentPlaylists(context: Context, limit: Int): List<PlayCountEntry> {
+        val result = aggregatePlaylists(context)
+        result.sortWith(compareByDescending<PlayCountEntry> { it.lastPlayedAtMs }
+            .thenByDescending { it.count })
+        return result.take(limit)
+    }
+
+    /**
+     * Normalizes a grouping key so the same logical playlist recorded under different id forms
+     * ("VLPL…" vs "PL…", "LL"/"LM" vs "__liked_videos__", a YT-mirror "Favoritos" vs the local
+     * favorites id) collapses into ONE group instead of duplicate cards.
+     */
+    private fun normalizePlaylistKey(playlistId: String, playlistName: String): String {
+        var id = playlistId.trim()
+        // Browse-form ids carry a "VL" prefix over the bare playlist id (VLPL…→PL…, VLLM→LM).
+        if (id.startsWith("VL") && id.length > 2) id = id.substring(2)
+        // Liked-music variants all render/route as the special liked collection.
+        if (id == "LL" || id == "LM" || id == YouTubeMusicService.SPECIAL_LIKED_VIDEOS_ID) {
+            return YouTubeMusicService.SPECIAL_LIKED_VIDEOS_ID
+        }
+        // A remote playlist named exactly like the local Favoritos (e.g. a YT mirror of it) is
+        // the same list for the user — collapse it into the fixed-art local card.
+        if (id != FavoritesPlaylistStore.PLAYLIST_ID &&
+            playlistName.trim().equals(FavoritesPlaylistStore.PLAYLIST_TITLE, ignoreCase = true)
+        ) {
+            return FavoritesPlaylistStore.PLAYLIST_ID
+        }
+        return id
+    }
+
+    private fun aggregatePlaylists(context: Context): MutableList<PlayCountEntry> {
         val entries = loadEntriesMutable(context.applicationContext)
         val byPlaylist = LinkedHashMap<String, MutableList<PlayCountEntry>>()
         for (e in entries) {
-            val pid = e.playlistId
+            if (e.playlistId.isEmpty()) continue
+            val pid = normalizePlaylistKey(e.playlistId, e.playlistName)
             if (pid.isEmpty()) continue
             byPlaylist.getOrPut(pid) { mutableListOf() }.add(e)
         }
         val result = mutableListOf<PlayCountEntry>()
         for ((pid, tracks) in byPlaylist) {
             // Exclude pseudo-playlists that only contain a single song played outside a real playlist
-            // (where the only track's videoId equals the playlistId).
+            // (where the only track's videoId equals the playlistId — checked against the raw id too,
+            // since normalization may have rewritten the group key).
             val uniqueTrackIds = tracks.map { it.videoId }.distinct()
-            if (uniqueTrackIds.size == 1 && uniqueTrackIds[0] == pid) continue
+            if (uniqueTrackIds.size == 1 &&
+                (uniqueTrackIds[0] == pid || tracks.all { it.playlistId == uniqueTrackIds[0] })
+            ) continue
 
             val totalCount = tracks.sumOf { it.count }
             val mostRecent = tracks.maxOf { it.lastPlayedAtMs }
             val bestTrack = tracks.maxByOrNull { it.count } ?: continue
-            val name = if (bestTrack.playlistName.isNotEmpty()) bestTrack.playlistName else "Playlist"
+            // Merged id variants: prefer the local-favorites identity for name/art when present,
+            // otherwise the most-played track's non-blank fields.
+            val localFav = if (pid == FavoritesPlaylistStore.PLAYLIST_ID) {
+                tracks.firstOrNull { it.playlistId == FavoritesPlaylistStore.PLAYLIST_ID }
+            } else null
+            val name = localFav?.playlistName?.takeIf { it.isNotEmpty() }
+                ?: bestTrack.playlistName.takeIf { it.isNotEmpty() }
+                ?: tracks.firstOrNull { it.playlistName.isNotEmpty() }?.playlistName
+                ?: "Playlist"
+            val imageUrl = localFav?.imageUrl?.takeIf { it.isNotEmpty() }
+                ?: bestTrack.imageUrl.takeIf { it.isNotEmpty() }
+                ?: tracks.firstOrNull { it.imageUrl.isNotEmpty() }?.imageUrl
+                ?: ""
             result.add(PlayCountEntry(
                 videoId = pid,
                 title = name,
                 artist = "${tracks.size} canciones",
-                imageUrl = bestTrack.imageUrl,
+                imageUrl = imageUrl,
                 playlistId = pid,
                 playlistName = name,
                 count = totalCount,
                 lastPlayedAtMs = mostRecent
             ))
         }
-        result.sortWith(compareByDescending<PlayCountEntry> { it.count }
-            .thenByDescending { it.lastPlayedAtMs })
-        return result.take(limit)
+        return result
     }
 
     @JvmStatic
     fun getPlaylistTrackImages(context: Context, playlistId: String, limit: Int): List<String> {
         if (playlistId.isEmpty()) return emptyList()
+        // Compare normalized keys on both sides: the aggregated playlist cards carry the
+        // normalized id, while tracks may have been recorded under a raw variant ("VLPL…", "LM").
+        val target = normalizePlaylistKey(playlistId, "")
         val entries = loadEntriesMutable(context.applicationContext)
         val seen = mutableSetOf<String>()
         val urls = mutableListOf<String>()
-        entries.filter { it.playlistId == playlistId && it.imageUrl.isNotEmpty() }
+        entries.filter { it.imageUrl.isNotEmpty() && normalizePlaylistKey(it.playlistId, it.playlistName) == target }
             .sortedByDescending { it.count }
             .forEach { e ->
                 if (seen.add(e.imageUrl)) {

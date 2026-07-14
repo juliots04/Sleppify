@@ -15,7 +15,6 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.ViewGroup
-import android.graphics.drawable.GradientDrawable
 import android.util.Log
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -52,17 +51,21 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         private const val PREF_LAST_YOUTUBE_WEB_COOKIE = AppConstants.PREF_LAST_YOUTUBE_WEB_COOKIE
         private const val PREFS_STREAMING_CACHE = AppConstants.PREFS_STREAMING_CACHE
         private const val PREFS_RADIO_CACHE = "sleppify_radio_ui_cache"
+        // Bumped when the radio card design/selection logic changes so stale persisted subtitle
+        // texts and side-url picks (computed with the old logic) are dropped once and recomputed.
+        private const val RADIO_UI_VERSION = 2
         private const val SHORTCUTS_PER_PAGE = 9
         private const val SHORTCUTS_MAX_PAGES = 3
         // Partial-bind payload: refresh only the play/equalizer icon without reloading artwork or
         // re-creating click listeners (avoids the flash/jank when tapping a shortcut).
         private const val PAYLOAD_EQ = "eq"
-        // Matches m:ss or h:mm:ss (1-2 leading digits): "2:12", "12:03", "1:02:33".
-        private val DURATION_REGEX = Regex("""^\d{1,2}(:\d{2}){1,2}$""")
         // RecyclerView.mTouchSlop is the same field for every instance — reflect it once, not per carousel.
         private var cachedTouchSlopField: java.lang.reflect.Field? = null
         private const val COVERS_PER_PAGE = 4
         private const val RECOMMENDED_LIMIT = 12
+        // Cupo máximo de playlists de la biblioteca propia en "recomendadas" (el resto son
+        // generadas por YT / la comunidad, que es lo que el usuario prefiere ver).
+        private const val RECOMMENDED_OWN_QUOTA = 2
         private const val COVERS_CACHE_TTL_MS = 12L * 60 * 60 * 1000 // 12 hours
         // Last-resort: if no section produced content within this window on cold start, reveal the
         // module anyway so the loading spinner never hangs (e.g. brand-new account with no data).
@@ -78,20 +81,16 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         private val SHARED_ROUNDED_16 = RoundedCorners(16)
     }
 
-    // Brand header views
+    // Brand header views. The header is a single pinned view (fixed + floating at once): it sits
+    // in its natural top position at rest and quick-returns via translationY while scrolled.
     private var llFragBrandHeader: View? = null
     private var tvFragBrandTitle: TextView? = null
     private var btnFragHeaderSearch: ImageView? = null
     private var btnFragSignIn: MaterialButton? = null
     private var btnFragProfilePhoto: ShapeableImageView? = null
     private var ivShortcutsProfilePhoto: ShapeableImageView? = null
-
-    // Floating quick-return header (pinned clone of the brand header; slides in on scroll-up)
-    private var llFloatingBrandHeader: View? = null
-    private var tvFloatBrandTitle: TextView? = null
-    private var btnFloatHeaderSearch: ImageView? = null
-    private var btnFloatProfilePhoto: ShapeableImageView? = null
-    private var floatingHeaderShown = false
+    // Mutated on scroll: transparent at rest over the backdrop, solid while the header floats.
+    private var headerBgDrawable: android.graphics.drawable.ColorDrawable? = null
 
     // Backdrop
     private var ivHomeBackdrop: ImageView? = null
@@ -114,9 +113,17 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
     private val radioDominantColorCache = HashMap<String, Int>()
     private val radioArtistTextCache = HashMap<String, String>()
     private val radioSideUrlsCache = HashMap<String, Pair<String, String>>()
+    // Normalized (lowercase) names the user knows: followed library artists (minus unfollow
+    // tombstones) + the artists they actually play. Used to bias the radio subtitle ("Con X, Y, Z
+    // y más") and the side thumbnails toward familiar artists instead of unknown ones.
+    private val knownArtistKeys = HashSet<String>()
     // Radio card width in px == the composite art render size. Computed once (used by
     // onCreateViewHolder and RadioArtComposer so the circle geometry maps 1:1 to the display).
-    private val radioCardWidthPx: Int by lazy { (resources.displayMetrics.widthPixels * 0.46).toInt() }
+    // Based on the SHORT screen axis so rotation/split-screen never stretches the squares.
+    private val radioCardWidthPx: Int by lazy {
+        val dm = resources.displayMetrics
+        (minOf(dm.widthPixels, dm.heightPixels) * 0.46).toInt()
+    }
 
     // Playlists recientes section
     private var llPlaylistsHeader: View? = null
@@ -124,6 +131,12 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
     private var llRecommendedHeader: View? = null
     private var rvRecommended: RecyclerView? = null
     private val recommendedEntries = mutableListOf<YouTubeMusicService.MixResult>()
+    private var llRecapsHeader: View? = null
+    private var rvRecaps: RecyclerView? = null
+    private val recapEntries = mutableListOf<YouTubeMusicService.MixResult>()
+    private var llNewFavesHeader: View? = null
+    private var rvNewFaves: RecyclerView? = null
+    private val newFavesEntries = mutableListOf<YouTubeMusicService.MixResult>()
     private val playlistEntries = mutableListOf<PlayCountStore.PlayCountEntry>()
 
     // State
@@ -160,12 +173,15 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
     // Cold-start skeleton placeholders (3x3 grid + carousel rows). Shown immediately on a cold
     // start so the home never renders empty, and hidden per-section as each section's data lands.
-    // Their heights match the real content so swapping in the real views causes no layout jump.
+    // Their geometry matches the real content so swapping in the real views causes no layout jump;
+    // the loading effect is the self-animating ShimmerFrameLayout each skeleton layout is wrapped in.
     private var llShortcutsSkeleton: View? = null
     private var llPlaylistsSkeleton: View? = null
     private var llCoversSkeleton: View? = null
     private var llRadiosSkeleton: View? = null
-    private var homeSkeletonPulse: android.animation.ValueAnimator? = null
+    private var llRecommendedSkeleton: View? = null
+    private var llRecapsSkeleton: View? = null
+    private var llNewFavesSkeleton: View? = null
 
     // Currently playing shortcut
     private var currentlyPlayingShortcutVideoId = ""
@@ -184,36 +200,13 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         val images = ArrayList<String>()
     }
 
-    private data class TrackMeta(val artist: String, val duration: String)
-
-    /**
-     * YouTube Music crams "artist • album • duration" (album often == the song title) into one
-     * subtitle string. Split on the bullet, drop the segment that is exactly the track title,
-     * pull the duration out by shape, and treat the rest as the artist. Radio/shortcut tracks
-     * carry an artist-only subtitle (no bullet/duration) so they parse back unchanged.
-     */
-    private fun parseTrackMeta(rawSubtitle: String?, title: String?): TrackMeta {
-        val raw = rawSubtitle?.trim().orEmpty()
-        if (raw.isEmpty()) return TrackMeta("", "")
-        val normTitle = title?.trim().orEmpty()
-        var duration = ""
-        val artistParts = mutableListOf<String>()
-        for (seg in raw.split("•").map { it.trim() }) {
-            if (seg.isEmpty()) continue
-            when {
-                DURATION_REGEX.matches(seg) -> duration = seg
-                normTitle.isNotEmpty() && seg.equals(normTitle, ignoreCase = true) -> { /* drop repeated title */ }
-                else -> artistParts.add(seg)
-            }
-        }
-        return TrackMeta(artistParts.joinToString(" • "), duration)
-    }
-
     private fun extractQueueData(tracks: List<YouTubeMusicService.TrackResult>): QueueData {
         val data = QueueData()
         for (t in tracks) {
             if (t.videoId.isNullOrEmpty()) continue
-            val meta = parseTrackMeta(t.subtitle, t.title)
+            // The artist fed to the player/miniplayer queue must be ONLY the artist name
+            // (no album/views residue) — nothing but the artist may show there.
+            val meta = SongSubtitle.parse(t.subtitle, t.title, t.duration)
             data.ids.add(t.videoId)
             data.titles.add(t.title)
             data.artists.add(meta.artist)
@@ -268,8 +261,10 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 val target = shortcutsHeader.top.toFloat()
                 overlay.alpha = if (target <= 0f) 1f else (scrollY / target).coerceIn(0f, 1f)
             }
-            updateFloatingHeaderOnScroll(scrollY, scrollY - oldScrollY)
+            updateHeaderOnScroll(scrollY, scrollY - oldScrollY)
         })
+        // Seed the header/background state once laid out (covers a restored scroll position).
+        nsv?.post { if (isAdded && nsv != null) updateHeaderOnScroll(nsv.scrollY, 0) }
 
         setupShortcuts()
         setupCovers()
@@ -284,10 +279,20 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         rvPlaylists = view.findViewById(R.id.rvPlaylists)
         setupPlaylists()
 
+        llNewFavesHeader = view.findViewById(R.id.llNewFavesHeader)
+        rvNewFaves = view.findViewById(R.id.rvNewFaves)
+        setupNewFaves()
+        loadCachedNewFaves()
+
         llRecommendedHeader = view.findViewById(R.id.llRecommendedHeader)
         rvRecommended = view.findViewById(R.id.rvRecommended)
         setupRecommended()
         loadCachedRecommended()
+
+        llRecapsHeader = view.findViewById(R.id.llRecapsHeader)
+        rvRecaps = view.findViewById(R.id.rvRecaps)
+        setupRecaps()
+        loadCachedRecaps()
 
         setupHomeSkeletons(view)
 
@@ -297,15 +302,16 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         }, COLD_START_REVEAL_SAFETY_MS)
 
         // Safety-net: dismiss any skeleton whose section never produced data.
-        handler.postDelayed({
-            if (isAdded) dismissAllHomeSkeletons()
-        }, HOME_SKELETON_SAFETY_MS)
+        armHomeSkeletonSafetyTimer()
     }
 
     override fun onResume() {
         super.onResume()
         PlaybackEventBus.addListener(this)
         if (isHidden) return
+        // Re-arm the skeleton safety net paused in onPause (e.g. while the login webview
+        // covered the activity) so covered time never consumes the skeleton budget invisibly.
+        if (hasVisibleHomeSkeleton()) armHomeSkeletonSafetyTimer()
         vpShortcuts?.setCurrentItem(0, false)
         vpCovers?.setCurrentItem(0, false)
         // Defer the carousel rebuilds past the resume frame: the retained views already show
@@ -327,6 +333,9 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         // Stop reacting to playback events while Principal is hidden/backgrounded: its only handler
         // refreshes this fragment's (now-invisible) EQ icons. onResume re-registers when shown again.
         PlaybackEventBus.removeListener(this)
+        // Pause the skeleton safety timer: it used to keep counting behind the login webview and
+        // dismissed all skeletons invisibly, which is why the post-login home showed none.
+        handler.removeCallbacks(skeletonSafetyDismiss)
     }
 
     override fun onDestroyView() {
@@ -346,12 +355,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         btnFragSignIn = null
         btnFragProfilePhoto = null
         ivShortcutsProfilePhoto = null
-        llFloatingBrandHeader?.animate()?.cancel()
-        llFloatingBrandHeader = null
-        tvFloatBrandTitle = null
-        btnFloatHeaderSearch = null
-        btnFloatProfilePhoto = null
-        floatingHeaderShown = false
+        headerBgDrawable = null
         cachedSongPlayer = null
         lastCachedSongPlayerTime = 0L
         llCoversHeader = null
@@ -365,11 +369,17 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         rvPlaylists = null
         llRecommendedHeader = null
         rvRecommended = null
-        stopHomeSkeletonPulse()
+        llRecapsHeader = null
+        rvRecaps = null
+        llNewFavesHeader = null
+        rvNewFaves = null
         llShortcutsSkeleton = null
         llPlaylistsSkeleton = null
         llCoversSkeleton = null
         llRadiosSkeleton = null
+        llRecommendedSkeleton = null
+        llRecapsSkeleton = null
+        llNewFavesSkeleton = null
     }
 
     override fun onHiddenChanged(hidden: Boolean) {
@@ -396,7 +406,26 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                     refreshPlaylists()
                 }
             }, 120)
+        } else {
+            // Al SALIR de Principal (cambio de módulo o entrar a un detalle — MainActivity oculta el
+            // fragment con hide(), lo que dispara esto): deja todos los carruseles en el primer item
+            // para que al volver empiecen desde el inicio, no donde se quedó el scroll.
+            resetCarouselsToStart()
         }
+    }
+
+    /** Devuelve todos los carruseles horizontales + pagers + el scroll vertical al inicio. */
+    private fun resetCarouselsToStart() {
+        (rvRadios?.layoutManager as? LinearLayoutManager)?.scrollToPositionWithOffset(0, 0)
+        (rvPlaylists?.layoutManager as? LinearLayoutManager)?.scrollToPositionWithOffset(0, 0)
+        (rvRecommended?.layoutManager as? LinearLayoutManager)?.scrollToPositionWithOffset(0, 0)
+        (rvRecaps?.layoutManager as? LinearLayoutManager)?.scrollToPositionWithOffset(0, 0)
+        (rvNewFaves?.layoutManager as? LinearLayoutManager)?.scrollToPositionWithOffset(0, 0)
+        // Pagers al primer item (los puntos siguen vía TabLayoutMediator).
+        vpShortcuts?.setCurrentItem(0, false)
+        vpCovers?.setCurrentItem(0, false)
+        // Scroll vertical exterior arriba del todo.
+        view?.findViewById<androidx.core.widget.NestedScrollView>(R.id.nsvPrincipalContent)?.scrollTo(0, 0)
     }
 
     override fun onDestroy() {
@@ -413,35 +442,37 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         btnFragSignIn = root.findViewById(R.id.btnFragSignIn)
         btnFragProfilePhoto = root.findViewById(R.id.btnFragProfilePhoto)
         ivShortcutsProfilePhoto = root.findViewById(R.id.ivShortcutsProfilePhoto)
-        llFloatingBrandHeader = root.findViewById(R.id.llFloatingBrandHeader)
-        tvFloatBrandTitle = root.findViewById(R.id.tvFloatBrandTitle)
-        btnFloatHeaderSearch = root.findViewById(R.id.btnFloatHeaderSearch)
-        btnFloatProfilePhoto = root.findViewById(R.id.btnFloatProfilePhoto)
-        floatingHeaderShown = false
 
-        listOfNotNull(llFragBrandHeader, llFloatingBrandHeader).forEach { header ->
+        llFragBrandHeader?.let { header ->
             ViewCompat.setOnApplyWindowInsetsListener(header) { v, insets ->
                 val statusBarHeight = insets.getInsets(WindowInsetsCompat.Type.systemBars()).top
                 v.setPadding(v.paddingLeft, statusBarHeight, v.paddingRight, v.paddingBottom)
                 insets
             }
             header.requestApplyInsets()
+
+            // Background starts fully transparent (header rests over the backdrop) and turns solid
+            // via updateHeaderOnScroll() as content scrolls underneath.
+            headerBgDrawable = android.graphics.drawable.ColorDrawable(
+                ContextCompat.getColor(requireContext(), R.color.surface_dark)
+            ).apply { alpha = 0 }
+            header.background = headerBgDrawable
+
+            // The header is out of the scroll flow, so a spacer reserves its height at the top of
+            // the content column. Sync it to the measured height (insets can change it).
+            val spacer = root.findViewById<View>(R.id.vHeaderSpacer)
+            header.addOnLayoutChangeListener { v, _, top, _, bottom, _, _, _, _ ->
+                val h = bottom - top
+                if (h > 0 && spacer != null && spacer.layoutParams.height != h) {
+                    spacer.layoutParams = spacer.layoutParams.apply { height = h }
+                }
+            }
         }
-        // Start the floating clone parked fully above the top edge so its first appearance slides
-        // down into view (translationY) rather than popping in at rest.
-        llFloatingBrandHeader?.let { fh -> fh.post { fh.translationY = -fh.height.toFloat() } }
 
         styleBrandTitle(tvFragBrandTitle)
-        styleBrandTitle(tvFloatBrandTitle)
 
         btnFragHeaderSearch?.setOnClickListener {
             (activity as? MainActivity)?.openSearchFragment()
-        }
-        btnFloatHeaderSearch?.setOnClickListener {
-            (activity as? MainActivity)?.openSearchFragment()
-        }
-        btnFloatProfilePhoto?.setOnClickListener {
-            (activity as? MainActivity)?.enterSettings()
         }
 
         btnFragSignIn?.setOnClickListener {
@@ -496,39 +527,32 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         tv.compoundDrawablePadding = (8 * density).toInt()
     }
 
-    // ========== Floating quick-return header ==========
+    // ========== Pinned quick-return header ==========
 
     /**
-     * Quick-return floating header (YT-Music style): the pinned clone of the in-flow brand header
-     * TRACKS the scroll via translationY — scrolling up slides it DOWN into view from the top edge,
-     * scrolling down slides it back UP out of view. No fade; it follows the finger as you scroll.
-     * Near the top it is driven fully off-screen (position-based) so a scroll all the way up ends
-     * with only the real in-flow header showing — no overlap, no flicker against the status bar.
+     * Single pinned header that is fixed and floating at once (YT-Music style, one view). The
+     * offset TRACKS the scroll delta 1:1 — scrolling down slides it up out of view, scrolling up
+     * slides it back down into view, following the finger. Near the top an in-flow bound
+     * (offset >= -scrollY) makes it behave exactly like an in-flow header: it settles into its
+     * natural top position with NO show/hide animation or view swap — at scrollY 0 it simply IS
+     * the resting header. Correct under programmatic scrollTo(0,0) jumps too (dy is huge, the
+     * bound forces offset to 0 instantly).
      */
-    private fun updateFloatingHeaderOnScroll(scrollY: Int, dy: Int) {
-        val header = llFloatingBrandHeader ?: return
+    private fun updateHeaderOnScroll(scrollY: Int, dy: Int) {
+        val header = llFragBrandHeader ?: return
         val h = header.height
         if (h <= 0) return
         val hf = h.toFloat()
 
-        // Delta-driven offset: scroll up (dy<0) moves toward 0 (slides down into view); scroll down
-        // (dy>0) moves toward -height (slides up out of view). translationY tracks the scroll amount.
         var offset = header.translationY - dy
-
-        // Position clamp near the top: ramp the header fully off-screen as we approach the in-flow
-        // header so it never overlaps the real header / status bar at rest.
-        val revealPoint = (llFragBrandHeader?.bottom ?: 0).toFloat()
-        val topCap = when {
-            scrollY <= revealPoint -> -hf
-            scrollY >= revealPoint + hf -> 0f
-            else -> -(revealPoint + hf - scrollY)
-        }
-
-        offset = offset.coerceIn(-hf, 0f).coerceAtMost(topCap)
+        offset = offset.coerceIn(-hf, 0f).coerceAtLeast(-scrollY.toFloat())
         header.translationY = offset
-        val shown = offset > -hf + 0.5f
-        header.visibility = if (shown) View.VISIBLE else View.INVISIBLE
-        floatingHeaderShown = offset > -hf / 2f
+
+        // Transparent at rest (over the backdrop), solid while detached/floating. The ramp spans
+        // the first header-height of scroll — while the header is still "attached" — so by the
+        // time it can float over content it is already opaque, and scrolling back to the top
+        // fades it back out to reveal the backdrop.
+        headerBgDrawable?.alpha = ((scrollY / hf).coerceIn(0f, 1f) * 255f).toInt()
     }
 
     fun refreshFragHeaderProfilePhoto() {
@@ -543,9 +567,8 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         if (signedIn) {
             btnFragSignIn?.visibility = View.GONE
             btnFragProfilePhoto?.visibility = View.VISIBLE
-            btnFloatProfilePhoto?.visibility = View.VISIBLE
             if (photoUri != null) {
-                listOfNotNull(btnFragProfilePhoto, btnFloatProfilePhoto, ivShortcutsProfilePhoto).forEach { iv ->
+                listOfNotNull(btnFragProfilePhoto, ivShortcutsProfilePhoto).forEach { iv ->
                     Glide.with(this)
                         .load(photoUri)
                         .diskCacheStrategy(DiskCacheStrategy.ALL)
@@ -553,17 +576,15 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                         .into(iv)
                 }
             } else {
-                btnFragProfilePhoto?.setImageResource(android.R.drawable.ic_menu_myplaces)
-                btnFloatProfilePhoto?.setImageResource(android.R.drawable.ic_menu_myplaces)
-                ivShortcutsProfilePhoto?.setImageResource(android.R.drawable.ic_menu_myplaces)
+                // Sin foto aún (recién logueado, URL no cacheada): vacío, nunca un placeholder.
+                btnFragProfilePhoto?.setImageDrawable(null)
+                ivShortcutsProfilePhoto?.setImageDrawable(null)
             }
         } else {
             btnFragProfilePhoto?.visibility = View.GONE
             btnFragProfilePhoto?.setImageDrawable(null)
-            btnFloatProfilePhoto?.visibility = View.GONE
-            btnFloatProfilePhoto?.setImageDrawable(null)
             btnFragSignIn?.visibility = View.VISIBLE
-            ivShortcutsProfilePhoto?.setImageResource(android.R.drawable.ic_menu_myplaces)
+            ivShortcutsProfilePhoto?.setImageDrawable(null)
         }
     }
 
@@ -738,9 +759,16 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                     it.visibility = if (pageCount > 1) View.VISIBLE else View.GONE
                 }
                 updateBackdropImage()
-                // Grid data landed: swap the skeleton for the real pager (same square height, no jump).
-                vpShortcuts?.visibility = View.VISIBLE
-                hideHomeSkeleton(llShortcutsSkeleton)
+                if (shortcutEntries.isNotEmpty()) {
+                    // Grid data landed: swap the skeleton for the real pager (same square height, no jump).
+                    vpShortcuts?.visibility = View.VISIBLE
+                    hideHomeSkeleton(llShortcutsSkeleton)
+                } else if (llShortcutsSkeleton?.visibility != View.VISIBLE) {
+                    // Warm empty state (skeleton already dismissed): keep the pager visible.
+                    vpShortcuts?.visibility = View.VISIBLE
+                }
+                // Empty on fresh install is NOT terminal — cloud hydration lands seconds later,
+                // so the skeleton keeps pulsing; the safety timer ends genuinely-empty accounts.
                 revealAfterFirstContentPass()
             }
         }
@@ -783,14 +811,40 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         llPlaylistsSkeleton = root.findViewById(R.id.llPlaylistsSkeleton)
         llCoversSkeleton = root.findViewById(R.id.llCoversSkeleton)
         llRadiosSkeleton = root.findViewById(R.id.llRadiosSkeleton)
+        llRecommendedSkeleton = root.findViewById(R.id.llRecommendedSkeleton)
+        llRecapsSkeleton = root.findViewById(R.id.llRecapsSkeleton)
+        llNewFavesSkeleton = root.findViewById(R.id.llNewFavesSkeleton)
 
         // Grid skeleton is a square that must match vpShortcuts (whose height is set to screenWidth).
         val screenWidth = resources.displayMetrics.widthPixels
         llShortcutsSkeleton?.let { it.layoutParams = it.layoutParams.apply { height = screenWidth } }
+        // The real grid content is top-aligned inside the square pager with 16dp page padding per
+        // side, so its cells are (screenWidth - 32dp)/3 squares. Size the inner grid to that height
+        // (top-aligned in the shimmer frame) so the skeleton cells are square like the real ones.
+        (llShortcutsSkeleton as? ViewGroup)?.getChildAt(0)?.let { grid ->
+            val gridHeight = screenWidth - (32 * resources.displayMetrics.density).toInt()
+            grid.layoutParams = grid.layoutParams.apply { height = gridHeight }
+        }
         // Carousel cards are 46% of screen width (== radioCardWidthPx), same as the real cards.
         sizeHomeSkeletonCards(llPlaylistsSkeleton)
         sizeHomeSkeletonCards(llRadiosSkeleton)
+        sizeHomeSkeletonCards(llRecommendedSkeleton)
+        sizeHomeSkeletonCards(llRecapsSkeleton)
+        sizeHomeSkeletonCards(llNewFavesSkeleton)
 
+        if (showHomeSkeletonsForEmptySections()) {
+            // Double-post so the skeletons are laid out before the spinner fades to reveal them.
+            root.post { root.post { if (isAdded) revealAfterFirstContentPass(force = true) } }
+        }
+    }
+
+    /**
+     * Shows the skeleton of every section that currently has no data and re-arms the safety
+     * dismiss. Sections that already render content are untouched (no skeleton flash). Reused
+     * by refreshAllContent() so the post-login / cloud-hydration repopulate has skeletons again
+     * — before, nothing ever re-showed them after the initial onViewCreated pass.
+     */
+    private fun showHomeSkeletonsForEmptySections(): Boolean {
         var anyShown = false
         if (shortcutEntries.isEmpty()) {
             llShortcutsSkeleton?.visibility = View.VISIBLE
@@ -800,13 +854,31 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         if (playlistEntries.isEmpty()) { llPlaylistsSkeleton?.visibility = View.VISIBLE; anyShown = true }
         if (coversResults.isEmpty()) { llCoversSkeleton?.visibility = View.VISIBLE; anyShown = true }
         if (radioEntries.isEmpty()) { llRadiosSkeleton?.visibility = View.VISIBLE; anyShown = true }
-
-        if (anyShown) {
-            startHomeSkeletonPulse()
-            // Double-post so the skeletons are laid out before the spinner fades to reveal them.
-            root.post { root.post { if (isAdded) revealAfterFirstContentPass(force = true) } }
-        }
+        if (recommendedEntries.isEmpty()) { llRecommendedSkeleton?.visibility = View.VISIBLE; anyShown = true }
+        if (anyShown) armHomeSkeletonSafetyTimer()
+        return anyShown
     }
+
+    private val skeletonSafetyDismiss = Runnable { if (isAdded) dismissAllHomeSkeletons() }
+
+    /**
+     * (Re)arms the safety net that ends any skeleton whose section never produced data. Re-armed
+     * on every refresh trigger (login result, cloud hydration) and paused in onPause so time
+     * covered by another activity doesn't consume the budget invisibly.
+     */
+    private fun armHomeSkeletonSafetyTimer() {
+        handler.removeCallbacks(skeletonSafetyDismiss)
+        handler.postDelayed(skeletonSafetyDismiss, HOME_SKELETON_SAFETY_MS)
+    }
+
+    private fun hasVisibleHomeSkeleton(): Boolean =
+        llShortcutsSkeleton?.visibility == View.VISIBLE ||
+            llPlaylistsSkeleton?.visibility == View.VISIBLE ||
+            llCoversSkeleton?.visibility == View.VISIBLE ||
+            llRadiosSkeleton?.visibility == View.VISIBLE ||
+            llRecommendedSkeleton?.visibility == View.VISIBLE ||
+            llRecapsSkeleton?.visibility == View.VISIBLE ||
+            llNewFavesSkeleton?.visibility == View.VISIBLE
 
     private fun sizeHomeSkeletonCards(row: View?) {
         row ?: return
@@ -818,46 +890,31 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         }
     }
 
-    private fun startHomeSkeletonPulse() {
-        stopHomeSkeletonPulse()
-        val anim = android.animation.ValueAnimator.ofFloat(1f, 0.4f)
-        anim.duration = 650L
-        anim.repeatMode = android.animation.ValueAnimator.REVERSE
-        anim.repeatCount = android.animation.ValueAnimator.INFINITE
-        anim.interpolator = android.view.animation.AccelerateDecelerateInterpolator()
-        anim.addUpdateListener { a ->
-            val alpha = a.animatedValue as Float
-            // Only pulse skeletons that are still shown; a hidden one keeps its reset alpha of 1f.
-            llShortcutsSkeleton?.let { if (it.visibility == View.VISIBLE) it.alpha = alpha }
-            llPlaylistsSkeleton?.let { if (it.visibility == View.VISIBLE) it.alpha = alpha }
-            llCoversSkeleton?.let { if (it.visibility == View.VISIBLE) it.alpha = alpha }
-            llRadiosSkeleton?.let { if (it.visibility == View.VISIBLE) it.alpha = alpha }
-        }
-        homeSkeletonPulse = anim
-        anim.start()
-    }
-
-    private fun stopHomeSkeletonPulse() {
-        homeSkeletonPulse?.cancel()
-        homeSkeletonPulse = null
+    /**
+     * Every home carousel card is EXACTLY radioCardWidthPx wide (a perfect 1:1 square regardless
+     * of screen shape). The item layouts no longer carry paddingHorizontal — the 6dp separation
+     * lives here as layout margins so the square equals the item width pixel-for-pixel.
+     */
+    private fun applyCarouselCardLayout(view: View) {
+        val margin = (6 * resources.displayMetrics.density).toInt()
+        val lp = (view.layoutParams as? ViewGroup.MarginLayoutParams)
+            ?: ViewGroup.MarginLayoutParams(radioCardWidthPx, ViewGroup.LayoutParams.WRAP_CONTENT)
+        lp.width = radioCardWidthPx
+        lp.height = ViewGroup.LayoutParams.WRAP_CONTENT
+        lp.marginStart = margin
+        lp.marginEnd = margin
+        view.layoutParams = lp
     }
 
     /**
-     * Hide one section's skeleton once its data pass has completed. Instant (not animated) so the
-     * pulse animator — which only writes to VISIBLE skeletons — can never fight the fade. Stops the
-     * pulse once every skeleton is gone.
+     * Hide one section's skeleton once its data pass has completed. Instant (not animated); the
+     * shimmer stops by itself when the view is GONE.
      */
     private fun hideHomeSkeleton(skeleton: View?) {
         skeleton ?: return
         if (skeleton.visibility == View.GONE) return
         skeleton.visibility = View.GONE
-        skeleton.alpha = 1f
-        if (noHomeSkeletonVisible()) stopHomeSkeletonPulse()
     }
-
-    private fun noHomeSkeletonVisible(): Boolean =
-        listOf(llShortcutsSkeleton, llPlaylistsSkeleton, llCoversSkeleton, llRadiosSkeleton)
-            .none { it?.visibility == View.VISIBLE }
 
     /** Safety-net: collapse any skeleton whose section never loaded (e.g. covers when signed out). */
     private fun dismissAllHomeSkeletons() {
@@ -867,6 +924,9 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         hideHomeSkeleton(llPlaylistsSkeleton)
         hideHomeSkeleton(llCoversSkeleton)
         hideHomeSkeleton(llRadiosSkeleton)
+        hideHomeSkeleton(llRecommendedSkeleton)
+        hideHomeSkeleton(llRecapsSkeleton)
+        hideHomeSkeleton(llNewFavesSkeleton)
     }
 
     private fun fillShortcutsFromHistory(appContext: Context, existing: MutableList<PlayCountStore.PlayCountEntry>, totalNeeded: Int) {
@@ -912,8 +972,11 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         // Callable from async callbacks (e.g. requireAuth success) — guard before requireContext.
         if (!isAdded) return
         val now = System.currentTimeMillis()
-        // Use persisted timestamp for 12h TTL check (survives process death)
-        if (!force && coversResults.isNotEmpty()) {
+        // Use persisted timestamp for 12h TTL check (survives process death). The persisted
+        // timestamp answers "is the cache fresh?" even while the async cache read from
+        // loadCachedCovers() hasn't landed yet — gating on coversResults.isNotEmpty() here used
+        // to let a cold-start race trigger a redundant network fetch over a fresh cache.
+        if (!force) {
             val cachedAt = if (lastCoversNetworkFetchTimeMs > 0L) lastCoversNetworkFetchTimeMs
             else requireContext().getSharedPreferences(PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
                 .getLong("home_covers_updated_at", 0L)
@@ -972,6 +1035,18 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                     override fun onSuccess(tracks: List<YouTubeMusicService.TrackResult>) {
                         if (!isAdded) return
                         lastCoversNetworkFetchTimeMs = System.currentTimeMillis()
+                        // If the fetch returned the same tracks already on screen, refresh the
+                        // timestamp silently — swapping equal content (reshuffled) made the section
+                        // visibly "refresh itself" right after opening the app.
+                        val newIds = tracks.mapTo(HashSet()) { it.videoId ?: "" }
+                        val currentIds = coversResults.mapTo(HashSet()) { it.videoId ?: "" }
+                        if (newIds == currentIds && coversResults.isNotEmpty()) {
+                            requireContext().getSharedPreferences(PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
+                                .edit()
+                                .putLong("home_covers_updated_at", lastCoversNetworkFetchTimeMs)
+                                .apply()
+                            return
+                        }
                         coversResults.clear()
                         coversResults.addAll(tracks.shuffled())
                         cacheCovers(coversResults)
@@ -1059,15 +1134,17 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                     }
 
                     val radioStoreTracks = mutableListOf<RadioHistoryStore.RadioTrack>()
+                    // Persist a clean artist, not the raw baked subtitle: this field resurfaces
+                    // in radio rows, the local track index and the "Con X, Y..." radio labels.
                     radioStoreTracks.add(RadioHistoryStore.RadioTrack(
                         selectedVideoId,
                         track.title.ifEmpty { "Tema" },
-                        track.subtitle ?: "",
+                        SongSubtitle.artistOnly(track.subtitle, track.title),
                         track.thumbnailUrl ?: ""
                     ))
                     for (t in tracks) {
                         if (t.videoId.isNullOrEmpty() || t.videoId == selectedVideoId) continue
-                        radioStoreTracks.add(RadioHistoryStore.RadioTrack(t.videoId, t.title ?: "", t.subtitle ?: "", t.thumbnailUrl ?: ""))
+                        radioStoreTracks.add(RadioHistoryStore.RadioTrack(t.videoId, t.title ?: "", SongSubtitle.artistOnly(t.subtitle, t.title), t.thumbnailUrl ?: ""))
                     }
                     RadioHistoryStore.saveRadio(requireContext(), radioPlaylistId, track.title.ifEmpty { "Tema" }, track.thumbnailUrl ?: "", radioStoreTracks)
                 }
@@ -1076,40 +1153,74 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         }
     }
 
-    private fun openPlaylistDetailFromPrincipal(playlistId: String, playlistName: String?, thumbnailUrl: String?) {
+    private fun openPlaylistDetailFromPrincipal(
+        playlistId: String,
+        playlistName: String?,
+        thumbnailUrl: String?,
+        params: String = "",
+        // ART_HINT_SINGLE for cards that always show ONE YT cover (recomendadas/Recaps + recap rows):
+        // the detail then clones that exact cover instead of synthesizing a 2x2 / radio composite.
+        artHint: String = ""
+    ) {
         if (!isAdded || parentFragmentManager.isStateSaved) return
-
-        val prefs = requireContext().getSharedPreferences(PREFS_PLAYER_STATE, Activity.MODE_PRIVATE)
-        val accessToken = prefs.getString("stream_last_youtube_access_token", "") ?: ""
-
-        val detailFragment = PlaylistDetailFragment.newInstance(
+        // Delegate to the shared launcher: id normalization, radio-id/title canonicalization
+        // (home radios arrive as "X Radio" — now stripped), overlay + top-bar hide, and the
+        // remove-existing + add + addToBackStack transaction all live in one place now.
+        PlaylistDetailLauncher.open(
+            activity,
+            parentFragmentManager,
             playlistId,
             if (playlistName.isNullOrEmpty()) "Playlist" else playlistName,
-            "",
+            ""/* subtitle: home never has one */,
             thumbnailUrl ?: "",
-            accessToken
+            params = params,
+            artHint = artHint
         )
-
-        (activity as? MainActivity)?.let {
-            it.showModuleLoadingOverlay()
-            it.hideTopAppBarForPlaylistDetail()
-        }
-
-        val existing = parentFragmentManager.findFragmentByTag("playlist_detail")
-        parentFragmentManager.beginTransaction()
-            .setReorderingAllowed(true)
-            .apply { if (existing != null && existing.isAdded) remove(existing) }
-            .add(R.id.fragmentContainer, detailFragment, "playlist_detail")
-            .addToBackStack("playlist_detail")
-            .commit()
     }
+
+    /**
+     * True si el título corresponde a un "Recap" generado por YT Music (resumen periódico de
+     * escucha). Los recaps traen SIEMPRE su propia portada única generada por YT, así que se
+     * muestran como una sola imagen (nunca 2x2 ni radio) y se separan a la sección "Recaps".
+     */
+    private fun isRecapTitle(title: String?): Boolean {
+        val t = title?.lowercase()?.trim() ?: return false
+        return t.contains("recap") || t.contains("resumen de tu año") || t.contains("tu resumen")
+    }
+
+    /**
+     * True para las mezclas personales de YT Music que van a "Lo nuevo y lo que más te gusta":
+     * Replay ("Mix de tus canciones más escuchadas"), Nuevos lanzamientos, Archivo, Descubrir y
+     * Supermix. Detección por título (ES + fallback EN); NO usa el prefijo RDTMAK genérico porque ese
+     * también abarca los "My Mix 1-6" por género, que se quedan en recomendadas.
+     */
+    private fun isPersonalFavoriteMix(item: YouTubeMusicService.MixResult): Boolean {
+        val t = item.title.lowercase().trim()
+        // "Mi Supermix" / "Supermix" no siempre llevan "mix de…".
+        if (t.contains("supermix")) return true
+        // El resto son variantes "Mix de/para …" — exige "mix" + palabra clave para NO barrer
+        // playlists de comunidad que casualmente contengan una de estas palabras.
+        if (!t.contains("mix")) return false
+        return t.contains("descubrir") || t.contains("discover")
+            || t.contains("lanzamiento") || t.contains("novedades") || t.contains("new release")
+            || t.contains("archivo") || t.contains("archive")
+            || t.contains("temas escuchados") || t.contains("temas más escuchados") || t.contains("temas mas escuchados")
+            || t.contains("canciones más escuchada") || t.contains("canciones mas escuchada")
+            || t.contains("replay") || t.contains("más escuchad") || t.contains("mas escuchad")
+    }
+
+    /** Tarjeta sintética de "Música que te gustó": siempre presente como primer item de la nueva
+     *  sección (es la playlist de likes de la app, no depende de que YT la incluya en el home). */
+    private fun likedMusicCard() = YouTubeMusicService.MixResult(
+        YouTubeMusicService.SPECIAL_LIKED_VIDEOS_ID, "Música que te gustó", "", "", ""
+    )
 
     // ========== Playlists recomendadas (YT Music home feed) ==========
 
     private fun setupRecommended() {
         rvRecommended?.layoutManager = LinearLayoutManager(requireContext(), LinearLayoutManager.HORIZONTAL, false)
         improveHorizontalScrollDetection(rvRecommended)
-        rvRecommended?.adapter = RecommendedCarouselAdapter()
+        rvRecommended?.adapter = MixCardAdapter(recommendedEntries) { onRecommendedClicked(it) }
     }
 
     private fun refreshRecommended(force: Boolean = false) {
@@ -1122,26 +1233,87 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         youTubeMusicService.fetchHomeBrowse(cookie, object : YouTubeMusicService.HomeBrowseCallback {
             override fun onSuccess(result: YouTubeMusicService.HomeBrowseResult) {
                 if (!isAdded) return
+                // El usuario quiere sobre todo listas generadas por YT / la comunidad y muy pocas
+                // de su propia biblioteca. Clasificamos cada item por el título de su sección
+                // (las secciones de biblioteca en el home de YT Music son "Escucha de nuevo",
+                // "Tus playlists", "Tu biblioteca", etc.) y limitamos las propias a OWN_QUOTA.
                 val seen = HashSet<String>()
-                val playlists = mutableListOf<YouTubeMusicService.MixResult>()
-                loop@ for (section in result.allSections) {
+                val ownItems = mutableListOf<YouTubeMusicService.MixResult>()
+                val otherItems = mutableListOf<YouTubeMusicService.MixResult>()
+                val recaps = mutableListOf<YouTubeMusicService.MixResult>()
+                val newFaves = mutableListOf<YouTubeMusicService.MixResult>()
+                for (section in result.allSections) {
+                    val ownSection = isOwnLibrarySectionTitle(section.title)
+                    val recapSection = isRecapTitle(section.title)
                     for (item in section.items) {
                         val pid = item.playlistId.trim()
-                        if (pid.isEmpty() || item.title.isBlank() || item.thumbnailUrl.isBlank()) continue
+                        if (pid.isEmpty() || item.title.isBlank()) continue
+                        // La tarjeta liked dibuja overlay local: no exijas thumbnail (YT a veces la manda vacía).
+                        val liked = isLikedPlaylistId(pid)
+                        if (!liked && item.thumbnailUrl.isBlank()) continue
                         if (!seen.add(pid)) continue
-                        playlists.add(item)
-                        if (playlists.size >= RECOMMENDED_LIMIT) break@loop
+                        // Favoritos (gato): fuera de TODO (ni recomendadas ni la nueva sección).
+                        val fav = FavoritesArt.isFavorites(pid) ||
+                            item.title.trim().equals(FavoritesPlaylistStore.PLAYLIST_TITLE, ignoreCase = true)
+                        if (fav) continue
+                        // "Música que te gustó" se añade sintetizada abajo (no desde el feed).
+                        if (liked) continue
+                        // Nueva sección "Lo nuevo y lo que más te gusta": mixes personales de YT.
+                        if (isPersonalFavoriteMix(item)) { newFaves.add(item); continue }
+                        // Los "Recap" (resúmenes YT) tienen su propia sección "Recaps": fuera de
+                        // recomendadas para que no llenen ese carrusel ni se muestren duplicados.
+                        if (recapSection || isRecapTitle(item.title)) { recaps.add(item); continue }
+                        if (ownSection) ownItems.add(item) else otherItems.add(item)
                     }
                 }
-                if (playlists.isEmpty()) return
-                recommendedEntries.clear()
-                recommendedEntries.addAll(playlists)
-                cacheRecommended(playlists)
-                updateRecommendedUi()
+                // Prioriza comunidad/YT; reserva como mucho OWN_QUOTA para biblioteca. Si falta
+                // para llenar el carrusel, rellena con lo que quede de cualquiera de los dos.
+                val fromOwn = ownItems.take(RECOMMENDED_OWN_QUOTA)
+                val fromOther = otherItems.take(RECOMMENDED_LIMIT - fromOwn.size)
+                val remaining = otherItems.drop(fromOther.size) + ownItems.drop(fromOwn.size)
+                val playlists = (fromOther + fromOwn + remaining).take(RECOMMENDED_LIMIT)
+                if (playlists.isNotEmpty()) {
+                    recommendedEntries.clear()
+                    recommendedEntries.addAll(playlists)
+                    cacheRecommended(playlists)
+                    updateRecommendedUi()
+                }
+                // Lo nuevo y lo que más te gusta: tarjeta de "Música que te gustó" SIEMPRE primero,
+                // luego los mixes personales de YT. Va antes de recomendadas.
+                val newFavesOrdered = listOf(likedMusicCard()) + newFaves
+                newFavesEntries.clear()
+                newFavesEntries.addAll(newFavesOrdered)
+                cacheNewFaves(newFavesOrdered)
+                updateNewFavesUi()
+                // Recaps: sección propia, debajo de "Selección rápida".
+                if (recaps.isNotEmpty()) {
+                    recapEntries.clear()
+                    recapEntries.addAll(recaps)
+                    cacheRecaps(recaps)
+                    updateRecapsUi()
+                }
             }
 
             override fun onError(error: String) { /* keep whatever cache is already shown */ }
         })
+    }
+
+    /**
+     * True si el título de la sección del home de YT Music corresponde a contenido de la BIBLIOTECA
+     * PROPIA del usuario (playlists guardadas/creadas o "escucha de nuevo"), frente a secciones
+     * editoriales o generadas por YT/la comunidad. Se usa para limitar cuántas listas propias
+     * aparecen en "Playlists recomendadas".
+     */
+    private fun isOwnLibrarySectionTitle(title: String): Boolean {
+        val t = title.lowercase().trim()
+        if (t.isEmpty()) return false
+        return t.contains("tu biblioteca") || t.contains("your library") ||
+            t.contains("tus listas") || t.contains("tus playlists") || t.contains("your playlists") ||
+            t.contains("tus mixes") ||
+            t.contains("escucha de nuevo") || t.contains("listen again") ||
+            t.contains("vuelve a escuchar") || t.contains("volver a escuchar") ||
+            t.contains("guardad") || t.contains("saved") ||
+            t.contains("creada por ti") || t.contains("creadas por ti")
     }
 
     private fun updateRecommendedUi() {
@@ -1149,8 +1321,80 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         val has = recommendedEntries.isNotEmpty()
         llRecommendedHeader?.visibility = if (has) View.VISIBLE else View.GONE
         rvRecommended?.visibility = if (has) View.VISIBLE else View.GONE
-        (rvRecommended?.adapter as? RecommendedCarouselAdapter)?.notifyDataSetChanged()
-        if (has) revealAfterFirstContentPass()
+        (rvRecommended?.adapter as? MixCardAdapter)?.notifyDataSetChanged()
+        if (has) {
+            hideHomeSkeleton(llRecommendedSkeleton)
+            revealAfterFirstContentPass()
+        }
+    }
+
+    private fun setupRecaps() {
+        rvRecaps?.layoutManager = LinearLayoutManager(requireContext(), LinearLayoutManager.HORIZONTAL, false)
+        improveHorizontalScrollDetection(rvRecaps)
+        rvRecaps?.adapter = MixCardAdapter(recapEntries) { onRecapClicked(it) }
+    }
+
+    private fun updateRecapsUi() {
+        if (!isAdded) return
+        val has = recapEntries.isNotEmpty()
+        llRecapsHeader?.visibility = if (has) View.VISIBLE else View.GONE
+        rvRecaps?.visibility = if (has) View.VISIBLE else View.GONE
+        (rvRecaps?.adapter as? MixCardAdapter)?.notifyDataSetChanged()
+        if (has) {
+            hideHomeSkeleton(llRecapsSkeleton)
+            revealAfterFirstContentPass()
+        }
+    }
+
+    // ========== Lo nuevo y lo que más te gusta (liked + mixes personales YT) ==========
+
+    private fun setupNewFaves() {
+        rvNewFaves?.layoutManager = LinearLayoutManager(requireContext(), LinearLayoutManager.HORIZONTAL, false)
+        improveHorizontalScrollDetection(rvNewFaves)
+        rvNewFaves?.adapter = MixCardAdapter(newFavesEntries) { onRecommendedClicked(it) }
+        // Siembra la tarjeta "Música que te gustó" al instante (no depende del fetch ni de estar
+        // online). El fetch luego reconstruye la lista con los mixes personales delante-detrás.
+        if (newFavesEntries.isEmpty()) {
+            newFavesEntries.add(likedMusicCard())
+            updateNewFavesUi()
+        }
+    }
+
+    private fun updateNewFavesUi() {
+        if (!isAdded) return
+        val has = newFavesEntries.isNotEmpty()
+        llNewFavesHeader?.visibility = if (has) View.VISIBLE else View.GONE
+        rvNewFaves?.visibility = if (has) View.VISIBLE else View.GONE
+        (rvNewFaves?.adapter as? MixCardAdapter)?.notifyDataSetChanged()
+        if (has) {
+            hideHomeSkeleton(llNewFavesSkeleton)
+            revealAfterFirstContentPass()
+        }
+    }
+
+    private fun cacheNewFaves(list: List<YouTubeMusicService.MixResult>) =
+        cacheMixList("home_newfaves_data", list)
+
+    private fun loadCachedNewFaves() {
+        if (!isAdded || newFavesEntries.size > 1) return
+        submitBg {
+            try {
+                val ctx = context ?: return@submitBg
+                val raw = ctx.getSharedPreferences(PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
+                    .getString("home_newfaves_data", "") ?: ""
+                if (raw.isEmpty()) return@submitBg
+                val parsed = parseRecommendedCacheList(raw)
+                if (parsed.isEmpty()) return@submitBg
+                handler.post {
+                    if (!isAdded || newFavesEntries.size > 1) return@post
+                    newFavesEntries.clear()
+                    newFavesEntries.addAll(parsed)
+                    updateNewFavesUi()
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Error loading newfaves cache", e)
+            }
+        }
     }
 
     private fun loadCachedRecommended() {
@@ -1165,7 +1409,14 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 if (parsed.isEmpty()) return@submitBg
                 handler.post {
                     if (!isAdded || recommendedEntries.isNotEmpty()) return@post
-                    recommendedEntries.addAll(parsed)
+                    // Un caché "home_recommended_data" escrito antes de este cambio puede contener
+                    // liked/favoritos/mixes personales que ahora viven en otra sección: fíltralos para
+                    // que no reaparezcan en recomendadas hasta el próximo fetch.
+                    recommendedEntries.addAll(parsed.filterNot {
+                        isLikedPlaylistId(it.playlistId) || FavoritesArt.isFavorites(it.playlistId) ||
+                            it.title.trim().equals(FavoritesPlaylistStore.PLAYLIST_TITLE, ignoreCase = true) ||
+                            isPersonalFavoriteMix(it)
+                    })
                     updateRecommendedUi()
                 }
             } catch (e: Exception) {
@@ -1183,7 +1434,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 val pid = obj.optString("playlistId", "")
                 val title = obj.optString("title", "")
                 if (pid.isEmpty() || title.isEmpty()) continue
-                out.add(YouTubeMusicService.MixResult(pid, title, obj.optString("subtitle", ""), obj.optString("thumbnailUrl", "")))
+                out.add(YouTubeMusicService.MixResult(pid, title, obj.optString("subtitle", ""), obj.optString("thumbnailUrl", ""), obj.optString("params", "")))
             }
         } catch (e: Exception) {
             Log.w(TAG, "Error parsing recommended cache", e)
@@ -1191,7 +1442,13 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         return out
     }
 
-    private fun cacheRecommended(list: List<YouTubeMusicService.MixResult>) {
+    private fun cacheRecommended(list: List<YouTubeMusicService.MixResult>) =
+        cacheMixList("home_recommended_data", list)
+
+    private fun cacheRecaps(list: List<YouTubeMusicService.MixResult>) =
+        cacheMixList("home_recaps_data", list)
+
+    private fun cacheMixList(prefKey: String, list: List<YouTubeMusicService.MixResult>) {
         submitBg {
             try {
                 val ctx = context ?: return@submitBg
@@ -1202,34 +1459,83 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                         put("title", m.title)
                         put("subtitle", m.subtitle)
                         put("thumbnailUrl", m.thumbnailUrl)
+                        // navigationEndpoint token: lets a cached YT-generated mix/recap still resolve
+                        // its tracks after a cold start. Old cache entries lack it (optString → "").
+                        put("params", m.params)
                     })
                 }
                 ctx.getSharedPreferences(PREFS_STREAMING_CACHE, Context.MODE_PRIVATE).edit()
-                    .putString("home_recommended_data", arr.toString())
+                    .putString(prefKey, arr.toString())
                     .apply()
             } catch (e: Exception) {
-                Log.w(TAG, "Error caching recommended", e)
+                Log.w(TAG, "Error caching mix list $prefKey", e)
+            }
+        }
+    }
+
+    private fun loadCachedRecaps() {
+        if (!isAdded || recapEntries.isNotEmpty()) return
+        submitBg {
+            try {
+                val ctx = context ?: return@submitBg
+                val raw = ctx.getSharedPreferences(PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
+                    .getString("home_recaps_data", "") ?: ""
+                if (raw.isEmpty()) return@submitBg
+                val parsed = parseRecommendedCacheList(raw)
+                if (parsed.isEmpty()) return@submitBg
+                handler.post {
+                    if (!isAdded || recapEntries.isNotEmpty()) return@post
+                    recapEntries.addAll(parsed)
+                    updateRecapsUi()
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Error loading recaps cache", e)
             }
         }
     }
 
     private fun onRecommendedClicked(item: YouTubeMusicService.MixResult) {
         if (!isAdded) return
-        // Opens the playlist detail, which loads ALL of its songs.
-        openPlaylistDetailFromPrincipal(item.playlistId, item.title, item.thumbnailUrl)
+        // Opens the playlist detail, which loads ALL of its songs. Forward the card's params token so
+        // YT-generated mixes/recaps (Replay/Archive/Recap) actually load instead of opening empty.
+        // ART_HINT_SINGLE: this carousel ALWAYS shows one YT thumbnail, so even when the item is a
+        // radio/mix id (e.g. a "listen again" seed like "mi gata") the detail clones that exact cover
+        // instead of building a 3-circle radio composite the card never showed.
+        openPlaylistDetailFromPrincipal(
+            item.playlistId, item.title, item.thumbnailUrl, item.params,
+            PlaylistDetailFragment.ART_HINT_SINGLE
+        )
     }
 
-    private inner class RecommendedCarouselAdapter : RecyclerView.Adapter<RecommendedCarouselAdapter.VH>() {
-        override fun getItemCount() = recommendedEntries.size
+    private fun onRecapClicked(item: YouTubeMusicService.MixResult) {
+        if (!isAdded) return
+        // Recaps carry their own single YT cover — clone it (ART_HINT_SINGLE), forward params so the
+        // generated tracklist resolves.
+        openPlaylistDetailFromPrincipal(
+            item.playlistId, item.title, item.thumbnailUrl, item.params,
+            PlaylistDetailFragment.ART_HINT_SINGLE
+        )
+    }
+
+    /**
+     * Single-cover carousel adapter shared by "Playlists recomendadas" and "Recaps": both render one
+     * YT thumbnail per card (never a 2x2/radio) and open the detail with ART_HINT_SINGLE. Backed by an
+     * explicit list + click callback so one class serves both sections.
+     */
+    private inner class MixCardAdapter(
+        private val entries: List<YouTubeMusicService.MixResult>,
+        private val onClick: (YouTubeMusicService.MixResult) -> Unit
+    ) : RecyclerView.Adapter<MixCardAdapter.VH>() {
+        override fun getItemCount() = entries.size
 
         override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH {
             val view = LayoutInflater.from(parent.context).inflate(R.layout.item_playlist_carousel, parent, false)
-            view.layoutParams.width = (resources.displayMetrics.widthPixels * 0.46f).toInt()
+            applyCarouselCardLayout(view)
             return VH(view)
         }
 
         override fun onBindViewHolder(holder: VH, position: Int) {
-            holder.bind(recommendedEntries[position])
+            holder.bind(entries[position])
         }
 
         inner class VH(itemView: View) : RecyclerView.ViewHolder(itemView) {
@@ -1240,14 +1546,37 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             private val ivLikedIcon: ImageView = itemView.findViewById(R.id.ivPlaylistLikedIcon)
 
             fun bind(item: YouTubeMusicService.MixResult) {
-                // Reuses item_playlist_carousel; its "liked" overlay views stay hidden here.
+                val isLiked = isLikedPlaylistId(item.playlistId)
+                val isFav = FavoritesArt.isFavorites(item.playlistId) ||
+                    item.title.trim().equals(FavoritesPlaylistStore.PLAYLIST_TITLE, ignoreCase = true)
+                val click = View.OnClickListener { onClick(item) }
+                itemView.setOnClickListener(click)
+                cardPlaylist.setOnClickListener(click)
+
+                if (isLiked || isFav) {
+                    // Misma portada compuesta que en "recientes": el arte remoto de YouTube trae
+                    // el pulgar/gato a otra proporción, así que dibujamos el overlay local para que
+                    // el icono central se vea idéntico en ambas secciones.
+                    tvName.text = if (isFav) FavoritesPlaylistStore.PLAYLIST_TITLE else "Música que te gustó"
+                    ivCover.setImageDrawable(null)
+                    ivCover.visibility = View.INVISIBLE
+                    vLikedBg.visibility = View.VISIBLE
+                    ivLikedIcon.visibility = View.VISIBLE
+                    vLikedBg.setBackgroundResource(
+                        if (isFav) R.drawable.bg_music_favorites_gradient
+                        else R.drawable.bg_music_liked_gradient
+                    )
+                    ivLikedIcon.setImageResource(
+                        if (isFav) R.drawable.ic_cat_white else R.drawable.ic_thumb_up_liked
+                    )
+                    return
+                }
+
+                // Item normal: oculta el overlay (holder reciclado) y carga la portada remota.
                 vLikedBg.visibility = View.GONE
                 ivLikedIcon.visibility = View.GONE
                 ivCover.visibility = View.VISIBLE
                 tvName.text = item.title
-                val click = View.OnClickListener { onRecommendedClicked(item) }
-                itemView.setOnClickListener(click)
-                cardPlaylist.setOnClickListener(click)
                 if (item.thumbnailUrl.isNotEmpty() && isAdded) {
                     try {
                         Glide.with(this@PrincipalFragment).load(item.thumbnailUrl)
@@ -1505,7 +1834,15 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         lastRadiosRefreshMs = now
         val appContext = requireContext().applicationContext
         submitBg {
-            val radios = RadioHistoryStore.getRadios(appContext).take(10)
+            // Solo las MÁS escuchadas: exige un mínimo de reproducciones (oculta las recién creadas)
+            // y ordena por reproducciones desc. Las radios ancladas se mantienen siempre visibles.
+            val radios = RadioHistoryStore.getRadios(appContext)
+                .filter {
+                    it.playCount >= RadioHistoryStore.MIN_PLAYS_FOR_TOP ||
+                        RadioHistoryStore.isPinned(appContext, it.radioPlaylistId)
+                }
+                .sortedByDescending { it.playCount }
+                .take(10)
             handler.post {
                 if (!isAdded) return@post
                 radioEntries.clear()
@@ -1514,7 +1851,9 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 llRadiosHeader?.visibility = if (hasRadios) View.VISIBLE else View.GONE
                 rvRadios?.visibility = if (hasRadios) View.VISIBLE else View.GONE
                 (rvRadios?.adapter as? RadioCarouselAdapter)?.notifyDataSetChanged()
-                hideHomeSkeleton(llRadiosSkeleton)
+                // Empty ≠ loaded: on fresh install the radios arrive with cloud hydration, so the
+                // skeleton stays until data (or the safety timer) resolves it.
+                if (hasRadios) hideHomeSkeleton(llRadiosSkeleton)
                 // Pre-fetch side images so they're in Glide disk cache before scroll
                 preloadRadioImages(radios)
                 revealAfterFirstContentPass()
@@ -1548,7 +1887,12 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         val otherTracks = radio.tracks.filter { it.thumbnailUrl.isNotEmpty() && it.thumbnailUrl != centerUrl }
         val sides: Pair<String, String> = if (otherTracks.size >= 2) {
             val seed = radio.radioPlaylistId.hashCode().toLong()
-            val seeded = otherTracks.sortedBy { it.videoId.hashCode().toLong() xor seed }
+            // Familiar faces first: tracks by followed/played artists win the two side slots,
+            // deterministic seeded order breaks ties.
+            val seeded = otherTracks.sortedWith(
+                compareByDescending<RadioHistoryStore.RadioTrack> { isKnownArtist(it.artist) }
+                    .thenBy { it.videoId.hashCode().toLong() xor seed }
+            )
             Pair(seeded[0].thumbnailUrl, seeded.getOrNull(1)?.thumbnailUrl ?: "")
         } else if (isAdded) {
             val gridUrls = resolvePlaylistGridUrls(radio.radioPlaylistId).filter { it != centerUrl }
@@ -1580,9 +1924,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
         override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RadioVH {
             val view = LayoutInflater.from(parent.context).inflate(R.layout.item_radio_carousel, parent, false)
-            // Narrow cards, almost 1:1 aspect for stacked circle illusion
-            val cardWidth = radioCardWidthPx
-            view.layoutParams = ViewGroup.LayoutParams(cardWidth, ViewGroup.LayoutParams.WRAP_CONTENT)
+            applyCarouselCardLayout(view)
             return RadioVH(view)
         }
 
@@ -1606,8 +1948,10 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 val text = if (cachedText != null) cachedText else {
                     val uniqueArtists = radio.tracks.map { it.artist }.filter { it.isNotEmpty() }.distinct()
                     val random = java.util.Random(radio.radioPlaylistId.hashCode().toLong())
-                    val shuffledArtists = uniqueArtists.shuffled(random)
-                    val top3 = shuffledArtists.take(3)
+                    // Familiar artists first (followed/played), unknown ones only fill the rest —
+                    // so "Con X, Y, Z y más" names people the user actually recognizes.
+                    val (known, unknown) = uniqueArtists.partition { isKnownArtist(it) }
+                    val top3 = (known.shuffled(random) + unknown.shuffled(random)).take(3)
                     val computed = when (top3.size) {
                         0 -> "Con varios artistas"
                         1 -> "Con ${top3[0]} y más"
@@ -1633,10 +1977,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                         // (recycled holder rebinding to the same radio, notifyDataSetChanged, etc.).
                         if (vBg.getTag(R.id.tag_radio_bg_color) != cachedColor) {
                             vBg.setTag(R.id.tag_radio_bg_color, cachedColor)
-                            vBg.background = GradientDrawable(
-                                GradientDrawable.Orientation.TOP_BOTTOM,
-                                intArrayOf(cachedColor, darkenColor(cachedColor, 0.6f))
-                            ).apply { cornerRadius = 0f }
+                            vBg.background = buildRadioCardGradient(cachedColor)
                         }
                     } else {
                         try {
@@ -1657,10 +1998,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                                             // color stays cached, but don't paint the wrong card.
                                             if (boundCenterUrl != centerUrl) return@generate
                                             vBg.setTag(R.id.tag_radio_bg_color, dominant)
-                                            vBg.background = GradientDrawable(
-                                                GradientDrawable.Orientation.TOP_BOTTOM,
-                                                intArrayOf(dominant, darkenColor(dominant, 0.6f))
-                                            ).apply { cornerRadius = 0f }
+                                            vBg.background = buildRadioCardGradient(dominant)
                                         }
                                     }
                                     override fun onLoadCleared(placeholder: android.graphics.drawable.Drawable?) {}
@@ -1725,6 +2063,20 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         submitBg {
             try {
                 val prefs = ctx.getSharedPreferences(PREFS_RADIO_CACHE, Context.MODE_PRIVATE)
+
+                // One-shot migration to the Spotify-style radio cards: the persisted subtitle
+                // texts and side-url picks were computed without the known-artist bias, and the
+                // composed art uses the old geometry. Drop them so they recompute (colors stay —
+                // they're raw Palette output, still valid input for the pastel gradient).
+                if (prefs.getInt("radio_ui_version", 1) != RADIO_UI_VERSION) {
+                    val editor = prefs.edit()
+                    for (key in prefs.all.keys) {
+                        if (key.startsWith("artists_") || key.startsWith("sides_")) editor.remove(key)
+                    }
+                    editor.putInt("radio_ui_version", RADIO_UI_VERSION).apply()
+                    RadioArtComposer.clearAllCaches(ctx)
+                }
+
                 val all = prefs.all
                 val colors = HashMap<String, Int>()
                 val sides = HashMap<String, Pair<String, String>>()
@@ -1748,11 +2100,41 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                     }
                 }
 
+                // "Known" artists = followed library artists (any signed-in account, minus the
+                // unfollow tombstones) + the artists the user actually plays. Loaded in the same
+                // bg pass so the FIFO executor + FIFO main-handler ordering guarantees the set is
+                // in place before the first radio bind computes a subtitle.
+                val known = HashSet<String>()
+                try {
+                    val streaming = ctx.getSharedPreferences(PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
+                    val unfollowed = streaming.getStringSet("unfollowed_artists_channel_ids", emptySet()) ?: emptySet()
+                    for ((key, value) in streaming.all) {
+                        if (!key.startsWith("library_artists_data_") || value !is String || value.isEmpty()) continue
+                        try {
+                            val arr = JSONArray(value)
+                            for (i in 0 until arr.length()) {
+                                val obj = arr.optJSONObject(i) ?: continue
+                                if (obj.optString("channelId", "") in unfollowed) continue
+                                val name = obj.optString("name", "").trim().lowercase()
+                                if (name.isNotEmpty()) known.add(name)
+                            }
+                        } catch (_: Exception) {}
+                    }
+                } catch (_: Exception) {}
+                try {
+                    for (entry in PlayCountStore.getTopEntries(ctx, 50)) {
+                        val name = entry.artist.trim().lowercase()
+                        if (name.isNotEmpty()) known.add(name)
+                    }
+                } catch (_: Exception) {}
+
                 handler.post {
                     if (!isAdded) return@post
                     radioDominantColorCache.putAll(colors)
                     radioSideUrlsCache.putAll(sides)
                     radioArtistTextCache.putAll(artists)
+                    knownArtistKeys.clear()
+                    knownArtistKeys.addAll(known)
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "preloadRadioCaches failed", e)
@@ -1765,6 +2147,21 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         val g = ((color shr 8 and 0xFF) * factor).toInt().coerceIn(0, 255)
         val b = ((color and 0xFF) * factor).toInt().coerceIn(0, 255)
         return (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+    }
+
+    /** Flat fluorescent field for radio cards (see RadioArtComposer.cardBackgroundColor).
+     *  [rawColor] is the Palette color as cached/persisted. */
+    private fun buildRadioCardGradient(rawColor: Int): android.graphics.drawable.ColorDrawable =
+        android.graphics.drawable.ColorDrawable(RadioArtComposer.cardBackgroundColor(rawColor))
+
+    /** True if [artist] matches (or contains) an artist the user follows or plays. */
+    private fun isKnownArtist(artist: String): Boolean {
+        if (artist.isEmpty() || knownArtistKeys.isEmpty()) return false
+        val norm = artist.trim().lowercase()
+        if (norm in knownArtistKeys) return true
+        // Compound credits ("A & B", "A ft. C"): any known name inside the string counts. Names
+        // shorter than 4 chars are skipped to avoid accidental substring hits.
+        return knownArtistKeys.any { it.length >= 4 && norm.contains(it) }
     }
 
     // ========== Playlists recientes ==========
@@ -1780,20 +2177,30 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         val now = System.currentTimeMillis()
         if (!force && now - lastPlaylistsRefreshMs < REENTRY_REFRESH_THROTTLE_MS && playlistEntries.isNotEmpty()) return
         lastPlaylistsRefreshMs = now
-        // PlayCountStore.getTopPlaylists() reads its in-memory snapshot (warm) or SharedPreferences
+        // PlayCountStore.getRecentPlaylists() reads its in-memory snapshot (warm) or SharedPreferences
         // + JSON (cold); run it off the UI thread either way so module entry never stalls.
         val appContext = requireContext().applicationContext
+        // Short (<4 urls) grid lists cached for the whole view lifetime hide grid urls persisted
+        // later by PlaylistDetail (covers that never load). Snapshot those ids here (main thread —
+        // the cache is main-confined) and re-resolve them from prefs on the bg pass.
+        val staleGridIds = playlistGridUrlsCache.filterValues { it.size < 4 }.keys.toList()
         submitBg {
-            val playlists = PlayCountStore.getTopPlaylists(appContext, 10)
+            val playlists = PlayCountStore.getRecentPlaylists(appContext, 10)
+            val freshGridUrls = HashMap<String, List<String>>()
+            for (pid in staleGridIds) {
+                freshGridUrls[pid] = computePlaylistGridUrls(appContext, pid)
+            }
             handler.post {
                 if (!isAdded) return@post
+                playlistGridUrlsCache.putAll(freshGridUrls)
                 playlistEntries.clear()
                 playlistEntries.addAll(playlists)
                 val hasPlaylists = playlistEntries.isNotEmpty()
                 llPlaylistsHeader?.visibility = if (hasPlaylists) View.VISIBLE else View.GONE
                 rvPlaylists?.visibility = if (hasPlaylists) View.VISIBLE else View.GONE
                 (rvPlaylists?.adapter as? PlaylistCarouselAdapter)?.notifyDataSetChanged()
-                hideHomeSkeleton(llPlaylistsSkeleton)
+                // Empty ≠ loaded (fresh install: la data llega con la hidratación cloud).
+                if (hasPlaylists) hideHomeSkeleton(llPlaylistsSkeleton)
                 revealAfterFirstContentPass()
             }
         }
@@ -1808,27 +2215,52 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
      */
     fun refreshAllContent() {
         if (!isAdded || isHidden) return
+        // Post-login / hydration repopulate: bring skeletons back for the still-empty sections
+        // (and re-arm their safety dismiss) so the reload is visible instead of a black home.
+        showHomeSkeletonsForEmptySections()
         // Force past the re-entry throttles: this is the explicit "new session/cloud data landed,
         // repopulate now" signal, so it must not be skipped as a redundant refresh.
         refreshShortcuts(force = true)
-        refreshCovers(force = true)
+        // Covers: only force when nothing is on screen (first-install / empty-cache case). Cloud
+        // hydration fires on EVERY signed-in app open, and forcing past the 12h TTL here replaced
+        // freshly-rendered cached covers with a reshuffled network result seconds after entering.
+        refreshCovers(force = coversResults.isEmpty())
         refreshRadios(force = true)
         refreshPlaylists(force = true)
         refreshRecommended(force = true)
     }
 
+    /**
+     * True for playlists that carry their OWN single cover art (albums / singles) rather than a
+     * synthesized mosaic. YouTube album browse ids start with "MPRE" and album playlist ids with
+     * "OLAK5uy"; local albums use LocalFilesStore's album prefix. These must show that one cover,
+     * not a 2x2 built from play-history images (which the autoplay queue can pollute).
+     */
+    private fun isSingleCoverPlaylistId(playlistId: String): Boolean {
+        val id = playlistId.trim()
+        // "RDCLAK5uy_…": YT auto-generated playlists — fixed tracklist + own single cover, so they
+        // must show that one cover (not a synthesized 2x2), matching the detail header.
+        return id.startsWith("MPRE") || id.startsWith("OLAK5uy")
+            || id.startsWith("RDCLAK") || LocalFilesStore.isLocalAlbumId(id)
+    }
+
     private fun isLikedPlaylistId(playlistId: String): Boolean {
         val id = playlistId.trim()
+        // "VLLM": browse-form liked id — cached recommended JSON may still carry it un-stripped.
         return id == YouTubeMusicService.SPECIAL_LIKED_VIDEOS_ID
-                || id == "LL" || id == "LM" || id.startsWith("VLLL")
+                || id == "LL" || id == "LM" || id.startsWith("VLLL") || id == "VLLM"
     }
 
     private fun onPlaylistClicked(entry: PlayCountStore.PlayCountEntry) {
         if (!isAdded) return
+        // A recap that landed in "recientes" (the user played it) must open cloning its single YT
+        // cover, not the synthesized 2x2 — same ART_HINT_SINGLE the Recaps carousel uses.
+        val artHint = if (isRecapTitle(entry.playlistName)) PlaylistDetailFragment.ART_HINT_SINGLE else ""
         openPlaylistDetailFromPrincipal(
             entry.playlistId,
             entry.playlistName,
-            entry.imageUrl
+            entry.imageUrl,
+            artHint = artHint
         )
     }
 
@@ -1840,19 +2272,24 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         override fun getItemCount() = playlistEntries.size
 
         override fun getItemViewType(position: Int): Int {
-            return if (playlistEntries[position].playlistId.startsWith("RD")) TYPE_RADIO else TYPE_PLAYLIST
+            // RDCLAK5uy_… are YT auto-generated PLAYLISTS (fixed tracklist + single static cover),
+            // not radios — render them as a single-image card so the library matches how the detail
+            // header now opens them (single rounded cover, not a 3-circle radio composite).
+            // Recaps also carry their own single YT cover → never a radio card.
+            val entry = playlistEntries[position]
+            val pid = entry.playlistId
+            return if (pid.startsWith("RD") && !pid.startsWith("RDCLAK") && !isRecapTitle(entry.playlistName))
+                TYPE_RADIO else TYPE_PLAYLIST
         }
 
         override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecyclerView.ViewHolder {
-            val screenWidth = resources.displayMetrics.widthPixels
-            val width = (screenWidth * 0.46f).toInt()
             if (viewType == TYPE_RADIO) {
                 val view = LayoutInflater.from(parent.context).inflate(R.layout.item_radio_carousel, parent, false)
-                view.layoutParams.width = width
+                applyCarouselCardLayout(view)
                 return RadioPlaylistVH(view)
             }
             val view = LayoutInflater.from(parent.context).inflate(R.layout.item_playlist_carousel, parent, false)
-            view.layoutParams.width = width
+            applyCarouselCardLayout(view)
             return PlaylistVH(view)
         }
 
@@ -1873,16 +2310,26 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
             fun bind(entry: PlayCountStore.PlayCountEntry) {
                 val isLiked = isLikedPlaylistId(entry.playlistId)
+                val isFav = FavoritesArt.isFavorites(entry.playlistId)
                 tvName.text = if (isLiked) "Música que te gustó" else entry.playlistName
                 val clickListener = View.OnClickListener { onPlaylistClicked(entry) }
                 itemView.setOnClickListener(clickListener)
                 cardPlaylist.setOnClickListener(clickListener)
 
-                if (isLiked) {
+                if (isLiked || isFav) {
                     ivCover.setImageDrawable(null)
                     ivCover.visibility = View.INVISIBLE
                     vLikedBg.visibility = View.VISIBLE
                     ivLikedIcon.visibility = View.VISIBLE
+                    // Fondo+icono explícitos en ambas ramas: los holders se reciclan y el
+                    // default del layout (liked) solo aplica al inflar.
+                    vLikedBg.setBackgroundResource(
+                        if (isFav) R.drawable.bg_music_favorites_gradient
+                        else R.drawable.bg_music_liked_gradient
+                    )
+                    ivLikedIcon.setImageResource(
+                        if (isFav) R.drawable.ic_cat_white else R.drawable.ic_thumb_up_liked
+                    )
                     // Icon is sized to 40% of the cover deterministically via the layout
                     // (layout_constraintWidth_percent), so it renders correct on the first
                     // frame — no post-layout padding hack that flashes huge then shrinks.
@@ -1895,7 +2342,14 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 ivLikedIcon.visibility = View.GONE
 
                 if (isAdded) {
-                    val gridUrls = resolvePlaylistGridUrls(entry.playlistId)
+                    // Albums (and single-cover playlists) have their OWN authoritative artwork, so
+                    // NEVER synthesize a 2x2 for them — the composite would mix in unrelated covers
+                    // from tracks the autoplay/up-next queue recorded under the same playlist id.
+                    // Recaps carry their own generated YT cover too → clone it, never a 2x2.
+                    val forceSingle = isSingleCoverPlaylistId(entry.playlistId)
+                        || isRecapTitle(entry.playlistName)
+                    val gridUrls = if (forceSingle) emptyList()
+                        else resolvePlaylistGridUrls(entry.playlistId)
                     if (gridUrls.size >= 4) {
                         val density = itemView.context.resources.displayMetrics.density
                         val sizePx = (180 * density).toInt()
@@ -1943,11 +2397,14 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 val sides: Pair<String, String> = if (cachedSides != null) {
                     cachedSides
                 } else {
-                    // 1. Try from in-memory radio tracks
+                    // 1. Try from in-memory radio tracks (familiar artists win the side slots)
                     val radioTracks = radio?.tracks?.filter { it.thumbnailUrl.isNotEmpty() && it.thumbnailUrl != centerUrl } ?: emptyList()
                     if (radioTracks.size >= 2) {
                         val seed = entry.playlistId.hashCode().toLong()
-                        val seeded = radioTracks.sortedBy { it.videoId.hashCode().toLong() xor seed }
+                        val seeded = radioTracks.sortedWith(
+                            compareByDescending<RadioHistoryStore.RadioTrack> { isKnownArtist(it.artist) }
+                                .thenBy { it.videoId.hashCode().toLong() xor seed }
+                        )
                         Pair(seeded[0].thumbnailUrl, seeded.getOrNull(1)?.thumbnailUrl ?: "")
                     } else if (isAdded) {
                         // 2. Fallback: streaming cache (playlist_tracks_data / grid_urls)
@@ -1972,10 +2429,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                         // (recycled holder rebinding to the same radio, notifyDataSetChanged, etc.).
                         if (vBg.getTag(R.id.tag_radio_bg_color) != cachedColor) {
                             vBg.setTag(R.id.tag_radio_bg_color, cachedColor)
-                            vBg.background = GradientDrawable(
-                                GradientDrawable.Orientation.TOP_BOTTOM,
-                                intArrayOf(cachedColor, darkenColor(cachedColor, 0.6f))
-                            ).apply { cornerRadius = 0f }
+                            vBg.background = buildRadioCardGradient(cachedColor)
                         }
                     } else {
                         try {
@@ -1996,10 +2450,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                                             // keep the cached color but don't paint the wrong card.
                                             if (boundCenterUrl != centerUrl) return@generate
                                             vBg.setTag(R.id.tag_radio_bg_color, dominant)
-                                            vBg.background = GradientDrawable(
-                                                GradientDrawable.Orientation.TOP_BOTTOM,
-                                                intArrayOf(dominant, darkenColor(dominant, 0.6f))
-                                            ).apply { cornerRadius = 0f }
+                                            vBg.background = buildRadioCardGradient(dominant)
                                         }
                                     }
                                     override fun onLoadCleared(placeholder: android.graphics.drawable.Drawable?) {}
@@ -2102,16 +2553,25 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
             val isPlaylist = !entry.playlistId.isNullOrEmpty() && entry.videoId == entry.playlistId
             val isLiked = isPlaylist && isLikedPlaylistId(entry.playlistId)
+            val isFav = isPlaylist && FavoritesArt.isFavorites(entry.playlistId)
 
             holder.tvTitle.text = if (isLiked) "Música que te gustó" else entry.title
 
-            // Liked playlist: gradient + icon, no artwork
-            if (isLiked) {
+            // Liked / Favoritos: gradient + icon, no artwork. Both branches set bg+icon
+            // explicitly — cells recycle and the layout default (liked) only applies on inflate.
+            if (isLiked || isFav) {
                 LocalArtworkResolver.detach(holder.ivThumb)
                 holder.ivThumb.setImageDrawable(null)
                 holder.vLikedBg.visibility = View.VISIBLE
                 holder.ivLikedIcon.visibility = View.VISIBLE
-                holder.ivThumb.setTag(R.id.tag_artwork_signature, "__liked__")
+                holder.vLikedBg.setBackgroundResource(
+                    if (isFav) R.drawable.bg_music_favorites_gradient
+                    else R.drawable.bg_music_liked_gradient
+                )
+                holder.ivLikedIcon.setImageResource(
+                    if (isFav) R.drawable.ic_cat_white else R.drawable.ic_thumb_up_liked
+                )
+                holder.ivThumb.setTag(R.id.tag_artwork_signature, if (isFav) "__fav__" else "__liked__")
             } else {
                 holder.vLikedBg.visibility = View.GONE
                 holder.ivLikedIcon.visibility = View.GONE
@@ -2233,10 +2693,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                     val tvTitle: TextView = row.findViewById(R.id.tvCoverTitle)
                     val tvSubtitle: TextView = row.findViewById(R.id.tvCoverSubtitle)
                     tvTitle.text = track.title
-                    val meta = parseTrackMeta(track.subtitle, track.title)
-                    tvSubtitle.text = listOf(meta.artist, meta.duration)
-                        .filter { it.isNotEmpty() }
-                        .joinToString(" • ")
+                    tvSubtitle.text = SongSubtitle.forRow(track.subtitle, track.title, track.duration)
                     if (!track.thumbnailUrl.isNullOrEmpty() && isAdded) {
                         try { Glide.with(this@PrincipalFragment).load(track.thumbnailUrl).placeholder(R.color.surface_high).transform(SHARED_YT_CROP, SHARED_CENTER_CROP).into(ivArt) } catch (_: Exception) {}
                     } else {

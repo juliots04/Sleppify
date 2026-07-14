@@ -49,81 +49,12 @@
                 android:layout_height="wrap_content"
                 android:orientation="vertical">
 
-            <!-- Brand header (scrolls with content, transparent) -->
-            <LinearLayout
-                android:id="@+id/llFragBrandHeader"
+            <!-- Reserves the pinned header's height at the top of the scroll flow (synced to the
+                 header's measured height in code) so content starts below it at rest. -->
+            <View
+                android:id="@+id/vHeaderSpacer"
                 android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:background="@android:color/transparent"
-                android:gravity="center_vertical"
-                android:orientation="horizontal"
-                android:paddingHorizontal="16dp"
-                android:paddingTop="0dp"
-                android:paddingBottom="4dp">
-
-                <TextView
-                    android:id="@+id/tvFragBrandTitle"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:drawablePadding="10dp"
-                    android:gravity="start|center_vertical"
-                    android:minHeight="0dp"
-                    android:paddingStart="0dp"
-                    android:paddingEnd="10dp"
-                    android:paddingVertical="2dp"
-                    android:text="@string/header_brand_title"
-                    android:textColor="@color/text_primary"
-                    android:textSize="18sp"
-                    android:textStyle="bold" />
-
-                <Space
-                    android:layout_width="0dp"
-                    android:layout_height="1dp"
-                    android:layout_weight="1" />
-
-                <ImageView
-                    android:id="@+id/btnFragHeaderSearch"
-                    android:layout_width="41.5dp"
-                    android:layout_height="41.5dp"
-                    android:background="?attr/selectableItemBackgroundBorderless"
-                    android:clickable="true"
-                    android:contentDescription="Buscar"
-                    android:focusable="true"
-                    android:layout_marginEnd="8dp"
-                    android:padding="6dp"
-                    android:src="@drawable/ic_search"
-                    app:tint="@android:color/white" />
-
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/btnFragSignIn"
-                    android:layout_width="wrap_content"
-                    android:layout_height="36dp"
-                    android:backgroundTint="@color/white"
-                    android:fontFamily="@font/inter_variable"
-                    android:text="Iniciar sesión"
-                    android:textAllCaps="false"
-                    android:textColor="#1F2B42"
-                    android:textSize="13sp"
-                    android:visibility="gone"
-                    app:cornerRadius="18dp"
-                    app:icon="@drawable/ic_google_logo"
-                    app:iconGravity="textStart"
-                    app:iconPadding="8dp"
-                    app:iconSize="18dp"
-                    app:iconTint="@null"
-                    app:rippleColor="#2200419E" />
-
-                <com.google.android.material.imageview.ShapeableImageView
-                    android:id="@+id/btnFragProfilePhoto"
-                    android:layout_width="34dp"
-                    android:layout_height="34dp"
-                    android:background="?attr/selectableItemBackgroundBorderless"
-                    android:clickable="true"
-                    android:contentDescription="@string/header_action_settings"
-                    android:focusable="true"
-                    android:padding="0dp"
-                    app:shapeAppearanceOverlay="@style/ShapeAppearance.Material3.Corner.Full" />
-            </LinearLayout>
+                android:layout_height="48dp" />
 
             <!-- Section header: profile row + Accesos directos (YT Music Speed Dial style) -->
             <LinearLayout
@@ -225,17 +156,17 @@
                 app:tabPaddingEnd="4dp"
                 app:tabPaddingStart="4dp" />
 
-            <!-- Cold-start skeleton for the Playlist recientes carousel. -->
+            <!-- Cold-start skeleton for the "Lo nuevo y lo que más te gusta" carousel. -->
             <include
-                android:id="@+id/llPlaylistsSkeleton"
+                android:id="@+id/llNewFavesSkeleton"
                 layout="@layout/skeleton_home_carousel_row"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:visibility="gone" />
 
-            <!-- Section: Playlist recientes -->
+            <!-- Section: Lo nuevo y lo que más te gusta (liked-music card + YT personal mixes) -->
             <LinearLayout
-                android:id="@+id/llPlaylistsHeader"
+                android:id="@+id/llNewFavesHeader"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:background="@android:color/transparent"
@@ -247,19 +178,19 @@
                 android:visibility="gone">
 
                 <TextView
-                    android:id="@+id/tvPlaylistsLabel"
+                    android:id="@+id/tvNewFavesLabel"
                     android:layout_width="0dp"
                     android:layout_height="wrap_content"
                     android:layout_weight="1"
                     android:fontFamily="@font/inter_variable"
-                    android:text="Playlist recientes"
+                    android:text="Lo nuevo y lo que más te gusta"
                     android:textColor="@color/text_primary"
                     android:textSize="18sp"
                     android:textStyle="bold" />
             </LinearLayout>
 
             <androidx.recyclerview.widget.RecyclerView
-                android:id="@+id/rvPlaylists"
+                android:id="@+id/rvNewFaves"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:clipToPadding="false"
@@ -267,6 +198,47 @@
                 android:overScrollMode="never"
                 android:visibility="gone" />
 
+            <!-- Cold-start skeleton for the Recaps carousel. -->
+            <include
+                android:id="@+id/llRecapsSkeleton"
+                layout="@layout/skeleton_home_carousel_row"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:visibility="gone" />
+
+            <!-- Section: Recaps (YT Music generated recaps — own single cover, never a 2x2/radio) -->
+            <LinearLayout
+                android:id="@+id/llRecapsHeader"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@android:color/transparent"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingHorizontal="16dp"
+                android:paddingTop="20dp"
+                android:paddingBottom="10dp"
+                android:visibility="gone">
+
+                <TextView
+                    android:id="@+id/tvRecapsLabel"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:fontFamily="@font/inter_variable"
+                    android:text="Recaps"
+                    android:textColor="@color/text_primary"
+                    android:textSize="18sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
+
+            <androidx.recyclerview.widget.RecyclerView
+                android:id="@+id/rvRecaps"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:clipToPadding="false"
+                android:paddingHorizontal="8dp"
+                android:overScrollMode="never"
+                android:visibility="gone" />
 
             <!-- Cold-start skeleton for the Covers y remixes section. -->
             <include
@@ -340,46 +312,12 @@
                 app:tabPaddingStart="4dp"
                 android:visibility="gone" />
 
-            <!-- Cold-start skeleton for the Estaciones más escuchadas carousel. -->
+            <!-- Cold-start skeleton for the Playlists recomendadas carousel. -->
             <include
-                android:id="@+id/llRadiosSkeleton"
+                android:id="@+id/llRecommendedSkeleton"
                 layout="@layout/skeleton_home_carousel_row"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:visibility="gone" />
-
-            <!-- Section: Radios -->
-            <LinearLayout
-                android:id="@+id/llRadiosHeader"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:background="@android:color/transparent"
-                android:gravity="center_vertical"
-                android:orientation="horizontal"
-                android:paddingHorizontal="16dp"
-                android:paddingTop="20dp"
-                android:paddingBottom="10dp"
-                android:visibility="gone">
-
-                <TextView
-                    android:id="@+id/tvRadiosLabel"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:fontFamily="@font/inter_variable"
-                    android:text="Estaciones más escuchadas"
-                    android:textColor="@color/text_primary"
-                    android:textSize="18sp"
-                    android:textStyle="bold" />
-            </LinearLayout>
-
-            <androidx.recyclerview.widget.RecyclerView
-                android:id="@+id/rvRadios"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:clipToPadding="false"
-                android:paddingHorizontal="8dp"
-                android:overScrollMode="never"
                 android:visibility="gone" />
 
             <!-- Section: Playlists recomendadas (YT Music home feed) -->
@@ -416,6 +354,90 @@
                 android:overScrollMode="never"
                 android:visibility="gone" />
 
+            <!-- Cold-start skeleton for the Playlist recientes carousel. -->
+            <include
+                android:id="@+id/llPlaylistsSkeleton"
+                layout="@layout/skeleton_home_carousel_row"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:visibility="gone" />
+
+            <!-- Section: Playlist recientes -->
+            <LinearLayout
+                android:id="@+id/llPlaylistsHeader"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@android:color/transparent"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingHorizontal="16dp"
+                android:paddingTop="20dp"
+                android:paddingBottom="10dp"
+                android:visibility="gone">
+
+                <TextView
+                    android:id="@+id/tvPlaylistsLabel"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:fontFamily="@font/inter_variable"
+                    android:text="Playlist recientes"
+                    android:textColor="@color/text_primary"
+                    android:textSize="18sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
+
+            <androidx.recyclerview.widget.RecyclerView
+                android:id="@+id/rvPlaylists"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:clipToPadding="false"
+                android:paddingHorizontal="8dp"
+                android:overScrollMode="never"
+                android:visibility="gone" />
+
+            <!-- Cold-start skeleton for the Estaciones más escuchadas carousel. -->
+            <include
+                android:id="@+id/llRadiosSkeleton"
+                layout="@layout/skeleton_home_carousel_row"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:visibility="gone" />
+
+            <!-- Section: Estaciones más escuchadas (al final) -->
+            <LinearLayout
+                android:id="@+id/llRadiosHeader"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@android:color/transparent"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingHorizontal="16dp"
+                android:paddingTop="20dp"
+                android:paddingBottom="10dp"
+                android:visibility="gone">
+
+                <TextView
+                    android:id="@+id/tvRadiosLabel"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:fontFamily="@font/inter_variable"
+                    android:text="Estaciones más escuchadas"
+                    android:textColor="@color/text_primary"
+                    android:textSize="18sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
+
+            <androidx.recyclerview.widget.RecyclerView
+                android:id="@+id/rvRadios"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:clipToPadding="false"
+                android:paddingHorizontal="8dp"
+                android:overScrollMode="never"
+                android:visibility="gone" />
+
             <!-- Bottom spacer to compensate for mini-player overlay -->
             <View
                 android:layout_width="match_parent"
@@ -437,26 +459,27 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toTopOf="parent" />
 
-    <!-- Floating quick-return header: pinned clone of llFragBrandHeader. Hidden while the in-flow
-         header is on screen; slides in when the user scrolls up from deep in the page and slides
-         back out on scroll-down (search-app style). Top padding = status bar inset (set in code). -->
+    <!-- Single pinned brand header: fixed AND floating at once. At the top it sits in its natural
+         position (transparent, over the backdrop) exactly like an in-flow header; scrolling down
+         slides it out via translationY and scrolling up slides it back in (quick-return), with the
+         background turning solid while it floats over content. Driven by updateHeaderOnScroll().
+         Top padding = status bar inset (set in code). -->
     <LinearLayout
-        android:id="@+id/llFloatingBrandHeader"
+        android:id="@+id/llFragBrandHeader"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
-        android:background="@color/surface_dark"
+        android:background="@android:color/transparent"
         android:gravity="center_vertical"
         android:orientation="horizontal"
         android:paddingHorizontal="16dp"
         android:paddingBottom="4dp"
         android:translationZ="51dp"
-        android:visibility="invisible"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toTopOf="parent">
 
         <TextView
-            android:id="@+id/tvFloatBrandTitle"
+            android:id="@+id/tvFragBrandTitle"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:drawablePadding="10dp"
@@ -476,7 +499,7 @@
             android:layout_weight="1" />
 
         <ImageView
-            android:id="@+id/btnFloatHeaderSearch"
+            android:id="@+id/btnFragHeaderSearch"
             android:layout_width="41.5dp"
             android:layout_height="41.5dp"
             android:background="?attr/selectableItemBackgroundBorderless"
@@ -488,8 +511,27 @@
             android:src="@drawable/ic_search"
             app:tint="@android:color/white" />
 
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnFragSignIn"
+            android:layout_width="wrap_content"
+            android:layout_height="36dp"
+            android:backgroundTint="@color/white"
+            android:fontFamily="@font/inter_variable"
+            android:text="Iniciar sesión"
+            android:textAllCaps="false"
+            android:textColor="#1F2B42"
+            android:textSize="13sp"
+            android:visibility="gone"
+            app:cornerRadius="18dp"
+            app:icon="@drawable/ic_google_logo"
+            app:iconGravity="textStart"
+            app:iconPadding="8dp"
+            app:iconSize="18dp"
+            app:iconTint="@null"
+            app:rippleColor="#2200419E" />
+
         <com.google.android.material.imageview.ShapeableImageView
-            android:id="@+id/btnFloatProfilePhoto"
+            android:id="@+id/btnFragProfilePhoto"
             android:layout_width="34dp"
             android:layout_height="34dp"
             android:background="?attr/selectableItemBackgroundBorderless"

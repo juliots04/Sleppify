@@ -58,6 +58,13 @@ object StreamResolver {
     private enum class SourceType { DIRECT, VIDEO }
     private data class CachedStream(val url: String, val type: SourceType, val timestamp: Long)
     private val urlCache = ConcurrentHashMap<String, CachedStream>()
+
+    // Side-cache for the muxed itag-18 VIDEO URL, populated opportunistically during the AUDIO
+    // extraction (same fetchPage → C1). Kept SEPARATE from urlCache on purpose: urlCache must stay
+    // DIRECT while audio plays so isVideoSource()/isVideoPresentation() never flip the hero to
+    // video with the audio stream running. Same 3.5h TTL discipline as urlCache.
+    private val videoPrefetchCache = ConcurrentHashMap<String, CachedStream>()
+
     // Dedup: in-flight resolutions so parallel callers wait on the same result
     private val inFlightResolutions = ConcurrentHashMap<String, java.util.concurrent.CompletableFuture<String?>>()
 
@@ -182,6 +189,7 @@ object StreamResolver {
         authCookieHeader = cookieHeader?.trim() ?: ""
         if (authCookieHeader.isNotBlank()) {
             urlCache.clear()
+            videoPrefetchCache.clear()
         }
     }
 
@@ -241,9 +249,22 @@ object StreamResolver {
                     return cached.url
                 }
             }
+            // C1: side-cache hit — the video URL was already extracted (for free) during a prior
+            // audio resolve. Promote it into urlCache as VIDEO (the mode actually being loaded IS
+            // video now) so isVideoSource() reports correctly, and SKIP the network round-trip.
+            videoPrefetchCache[videoId]?.let { pf ->
+                if (System.currentTimeMillis() - pf.timestamp < DIRECT_CACHE_TTL_MS) {
+                    urlCache[videoId] = CachedStream(pf.url, SourceType.VIDEO, pf.timestamp)
+                    Log.d(TAG, "video_prefetch[$videoId] hit (skipped network)")
+                    return pf.url
+                }
+                videoPrefetchCache.remove(videoId)
+            }
             val videoUrl = resolveVideoViaNewPipe(videoId)
             if (!videoUrl.isNullOrBlank()) {
-                urlCache[videoId] = CachedStream(videoUrl, SourceType.VIDEO, System.currentTimeMillis())
+                val now = System.currentTimeMillis()
+                urlCache[videoId] = CachedStream(videoUrl, SourceType.VIDEO, now)
+                videoPrefetchCache[videoId] = CachedStream(videoUrl, SourceType.VIDEO, now)
                 Log.d(TAG, "newpipe_video[$videoId] ok (video mode)")
                 return videoUrl
             }
@@ -345,6 +366,7 @@ object StreamResolver {
     fun invalidate(videoId: String?) {
         if (videoId.isNullOrBlank()) return
         urlCache.remove(videoId)
+        videoPrefetchCache.remove(videoId)
     }
 
     @JvmStatic
@@ -356,6 +378,7 @@ object StreamResolver {
     fun markFailed(videoId: String?) {
         if (videoId.isNullOrBlank()) return
         urlCache.remove(videoId)
+        videoPrefetchCache.remove(videoId)
     }
 
     // ─── NewPipe internals ────────────────────────────────────────────────
@@ -424,22 +447,32 @@ object StreamResolver {
             ensureNewPipeInitialized()
             val extractor = ServiceList.YouTube.getStreamExtractor("https://www.youtube.com/watch?v=$videoId")
             extractor.fetchPage()
-            // videoStreams are the MUXED (video+audio) streams — ExoPlayer plays them directly,
-            // no on-device muxing. videoOnlyStreams (DASH) are deliberately ignored here.
-            val muxed = extractor.videoStreams ?: emptyList()
-            val playable = muxed.filter { !it.content.isNullOrBlank() }
-            val progressive = playable.filter { it.deliveryMethod == DeliveryMethod.PROGRESSIVE_HTTP }
-                .ifEmpty { playable }
-            if (progressive.isEmpty()) return null
-            val byItag = progressive.associateBy { it.itag }
-            val chosen = byItag[18]
-                ?: progressive.minByOrNull { parseResolutionHeight(it.resolution) }
-                ?: return null
-            chosen.content
+            extractMuxedVideoUrl(extractor)
         } catch (e: Exception) {
             Log.w(TAG, "video[$videoId] resolve failed: ${e.javaClass.simpleName} — ${e.message}")
             null
         }
+    }
+
+    /**
+     * Picks the muxed itag-18 (else the lowest-resolution muxed mp4) direct URL from an ALREADY
+     * fetched [extractor]. videoStreams are the MUXED (video+audio) streams — ExoPlayer plays them
+     * directly, no on-device muxing; videoOnlyStreams (DASH) are deliberately ignored.
+     *
+     * This is the core of C1: pulling a second URL out of a StreamInfo we already paid one
+     * fetchPage() for is nearly free, so the audio resolve can also stock the video side-cache.
+     */
+    private fun extractMuxedVideoUrl(extractor: StreamExtractor): String? {
+        val muxed = extractor.videoStreams ?: emptyList()
+        val playable = muxed.filter { !it.content.isNullOrBlank() }
+        val progressive = playable.filter { it.deliveryMethod == DeliveryMethod.PROGRESSIVE_HTTP }
+            .ifEmpty { playable }
+        if (progressive.isEmpty()) return null
+        val byItag = progressive.associateBy { it.itag }
+        val chosen = byItag[18]
+            ?: progressive.minByOrNull { parseResolutionHeight(it.resolution) }
+            ?: return null
+        return chosen.content
     }
 
     /** "360p" / "720p60" → 360 / 720; unknown resolutions sort last. */
@@ -455,11 +488,64 @@ object StreamResolver {
         return urlCache[videoId]?.type == SourceType.VIDEO
     }
 
+    /**
+     * The muxed video URL for [videoId] if it is ALREADY known — from the C1 side-cache (extracted
+     * during a prior audio resolve) or a live VIDEO urlCache entry — with NO network fetch. Returns
+     * null when a fetch would be needed. Used by the player to (a) warm the video head into the
+     * media cache (C2) and (b) decide whether a hot-swap can use the fast (already-warm) timings.
+     */
+    @JvmStatic
+    fun getPrefetchedVideoUrl(videoId: String?): String? {
+        if (videoId.isNullOrBlank() || videoId.startsWith("local_")) return null
+        val now = System.currentTimeMillis()
+        videoPrefetchCache[videoId]?.let { pf ->
+            if (now - pf.timestamp < DIRECT_CACHE_TTL_MS) return pf.url
+            videoPrefetchCache.remove(videoId)
+        }
+        urlCache[videoId]?.let { cached ->
+            if (cached.type == SourceType.VIDEO && now - cached.timestamp < DIRECT_CACHE_TTL_MS) {
+                return cached.url
+            }
+        }
+        return null
+    }
+
+    /**
+     * Eagerly resolves and side-caches the muxed video URL for [videoId] so a later Canción→Video tap
+     * skips the NewPipe fetch (C1) even on tracks whose audio was served from cache (where the free
+     * C1 extraction never ran). Instant no-op when the URL is already known. Deliberately does NOT
+     * touch [urlCache]: audio keeps playing as DIRECT and isVideoSource() stays audio until the mode
+     * actually flips. Metadata-only (does not download media bytes). Must run on a background thread.
+     */
+    @JvmStatic
+    fun prefetchVideoUrl(@Suppress("UNUSED_PARAMETER") context: Context, videoId: String?): String? {
+        if (videoId.isNullOrBlank() || videoId.startsWith("local_")) return null
+        getPrefetchedVideoUrl(videoId)?.let { return it }
+        val url = resolveVideoViaNewPipe(videoId)
+        if (!url.isNullOrBlank()) {
+            videoPrefetchCache[videoId] = CachedStream(url, SourceType.VIDEO, System.currentTimeMillis())
+            Log.d(TAG, "prefetchVideoUrl[$videoId] side-cached")
+        }
+        return url
+    }
+
     private fun resolveViaNewPipe(videoId: String, preferredItags: IntArray = PREFERRED_ITAGS): String? {
         ensureNewPipeInitialized()
         val url = "https://www.youtube.com/watch?v=$videoId"
         val extractor: StreamExtractor = ServiceList.YouTube.getStreamExtractor(url)
         extractor.fetchPage()
+
+        // C1: opportunistically stock the video side-cache from THIS SAME extraction (no extra
+        // fetchPage). Lets a later Audio→Video swap skip the network round-trip. Does NOT touch
+        // urlCache, so the primary source type stays DIRECT while audio plays.
+        try {
+            val videoUrl = extractMuxedVideoUrl(extractor)
+            if (!videoUrl.isNullOrBlank()) {
+                videoPrefetchCache[videoId] = CachedStream(videoUrl, SourceType.VIDEO, System.currentTimeMillis())
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "video_prefetch[$videoId] failed: ${e.message}")
+        }
 
         val audioStreams: List<AudioStream> = extractor.audioStreams ?: emptyList()
         if (audioStreams.isEmpty()) {

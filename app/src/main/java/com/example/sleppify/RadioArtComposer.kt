@@ -24,17 +24,27 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 /**
- * Composes the radio card artwork (the 3 overlapping circular thumbnails: left, center, right) into
- * a SINGLE bitmap that is cached in memory AND on disk, keyed by the three source URLs.
+ * Composes the radio card artwork into a SINGLE bitmap that is cached in memory AND on disk, keyed
+ * by the three source URLs.
  *
- * Why: the carousel previously fired 3–4 separate Glide requests per card on every bind, so scrolling
- * showed the thumbnails streaming in one by one. Now each card's art is built once, persisted as one
- * image, and painted atomically — instant on every re-scroll, and warmable ahead of first paint.
+ * Spotify-radio style (measured from Spotify's live generated covers, normalized to a square of
+ * side S): two faint concentric "sonar" discs (black @ 5% alpha, radii 0.33S / 0.52S centered at
+ * 0.50S, 0.45S), then in the lower half a large full-color seed circle (r = 0.2225S at 0.50S,
+ * 0.64S) flanked by two smaller GRAYSCALE circles (r = 0.16S at 0.165S / 0.835S) — grayscale is
+ * what visually says "radio = this artist + similar artists". Every circle carries a thin
+ * off-white halo stroke. The canvas stays TRANSPARENT so the card's fluorescent field (vRadioBg,
+ * see [cardBackgroundColor]) shows through; the title and "RADIO" label are TextViews in
+ * item_radio_carousel.xml.
  *
- * The composite is drawn on a TRANSPARENT canvas so the card's colored gradient (vRadioBg) still shows
- * through the gaps between circles, exactly like the original layered layout.
+ * Why a composite: the carousel previously fired 3–4 separate Glide requests per card on every
+ * bind, so scrolling showed the thumbnails streaming in one by one. Now each card's art is built
+ * once, persisted as one image, and painted atomically.
  */
 object RadioArtComposer {
+
+    // Bumped whenever the composition geometry/style changes so stale cached composites
+    // (memory + disk, keyed by signature) are never reused for the new design.
+    private const val STYLE_VERSION = "v3-bigger-circles"
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -59,6 +69,33 @@ object RadioArtComposer {
     /** Drops the in-memory composite cache under system memory pressure; disk cache is untouched. */
     fun trimMemory() {
         memCache.evictAll()
+    }
+
+    /**
+     * Flat "fluorescent" card field behind the circles — the same punchy family as the liked
+     * (#FC5DAE→#8B70F5) and favorites (#FF512F→#F09819) gradients but a single saturated color,
+     * no gradient. Derived from the seed's raw Palette color so each radio keeps its own hue.
+     * Shared by every surface that paints a radio cover (home carousels, detail header).
+     */
+    @JvmStatic
+    fun cardBackgroundColor(rawColor: Int): Int {
+        val hsl = FloatArray(3)
+        androidx.core.graphics.ColorUtils.colorToHSL(rawColor, hsl)
+        // Near-grayscale seeds (b/w covers) have no meaningful hue — forcing a bright color (the old
+        // violet) looked out of place because nothing in the image was that color. Give them a deep
+        // neutral slate that sits behind any artwork instead.
+        if (hsl[1] < 0.12f) {
+            hsl[0] = 220f
+            hsl[1] = 0.16f
+            hsl[2] = 0.34f
+            return androidx.core.graphics.ColorUtils.HSLToColor(hsl)
+        }
+        // Keep the seed's OWN hue so the field combines with the central image; vivid but not neon
+        // (toned down from the old 0.85–0.98 saturation), and deep enough that the white circles and
+        // halo read clearly on top.
+        hsl[1] = hsl[1].coerceIn(0.42f, 0.66f)
+        hsl[2] = hsl[2].coerceIn(0.40f, 0.52f)
+        return androidx.core.graphics.ColorUtils.HSLToColor(hsl)
     }
 
     /**
@@ -145,9 +182,14 @@ object RadioArtComposer {
         rightUrl: String,
         sizePx: Int
     ): Bitmap? {
-        val density = ctx.resources.displayMetrics.density
-        val centerDia = Math.max(160, Math.round(95f * density))
-        val sideDia = Math.max(160, Math.round(68f * density))
+        // Spotify-radio geometry, proportional to the card size. Circles sit at the vertical
+        // center now: the badge lives top-right and the seed title bottom-left (both small),
+        // so the image row owns the middle band and can be larger.
+        val centerR = sizePx * 0.27f
+        val sideR = sizePx * 0.19f
+        val circleCy = sizePx * 0.50f
+        val centerDia = Math.max(160, Math.round(centerR * 2f))
+        val sideDia = Math.max(120, Math.round(sideR * 2f))
 
         val futures = ArrayList<FutureTarget<Bitmap>>()
         fun thumb(url: String, decodePx: Int): Bitmap? {
@@ -174,15 +216,16 @@ object RadioArtComposer {
 
             val out = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
             val canvas = Canvas(out)
-            val cy = sizePx / 2f
-            val centerR = 95f * density / 2f
-            val sideR = 68f * density / 2f
-            val leftCx = 22f * density
-            val rightCx = sizePx - 22f * density
-            // Draw order matches the layout's elevation: side circles first, center on top.
-            drawCircle(canvas, left, leftCx, cy, sideR)
-            drawCircle(canvas, right, rightCx, cy, sideR)
-            drawCircle(canvas, center, sizePx / 2f, cy, centerR)
+
+            // Faint concentric "sonar" discs — the tone-on-tone radio-wave motif behind everything.
+            discPaint.color = 0x0D000000
+            canvas.drawCircle(sizePx * 0.5f, circleCy, sizePx * 0.52f, discPaint)
+            canvas.drawCircle(sizePx * 0.5f, circleCy, sizePx * 0.36f, discPaint)
+
+            // Side circles (similar artists) in GRAYSCALE, behind; full-color seed circle on top.
+            drawCircle(canvas, left, sizePx * 0.165f, circleCy, sideR, sizePx, grayscale = true)
+            drawCircle(canvas, right, sizePx * 0.835f, circleCy, sideR, sizePx, grayscale = true)
+            drawCircle(canvas, center, sizePx * 0.5f, circleCy, centerR, sizePx, grayscale = false)
             return out
         } finally {
             for (f in futures) {
@@ -191,12 +234,26 @@ object RadioArtComposer {
         }
     }
 
-    private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    private val discPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+    private val haloPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        color = 0x22000000
+        color = 0xFFF4F5F2.toInt() // off-white halo, like the light tint stroke on Spotify's circles
     }
 
-    private fun drawCircle(canvas: Canvas, bmp: Bitmap?, cx: Float, cy: Float, r: Float) {
+    private val grayscaleFilter = android.graphics.ColorMatrixColorFilter(
+        android.graphics.ColorMatrix().apply { setSaturation(0f) }
+    )
+
+    private fun drawCircle(
+        canvas: Canvas,
+        bmp: Bitmap?,
+        cx: Float,
+        cy: Float,
+        r: Float,
+        sizePx: Int,
+        grayscale: Boolean
+    ) {
         if (bmp == null || bmp.isRecycled) return
         val shader = BitmapShader(bmp, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
         // center-crop the bitmap to cover the circle
@@ -208,10 +265,20 @@ object RadioArtComposer {
         shader.setLocalMatrix(m)
         val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
         paint.shader = shader
+        if (grayscale) paint.colorFilter = grayscaleFilter
         canvas.drawCircle(cx, cy, r, paint)
-        // Thin dark ring to separate overlapping circles (mimics the original elevation seam).
-        ringPaint.strokeWidth = Math.max(1f, r * 0.03f)
-        canvas.drawCircle(cx, cy, r - ringPaint.strokeWidth / 2f, ringPaint)
+        // Thin off-white halo ring (~8px at 640, proportional here).
+        haloPaint.strokeWidth = Math.max(2f, sizePx * 0.0125f)
+        canvas.drawCircle(cx, cy, r - haloPaint.strokeWidth / 2f, haloPaint)
+    }
+
+    /** Wipes every composite from disk + memory (used once when the art style version changes). */
+    fun clearAllCaches(ctx: Context) {
+        val appCtx = ctx.applicationContext
+        memCache.evictAll()
+        io.execute {
+            try { File(appCtx.cacheDir, "radio_art").deleteRecursively() } catch (_: Throwable) {}
+        }
     }
 
     private fun writeDisk(file: File, bmp: Bitmap) {
@@ -229,7 +296,8 @@ object RadioArtComposer {
     private fun diskFile(ctx: Context, sig: String): File =
         File(File(ctx.cacheDir, "radio_art").also { it.mkdirs() }, "$sig.png")
 
-    private fun signature(vararg parts: Any): String = md5(parts.joinToString("|"))
+    private fun signature(vararg parts: Any): String =
+        md5(parts.joinToString("|") + "|" + STYLE_VERSION)
 
     private fun md5(input: String): String {
         return try {
