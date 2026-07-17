@@ -9,7 +9,7 @@ class YouTubeCropTransformation : BitmapTransformation() {
     
     companion object {
         /** Bumped when [YouTubeImageProcessor.smartCrop] output semantics change (invalidates Glide disk cache). */
-        private const val ID = "com.example.sleppify.utils.YouTubeCropTransformation.v3-non-square-safe-margins"
+        private const val ID = "com.example.sleppify.utils.YouTubeCropTransformation.v4-square-untouched-symmetric-bars"
         private val ID_BYTES = ID.toByteArray(CHARSET)
     }
 

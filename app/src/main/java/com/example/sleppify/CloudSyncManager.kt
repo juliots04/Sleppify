@@ -140,6 +140,10 @@ class CloudSyncManager private constructor(context: Context) {
             bool(KEY_OFFLINE_MODE_ENABLED, false)
             string(KEY_STREAMING_QUALITY_WIFI, STREAMING_QUALITY_MEDIUM)
             string(KEY_STREAMING_QUALITY_MOBILE, STREAMING_QUALITY_MEDIUM)
+            // Calidad de video (streams muxed progresivos: normalmente 360p, a veces 720p).
+            // Se sube a Firebase solo — settingsListener + encodeSettingsPreferences cubren toda clave.
+            string(KEY_VIDEO_QUALITY_WIFI, STREAMING_QUALITY_MEDIUM)
+            string(KEY_VIDEO_QUALITY_MOBILE, STREAMING_QUALITY_MEDIUM)
             bool(KEY_LIMIT_MOBILE_DATA, false)
             bool(KEY_WIFI_ONLY_PLAYBACK, false)
             bool(KEY_NO_MUSIC_VIDEOS, true)
@@ -1680,6 +1684,8 @@ class CloudSyncManager private constructor(context: Context) {
 
         @JvmField val KEY_STREAMING_QUALITY_WIFI = "streaming_quality_wifi"
         @JvmField val KEY_STREAMING_QUALITY_MOBILE = "streaming_quality_mobile"
+        @JvmField val KEY_VIDEO_QUALITY_WIFI = "video_quality_wifi"
+        @JvmField val KEY_VIDEO_QUALITY_MOBILE = "video_quality_mobile"
         @JvmField val KEY_LIMIT_MOBILE_DATA = "limit_mobile_data"
         @JvmField val KEY_WIFI_ONLY_PLAYBACK = "wifi_only_playback"
         @JvmField val KEY_NO_MUSIC_VIDEOS = "no_music_videos"

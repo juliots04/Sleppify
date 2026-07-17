@@ -22,6 +22,7 @@ import androidx.media3.datasource.cache.SimpleCache
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.DefaultRenderersFactory
+import androidx.media3.exoplayer.SeekParameters
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import java.io.File
 import java.util.concurrent.CopyOnWriteArrayList
@@ -81,6 +82,79 @@ class ExoMediaPlayer {
         }
 
         /**
+         * Clave de caché ESTABLE por contenido para URLs de googlevideo: id + itag. La URL
+         * completa caduca cada ~6h (cambian expire/sig/ip) y con la clave default (la URI entera)
+         * los bytes ya cacheados quedaban huérfanos en cada re-resolución — una canción cacheada
+         * al 100% volvía a descargarse entera. Con la clave estable: pista totalmente cacheada →
+         * reproduce DESDE DISCO al instante sin red aunque la URL haya caducado; pista parcial →
+         * reusa los rangos ya bajados con la URL nueva. itag en la clave separa calidades (bytes
+         * distintos). URLs no-googlevideo conservan la URI como clave (comportamiento default).
+         */
+        @JvmStatic
+        fun stableCacheKey(uri: Uri): String {
+            val host = uri.host ?: return uri.toString()
+            if (!host.contains("googlevideo")) return uri.toString()
+            val id = try { uri.getQueryParameter("id") } catch (_: Exception) { null }
+                ?: return uri.toString()
+            val itag = try { uri.getQueryParameter("itag") } catch (_: Exception) { null } ?: ""
+            return "gv:$id:$itag"
+        }
+
+        /** Fábrica compartida por playback ([prepareAsync]) y warm ([warmStreamHead]) — las claves
+         *  DEBEN coincidir entre ambos para que el head calentado se lea al preparar. */
+        @JvmStatic
+        val stableCacheKeyFactory: androidx.media3.datasource.cache.CacheKeyFactory =
+            androidx.media3.datasource.cache.CacheKeyFactory { spec -> stableCacheKey(spec.uri) }
+
+        /**
+         * True si el audio de [videoId] está COMPLETO en el exo_stream_cache (los bytes quedaron
+         * en disco al reproducir la canción entera). Recorre las claves estables "gv:id:itag" del
+         * id y compara los bytes cacheados contra el content length que registró Media3 — solo un
+         * stream entero cuenta como descargado-de-facto. El índice de SimpleCache vive en
+         * memoria, así que es barato.
+         */
+        @JvmStatic
+        fun isFullyCached(context: Context, videoId: String): Boolean {
+            if (videoId.isBlank()) return false
+            return try {
+                val cache = getSharedCache(context)
+                val prefix = "gv:$videoId:"
+                for (key in cache.keys) {
+                    if (!key.startsWith(prefix)) continue
+                    val len = androidx.media3.datasource.cache.ContentMetadata.getContentLength(
+                        cache.getContentMetadata(key)
+                    )
+                    if (len <= 0) continue
+                    if (cache.getCachedBytes(key, 0, len) >= len) return true
+                }
+                false
+            } catch (_: Throwable) {
+                false
+            }
+        }
+
+        /**
+         * Borra del exo_stream_cache TODOS los streams de [videoId] (todas las calidades). Solo
+         * para la acción EXPLÍCITA del usuario "eliminar descarga" sobre una canción que estaba
+         * disponible offline vía caché — la política de nunca evictar el cache aplica a la
+         * gestión automática, no a un borrado pedido por el usuario.
+         */
+        @JvmStatic
+        fun removeCachedAudio(context: Context, videoId: String) {
+            if (videoId.isBlank()) return
+            try {
+                val cache = getSharedCache(context)
+                val prefix = "gv:$videoId:"
+                for (key in cache.keys.toList()) {
+                    if (key.startsWith(prefix)) {
+                        try { cache.removeResource(key) } catch (_: Throwable) {}
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+        }
+
+        /**
          * C2 — warms roughly the first [lengthBytes] of [url] into the SHARED exo_stream_cache on a
          * background thread, best-effort and cancellable. Uses the SAME CacheDataSource factory +
          * browser [headers] as playback ([prepareAsync]) so the cache key (= the URL) matches: when
@@ -126,6 +200,7 @@ class ExoMediaPlayer {
                 // Identical wrapping to prepareAsync() so cache keys line up.
                 val cacheDataSource = CacheDataSource.Factory()
                     .setCache(getSharedCache(appContext))
+                    .setCacheKeyFactory(stableCacheKeyFactory)
                     .setUpstreamDataSourceFactory(httpFactory)
                     .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
                     .createDataSource()
@@ -230,12 +305,19 @@ class ExoMediaPlayer {
             lowBuffer -> {
                 DefaultLoadControl.Builder()
                     .setBufferDurationsMs(5_000, 15_000, 250, 500)
+                    // Back-buffer: los seeks hacia atrás dentro de lo recién reproducido se
+                    // sirven de RAM en vez de re-pedir el rango al CDN (el default es 0).
+                    .setBackBuffer(15_000, true)
                     .setPrioritizeTimeOverSizeThresholds(true)
                     .build()
             }
             else -> {
                 DefaultLoadControl.Builder()
                     .setBufferDurationsMs(15_000, 50_000, 250, 500)
+                    // Mismo back-buffer que el player compartido (ExoPlayerManager): tras un
+                    // hot-swap o crossfade el player activo es uno de estos PROPIOS, y sin
+                    // back-buffer cada seek hacia atrás re-descargaba desde el CDN.
+                    .setBackBuffer(30_000, true)
                     .setPrioritizeTimeOverSizeThresholds(true)
                     .build()
             }
@@ -249,6 +331,10 @@ class ExoMediaPlayer {
             .setAudioAttributes(audioAttributes, true)
             .setHandleAudioBecomingNoisy(true)
             .build()
+        // Seek al keyframe más cercano (ver ExoPlayerManager): sin esto, un seek en una fuente
+        // con video decodifica desde el keyframe previo hasta el frame exacto antes de READY.
+        // El player del hot-swap lo revierte a EXACT hasta el commit (setSeekToClosestSync).
+        player.setSeekParameters(SeekParameters.CLOSEST_SYNC)
         this.exoPlayer = player
         this.ownsPlayer = true
         this.audioSessionId = player.audioSessionId
@@ -315,7 +401,14 @@ class ExoMediaPlayer {
             // isn't initialized yet) — this callback is the only reliable source of the real
             // session. Feed it to the EQ service so app-scoped EQ can attach to the live session.
             this@ExoMediaPlayer.audioSessionId = audioSessionId
-            AudioEffectsService.notifyPlayerSessionChanged(appContext, audioSessionId)
+            // Solo el player AUDIBLE reporta su sesión al EQ. Media3 genera y despacha el id en
+            // la construcción (sin reproducir nada), así que los players desechables (pre-buffer
+            // gapless, crossfade entrante, swap de modo) pisaban KEY_PLAYER_SESSION_ID con
+            // sesiones mudas que mueren al release — el EQ solo-app quedaba colgado de una
+            // sesión muerta. El flag lo activa markAsActiveForEq() al promocionar el player.
+            if (reportsSessionToEq) {
+                AudioEffectsService.notifyPlayerSessionChanged(appContext, audioSessionId)
+            }
         }
 
         override fun onPlayerError(error: PlaybackException) {
@@ -405,9 +498,12 @@ class ExoMediaPlayer {
                     httpFactory.setDefaultRequestProperties(headers)
                 }
             }
-            // Wrap with CacheDataSource for disk caching of streamed audio
+            // Wrap with CacheDataSource for disk caching of streamed audio. Clave estable por
+            // contenido (ver stableCacheKey): una canción ya cacheada reproduce desde disco al
+            // instante aunque su URL de googlevideo haya caducado.
             CacheDataSource.Factory()
                 .setCache(getSharedCache(appContext))
+                .setCacheKeyFactory(stableCacheKeyFactory)
                 .setUpstreamDataSourceFactory(httpFactory)
                 .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
         } else {
@@ -486,6 +582,20 @@ class ExoMediaPlayer {
         exoPlayer?.seekTo(Math.max(0L, msec.toLong()))
     }
 
+    /**
+     * Alterna entre seek al keyframe más cercano (default, rápido en fuentes con video) y seek
+     * EXACT. El hot-swap Audio↔Video necesita EXACT mientras sincroniza su player en silencio:
+     * el intercambio sin pausa depende de que viejo y nuevo queden a <~900ms de drift, y
+     * CLOSEST_SYNC en un mp4 puede caer segundos lejos (GOPs del itag-18). Al adoptar el player
+     * como activo se vuelve a CLOSEST_SYNC para que los seeks del usuario sean rápidos.
+     */
+    fun setSeekToClosestSync(enabled: Boolean) {
+        if (released) return
+        exoPlayer?.setSeekParameters(
+            if (enabled) SeekParameters.CLOSEST_SYNC else SeekParameters.EXACT
+        )
+    }
+
     fun getCurrentPosition(): Int {
         if (released) return 0
         return (exoPlayer?.currentPosition?.coerceAtLeast(0L)?.toInt()) ?: 0
@@ -515,6 +625,26 @@ class ExoMediaPlayer {
         return exoPlayer?.audioSessionId ?: audioSessionId
     }
 
+    // True solo para el player que SUENA: es el único que puede persistir su sesión de audio
+    // para el EQ solo-app (ver onAudioSessionIdChanged).
+    @Volatile private var reportsSessionToEq: Boolean = false
+
+    /**
+     * Marca este player como el AUDIBLE y reporta su sesión al EQ solo-app. Llamar en cada
+     * promoción (start normal, adopción del shared/pre-buffer, commit de crossfade o de swap
+     * de modo). El reporte inmediato es imprescindible para el player COMPARTIDO: su id se
+     * generó una vez en ExoPlayerManager.initialize() y nunca cambia, así que
+     * onAudioSessionIdChanged jamás dispara para él; para players propios recién construidos
+     * cuyo id aún no llegó (UNSET/-1), el listener gateado lo reporta cuando aterrice.
+     */
+    fun markAsActiveForEq() {
+        reportsSessionToEq = true
+        val sid = getAudioSessionId()
+        if (sid > 0) {
+            AudioEffectsService.notifyPlayerSessionChanged(appContext, sid)
+        }
+    }
+
     fun getExoPlayer(): Player? {
         if (released) return null
         return exoPlayer
@@ -532,8 +662,31 @@ class ExoMediaPlayer {
     }
 
     fun release() {
+        releaseInternal(false)
+    }
+
+    /**
+     * Igual que [release], pero la liberación PESADA del player propio (ExoPlayer.release(),
+     * que bloquea al caller hasta ~500ms esperando su hilo interno) se difiere a un mensaje
+     * posterior del main looper. El stop + detach de listeners corre YA, así el caller (el
+     * gesto de seek, el commit del hot-swap, un cambio de pista) nunca paga el release dentro
+     * de su propio frame. Media3 exige release() en el hilo donde se construyó el player
+     * (main) — por eso se postea al mainHandler, nunca a un executor de fondo.
+     */
+    fun releaseAsync() {
+        releaseInternal(true)
+    }
+
+    private fun releaseInternal(deferHeavyRelease: Boolean) {
         if (released) return
         released = true
+        // Si este era el player audible con dueño propio, su sesión de audio muere con el
+        // release: invalida la persistida para que el EQ solo-app caiga a global en vez de
+        // quedarse atado a una sesión muerta. El shared player sobrevive al wrapper — no tocar.
+        if (reportsSessionToEq && ownsPlayer) {
+            try { AudioEffectsService.notifyPlayerSessionInvalid(appContext) } catch (_: Exception) { }
+        }
+        reportsSessionToEq = false
         prepared = false
         preparedListener = null
         completionListener = null
@@ -547,10 +700,20 @@ class ExoMediaPlayer {
             try {
                 player.removeListener(playerListener)
                 if (ownsPlayer) {
-                    Log.d(TAG, "[PLAYBACK_DBG] release: OWNED player — stop+release hash=${this.hashCode()}")
+                    Log.d(TAG, "[PLAYBACK_DBG] release: OWNED player — stop+release hash=${this.hashCode()} deferred=$deferHeavyRelease")
                     player.stop()
                     player.clearMediaItems()
-                    player.release()
+                    if (deferHeavyRelease) {
+                        mainHandler.post {
+                            try {
+                                player.release()
+                            } catch (e: Exception) {
+                                Log.w(TAG, "deferred release: exception", e)
+                            }
+                        }
+                    } else {
+                        player.release()
+                    }
                 } else {
                     // For shared player: stop and clear to prevent stale audio from continuing
                     Log.d(TAG, "[PLAYBACK_DBG] release: SHARED player — stop+clear hash=${this.hashCode()}")

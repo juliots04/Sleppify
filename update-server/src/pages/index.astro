@@ -1,0 +1,75 @@
+---
+// Login del panel. El middleware ya redirige a /panel si hay sesión activa.
+import '../styles/global.css';
+---
+
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <title>Entrar · Sleppify Updates</title>
+  </head>
+  <body>
+    <div class="ambient"><span></span><span></span><span></span></div>
+
+    <div class="auth-wrap">
+      <div class="card auth-card">
+        <div class="auth-logo">S</div>
+        <div class="brand">Sleppify <span>Updates</span></div>
+        <h2 style="margin-top:14px">Entrar al panel</h2>
+        <p class="muted small">Publica y gestiona las actualizaciones de la app</p>
+
+        <div class="error" id="err" style="display:none"></div>
+
+        <form id="loginForm" autocomplete="off">
+          <label
+            >Usuario
+            <input type="text" name="username" id="u" required autofocus autocomplete="username" />
+          </label>
+          <label
+            >Contraseña
+            <input
+              type="password"
+              name="password"
+              id="p"
+              required
+              autocomplete="current-password"
+            />
+          </label>
+          <button class="btn btn-primary" type="submit" id="go">Entrar</button>
+        </form>
+      </div>
+    </div>
+
+    <script>
+      const form = document.getElementById('loginForm') as HTMLFormElement;
+      const err = document.getElementById('err') as HTMLDivElement;
+      const go = document.getElementById('go') as HTMLButtonElement;
+
+      form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        err.style.display = 'none';
+        go.disabled = true;
+        go.textContent = 'Entrando…';
+        try {
+          const res = await fetch('/api/login', { method: 'POST', body: new FormData(form) });
+          const data = await res.json();
+          if (data.ok) {
+            go.textContent = '✓ Listo';
+            location.href = '/panel';
+            return;
+          }
+          err.textContent = data.error || 'No se pudo entrar.';
+          err.style.display = 'block';
+        } catch {
+          err.textContent = 'Fallo de red. Reintenta.';
+          err.style.display = 'block';
+        }
+        go.disabled = false;
+        go.textContent = 'Entrar';
+      });
+    </script>
+  </body>
+</html>

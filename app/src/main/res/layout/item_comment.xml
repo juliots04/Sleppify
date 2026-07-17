@@ -35,22 +35,75 @@
         android:orientation="vertical">
 
         <LinearLayout
+            android:id="@+id/llCommentPinned"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="3dp"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:visibility="gone">
+
+            <ImageView
+                android:layout_width="12dp"
+                android:layout_height="12dp"
+                android:src="@drawable/ic_comment_pin"
+                app:tint="@color/text_secondary" />
+
+            <TextView
+                android:id="@+id/tvCommentPinned"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="4dp"
+                android:textColor="@color/text_secondary"
+                android:textSize="11sp"
+                android:fontFamily="@font/inter_variable"
+                android:singleLine="true"
+                android:ellipsize="end" />
+
+        </LinearLayout>
+
+        <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="horizontal"
             android:gravity="center_vertical">
 
-            <TextView
-                android:id="@+id/tvCommentAuthor"
+            <!-- El wrapper lleva el weight (no el nombre) para que el chip de dueño
+                 abrace el texto y la hora nunca salga de pantalla. -->
+            <LinearLayout
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:textColor="@color/text_primary"
-                android:textSize="13sp"
-                android:textStyle="bold"
-                android:fontFamily="@font/inter_variable"
-                android:singleLine="true"
-                android:ellipsize="end" />
+                android:orientation="horizontal"
+                android:gravity="center_vertical">
+
+                <TextView
+                    android:id="@+id/tvCommentAuthor"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:textColor="@color/text_primary"
+                    android:textSize="13sp"
+                    android:textStyle="bold"
+                    android:fontFamily="@font/inter_variable"
+                    android:singleLine="true"
+                    android:ellipsize="end" />
+
+                <ImageView
+                    android:id="@+id/ivCommentBadge"
+                    android:layout_width="13dp"
+                    android:layout_height="13dp"
+                    android:layout_marginStart="4dp"
+                    android:visibility="gone"
+                    app:tint="@color/text_secondary" />
+
+                <ImageView
+                    android:id="@+id/ivCommentMemberBadge"
+                    android:layout_width="14dp"
+                    android:layout_height="14dp"
+                    android:layout_marginStart="4dp"
+                    android:visibility="gone" />
+
+            </LinearLayout>
 
             <TextView
                 android:id="@+id/tvCommentTime"
@@ -94,6 +147,29 @@
                 android:textColor="@color/text_secondary"
                 android:textSize="12sp"
                 android:fontFamily="@font/inter_variable" />
+
+            <!-- Corazón del creador: avatar del canal + corazón rojo pequeño -->
+            <FrameLayout
+                android:id="@+id/flCommentHeart"
+                android:layout_width="19dp"
+                android:layout_height="17dp"
+                android:layout_marginStart="12dp"
+                android:visibility="gone">
+
+                <ImageView
+                    android:id="@+id/ivHeartCreatorAvatar"
+                    android:layout_width="14dp"
+                    android:layout_height="14dp"
+                    android:layout_gravity="top|start"
+                    android:scaleType="centerCrop" />
+
+                <ImageView
+                    android:layout_width="9dp"
+                    android:layout_height="9dp"
+                    android:layout_gravity="bottom|end"
+                    android:src="@drawable/ic_comment_heart" />
+
+            </FrameLayout>
 
         </LinearLayout>
 

@@ -54,6 +54,10 @@ import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequest
 import androidx.work.WorkManager
 
+// The canonical recents model now lives in the app-scoped RecentSearchesStore (per-uid prefs +
+// gated Firestore sync); this alias keeps the fragment's many usages readable.
+private typealias RecentSearch = RecentSearchesStore.RecentSearch
+
 class SearchFragment : Fragment() {
 
     companion object {
@@ -67,14 +71,10 @@ class SearchFragment : Fragment() {
         const val EXTRA_RESULT_THUMBNAIL = "search_result_thumbnail"
         const val EXTRA_RESULT_TRACKS_JSON = "search_result_tracks_json"
 
-        private val PREFS_STREAMING_CACHE = AppConstants.PREFS_STREAMING_CACHE
-        private const val PREF_RECENT_SEARCH_QUERIES = "stream_recent_search_queries"
-        private const val PREF_RECENT_SEARCH_DATA = "stream_recent_search_data"
+        // Recents persistence (per-uid prefs + Firestore, with hydrate gating) lives in
+        // RecentSearchesStore; the fragment only observes it and renders snapshots.
         private const val SEARCH_PAGE_SIZE = 30
         private const val SEARCH_SUGGESTION_RECENT_LIMIT = 6
-        // Stored recents (memory + prefs + Firebase). Larger than the text-row limit so the
-        // images carousel can surface up to RECENT_IMAGES_LIMIT entries that have a thumbnail.
-        private const val SEARCH_RECENT_STORE_LIMIT = 20
         private const val RECENT_IMAGES_LIMIT = 10
         private const val SERVER_SUGGESTIONS_LIMIT = 6
         private const val SEARCH_SCROLL_LOAD_MORE_THRESHOLD = 4
@@ -93,22 +93,20 @@ class SearchFragment : Fragment() {
         private val PLAY_COUNT_PLAYS_REGEX = Regex("([\\d,.]+)\\s*(m|k|b|mil)?\\s*(plays|views)", RegexOption.IGNORE_CASE)
         private val PLAY_COUNT_NUM_REGEX = Regex("([\\d,.]+)\\s*(m|k|b|mil)?", RegexOption.IGNORE_CASE)
 
+        // Process-wide cache of the local-library autocomplete index. The old code re-parsed
+        // favorites + every custom playlist + ALL cached playlist JSON blobs + history + radios on
+        // EVERY onResume/onHiddenChanged; now it rebuilds only when the cheap staleness signature
+        // over those sources changes (see loadLocalTrackIndex).
+        @Volatile private var cachedLocalTrackIndex: List<IndexedTrack>? = null
+        @Volatile private var cachedLocalTrackIndexSignature = 0L
+
         fun newInstance() = SearchFragment()
     }
-
-    data class RecentSearch(
-        val query: String,
-        val videoId: String = "",
-        val title: String = "",
-        val thumbnail: String = "",
-        val artist: String = ""
-    )
 
     private val youTubeMusicService = YouTubeMusicService()
     private val normalizedFilterCache = java.util.concurrent.ConcurrentHashMap<String, String>()
     private val allTracks = mutableListOf<YouTubeMusicService.TrackResult>()
     private val tracks = mutableListOf<YouTubeMusicService.TrackResult>()
-    private val recentSearchData = mutableListOf<RecentSearch>()
 
     /**
      * Library index for autocomplete. Titles/artists are normalized + word-split ONCE at load
@@ -129,6 +127,10 @@ class SearchFragment : Fragment() {
     private var suggestionsDebounceRunnable: Runnable? = null
     private var suggestionsJob: kotlinx.coroutines.Job? = null
     private var cachedSmartSuggestions: List<String>? = null
+    // Identity of the history queue the cached pool was derived from. Empty pools are never
+    // latched, so "Temas relacionados" appears as soon as listen history hydrates (see
+    // buildSmartSuggestions).
+    private var cachedSmartSuggestionsSignature = 0L
     // YT Music server autocomplete for the draft currently typed (query -> suggestions)
     private var serverSuggestions: List<String> = emptyList()
     private var serverSuggestionsQuery = ""
@@ -180,13 +182,10 @@ class SearchFragment : Fragment() {
     private var autoPlayOnFirstResult = false
     private var backPressedCallback: OnBackPressedCallback? = null
 
-    // Recent searches live under the Firebase UID. On a fresh install the user is often still
-    // picking their Google account when this fragment is first created, so the initial
-    // loadRecentSearchesFromFirebase() no-ops (not signed in yet) and — with no auth listener —
-    // recents/images never hydrated until a lucky module re-entry. This listener re-runs the load
-    // the moment auth resolves. loadedRecentsForUid stops token-refresh callbacks re-loading.
-    private var recentSearchAuthListener: com.google.firebase.auth.FirebaseAuth.AuthStateListener? = null
-    private var loadedRecentsForUid: String? = null
+    // Recents live in the app-scoped RecentSearchesStore (per-uid prefs + Firestore hydrate with
+    // retry, auth listener registered at application scope in SleppifyApp). The fragment only
+    // observes the store and re-pools suggestions when it changes.
+    private var recentSearchesListener: RecentSearchesStore.Listener? = null
 
     override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View? {
         return inflater.inflate(R.layout.fragment_search, container, false)
@@ -200,11 +199,13 @@ class SearchFragment : Fragment() {
         setupSearchInput()
         setupBackButton()
 
-        restoreRecentSearchQueries()
-        // The auth listener fires immediately with the current user (and again once a delayed sign-in
-        // resolves), so registering it IS the initial cloud hydrate — no separate eager load, which
-        // would just double the Firestore read on every open.
-        registerRecentSearchAuthListener()
+        // Recents restore, artist backfill and cloud hydrate all happen inside the app-scoped
+        // store (off the main thread, usually long before this fragment exists). Observe it so a
+        // load/hydrate landing later re-pools the visible suggestions.
+        RecentSearchesStore.ensureInitialized(requireContext())
+        recentSearchesListener = RecentSearchesStore.Listener {
+            if (isAdded) refreshSearchSuggestions(etSearchQuery.text?.toString()?.trim() ?: "")
+        }.also { RecentSearchesStore.addListener(it) }
         refreshSearchSuggestions("")
 
         setupBackNavigation()
@@ -313,7 +314,10 @@ class SearchFragment : Fragment() {
     }
 
     private fun setupBackNavigation() {
-        backPressedCallback = object : OnBackPressedCallback(true) {
+        // Habilitado solo si el fragment está visible: tras recrear la activity (rotación/tema)
+        // este onViewCreated corre también con Search restaurado OCULTO, y un callback armado
+        // aquí se tragaría los back de los otros módulos.
+        backPressedCallback = object : OnBackPressedCallback(!isHidden) {
             override fun handleOnBackPressed() {
                 if (nsvSearchContent.visibility == View.VISIBLE) {
                     showSuggestionsMode()
@@ -417,6 +421,51 @@ class SearchFragment : Fragment() {
     private fun loadLocalTrackIndex() {
         lifecycleScope.launch(Dispatchers.IO) {
             val ctx = context ?: return@launch
+
+            // Cheap staleness signature over the index's sources. Favorites, custom playlists,
+            // history and radios are memory-cached by their stores after the first parse; the
+            // playlist_tracks_data_* blobs (which have no parsed cache) are represented by
+            // key + raw length, so no JSON is touched unless something actually changed.
+            val favorites = try { FavoritesPlaylistStore.loadFavorites(ctx) } catch (e: Exception) { emptyList() }
+            val customPlaylists = try {
+                CustomPlaylistsStore.getAllPlaylistNames(ctx).map { name ->
+                    name to (try { CustomPlaylistsStore.getTracksFromPlaylist(ctx, name) } catch (e: Exception) { emptyList<FavoritesPlaylistStore.FavoriteTrack>() })
+                }
+            } catch (e: Exception) { emptyList() }
+            val history = try { PlaybackHistoryStore.load(ctx).queue } catch (e: Exception) { emptyList() }
+            val radios = try { RadioHistoryStore.getRadios(ctx) } catch (e: Exception) { emptyList() }
+            // Snapshot to a copy: cache.all can throw ConcurrentModificationException if the
+            // offline worker commits to this prefs file while we iterate it.
+            val cachedBlobs = try {
+                ctx.getSharedPreferences(AppConstants.PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
+                    .all.toMap()
+                    .filter { (key, value) -> key.startsWith("playlist_tracks_data_") && value is String }
+            } catch (e: Exception) { emptyMap() }
+
+            var signature = 1125899906842597L
+            fun mix(h: Int) { signature = signature * 31 + h }
+            for (t in favorites) mix(t.videoId.hashCode())
+            for ((name, playlistTracks) in customPlaylists) {
+                mix(name.hashCode())
+                for (t in playlistTracks) mix(t.videoId.hashCode())
+            }
+            for (t in history) mix(t.videoId.hashCode())
+            for (radio in radios) for (t in radio.tracks) mix(t.videoId.hashCode())
+            for ((key, value) in cachedBlobs) {
+                mix(key.hashCode())
+                mix((value as String).length)
+            }
+
+            val cached = cachedLocalTrackIndex
+            if (cached != null && cachedLocalTrackIndexSignature == signature) {
+                launch(Dispatchers.Main) {
+                    if (!isAdded) return@launch
+                    localTrackIndex.clear()
+                    localTrackIndex.addAll(cached)
+                }
+                return@launch
+            }
+
             val seen = mutableSetOf<String>()
             val result = mutableListOf<FavoritesPlaylistStore.FavoriteTrack>()
 
@@ -427,50 +476,32 @@ class SearchFragment : Fragment() {
             }
 
             // 1. Favorites
-            try { FavoritesPlaylistStore.loadFavorites(ctx).forEach { tryAdd(it.videoId, it.title, it.artist, it.duration, it.imageUrl) } } catch (_: Exception) {}
+            favorites.forEach { tryAdd(it.videoId, it.title, it.artist, it.duration, it.imageUrl) }
 
             // 2. Custom playlists
-            try {
-                for (name in CustomPlaylistsStore.getAllPlaylistNames(ctx)) {
-                    CustomPlaylistsStore.getTracksFromPlaylist(ctx, name).forEach { tryAdd(it.videoId, it.title, it.artist, it.duration, it.imageUrl) }
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "Unexpected error", e)
+            for ((_, playlistTracks) in customPlaylists) {
+                playlistTracks.forEach { tryAdd(it.videoId, it.title, it.artist, it.duration, it.imageUrl) }
             }
 
             // 3. All cached YT Music playlists (playlist_tracks_data_*)
-            try {
-                val cache = ctx.getSharedPreferences(AppConstants.PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
-                // Snapshot to a copy: cache.all can throw ConcurrentModificationException if the
-                // offline worker commits to this prefs file while we iterate it.
-                val allEntries = try { cache.all.toMap() } catch (e: Exception) { emptyMap() }
-                for ((key, value) in allEntries) {
-                    if (key.startsWith("playlist_tracks_data_") && value is String) {
-                        val arr = org.json.JSONArray(value)
-                        for (i in 0 until arr.length()) {
-                            val obj = arr.getJSONObject(i)
-                            tryAdd(obj.optString("videoId"), obj.optString("title"), obj.optString("artist"), obj.optString("duration", ""), obj.optString("imageUrl"))
-                        }
+            for ((_, value) in cachedBlobs) {
+                try {
+                    val arr = org.json.JSONArray(value as String)
+                    for (i in 0 until arr.length()) {
+                        val obj = arr.getJSONObject(i)
+                        tryAdd(obj.optString("videoId"), obj.optString("title"), obj.optString("artist"), obj.optString("duration", ""), obj.optString("imageUrl"))
                     }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Unexpected error", e)
                 }
-            } catch (e: Exception) {
-                Log.w(TAG, "Unexpected error", e)
             }
 
             // 4. Playback history
-            try {
-                PlaybackHistoryStore.load(ctx).queue.forEach { tryAdd(it.videoId, it.title, it.artist, it.duration, it.imageUrl) }
-            } catch (e: Exception) {
-                Log.w(TAG, "Unexpected error", e)
-            }
+            history.forEach { tryAdd(it.videoId, it.title, it.artist, it.duration, it.imageUrl) }
 
             // 5. Radio history tracks
-            try {
-                RadioHistoryStore.getRadios(ctx).forEach { radio ->
-                    radio.tracks.forEach { t -> tryAdd(t.videoId, t.title, t.artist, "", t.thumbnailUrl) }
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "Unexpected error", e)
+            for (radio in radios) {
+                radio.tracks.forEach { t -> tryAdd(t.videoId, t.title, t.artist, "", t.thumbnailUrl) }
             }
 
             // Normalize + word-split every track ONCE here (on IO), not per keystroke later.
@@ -485,6 +516,8 @@ class SearchFragment : Fragment() {
                     normArtist.split(WHITESPACE_REGEX).filter { it.isNotEmpty() }
                 )
             }
+            cachedLocalTrackIndex = indexed
+            cachedLocalTrackIndexSignature = signature
 
             launch(Dispatchers.Main) {
                 if (!isAdded) return@launch
@@ -1086,16 +1119,10 @@ class SearchFragment : Fragment() {
             tvFeaturedSubtitle.text = if (clean.isEmpty()) typeLabel else "$typeLabel • $clean"
         }
         
-        val isDownloaded = track.videoId.isNotEmpty() && OfflineAudioStore.hasOfflineAudio(requireContext(), track.videoId)
-        if (isDownloaded) {
-            ivFeaturedOfflineIndicator.visibility = View.VISIBLE
-            ivFeaturedOfflineIndicator.setImageResource(R.drawable.ic_check_small)
-            ivFeaturedOfflineIndicator.setBackgroundResource(R.drawable.bg_offline_state_filled_primary)
-            ivFeaturedOfflineIndicator.setColorFilter(ContextCompat.getColor(requireContext(), R.color.surface_dark))
-        } else {
-            ivFeaturedOfflineIndicator.visibility = View.GONE
-        }
-        
+        // El estado "descargada" ya no se marca en las filas de search (solo en el bottom sheet
+        // de opciones y en la sección Descargadas de la biblioteca).
+        ivFeaturedOfflineIndicator.visibility = View.GONE
+
         loadArtworkInto(ivFeaturedThumb, track.thumbnailUrl, track.videoId)
         llFeaturedResult.setOnClickListener { onTrackClicked(track) }
         llFeaturedResult.setOnLongClickListener {
@@ -1736,23 +1763,31 @@ class SearchFragment : Fragment() {
             val ivCheck = row.findViewById<ImageView>(R.id.ivSaveCheck)
             tvName.text = ytItem.title ?: ""
             tvCount.text = ytItem.subtitle ?: "Playlist"
-            var ytUrls = loadPersistedGridUrls(ctx, ytPlaylistId)
-            if (ytUrls.size < 4) {
-                ytUrls = mutableListOf()
-                val ytMirrorTracks = CustomPlaylistsStore.getYtMirrorTracks(ctx, ytPlaylistId)
-                for (t in ytMirrorTracks) {
-                    if (!t.imageUrl.isNullOrEmpty() && t.imageUrl !in ytUrls) {
-                        ytUrls.add(t.imageUrl)
-                        if (ytUrls.size >= 4) break
+            // La miniatura que YT entrega para la playlist es su portada OFICIAL: se registra y
+            // manda sobre el collage 2x2 en todas las superficies.
+            if (ytFallbackThumb.isNotEmpty()) {
+                OfficialCoverStore.save(ctx, ytPlaylistId, ytFallbackThumb)
+            }
+            val ytOfficial = OfficialCoverStore.get(ctx, ytPlaylistId) ?: ytFallbackThumb
+            if (ytOfficial.isNotEmpty()) {
+                loadArtworkInto(ivThumb, ytOfficial)
+            } else {
+                var ytUrls = loadPersistedGridUrls(ctx, ytPlaylistId)
+                if (ytUrls.size < 4) {
+                    ytUrls = mutableListOf()
+                    val ytMirrorTracks = CustomPlaylistsStore.getYtMirrorTracks(ctx, ytPlaylistId)
+                    for (t in ytMirrorTracks) {
+                        if (!t.imageUrl.isNullOrEmpty() && t.imageUrl !in ytUrls) {
+                            ytUrls.add(t.imageUrl)
+                            if (ytUrls.size >= 4) break
+                        }
                     }
                 }
-            }
-            if (ytUrls.size >= 4) {
-                PlaylistGridArtLoader.load(ivThumb, ytUrls, thumbSizePx)
-            } else if (ytUrls.isNotEmpty()) {
-                loadArtworkInto(ivThumb, ytUrls[0])
-            } else if (ytFallbackThumb.isNotEmpty()) {
-                loadArtworkInto(ivThumb, ytFallbackThumb)
+                if (ytUrls.size >= 4) {
+                    PlaylistGridArtLoader.load(ivThumb, ytUrls, thumbSizePx)
+                } else if (ytUrls.isNotEmpty()) {
+                    loadArtworkInto(ivThumb, ytUrls[0])
+                }
             }
             val isIn = CustomPlaylistsStore.isTrackInYtMirror(ctx, ytPlaylistId, track.videoId ?: "")
             ivCheck?.visibility = if (isIn) View.VISIBLE else View.GONE
@@ -2005,84 +2040,18 @@ class SearchFragment : Fragment() {
         }
     }
 
-    private fun restoreRecentSearchQueries() {
-        val prefs = requireContext().getSharedPreferences(PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
-        // Try to load extended data first
-        val dataJson = prefs.getString(PREF_RECENT_SEARCH_DATA, "[]")
-        recentSearchData.clear()
-        try {
-            val array = JSONArray(dataJson)
-            for (i in 0 until array.length()) {
-                val obj = array.getJSONObject(i)
-                recentSearchData.add(RecentSearch(
-                    query = obj.optString("query", ""),
-                    videoId = obj.optString("videoId", ""),
-                    title = obj.optString("title", ""),
-                    thumbnail = obj.optString("thumbnail", ""),
-                    artist = obj.optString("artist", "")
-                ))
-            }
-        } catch (e: Exception) {
-            // Fallback: try old format
-            val oldJson = prefs.getString(PREF_RECENT_SEARCH_QUERIES, "[]")
-            try {
-                val array = JSONArray(oldJson)
-                for (i in 0 until array.length()) {
-                    recentSearchData.add(RecentSearch(query = array.getString(i)))
-                }
-            } catch (e2: Exception) {}
-        }
-        // Back-fill missing artist for entries that have a videoId
-        var dirty = false
-        for (i in recentSearchData.indices) {
-            val entry = recentSearchData[i]
-            if (entry.videoId.isNotEmpty() && entry.artist.isEmpty()) {
-                val resolved = resolveArtistForVideoId(entry.videoId)
-                if (resolved.isNotEmpty()) {
-                    recentSearchData[i] = entry.copy(artist = resolved)
-                    dirty = true
-                }
-            }
-        }
-        if (dirty) saveRecentSearchQueries()
-    }
-
     private fun rememberRecentSearchQuery(query: String, firstResult: YouTubeMusicService.TrackResult? = null) {
-        val norm = query.trim()
-        if (norm.isEmpty()) return
-        
-        // A plain text search calls this with firstResult == null (blank videoId/title/thumbnail).
-        // If a thumbnailed entry for this query (or this videoId) already exists — created earlier
-        // when the user PLAYED a track for it — MERGE instead of clobbering, so the recent-images
-        // carousel keeps its thumbnail across re-searches. Clobbering it with a blank entry (and
-        // then uploading that to Firestore) is why the carousel thumbnails vanished "de la nada".
-        val incomingVideoId = firstResult?.videoId?.takeIf { it.isNotEmpty() }
-        val existing = recentSearchData.firstOrNull {
-            it.query.equals(norm, ignoreCase = true) || (incomingVideoId != null && it.videoId == incomingVideoId)
-        }
-        val incomingArtist = extractArtistFromSubtitle(firstResult?.subtitle).takeIf { it.isNotEmpty() }
-        val newSearch = RecentSearch(
-            query = norm,
-            videoId = incomingVideoId ?: existing?.videoId ?: "",
-            title = firstResult?.title?.takeIf { it.isNotEmpty() } ?: existing?.title ?: "",
-            thumbnail = firstResult?.thumbnailUrl?.takeIf { it.isNotEmpty() } ?: existing?.thumbnail ?: "",
-            // Subtitles decorate the artist ("Canción • Artista • Álbum • 3:22") — persist only
-            // the name: this value syncs to Firestore and feeds the player queue as artist.
-            artist = incomingArtist ?: existing?.artist ?: ""
+        // Merge-not-clobber semantics (thumbnailed entries survive plain re-searches), trimming
+        // and persistence all live in the store now. Subtitles decorate the artist
+        // ("Canción • Artista • Álbum • 3:22") — pass only the name: it syncs to Firestore and
+        // feeds the player queue as artist.
+        RecentSearchesStore.remember(
+            query,
+            videoId = firstResult?.videoId ?: "",
+            title = firstResult?.title ?: "",
+            thumbnail = firstResult?.thumbnailUrl ?: "",
+            artist = extractArtistFromSubtitle(firstResult?.subtitle)
         )
-
-        recentSearchData.run {
-            removeAll { it.query.equals(norm, ignoreCase = true) || (newSearch.videoId.isNotEmpty() && it.videoId == newSearch.videoId) }
-            add(0, newSearch)
-            // Over capacity: drop thumbnail-less entries first so the carousel's history (the
-            // thumbnailed recents) survives a burst of plain searches instead of being evicted
-            // from the tail.
-            while (size > SEARCH_RECENT_STORE_LIMIT) {
-                val victim = indexOfLast { it.thumbnail.isEmpty() }.takeIf { it >= 0 } ?: (size - 1)
-                removeAt(victim)
-            }
-        }
-        saveRecentSearchQueries()
     }
 
     private fun rememberRecentTrackPlayback(track: YouTubeMusicService.TrackResult) {
@@ -2104,148 +2073,14 @@ class SearchFragment : Fragment() {
      */
     private fun attachTopResultArtworkToRecent(query: String) {
         val top = featuredTrack ?: return
-        val norm = query.trim()
-        if (norm.isEmpty()) return
-        val idx = recentSearchData.indexOfFirst { it.query.equals(norm, ignoreCase = true) }
-        if (idx < 0) return
-        val cur = recentSearchData[idx]
-        // Don't stamp the top result's cover onto an entry that already points at a DIFFERENT played
-        // track (it carries that track's videoId + title). Doing so would show the top-result cover on
-        // a tile that still plays the older track — cover/title/playback all mismatch. Only stamp
-        // query-only entries (no videoId) or the same track.
-        if (cur.videoId.isNotEmpty() && cur.videoId != top.videoId) return
-        val newThumb = top.thumbnailUrl.takeIf { it.isNotEmpty() } ?: cur.thumbnail
-        val newArtist = extractArtistFromSubtitle(top.subtitle).takeIf { it.isNotEmpty() } ?: cur.artist
-        if (newThumb != cur.thumbnail || newArtist != cur.artist) {
-            recentSearchData[idx] = cur.copy(thumbnail = newThumb, artist = newArtist)
-            saveRecentSearchQueries()
-        }
-    }
-
-    private fun saveRecentSearchQueries() {
-        val array = JSONArray()
-        recentSearchData.forEach { search ->
-            val obj = JSONObject()
-            obj.put("query", search.query)
-            obj.put("videoId", search.videoId)
-            obj.put("title", search.title)
-            obj.put("thumbnail", search.thumbnail)
-            obj.put("artist", search.artist)
-            array.put(obj)
-        }
-        requireContext().getSharedPreferences(PREFS_STREAMING_CACHE, Context.MODE_PRIVATE).edit()
-            .putString(PREF_RECENT_SEARCH_DATA, array.toString())
-            .apply()
-        saveRecentSearchesToFirebase()
-    }
-
-    private fun saveRecentSearchesToFirebase() {
-        val ctx = context ?: return
-        if (!AuthManager.getInstance(ctx).isSignedIn()) return
-        val uid = com.google.firebase.auth.FirebaseAuth.getInstance().currentUser?.uid ?: return
-        val db = com.google.firebase.firestore.FirebaseFirestore.getInstance()
-        val searches = recentSearchData.map { search ->
-            hashMapOf(
-                "query" to search.query,
-                "videoId" to search.videoId,
-                "title" to search.title,
-                "thumbnail" to search.thumbnail,
-                "artist" to search.artist
-            )
-        }
-        db.collection("users").document(uid)
-            .collection("sleppify").document("recent_searches")
-            .set(hashMapOf("searches" to searches))
-            .addOnFailureListener { Log.e("SearchFragment", "Failed to save recent searches to Firebase", it) }
-    }
-
-    /**
-     * Re-runs [loadRecentSearchesFromFirebase] as soon as Firebase auth resolves. On a fresh
-     * install the account picker often outlives this fragment's onViewCreated, so the eager load
-     * bails (not signed in) and recents/images stay empty. This closes that gap without a restart.
-     */
-    private fun registerRecentSearchAuthListener() {
-        if (recentSearchAuthListener != null) return
-        val listener = com.google.firebase.auth.FirebaseAuth.AuthStateListener { auth ->
-            val uid = auth.currentUser?.uid
-            if (uid != null && uid != loadedRecentsForUid && isAdded) {
-                // Account switch: a DIFFERENT account was already loaded. Drop account A's recents
-                // (memory + local pref) BEFORE loading B, so the merge in loadRecentSearchesFromFirebase
-                // doesn't graft A's history onto B and re-upload the mix to B's Firestore. Clear the pref
-                // directly — NOT via saveRecentSearchQueries, which would upload the empty list to B.
-                if (loadedRecentsForUid != null) {
-                    recentSearchData.clear()
-                    context?.getSharedPreferences(PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)?.edit()
-                        ?.remove(PREF_RECENT_SEARCH_DATA)?.apply()
-                    refreshSearchSuggestions(etSearchQuery.text?.toString()?.trim() ?: "")
-                }
-                loadRecentSearchesFromFirebase()
-            }
-        }
-        recentSearchAuthListener = listener
-        com.google.firebase.auth.FirebaseAuth.getInstance().addAuthStateListener(listener)
-    }
-
-    private fun loadRecentSearchesFromFirebase() {
-        val ctx = context ?: return
-        if (!AuthManager.getInstance(ctx).isSignedIn()) return
-        val uid = com.google.firebase.auth.FirebaseAuth.getInstance().currentUser?.uid ?: return
-        val db = com.google.firebase.firestore.FirebaseFirestore.getInstance()
-        db.collection("users").document(uid)
-            .collection("sleppify").document("recent_searches")
-            .get()
-            .addOnSuccessListener { doc ->
-                // The GET resolved for this uid — don't let the auth listener re-fire it on every
-                // token refresh. (A failed GET leaves this null so the next auth callback retries.)
-                loadedRecentsForUid = uid
-                if (!isAdded || doc == null || !doc.exists()) return@addOnSuccessListener
-                val list = doc.get("searches") as? List<*> ?: return@addOnSuccessListener
-                val parsed = list.mapNotNull { item ->
-                    val map = item as? Map<*, *> ?: return@mapNotNull null
-                    RecentSearch(
-                        query = map["query"] as? String ?: return@mapNotNull null,
-                        videoId = map["videoId"] as? String ?: "",
-                        title = map["title"] as? String ?: "",
-                        thumbnail = map["thumbnail"] as? String ?: "",
-                        artist = map["artist"] as? String ?: ""
-                    )
-                }
-                if (parsed.isEmpty()) return@addOnSuccessListener
-                // MERGE local-first instead of replacing: the async Firestore response used to
-                // clobber searches typed in this session (which had no thumbnails yet) with the
-                // older cloud copy, and then re-upload the clobbered state. Cloud entries only
-                // append at the tail or backfill missing thumbnails on matching queries.
-                var changed = false
-                for (cloud in parsed) {
-                    val idx = recentSearchData.indexOfFirst { it.query.equals(cloud.query, ignoreCase = true) }
-                    if (idx >= 0) {
-                        val local = recentSearchData[idx]
-                        if (local.thumbnail.isEmpty() && cloud.thumbnail.isNotEmpty()) {
-                            recentSearchData[idx] = local.copy(
-                                videoId = local.videoId.ifEmpty { cloud.videoId },
-                                title = local.title.ifEmpty { cloud.title },
-                                thumbnail = cloud.thumbnail,
-                                artist = local.artist.ifEmpty { cloud.artist }
-                            )
-                            changed = true
-                        }
-                    } else if (cloud.videoId.isEmpty() || recentSearchData.none { it.videoId == cloud.videoId }) {
-                        // videoId dedup keeps the images carousel from showing the same song
-                        // twice under two different query strings.
-                        recentSearchData.add(cloud)
-                        changed = true
-                    }
-                }
-                if (changed) {
-                    while (recentSearchData.size > SEARCH_RECENT_STORE_LIMIT) {
-                        val victim = recentSearchData.indexOfLast { it.thumbnail.isEmpty() }
-                            .takeIf { it >= 0 } ?: (recentSearchData.size - 1)
-                        recentSearchData.removeAt(victim)
-                    }
-                    saveRecentSearchQueries()
-                    refreshSearchSuggestions(etSearchQuery.text?.toString()?.trim() ?: "")
-                }
-            }
+        // The store only stamps query-only entries (no videoId) or the same track, so an entry
+        // that points at a DIFFERENT played track keeps its own cover/title/playback intact.
+        RecentSearchesStore.stampArtwork(
+            query,
+            topVideoId = top.videoId ?: "",
+            thumbnail = top.thumbnailUrl ?: "",
+            artist = extractArtistFromSubtitle(top.subtitle)
+        )
     }
 
     private fun showDeleteSearchDialog(query: String) {
@@ -2254,10 +2089,8 @@ class SearchFragment : Fragment() {
             .setTitle("Eliminar búsqueda")
             .setMessage("¿Eliminar \"$query\" de las búsquedas recientes?")
             .setPositiveButton("Sí") { _, _ ->
-                recentSearchData.removeAll { it.query == query }
-                saveRecentSearchQueries()
-                saveRecentSearchesToFirebase()
-                refreshSearchSuggestions(etSearchQuery.text?.toString()?.trim() ?: "")
+                // The store notifies its listeners, which re-pools the visible suggestions.
+                RecentSearchesStore.delete(query)
             }
             .setNegativeButton("No", null)
             .show()
@@ -2266,7 +2099,7 @@ class SearchFragment : Fragment() {
     private fun refreshSearchSuggestions(draft: String?) {
         suggestionsJob?.cancel()
         val norm = draft?.trim() ?: ""
-        val recentSnapshot = recentSearchData.toList()
+        val recentSnapshot = RecentSearchesStore.snapshot()
         val trackSnapshot = localTrackIndex.toList()
         val serverSnapshot = if (norm.isNotEmpty() && norm == serverSuggestionsQuery) serverSuggestions else emptyList()
         suggestionsJob = lifecycleScope.launch {
@@ -2299,7 +2132,7 @@ class SearchFragment : Fragment() {
         })
     }
 
-    private fun poolSuggestionItems(draft: String, recentSearchData: List<RecentSearch> = this.recentSearchData, localTrackIndex: List<IndexedTrack> = this.localTrackIndex, serverSuggestions: List<String> = emptyList()): List<SuggestionItem> {
+    private fun poolSuggestionItems(draft: String, recentSearchData: List<RecentSearch>, localTrackIndex: List<IndexedTrack> = this.localTrackIndex, serverSuggestions: List<String> = emptyList()): List<SuggestionItem> {
         val normDraft = normalizeForFilter(draft)
 
         val matchingRecent = recentSearchData.filter { candidate ->
@@ -2417,27 +2250,41 @@ class SearchFragment : Fragment() {
 
     fun invalidateSmartSuggestionsCache() {
         cachedSmartSuggestions = null
+        cachedSmartSuggestionsSignature = 0L
     }
 
     private fun buildSmartSuggestions(normDraft: String, recentQueries: List<String>): List<String> {
         val ctx = context ?: return emptyList()
         val recentNorm = recentQueries.map { normalizeForFilter(it) }.toSet()
 
-        // Build base pool once and cache it to avoid disk I/O on every keystroke
-        val basePool = cachedSmartSuggestions ?: run {
-            val pool = LinkedHashSet<String>()
-            val snapshot = PlaybackHistoryStore.load(ctx)
-            val current = snapshot.currentTrack()
-            if (current != null) {
-                val artist = current.artist.trim()
-                if (artist.isNotEmpty()) pool.add(artist)
+        // PlaybackHistoryStore.load is memory-cached after the first parse, so re-checking it per
+        // pooling pass is cheap. The pool is keyed on the queue's identity and an EMPTY pool is
+        // never latched: cloud listen-history hydrates fire-and-forget after entry, and caching
+        // the pre-hydrate empty pool is what left "Temas relacionados" blank for the whole visit.
+        val snapshot = PlaybackHistoryStore.load(ctx)
+        var signature = 1125899906842597L
+        for (track in snapshot.queue) signature = signature * 31 + track.videoId.hashCode()
+
+        val basePool = cachedSmartSuggestions
+            ?.takeIf { it.isNotEmpty() && cachedSmartSuggestionsSignature == signature }
+            ?: run {
+                val pool = LinkedHashSet<String>()
+                val current = snapshot.currentTrack()
+                if (current != null) {
+                    val artist = current.artist.trim()
+                    if (artist.isNotEmpty()) pool.add(artist)
+                }
+                for (track in snapshot.queue) {
+                    val artist = track.artist.trim()
+                    if (artist.isNotEmpty()) pool.add(artist)
+                }
+                pool.toList().also {
+                    if (it.isNotEmpty()) {
+                        cachedSmartSuggestions = it
+                        cachedSmartSuggestionsSignature = signature
+                    }
+                }
             }
-            for (track in snapshot.queue) {
-                val artist = track.artist.trim()
-                if (artist.isNotEmpty()) pool.add(artist)
-            }
-            pool.toList().also { cachedSmartSuggestions = it }
-        }
 
         return basePool
             .filter { candidate ->
@@ -2448,56 +2295,6 @@ class SearchFragment : Fragment() {
                 )
             }
             .take(12)
-    }
-
-    private fun resolveArtistForVideoId(videoId: String): String {
-        val ctx = context ?: return ""
-        // 1. Playback history (most likely to have full metadata)
-        try {
-            val history = PlaybackHistoryStore.load(ctx)
-            history.queue.firstOrNull { it.videoId == videoId }?.let {
-                if (it.artist.isNotEmpty()) return it.artist
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Unexpected error", e)
-        }
-        // 2. Favorites
-        try {
-            FavoritesPlaylistStore.loadFavorites(ctx).firstOrNull { it.videoId == videoId }?.let {
-                if (it.artist.isNotEmpty()) return it.artist
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Unexpected error", e)
-        }
-        // 3. Custom playlists
-        try {
-            for (name in CustomPlaylistsStore.getAllPlaylistNames(ctx)) {
-                CustomPlaylistsStore.getTracksFromPlaylist(ctx, name).firstOrNull { it.videoId == videoId }?.let {
-                    if (it.artist.isNotEmpty()) return it.artist
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Unexpected error", e)
-        }
-        // 4. Cached online playlists
-        try {
-            val cache = ctx.getSharedPreferences(AppConstants.PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
-            for ((key, value) in cache.all) {
-                if (key.startsWith("playlist_tracks_data_") && value is String) {
-                    val arr = org.json.JSONArray(value)
-                    for (i in 0 until arr.length()) {
-                        val obj = arr.getJSONObject(i)
-                        if (obj.optString("videoId") == videoId) {
-                            val artist = obj.optString("artist", "")
-                            if (artist.isNotEmpty()) return artist
-                        }
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Unexpected error", e)
-        }
-        return ""
     }
 
     private fun loadPersistedGridUrls(ctx: android.content.Context, playlistId: String): List<String> {
@@ -2624,7 +2421,9 @@ class SearchFragment : Fragment() {
         moduleLoadingOverlay.animate().cancel()
         moduleLoadingOverlay.animate()
             .alpha(0f)
-            .setDuration(200)
+            // Short fade: the overlay only exists to cover first-create layout; 200ms of it was
+            // pure perceived latency on every first entry.
+            .setDuration(100)
             .withEndAction { moduleLoadingOverlay.visibility = View.GONE }
             .start()
     }
@@ -2699,46 +2498,16 @@ class SearchFragment : Fragment() {
             }
             loadArtworkInto(holder.thumb, item.thumbnailUrl, item.videoId, rowThumbPx)
 
-            val vid = item.videoId ?: ""
-            if (vid.isNotEmpty()) {
-                val cached = offlineStateCache[vid]
-                if (cached == true) {
-                    holder.offlineIndicator.visibility = View.VISIBLE
-                    holder.offlineIndicator.setImageResource(R.drawable.ic_check_small)
-                    holder.offlineIndicator.setBackgroundResource(R.drawable.bg_offline_state_filled_primary)
-                    holder.offlineIndicator.setColorFilter(ContextCompat.getColor(requireContext(), R.color.surface_dark))
-                } else {
-                    holder.offlineIndicator.visibility = View.GONE
-                    if (cached == null) triggerOfflineLookup(vid, position)
-                }
-            } else {
-                holder.offlineIndicator.visibility = View.GONE
-            }
-            
+            // El estado "descargada" ya no se marca en las filas de search (solo en el bottom
+            // sheet de opciones y en Descargadas) — sin lookup de disco por fila.
+            holder.offlineIndicator.visibility = View.GONE
+
             holder.itemView.setOnClickListener { onClick(item) }
             holder.itemView.setOnLongClickListener {
                 onMoreClick(item, it)
                 true
             }
             holder.more.setOnClickListener { onMoreClick(item, it) }
-        }
-
-        private fun triggerOfflineLookup(videoId: String, position: Int) {
-            if (pendingLookups.contains(videoId)) return
-            pendingLookups.add(videoId)
-            val ctx = context?.applicationContext ?: return
-            lookupExecutor.execute {
-                val available = OfflineAudioStore.hasOfflineAudio(ctx, videoId)
-                handler.post {
-                    pendingLookups.remove(videoId)
-                    val prev = offlineStateCache[videoId]
-                    offlineStateCache[videoId] = available
-                    if (available && prev != true && position >= 0 && position < data.size
-                        && data[position].videoId == videoId) {
-                        notifyItemChanged(position)
-                    }
-                }
-            }
         }
 
         override fun getItemCount() = data.size
@@ -2767,8 +2536,16 @@ class SearchFragment : Fragment() {
         if (!hasBeenVisible) {
             etSearchQuery.setText("")
             showSuggestionsMode()
+        } else if (llSearchSuggestionsContainer.visibility == View.VISIBLE) {
+            // onPause cancels suggestionsJob mid-pool and nothing re-ran it: a screen-off or
+            // dialog during pooling left recents/"Temas relacionados" blank until the next
+            // keystroke. Returning with the suggestions panel visible re-pools it.
+            refreshSearchSuggestions(etSearchQuery.text?.toString()?.trim() ?: "")
         }
         loadLocalTrackIndex()
+        // Cloud hydrate is app-scoped in RecentSearchesStore; kick a bounded retry in case every
+        // earlier GET failed (e.g. signed in while offline). No-op once hydrated.
+        RecentSearchesStore.retryCloudHydrateIfNeeded()
         // Show overlay only on first creation; skip on re-entry to avoid delay
         if (!hasBeenVisible) {
             showModuleLoadingOverlay()
@@ -2791,17 +2568,18 @@ class SearchFragment : Fragment() {
         suggestionsDebounceRunnable?.let { suggestionsDebounceHandler.removeCallbacks(it) }
         suggestionsJob?.cancel()
         adapter?.shutdown()
-        recentSearchAuthListener?.let {
-            com.google.firebase.auth.FirebaseAuth.getInstance().removeAuthStateListener(it)
-        }
-        recentSearchAuthListener = null
+        recentSearchesListener?.let { RecentSearchesStore.removeListener(it) }
+        recentSearchesListener = null
         super.onDestroyView()
     }
 
     override fun onHiddenChanged(hidden: Boolean) {
         super.onHiddenChanged(hidden)
         if (hidden) {
-            // no-op
+            // The fragment now SURVIVES close (hidden, not popped/destroyed), so its
+            // view-lifecycle back callback stays registered. Disable it here or it would swallow
+            // system-back presses meant for whichever module/player is now on screen.
+            backPressedCallback?.isEnabled = false
         } else {
             rvSearchResults.post { rvSearchResults.scrollToPosition(0) }
             rvSearchSuggestions.post { rvSearchSuggestions.scrollToPosition(0) }
@@ -2817,10 +2595,11 @@ class SearchFragment : Fragment() {
                 showSuggestionsMode()
             }
             loadLocalTrackIndex()
-            // Retry Firebase load if local data has no thumbnails (e.g. auth wasn't ready at startup)
-            if (recentSearchData.none { it.thumbnail.isNotEmpty() }) {
-                loadRecentSearchesFromFirebase()
-            }
+            // Cloud hydrate is app-scoped in RecentSearchesStore; kick a bounded retry in case
+            // every earlier GET failed. Unlike the old thumbnail-count gate (which one local
+            // thumbnailed entry suppressed for the whole process), this is a no-op ONLY once a
+            // GET actually succeeded for the signed-in uid.
+            RecentSearchesStore.retryCloudHydrateIfNeeded()
             if (!hasBeenVisible) {
                 showModuleLoadingOverlay()
                 scheduleOverlayRevealAfterDraw()
@@ -2837,7 +2616,9 @@ class SearchFragment : Fragment() {
         data class Suggestion(val query: String) : SuggestionItem()
         data class Autocomplete(val query: String) : SuggestionItem()
         data class Track(val track: FavoritesPlaylistStore.FavoriteTrack) : SuggestionItem()
-        data class RecentImages(val items: List<RecentSearch>) : SuggestionItem()
+        // Fully qualified (not the file-private alias): this nested type is effectively public,
+        // and exposing a private-in-file typealias from it is a compiler error on modern Kotlin.
+        data class RecentImages(val items: List<RecentSearchesStore.RecentSearch>) : SuggestionItem()
     }
 
     private fun improveHorizontalScrollDetection(recyclerView: RecyclerView?) {
@@ -2900,9 +2681,31 @@ class SearchFragment : Fragment() {
         private val TYPE_RECENT_IMAGES = 4
 
         fun updateItems(newList: List<SuggestionItem>) {
+            // DiffUtil instead of notifyDataSetChanged: a refresh lands on every keystroke/pool
+            // pass and most rows are unchanged. The list is tiny, so the diff runs inline.
+            val old = data.toList()
+            val diff = DiffUtil.calculateDiff(object : DiffUtil.Callback() {
+                override fun getOldListSize() = old.size
+                override fun getNewListSize() = newList.size
+                override fun areItemsTheSame(op: Int, np: Int): Boolean {
+                    val o = old[op]
+                    val n = newList[np]
+                    return when {
+                        o is SuggestionItem.Header && n is SuggestionItem.Header -> o.label == n.label
+                        o is SuggestionItem.Recent && n is SuggestionItem.Recent -> o.query == n.query
+                        o is SuggestionItem.Suggestion && n is SuggestionItem.Suggestion -> o.query == n.query
+                        o is SuggestionItem.Autocomplete && n is SuggestionItem.Autocomplete -> o.query == n.query
+                        o is SuggestionItem.Track && n is SuggestionItem.Track -> o.track.videoId == n.track.videoId
+                        o is SuggestionItem.RecentImages && n is SuggestionItem.RecentImages -> true
+                        else -> false
+                    }
+                }
+
+                override fun areContentsTheSame(op: Int, np: Int) = old[op] == newList[np]
+            })
             data.clear()
             data.addAll(newList)
-            notifyDataSetChanged()
+            diff.dispatchUpdatesTo(this)
         }
 
         override fun getItemViewType(position: Int) = when (data[position]) {
@@ -2988,16 +2791,9 @@ class SearchFragment : Fragment() {
                         val trackResult = YouTubeMusicService.TrackResult(
                             "video", item.track.videoId, item.track.title, item.track.artist, item.track.imageUrl
                         )
-                        val isOffline = item.track.videoId.isNotEmpty()
-                            && OfflineAudioStore.hasOfflineAudio(requireContext(), item.track.videoId)
-                        if (isOffline) {
-                            offline.setImageResource(R.drawable.ic_check_small)
-                            offline.setBackgroundResource(R.drawable.bg_offline_state_filled_primary)
-                            offline.setColorFilter(ContextCompat.getColor(requireContext(), R.color.surface_dark))
-                            offline.visibility = View.VISIBLE
-                        } else {
-                            offline.visibility = View.INVISIBLE
-                        }
+                        // El estado "descargada" ya no se marca en las filas de search (solo en
+                        // el bottom sheet de opciones y en Descargadas) — sin lookup por fila.
+                        offline.visibility = View.INVISIBLE
                         itemView.setOnClickListener { playTrackDirectly(trackResult) }
                         itemView.setOnLongClickListener {
                             showTrackOptionsBottomSheet(trackResult, it)
@@ -3011,19 +2807,29 @@ class SearchFragment : Fragment() {
                     val imgAdapter = vh.rv.adapter as? RecentSearchImageAdapter
                         ?: RecentSearchImageAdapter { recentSearch ->
                             if (recentSearch.videoId.isNotEmpty()) {
-                                var artist = recentSearch.artist
-                                if (artist.isEmpty()) artist = resolveArtistForVideoId(recentSearch.videoId)
-                                val track = YouTubeMusicService.TrackResult(
-                                    "video", recentSearch.videoId, recentSearch.title, artist, recentSearch.thumbnail
-                                )
-                                if (recentSearch.artist.isEmpty() && artist.isNotEmpty()) {
-                                    val idx = recentSearchData.indexOfFirst { it.videoId == recentSearch.videoId }
-                                    if (idx >= 0) {
-                                        recentSearchData[idx] = recentSearch.copy(artist = artist)
-                                        saveRecentSearchQueries()
+                                if (recentSearch.artist.isNotEmpty()) {
+                                    playTrackDirectly(YouTubeMusicService.TrackResult(
+                                        "video", recentSearch.videoId, recentSearch.title, recentSearch.artist, recentSearch.thumbnail
+                                    ))
+                                } else {
+                                    // The artist backfill scans the whole streaming cache on a
+                                    // miss — resolve on IO, then play (and persist via the store).
+                                    val appCtx = context?.applicationContext
+                                    lifecycleScope.launch(Dispatchers.IO) {
+                                        val resolved = if (appCtx != null) {
+                                            RecentSearchesStore.resolveArtistForVideoId(appCtx, recentSearch.videoId)
+                                        } else ""
+                                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                                            if (!isAdded) return@withContext
+                                            if (resolved.isNotEmpty()) {
+                                                RecentSearchesStore.updateArtistForVideo(recentSearch.videoId, resolved)
+                                            }
+                                            playTrackDirectly(YouTubeMusicService.TrackResult(
+                                                "video", recentSearch.videoId, recentSearch.title, resolved, recentSearch.thumbnail
+                                            ))
+                                        }
                                     }
                                 }
-                                playTrackDirectly(track)
                             } else {
                                 etSearchQuery.setText(recentSearch.query)
                                 etSearchQuery.setSelection(recentSearch.query.length)

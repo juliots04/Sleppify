@@ -53,15 +53,23 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         private const val PREFS_RADIO_CACHE = "sleppify_radio_ui_cache"
         // Bumped when the radio card design/selection logic changes so stale persisted subtitle
         // texts and side-url picks (computed with the old logic) are dropped once and recomputed.
-        private const val RADIO_UI_VERSION = 2
+        // v6: barras en DOS ROMBOS + color FUSIONADO de las 3 carátulas (la fusión vive en el
+        // composite; el color persistido sigue siendo el del centro, solo placeholder de vBg).
+        private const val RADIO_UI_VERSION = 6
         private const val SHORTCUTS_PER_PAGE = 9
         private const val SHORTCUTS_MAX_PAGES = 3
+        // Mínimo de reproducciones reales para entrar al grid de "más escuchadas": evita que
+        // canciones oídas una sola vez ocupen celdas. El grid ya no se rellena a 3 páginas
+        // exactas — 2 páginas o 2 y media son válidas.
+        private const val SHORTCUTS_MIN_PLAYS = 3
         // Partial-bind payload: refresh only the play/equalizer icon without reloading artwork or
         // re-creating click listeners (avoids the flash/jank when tapping a shortcut).
         private const val PAYLOAD_EQ = "eq"
         // RecyclerView.mTouchSlop is the same field for every instance — reflect it once, not per carousel.
         private var cachedTouchSlopField: java.lang.reflect.Field? = null
         private const val COVERS_PER_PAGE = 4
+        // Tope de canciones de "Selección rápida" (5 páginas de 4 rows como covers).
+        private const val QUICK_PICKS_LIMIT = 20
         private const val RECOMMENDED_LIMIT = 12
         // Cupo máximo de playlists de la biblioteca propia en "recomendadas" (el resto son
         // generadas por YT / la comunidad, que es lo que el usuario prefiere ver).
@@ -106,6 +114,13 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
     private var vpCovers: ViewPager2? = null
     private var tabDotsCovers: TabLayout? = null
 
+    // Selección rápida (quick picks del home de YT): mismas rows/pager que covers, va debajo de
+    // "Playlists recomendadas". Se alimenta del MISMO fetchHomeBrowse de recomendadas.
+    private var llQuickPicksHeader: View? = null
+    private var btnQuickPicksPlayAll: TextView? = null
+    private var vpQuickPicks: ViewPager2? = null
+    private var tabDotsQuickPicks: TabLayout? = null
+
     // Radios section
     private var llRadiosHeader: View? = null
     private var rvRadios: RecyclerView? = null
@@ -122,7 +137,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
     // Based on the SHORT screen axis so rotation/split-screen never stretches the squares.
     private val radioCardWidthPx: Int by lazy {
         val dm = resources.displayMetrics
-        (minOf(dm.widthPixels, dm.heightPixels) * 0.46).toInt()
+        (minOf(dm.widthPixels, dm.heightPixels) * 0.43).toInt()
     }
 
     // Playlists recientes section
@@ -182,6 +197,81 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
     private var llRecommendedSkeleton: View? = null
     private var llRecapsSkeleton: View? = null
     private var llNewFavesSkeleton: View? = null
+    private var llQuickPicksSkeleton: View? = null
+
+    // ===== Carga lazy por visibilidad =====
+    // Primer poblado de una sección bajo el fold: en vez de bindear todas las secciones a la vez
+    // (cold start = todos los adapters + Glide en un frame), el skeleton se queda visible y el
+    // bind real corre cuando el usuario se ACERCA scrolleando (margen de media pantalla extra,
+    // para que al llegar ya esté pintada). Las secciones ya visibles en pantalla o con contenido
+    // previo bindean al instante, exactamente igual que antes. Clave = el skeleton de la sección
+    // (está VISIBLE y laid-out durante la carga, así que su posición es fiable).
+    private val pendingSectionReveals = LinkedHashMap<View, () -> Unit>()
+
+    /** Top del anchor relativo al contenido del NestedScrollView vs. borde inferior visible + margen. */
+    private fun sectionNearViewport(anchor: View): Boolean {
+        val nsv = view?.findViewById<androidx.core.widget.NestedScrollView>(R.id.nsvPrincipalContent)
+            ?: return true
+        if (nsv.height <= 0) return true // pre-layout: bindea ya (comportamiento clásico)
+        var top = 0
+        var v: View? = anchor
+        while (v != null && v !== nsv) {
+            top += v.top
+            v = v.parent as? View
+        }
+        return top < nsv.scrollY + nsv.height + nsv.height / 2
+    }
+
+    /**
+     * Ejecuta [bind] ya si la sección está (casi) visible o ya muestra contenido; si no, la deja
+     * pendiente con su skeleton visible hasta que el scroll la acerque. Un bind pendiente se
+     * SOBRESCRIBE con datos más nuevos (última versión gana).
+     */
+    private fun revealSectionWhenVisible(anchor: View?, contentShowing: Boolean, bind: () -> Unit) {
+        if (anchor == null || contentShowing || sectionNearViewport(anchor)) {
+            if (anchor != null) pendingSectionReveals.remove(anchor)
+            bind()
+            return
+        }
+        anchor.visibility = View.VISIBLE // el skeleton sigue en pantalla mientras espera
+        pendingSectionReveals[anchor] = bind
+    }
+
+    /** Corre los binds pendientes cuyas secciones ya se acercaron al viewport. Los binds se
+     *  ESCALONAN (uno por frame) en vez de correr todos dentro del frame de scroll: un scroll que
+     *  destapa 2-3 carruseles a la vez inflaba+bindeaba+disparaba Glide de todos en un mismo frame
+     *  (el jank del primer scroll). El margen de media pantalla de sectionNearViewport da holgura
+     *  para que el reparto en frames sucesivos siga llegando antes de que la sección sea visible. */
+    private fun runDueSectionReveals() {
+        if (pendingSectionReveals.isEmpty() || revealDrainScheduled) return
+        drainOneDueReveal()
+    }
+
+    private var revealDrainScheduled = false
+
+    private fun drainOneDueReveal() {
+        revealDrainScheduled = false
+        if (!isAdded || pendingSectionReveals.isEmpty()) return
+        val next = pendingSectionReveals.entries.firstOrNull { sectionNearViewport(it.key) } ?: return
+        pendingSectionReveals.remove(next.key)
+        next.value()
+        // Si quedan más secciones ya vencidas, procesarlas en frames sucesivos.
+        if (pendingSectionReveals.entries.any { sectionNearViewport(it.key) }) {
+            revealDrainScheduled = true
+            handler.post { drainOneDueReveal() }
+        }
+    }
+
+    /** Muestra una vista con fade SOLO en su primer poblado (GONE→VISIBLE); un refresh con la
+     *  sección ya visible no parpadea. */
+    private fun showSectionView(v: View?, show: Boolean) {
+        v ?: return
+        if (!show) { v.visibility = View.GONE; return }
+        if (v.visibility == View.VISIBLE) return
+        v.alpha = 0f
+        v.visibility = View.VISIBLE
+        v.animate().alpha(1f).setDuration(220L).start()
+    }
 
     // Currently playing shortcut
     private var currentlyPlayingShortcutVideoId = ""
@@ -190,6 +280,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
     // Data
     private val shortcutEntries = mutableListOf<PlayCountStore.PlayCountEntry>()
     private val coversResults = mutableListOf<YouTubeMusicService.TrackResult>()
+    private val quickPicksResults = mutableListOf<YouTubeMusicService.TrackResult>()
 
     // Helper structure
     private class QueueData {
@@ -262,11 +353,16 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 overlay.alpha = if (target <= 0f) 1f else (scrollY / target).coerceIn(0f, 1f)
             }
             updateHeaderOnScroll(scrollY, scrollY - oldScrollY)
+            // Carga lazy: bindea las secciones cuyo skeleton ya se acercó al viewport.
+            runDueSectionReveals()
         })
         // Seed the header/background state once laid out (covers a restored scroll position).
         nsv?.post { if (isAdded && nsv != null) updateHeaderOnScroll(nsv.scrollY, 0) }
 
         setupShortcuts()
+        // PRIMERO en la cola del bgExecutor: pinta el 3x3 desde el snapshot de la sesión anterior
+        // casi al instante en frío, antes que las demás lecturas de caché.
+        loadCachedShortcuts()
         setupCovers()
         loadCachedCovers()
 
@@ -288,6 +384,13 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         rvRecommended = view.findViewById(R.id.rvRecommended)
         setupRecommended()
         loadCachedRecommended()
+
+        llQuickPicksHeader = view.findViewById(R.id.llQuickPicksHeader)
+        btnQuickPicksPlayAll = view.findViewById(R.id.btnQuickPicksPlayAll)
+        vpQuickPicks = view.findViewById(R.id.vpQuickPicks)
+        tabDotsQuickPicks = view.findViewById(R.id.tabDotsQuickPicks)
+        setupQuickPicks()
+        loadCachedQuickPicks()
 
         llRecapsHeader = view.findViewById(R.id.llRecapsHeader)
         rvRecaps = view.findViewById(R.id.rvRecaps)
@@ -314,6 +417,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         if (hasVisibleHomeSkeleton()) armHomeSkeletonSafetyTimer()
         vpShortcuts?.setCurrentItem(0, false)
         vpCovers?.setCurrentItem(0, false)
+        vpQuickPicks?.setCurrentItem(0, false)
         // Defer the carousel rebuilds past the resume frame: the retained views already show
         // the previous content, so the return feels instant and the refreshes trickle in.
         handler.postDelayed({
@@ -344,6 +448,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         handler.removeCallbacksAndMessages(null)
         firstContentRevealDone = false
         playlistGridUrlsCache.clear()
+        pendingSectionReveals.clear()
         vpShortcuts = null
         tabDotsShortcuts = null
         ivHomeBackdrop = null
@@ -363,6 +468,10 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         btnCoversPlayAll = null
         vpCovers = null
         tabDotsCovers = null
+        llQuickPicksHeader = null
+        btnQuickPicksPlayAll = null
+        vpQuickPicks = null
+        tabDotsQuickPicks = null
         llRadiosHeader = null
         rvRadios = null
         llPlaylistsHeader = null
@@ -380,6 +489,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         llRecommendedSkeleton = null
         llRecapsSkeleton = null
         llNewFavesSkeleton = null
+        llQuickPicksSkeleton = null
     }
 
     override fun onHiddenChanged(hidden: Boolean) {
@@ -391,6 +501,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             // Always reset to first page when re-entering
             vpShortcuts?.setCurrentItem(0, false)
             vpCovers?.setCurrentItem(0, false)
+            vpQuickPicks?.setCurrentItem(0, false)
             // Rebuilding all four carousels synchronously here is what made switching to
             // Principal feel slow — the switch frame paid for every adapter rebuild + Glide
             // bind at once. The kept-alive views still show the previous content, so defer
@@ -424,6 +535,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         // Pagers al primer item (los puntos siguen vía TabLayoutMediator).
         vpShortcuts?.setCurrentItem(0, false)
         vpCovers?.setCurrentItem(0, false)
+        vpQuickPicks?.setCurrentItem(0, false)
         // Scroll vertical exterior arriba del todo.
         view?.findViewById<androidx.core.widget.NestedScrollView>(R.id.nsvPrincipalContent)?.scrollTo(0, 0)
     }
@@ -705,6 +817,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             // score = count / (1 + daysSinceLastPlayed / 3)
             val nowMs = System.currentTimeMillis()
             val allEntries = PlayCountStore.getAllEntries(appContext)
+                .filter { it.count >= SHORTCUTS_MIN_PLAYS }
                 .sortedByDescending { entry ->
                     val daysSince = (nowMs - entry.lastPlayedAtMs) / 86_400_000.0
                     entry.count / (1.0 + daysSince / 3.0)
@@ -723,12 +836,18 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             for (t in allEntries) {
                 if (merged.size >= totalNeeded) break
                 if (t.videoId in seenIds) continue
+                // Una sola playlist en el grid: la fijada en la posición 0. Las pseudo-entradas
+                // agregadas (videoId == playlistId) que la nube reimporta al store crudo no
+                // pueden colarse como segunda fila de playlist.
+                if (!t.playlistId.isNullOrEmpty() && t.videoId == t.playlistId) continue
                 seenIds.add(t.videoId)
                 merged.add(t)
             }
 
             val top = ArrayList(merged)
-            if (top.size < totalNeeded) fillShortcutsFromHistory(appContext, top, totalNeeded)
+            // Solo cuentas nuevas sin escuchas suficientes completan la PRIMERA página desde el
+            // historial (celdas count=0), para que el grid no quede vacío; nunca se fuerza a 3.
+            if (top.size < SHORTCUTS_PER_PAGE) fillShortcutsFromHistory(appContext, top, SHORTCUTS_PER_PAGE)
 
             // Warm the grid-art cache off the UI thread so cell binds don't touch disk.
             val gridCache = HashMap<String, List<String>>()
@@ -736,15 +855,6 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 val pid = e.playlistId
                 if (!pid.isNullOrEmpty() && e.videoId == pid) {
                     gridCache[pid] = computePlaylistGridUrls(appContext, pid)
-                }
-            }
-
-            // Sync shortcuts to Firebase if user is signed in
-            if (top.isNotEmpty()) {
-                try {
-                    CloudSyncManager.getInstance(appContext).syncShortcutsToCloud(top)
-                } catch (e: Exception) {
-                    Log.w(TAG, "syncShortcutsToCloud failed", e)
                 }
             }
 
@@ -770,6 +880,102 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 // Empty on fresh install is NOT terminal — cloud hydration lands seconds later,
                 // so the skeleton keeps pulsing; the safety timer ends genuinely-empty accounts.
                 revealAfterFirstContentPass()
+            }
+
+            // Trabajo NO crítico — se hace DESPUÉS de postear el grid para no retrasar su pintado:
+            // (1) persistir el snapshot para que el PRÓXIMO arranque en frío lo pinte al instante
+            //     (loadCachedShortcuts), (2) subir a la nube (antes bloqueaba el post con la
+            //     serialización + lookup del singleton).
+            if (top.isNotEmpty()) {
+                writeShortcutsSnapshot(appContext, top)
+                try {
+                    CloudSyncManager.getInstance(appContext).syncShortcutsToCloud(top)
+                } catch (e: Exception) {
+                    Log.w(TAG, "syncShortcutsToCloud failed", e)
+                }
+            }
+        }
+    }
+
+    /** Persiste el grid de shortcuts a UNA clave de prefs para que el próximo arranque en frío lo
+     *  pinte al instante. Debe llamarse en un hilo de fondo (se escribe con apply()). */
+    private fun writeShortcutsSnapshot(ctx: Context, entries: List<PlayCountStore.PlayCountEntry>) {
+        try {
+            val arr = org.json.JSONArray()
+            for (e in entries) {
+                arr.put(org.json.JSONObject().apply {
+                    put("videoId", e.videoId)
+                    put("title", e.title)
+                    put("artist", e.artist)
+                    put("imageUrl", e.imageUrl)
+                    put("playlistId", e.playlistId)
+                    put("playlistName", e.playlistName)
+                    put("count", e.count)
+                    put("lastPlayedAtMs", e.lastPlayedAtMs)
+                })
+            }
+            ctx.getSharedPreferences(PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
+                .edit()
+                .putString("home_shortcuts_data", arr.toString())
+                .apply()
+        } catch (e: Exception) {
+            Log.w(TAG, "writeShortcutsSnapshot failed", e)
+        }
+    }
+
+    private fun parseShortcutsSnapshot(raw: String): List<PlayCountStore.PlayCountEntry> {
+        val out = ArrayList<PlayCountStore.PlayCountEntry>()
+        try {
+            val arr = org.json.JSONArray(raw)
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val vid = o.optString("videoId", "")
+                if (vid.isEmpty()) continue
+                out.add(
+                    PlayCountStore.PlayCountEntry(
+                        vid,
+                        o.optString("title", ""),
+                        o.optString("artist", ""),
+                        o.optString("imageUrl", ""),
+                        o.optString("playlistId", ""),
+                        o.optString("playlistName", ""),
+                        o.optInt("count", 0),
+                        o.optLong("lastPlayedAtMs", 0L)
+                    )
+                )
+            }
+        } catch (_: Exception) {
+        }
+        return out
+    }
+
+    /** Pinta el grid 3x3 desde el snapshot persistido de la sesión anterior, LO ANTES posible en
+     *  frío — antes era la única sección sin caché temprana y quedaba al final de la cola del
+     *  bgExecutor detrás de las otras 5-6 lecturas, dejando el shimmer del 3x3 pulsando de más.
+     *  refreshShortcuts recalcula después y actualiza (grid-art incluido). */
+    private fun loadCachedShortcuts() {
+        if (!isAdded || shortcutEntries.isNotEmpty()) return
+        submitBg {
+            try {
+                val ctx = context ?: return@submitBg
+                val raw = ctx.getSharedPreferences(PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
+                    .getString("home_shortcuts_data", "") ?: ""
+                if (raw.isEmpty()) return@submitBg
+                val parsed = parseShortcutsSnapshot(raw)
+                if (parsed.isEmpty()) return@submitBg
+                handler.post {
+                    if (!isAdded || shortcutEntries.isNotEmpty()) return@post
+                    shortcutEntries.addAll(parsed)
+                    vpShortcuts?.adapter?.notifyDataSetChanged()
+                    tabDotsShortcuts?.let {
+                        val pageCount = Math.max(1, Math.ceil(shortcutEntries.size / SHORTCUTS_PER_PAGE.toFloat().toDouble()).toInt())
+                        it.visibility = if (pageCount > 1) View.VISIBLE else View.GONE
+                    }
+                    vpShortcuts?.visibility = View.VISIBLE
+                    hideHomeSkeleton(llShortcutsSkeleton)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "loadCachedShortcuts failed", e)
             }
         }
     }
@@ -814,6 +1020,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         llRecommendedSkeleton = root.findViewById(R.id.llRecommendedSkeleton)
         llRecapsSkeleton = root.findViewById(R.id.llRecapsSkeleton)
         llNewFavesSkeleton = root.findViewById(R.id.llNewFavesSkeleton)
+        llQuickPicksSkeleton = root.findViewById(R.id.llQuickPicksSkeleton)
 
         // Grid skeleton is a square that must match vpShortcuts (whose height is set to screenWidth).
         val screenWidth = resources.displayMetrics.widthPixels
@@ -855,6 +1062,9 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         if (coversResults.isEmpty()) { llCoversSkeleton?.visibility = View.VISIBLE; anyShown = true }
         if (radioEntries.isEmpty()) { llRadiosSkeleton?.visibility = View.VISIBLE; anyShown = true }
         if (recommendedEntries.isEmpty()) { llRecommendedSkeleton?.visibility = View.VISIBLE; anyShown = true }
+        // Antes estas dos secciones cargaban SIN skeleton (se veía un hueco mientras llegaban).
+        if (recapEntries.isEmpty()) { llRecapsSkeleton?.visibility = View.VISIBLE; anyShown = true }
+        if (quickPicksResults.isEmpty()) { llQuickPicksSkeleton?.visibility = View.VISIBLE; anyShown = true }
         if (anyShown) armHomeSkeletonSafetyTimer()
         return anyShown
     }
@@ -878,7 +1088,8 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             llRadiosSkeleton?.visibility == View.VISIBLE ||
             llRecommendedSkeleton?.visibility == View.VISIBLE ||
             llRecapsSkeleton?.visibility == View.VISIBLE ||
-            llNewFavesSkeleton?.visibility == View.VISIBLE
+            llNewFavesSkeleton?.visibility == View.VISIBLE ||
+            llQuickPicksSkeleton?.visibility == View.VISIBLE
 
     private fun sizeHomeSkeletonCards(row: View?) {
         row ?: return
@@ -892,11 +1103,11 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
     /**
      * Every home carousel card is EXACTLY radioCardWidthPx wide (a perfect 1:1 square regardless
-     * of screen shape). The item layouts no longer carry paddingHorizontal — the 6dp separation
+     * of screen shape). The item layouts no longer carry paddingHorizontal — the 8dp separation
      * lives here as layout margins so the square equals the item width pixel-for-pixel.
      */
     private fun applyCarouselCardLayout(view: View) {
-        val margin = (6 * resources.displayMetrics.density).toInt()
+        val margin = (8 * resources.displayMetrics.density).toInt()
         val lp = (view.layoutParams as? ViewGroup.MarginLayoutParams)
             ?: ViewGroup.MarginLayoutParams(radioCardWidthPx, ViewGroup.LayoutParams.WRAP_CONTENT)
         lp.width = radioCardWidthPx
@@ -916,17 +1127,20 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         skeleton.visibility = View.GONE
     }
 
-    /** Safety-net: collapse any skeleton whose section never loaded (e.g. covers when signed out). */
+    /** Safety-net: collapse any skeleton whose section never loaded (e.g. covers when signed out).
+     *  Un skeleton con bind pendiente (datos listos esperando el scroll — carga lazy) NO se
+     *  desmonta: su sección sí cargó, solo espera hacerse visible. */
     private fun dismissAllHomeSkeletons() {
         // The grid never legitimately stays empty long; reveal the (possibly empty) pager under it.
         if (llShortcutsSkeleton?.visibility == View.VISIBLE) vpShortcuts?.visibility = View.VISIBLE
         hideHomeSkeleton(llShortcutsSkeleton)
-        hideHomeSkeleton(llPlaylistsSkeleton)
-        hideHomeSkeleton(llCoversSkeleton)
-        hideHomeSkeleton(llRadiosSkeleton)
-        hideHomeSkeleton(llRecommendedSkeleton)
-        hideHomeSkeleton(llRecapsSkeleton)
-        hideHomeSkeleton(llNewFavesSkeleton)
+        for (sk in listOf(
+            llPlaylistsSkeleton, llCoversSkeleton, llRadiosSkeleton, llRecommendedSkeleton,
+            llRecapsSkeleton, llNewFavesSkeleton, llQuickPicksSkeleton
+        )) {
+            if (sk != null && pendingSectionReveals.containsKey(sk)) continue
+            hideHomeSkeleton(sk)
+        }
     }
 
     private fun fillShortcutsFromHistory(appContext: Context, existing: MutableList<PlayCountStore.PlayCountEntry>, totalNeeded: Int) {
@@ -956,10 +1170,22 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
     // ========== Covers ==========
 
+    /** Transición un poco más suave entre páginas de covers/selección rápida: fundido y escala
+     *  sutiles ligados a la posición del swipe, para que el snap de ViewPager2 (cuya duración es
+     *  interna y no configurable) deje de sentirse como un corte seco. */
+    private val gentlePageTransformer = ViewPager2.PageTransformer { page, position ->
+        val f = 1f - kotlin.math.abs(position.coerceIn(-1f, 1f))
+        page.alpha = 0.55f + 0.45f * f
+        val s = 0.97f + 0.03f * f
+        page.scaleX = s
+        page.scaleY = s
+    }
+
     private fun setupCovers() {
         vpCovers ?: return
-        vpCovers?.adapter = CoversPagerAdapter()
+        vpCovers?.adapter = TrackRowsPagerAdapter(coversResults)
         vpCovers?.offscreenPageLimit = 1
+        vpCovers?.setPageTransformer(gentlePageTransformer)
         val coversRv = vpCovers?.getChildAt(0) as? RecyclerView
         improveHorizontalScrollDetection(coversRv)
         tabDotsCovers?.let { TabLayoutMediator(it, vpCovers!!) { _, _ -> }.attach() }
@@ -1034,6 +1260,16 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 youTubeMusicService.fetchCoversAndRemixes(cookie, selected, object : YouTubeMusicService.CoversRemixesCallback {
                     override fun onSuccess(tracks: List<YouTubeMusicService.TrackResult>) {
                         if (!isAdded) return
+                        // Éxito VACÍO o degradado = fallo silencioso aguas arriba (cookie caducada,
+                        // 401 de InnerTube, bot-check): NUNCA sustituir contenido ya visible ni el
+                        // caché bueno de disco — era la causa de que "Covers y remixes"
+                        // desapareciera hasta recrear la vista. No se sella el TTL (un refresh
+                        // posterior reintenta) y, si la memoria está vacía, se rehidrata del disco.
+                        if (tracks.isEmpty() || (tracks.size < COVERS_PER_PAGE && coversResults.size > tracks.size)) {
+                            lastCoversNetworkFetchTimeMs = 0L
+                            if (coversResults.isEmpty()) loadCachedCovers()
+                            return
+                        }
                         lastCoversNetworkFetchTimeMs = System.currentTimeMillis()
                         // If the fetch returned the same tracks already on screen, refresh the
                         // timestamp silently — swapping equal content (reshuffled) made the section
@@ -1058,19 +1294,105 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         }
     }
 
+    // ========== Selección rápida ==========
+
+    private fun setupQuickPicks() {
+        vpQuickPicks ?: return
+        vpQuickPicks?.adapter = TrackRowsPagerAdapter(quickPicksResults)
+        vpQuickPicks?.offscreenPageLimit = 1
+        vpQuickPicks?.setPageTransformer(gentlePageTransformer)
+        improveHorizontalScrollDetection(vpQuickPicks?.getChildAt(0) as? RecyclerView)
+        tabDotsQuickPicks?.let { TabLayoutMediator(it, vpQuickPicks!!) { _, _ -> }.attach() }
+        btnQuickPicksPlayAll?.setOnClickListener {
+            if (quickPicksResults.isNotEmpty()) playTrackList(quickPicksResults, 0)
+        }
+    }
+
+    private fun updateQuickPicksUi() {
+        if (quickPicksResults.isEmpty()) {
+            llQuickPicksHeader?.visibility = View.GONE
+            vpQuickPicks?.visibility = View.GONE
+            tabDotsQuickPicks?.visibility = View.GONE
+            hideHomeSkeleton(llQuickPicksSkeleton)
+            revealAfterFirstContentPass()
+            return
+        }
+        revealSectionWhenVisible(llQuickPicksSkeleton, vpQuickPicks?.visibility == View.VISIBLE) {
+            showSectionView(llQuickPicksHeader, true)
+            vpQuickPicks?.let {
+                it.adapter?.notifyDataSetChanged()
+                showSectionView(it, true)
+            }
+            tabDotsQuickPicks?.visibility =
+                if (quickPicksResults.size > COVERS_PER_PAGE) View.VISIBLE else View.GONE
+            hideHomeSkeleton(llQuickPicksSkeleton)
+            revealAfterFirstContentPass()
+        }
+    }
+
+    private fun cacheQuickPicks(tracks: List<YouTubeMusicService.TrackResult>) {
+        if (!isAdded || tracks.isEmpty()) return
+        try {
+            val arr = JSONArray()
+            for (t in tracks) {
+                arr.put(JSONObject().apply {
+                    put("videoId", t.videoId ?: "")
+                    put("title", t.title ?: "")
+                    put("subtitle", t.subtitle ?: "")
+                    put("thumbnailUrl", t.thumbnailUrl ?: "")
+                })
+            }
+            requireContext().getSharedPreferences(PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
+                .edit()
+                .putString("home_quickpicks_data", arr.toString())
+                .apply()
+        } catch (e: Exception) {
+            Log.w(TAG, "Unexpected error", e)
+        }
+    }
+
+    private fun loadCachedQuickPicks() {
+        if (!isAdded || quickPicksResults.isNotEmpty()) return
+        // Mismo patrón off-main que loadCachedCovers (el prefs de streaming es grande).
+        submitBg {
+            try {
+                val ctx = context ?: return@submitBg
+                val raw = ctx.getSharedPreferences(PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
+                    .getString("home_quickpicks_data", "") ?: ""
+                if (raw.isEmpty()) return@submitBg
+                val parsed = parseCoversCacheList(raw) // misma forma de JSON que covers
+                if (parsed.isEmpty()) return@submitBg
+                handler.post {
+                    if (!isAdded || quickPicksResults.isNotEmpty()) return@post
+                    quickPicksResults.addAll(parsed)
+                    updateQuickPicksUi()
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Unexpected error", e)
+            }
+        }
+    }
+
     private fun updateCoversUi() {
-        val empty = coversResults.isEmpty()
-        llCoversHeader?.visibility = if (empty) View.GONE else View.VISIBLE
-        vpCovers?.let {
-            it.visibility = if (empty) View.GONE else View.VISIBLE
-            it.adapter?.notifyDataSetChanged()
+        if (coversResults.isEmpty()) {
+            llCoversHeader?.visibility = View.GONE
+            vpCovers?.visibility = View.GONE
+            tabDotsCovers?.visibility = View.GONE
+            hideHomeSkeleton(llCoversSkeleton)
+            revealAfterFirstContentPass()
+            return
         }
-        tabDotsCovers?.let {
-            val pageCount = Math.ceil(coversResults.size / COVERS_PER_PAGE.toFloat().toDouble()).toInt()
-            it.visibility = if (pageCount > 1) View.VISIBLE else View.GONE
+        revealSectionWhenVisible(llCoversSkeleton, vpCovers?.visibility == View.VISIBLE) {
+            showSectionView(llCoversHeader, true)
+            vpCovers?.let {
+                it.adapter?.notifyDataSetChanged()
+                showSectionView(it, true)
+            }
+            tabDotsCovers?.visibility =
+                if (coversResults.size > COVERS_PER_PAGE) View.VISIBLE else View.GONE
+            hideHomeSkeleton(llCoversSkeleton)
+            revealAfterFirstContentPass()
         }
-        hideHomeSkeleton(llCoversSkeleton)
-        revealAfterFirstContentPass()
     }
 
     // ========== Actions ==========
@@ -1219,6 +1541,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
     private fun setupRecommended() {
         rvRecommended?.layoutManager = LinearLayoutManager(requireContext(), LinearLayoutManager.HORIZONTAL, false)
+        rvRecommended?.setHasFixedSize(true)
         improveHorizontalScrollDetection(rvRecommended)
         rvRecommended?.adapter = MixCardAdapter(recommendedEntries) { onRecommendedClicked(it) }
     }
@@ -1242,12 +1565,19 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 val otherItems = mutableListOf<YouTubeMusicService.MixResult>()
                 val recaps = mutableListOf<YouTubeMusicService.MixResult>()
                 val newFaves = mutableListOf<YouTubeMusicService.MixResult>()
+                val storeCtx = context?.applicationContext
                 for (section in result.allSections) {
                     val ownSection = isOwnLibrarySectionTitle(section.title)
                     val recapSection = isRecapTitle(section.title)
                     for (item in section.items) {
                         val pid = item.playlistId.trim()
                         if (pid.isEmpty() || item.title.isBlank()) continue
+                        // Registra la portada OFICIAL que YT manda para esta playlist: es la que
+                        // debe verse en TODAS las superficies (recientes, biblioteca, descargas),
+                        // nunca sustituida por el collage 2x2 de la app.
+                        if (storeCtx != null && item.thumbnailUrl.isNotBlank()) {
+                            OfficialCoverStore.save(storeCtx, pid, item.thumbnailUrl)
+                        }
                         // La tarjeta liked dibuja overlay local: no exijas thumbnail (YT a veces la manda vacía).
                         val liked = isLikedPlaylistId(pid)
                         if (!liked && item.thumbnailUrl.isBlank()) continue
@@ -1280,17 +1610,32 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 }
                 // Lo nuevo y lo que más te gusta: tarjeta de "Música que te gustó" SIEMPRE primero,
                 // luego los mixes personales de YT. Va antes de recomendadas.
-                val newFavesOrdered = listOf(likedMusicCard()) + newFaves
-                newFavesEntries.clear()
-                newFavesEntries.addAll(newFavesOrdered)
-                cacheNewFaves(newFavesOrdered)
-                updateNewFavesUi()
+                // Guard como recomendadas/recaps: si el home vino sin mixes personales (cookie
+                // degradada a sesión anónima, shelf ausente), conservar los que ya se muestran en
+                // vez de reconstruir la lista solo con la tarjeta liked — reconstruir sin guard
+                // hacía desaparecer los mixes personales y machacaba su caché de disco.
+                if (newFaves.isNotEmpty() || newFavesEntries.size <= 1) {
+                    val newFavesOrdered = listOf(likedMusicCard()) + newFaves
+                    newFavesEntries.clear()
+                    newFavesEntries.addAll(newFavesOrdered)
+                    if (newFaves.isNotEmpty()) cacheNewFaves(newFavesOrdered)
+                    updateNewFavesUi()
+                }
                 // Recaps: sección propia, debajo de "Selección rápida".
                 if (recaps.isNotEmpty()) {
                     recapEntries.clear()
                     recapEntries.addAll(recaps)
                     cacheRecaps(recaps)
                     updateRecapsUi()
+                }
+                // Selección rápida: canciones del shelf de quick-picks del MISMO home browse
+                // (sin llamada extra). Pintadas con el diseño de covers, bajo recomendadas.
+                if (result.quickPicks.isNotEmpty()) {
+                    val picks = result.quickPicks.take(QUICK_PICKS_LIMIT)
+                    quickPicksResults.clear()
+                    quickPicksResults.addAll(picks)
+                    cacheQuickPicks(picks)
+                    updateQuickPicksUi()
                 }
             }
 
@@ -1318,11 +1663,16 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
     private fun updateRecommendedUi() {
         if (!isAdded) return
-        val has = recommendedEntries.isNotEmpty()
-        llRecommendedHeader?.visibility = if (has) View.VISIBLE else View.GONE
-        rvRecommended?.visibility = if (has) View.VISIBLE else View.GONE
-        (rvRecommended?.adapter as? MixCardAdapter)?.notifyDataSetChanged()
-        if (has) {
+        if (recommendedEntries.isEmpty()) {
+            llRecommendedHeader?.visibility = View.GONE
+            rvRecommended?.visibility = View.GONE
+            (rvRecommended?.adapter as? MixCardAdapter)?.notifyDataSetChanged()
+            return
+        }
+        revealSectionWhenVisible(llRecommendedSkeleton, rvRecommended?.visibility == View.VISIBLE) {
+            showSectionView(llRecommendedHeader, true)
+            (rvRecommended?.adapter as? MixCardAdapter)?.notifyDataSetChanged()
+            showSectionView(rvRecommended, true)
             hideHomeSkeleton(llRecommendedSkeleton)
             revealAfterFirstContentPass()
         }
@@ -1330,17 +1680,23 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
     private fun setupRecaps() {
         rvRecaps?.layoutManager = LinearLayoutManager(requireContext(), LinearLayoutManager.HORIZONTAL, false)
+        rvRecaps?.setHasFixedSize(true)
         improveHorizontalScrollDetection(rvRecaps)
         rvRecaps?.adapter = MixCardAdapter(recapEntries) { onRecapClicked(it) }
     }
 
     private fun updateRecapsUi() {
         if (!isAdded) return
-        val has = recapEntries.isNotEmpty()
-        llRecapsHeader?.visibility = if (has) View.VISIBLE else View.GONE
-        rvRecaps?.visibility = if (has) View.VISIBLE else View.GONE
-        (rvRecaps?.adapter as? MixCardAdapter)?.notifyDataSetChanged()
-        if (has) {
+        if (recapEntries.isEmpty()) {
+            llRecapsHeader?.visibility = View.GONE
+            rvRecaps?.visibility = View.GONE
+            (rvRecaps?.adapter as? MixCardAdapter)?.notifyDataSetChanged()
+            return
+        }
+        revealSectionWhenVisible(llRecapsSkeleton, rvRecaps?.visibility == View.VISIBLE) {
+            showSectionView(llRecapsHeader, true)
+            (rvRecaps?.adapter as? MixCardAdapter)?.notifyDataSetChanged()
+            showSectionView(rvRecaps, true)
             hideHomeSkeleton(llRecapsSkeleton)
             revealAfterFirstContentPass()
         }
@@ -1350,6 +1706,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
     private fun setupNewFaves() {
         rvNewFaves?.layoutManager = LinearLayoutManager(requireContext(), LinearLayoutManager.HORIZONTAL, false)
+        rvNewFaves?.setHasFixedSize(true)
         improveHorizontalScrollDetection(rvNewFaves)
         rvNewFaves?.adapter = MixCardAdapter(newFavesEntries) { onRecommendedClicked(it) }
         // Siembra la tarjeta "Música que te gustó" al instante (no depende del fetch ni de estar
@@ -1823,6 +2180,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
     private fun setupRadios() {
         rvRadios?.layoutManager = LinearLayoutManager(requireContext(), LinearLayoutManager.HORIZONTAL, false)
+        rvRadios?.setHasFixedSize(true)
         improveHorizontalScrollDetection(rvRadios)
         rvRadios?.adapter = RadioCarouselAdapter()
     }
@@ -1847,16 +2205,24 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 if (!isAdded) return@post
                 radioEntries.clear()
                 radioEntries.addAll(radios)
-                val hasRadios = radioEntries.isNotEmpty()
-                llRadiosHeader?.visibility = if (hasRadios) View.VISIBLE else View.GONE
-                rvRadios?.visibility = if (hasRadios) View.VISIBLE else View.GONE
-                (rvRadios?.adapter as? RadioCarouselAdapter)?.notifyDataSetChanged()
-                // Empty ≠ loaded: on fresh install the radios arrive with cloud hydration, so the
-                // skeleton stays until data (or the safety timer) resolves it.
-                if (hasRadios) hideHomeSkeleton(llRadiosSkeleton)
-                // Pre-fetch side images so they're in Glide disk cache before scroll
+                if (radioEntries.isEmpty()) {
+                    // Empty ≠ loaded: on fresh install the radios arrive with cloud hydration, so
+                    // the skeleton stays until data (or the safety timer) resolves it.
+                    llRadiosHeader?.visibility = View.GONE
+                    rvRadios?.visibility = View.GONE
+                    (rvRadios?.adapter as? RadioCarouselAdapter)?.notifyDataSetChanged()
+                    return@post
+                }
+                // Pre-composición SIEMPRE inmediata (aunque el bind visual espere al scroll):
+                // así el arte ya está en caché cuando la sección se revela.
                 preloadRadioImages(radios)
-                revealAfterFirstContentPass()
+                revealSectionWhenVisible(llRadiosSkeleton, rvRadios?.visibility == View.VISIBLE) {
+                    showSectionView(llRadiosHeader, true)
+                    (rvRadios?.adapter as? RadioCarouselAdapter)?.notifyDataSetChanged()
+                    showSectionView(rvRadios, true)
+                    hideHomeSkeleton(llRadiosSkeleton)
+                    revealAfterFirstContentPass()
+                }
             }
         }
     }
@@ -1869,9 +2235,12 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             for (radio in radios) {
                 val centerUrl = radio.songThumbnail
                 val (leftUrl, rightUrl) = resolveRadioSides(radio, centerUrl)
-                // Build + cache the single 3-circle composite ahead of first paint (no-op if the
+                // Build + cache the single composite ahead of first paint (no-op if the
                 // memory/disk cache already has it), so the very first scroll is already instant.
-                RadioArtComposer.precompose(ctx, radio.radioPlaylistId, centerUrl, leftUrl, rightUrl, sizePx)
+                // Sin color resuelto aún se precompone con la paleta por defecto; el bind
+                // recompondrá con la real al resolver Palette.
+                val raw = radioDominantColorCache[centerUrl] ?: RadioArt.DEFAULT_RAW
+                RadioArtComposer.precompose(ctx, radio.radioPlaylistId, centerUrl, leftUrl, rightUrl, sizePx, raw)
             }
         } catch (_: Exception) {}
     }
@@ -1941,7 +2310,6 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             private var boundCenterUrl: String = ""
             private val ivComposite: ImageView = itemView.findViewById(R.id.ivRadioComposite)
             private val tvName: TextView = itemView.findViewById(R.id.tvRadioName)
-            private val tvTitle: TextView = itemView.findViewById(R.id.tvRadioTitle)
 
             fun bind(radio: RadioHistoryStore.RadioEntry) {
                 val cachedText = radioArtistTextCache[radio.radioPlaylistId]
@@ -1962,62 +2330,62 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                     computed
                 }
                 tvName.text = text
-                tvTitle.text = radio.songTitle
                 val clickListener = View.OnClickListener { onRadioClicked(radio) }
                 itemView.setOnClickListener(clickListener)
                 cardRadio.setOnClickListener(clickListener)
 
-                // Center seed thumbnail drives the card's gradient background color.
+                // Center seed thumbnail drives the card's dominant-color palette (campo degradado
+                // + barras del composite). El color raw entra en la firma del composite: al
+                // resolverse el Palette la tarjeta se recompone sola con su paleta real.
                 val centerUrl = radio.songThumbnail
                 boundCenterUrl = centerUrl
-                if (centerUrl.isNotEmpty() && isAdded) {
-                    val cachedColor = radioDominantColorCache[centerUrl]
-                    if (cachedColor != null) {
-                        // Skip rebuilding the gradient if this card already shows this exact color
-                        // (recycled holder rebinding to the same radio, notifyDataSetChanged, etc.).
-                        if (vBg.getTag(R.id.tag_radio_bg_color) != cachedColor) {
-                            vBg.setTag(R.id.tag_radio_bg_color, cachedColor)
-                            vBg.background = buildRadioCardGradient(cachedColor)
-                        }
-                    } else {
-                        try {
-                            Glide.with(this@PrincipalFragment)
-                                .asBitmap()
-                                .load(centerUrl)
-                                .diskCacheStrategy(DiskCacheStrategy.ALL)
-                                .override(64, 64)
-                                .centerCrop()
-                                .into(object : com.bumptech.glide.request.target.CustomTarget<android.graphics.Bitmap>() {
-                                    override fun onResourceReady(resource: android.graphics.Bitmap, transition: com.bumptech.glide.request.transition.Transition<in android.graphics.Bitmap>?) {
-                                        Palette.from(resource).generate { palette ->
-                                            val dominant = palette?.getDarkMutedColor(
-                                                palette.getMutedColor(0xFF333333.toInt())
-                                            ) ?: 0xFF333333.toInt()
-                                            persistDominantColor(radio.radioPlaylistId, centerUrl, dominant)
-                                            // Recycled holder may already show another radio — the
-                                            // color stays cached, but don't paint the wrong card.
-                                            if (boundCenterUrl != centerUrl) return@generate
-                                            vBg.setTag(R.id.tag_radio_bg_color, dominant)
-                                            vBg.background = buildRadioCardGradient(dominant)
-                                        }
-                                    }
-                                    override fun onLoadCleared(placeholder: android.graphics.drawable.Drawable?) {}
-                                })
-                        } catch (_: Exception) {}
+                val (leftUrl, rightUrl) = resolveRadioSides(radio, centerUrl)
+
+                fun paint(rawColor: Int) {
+                    // Fondo GRIS de carga (como las demás tarjetas), NO el degradado de color: el
+                    // usuario quiere contenedores grises hasta que carguen. El color aparece solo
+                    // cuando el composite termina (entra con fade sobre este gris).
+                    val loadingGray = 0xFF282A30.toInt()
+                    if (vBg.getTag(R.id.tag_radio_bg_color) != loadingGray) {
+                        vBg.setTag(R.id.tag_radio_bg_color, loadingGray)
+                        vBg.setBackgroundColor(loadingGray)
                     }
+                    RadioArtComposer.load(
+                        ivComposite,
+                        radio.radioPlaylistId,
+                        centerUrl,
+                        leftUrl,
+                        rightUrl,
+                        radioCardWidthPx,
+                        rawColor
+                    )
                 }
 
-                // The 3 circular thumbnails are composed into ONE cached image (RadioArtComposer)
-                // instead of 3 live Glide loads, so the carousel never streams them in one by one.
-                val (leftUrl, rightUrl) = resolveRadioSides(radio, centerUrl)
-                RadioArtComposer.load(
-                    ivComposite,
-                    radio.radioPlaylistId,
-                    centerUrl,
-                    leftUrl,
-                    rightUrl,
-                    radioCardWidthPx
-                )
+                val cachedColor = radioDominantColorCache[centerUrl]
+                paint(cachedColor ?: RadioArt.DEFAULT_RAW)
+                if (cachedColor == null && centerUrl.isNotEmpty() && isAdded) {
+                    try {
+                        Glide.with(this@PrincipalFragment)
+                            .asBitmap()
+                            .load(centerUrl)
+                            .diskCacheStrategy(DiskCacheStrategy.ALL)
+                            .override(64, 64)
+                            .centerCrop()
+                            .into(object : com.bumptech.glide.request.target.CustomTarget<android.graphics.Bitmap>() {
+                                override fun onResourceReady(resource: android.graphics.Bitmap, transition: com.bumptech.glide.request.transition.Transition<in android.graphics.Bitmap>?) {
+                                    Palette.from(resource).generate { palette ->
+                                        val dominant = RadioArtComposer.pickRawColor(palette)
+                                        persistDominantColor(radio.radioPlaylistId, centerUrl, dominant)
+                                        // Recycled holder may already show another radio — the
+                                        // color stays cached, but don't paint the wrong card.
+                                        if (boundCenterUrl != centerUrl) return@generate
+                                        paint(dominant)
+                                    }
+                                }
+                                override fun onLoadCleared(placeholder: android.graphics.drawable.Drawable?) {}
+                            })
+                    } catch (_: Exception) {}
+                }
             }
         }
     }
@@ -2064,14 +2432,16 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             try {
                 val prefs = ctx.getSharedPreferences(PREFS_RADIO_CACHE, Context.MODE_PRIVATE)
 
-                // One-shot migration to the Spotify-style radio cards: the persisted subtitle
-                // texts and side-url picks were computed without the known-artist bias, and the
-                // composed art uses the old geometry. Drop them so they recompute (colors stay —
-                // they're raw Palette output, still valid input for the pastel gradient).
+                // One-shot migration when the card design changes: drop persisted subtitle texts,
+                // side-url picks AND the cached Palette colors — desde v5 el selector de color
+                // cambió (dominante/vibrante en vez de muted), así que los colores viejos ya no
+                // representan el diseño y deben recomputarse del thumbnail central.
                 if (prefs.getInt("radio_ui_version", 1) != RADIO_UI_VERSION) {
                     val editor = prefs.edit()
                     for (key in prefs.all.keys) {
-                        if (key.startsWith("artists_") || key.startsWith("sides_")) editor.remove(key)
+                        if (key.startsWith("artists_") || key.startsWith("sides_")
+                            || key.startsWith("color_") || key.startsWith("colorurl_")
+                        ) editor.remove(key)
                     }
                     editor.putInt("radio_ui_version", RADIO_UI_VERSION).apply()
                     RadioArtComposer.clearAllCaches(ctx)
@@ -2149,10 +2519,10 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         return (0xFF shl 24) or (r shl 16) or (g shl 8) or b
     }
 
-    /** Flat fluorescent field for radio cards (see RadioArtComposer.cardBackgroundColor).
+    /** Campo degradado claro→oscuro para las tarjetas/filas de radio (diseño YT Music).
      *  [rawColor] is the Palette color as cached/persisted. */
-    private fun buildRadioCardGradient(rawColor: Int): android.graphics.drawable.ColorDrawable =
-        android.graphics.drawable.ColorDrawable(RadioArtComposer.cardBackgroundColor(rawColor))
+    private fun buildRadioCardGradient(rawColor: Int): android.graphics.drawable.Drawable =
+        RadioArtComposer.fieldDrawable(rawColor)
 
     /** True if [artist] matches (or contains) an artist the user follows or plays. */
     private fun isKnownArtist(artist: String): Boolean {
@@ -2168,6 +2538,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
     private fun setupPlaylists() {
         rvPlaylists?.layoutManager = LinearLayoutManager(requireContext(), LinearLayoutManager.HORIZONTAL, false)
+        rvPlaylists?.setHasFixedSize(true)
         improveHorizontalScrollDetection(rvPlaylists)
         rvPlaylists?.adapter = PlaylistCarouselAdapter()
     }
@@ -2195,13 +2566,20 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 playlistGridUrlsCache.putAll(freshGridUrls)
                 playlistEntries.clear()
                 playlistEntries.addAll(playlists)
-                val hasPlaylists = playlistEntries.isNotEmpty()
-                llPlaylistsHeader?.visibility = if (hasPlaylists) View.VISIBLE else View.GONE
-                rvPlaylists?.visibility = if (hasPlaylists) View.VISIBLE else View.GONE
-                (rvPlaylists?.adapter as? PlaylistCarouselAdapter)?.notifyDataSetChanged()
-                // Empty ≠ loaded (fresh install: la data llega con la hidratación cloud).
-                if (hasPlaylists) hideHomeSkeleton(llPlaylistsSkeleton)
-                revealAfterFirstContentPass()
+                if (playlistEntries.isEmpty()) {
+                    // Empty ≠ loaded (fresh install: la data llega con la hidratación cloud).
+                    llPlaylistsHeader?.visibility = View.GONE
+                    rvPlaylists?.visibility = View.GONE
+                    (rvPlaylists?.adapter as? PlaylistCarouselAdapter)?.notifyDataSetChanged()
+                    return@post
+                }
+                revealSectionWhenVisible(llPlaylistsSkeleton, rvPlaylists?.visibility == View.VISIBLE) {
+                    showSectionView(llPlaylistsHeader, true)
+                    (rvPlaylists?.adapter as? PlaylistCarouselAdapter)?.notifyDataSetChanged()
+                    showSectionView(rvPlaylists, true)
+                    hideHomeSkeleton(llPlaylistsSkeleton)
+                    revealAfterFirstContentPass()
+                }
             }
         }
     }
@@ -2346,8 +2724,12 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                     // NEVER synthesize a 2x2 for them — the composite would mix in unrelated covers
                     // from tracks the autoplay/up-next queue recorded under the same playlist id.
                     // Recaps carry their own generated YT cover too → clone it, never a 2x2.
+                    // Y cualquier playlist con portada OFICIAL de YT registrada (Recap, mixes,
+                    // listas del usuario con miniatura de YT) muestra ESA imagen, nunca el collage.
+                    val officialUrl = OfficialCoverStore.get(itemView.context, entry.playlistId)
                     val forceSingle = isSingleCoverPlaylistId(entry.playlistId)
                         || isRecapTitle(entry.playlistName)
+                        || !officialUrl.isNullOrEmpty()
                     val gridUrls = if (forceSingle) emptyList()
                         else resolvePlaylistGridUrls(entry.playlistId)
                     if (gridUrls.size >= 4) {
@@ -2355,7 +2737,8 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                         val sizePx = (180 * density).toInt()
                         PlaylistGridArtLoader.load(ivCover, gridUrls, sizePx)
                     } else {
-                        val fallbackUrl = gridUrls.firstOrNull() ?: entry.imageUrl
+                        val fallbackUrl = officialUrl?.takeIf { it.isNotEmpty() }
+                            ?: gridUrls.firstOrNull() ?: entry.imageUrl
                         if (fallbackUrl.isNotEmpty()) {
                             try {
                                 Glide.with(this@PrincipalFragment)
@@ -2381,11 +2764,9 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             private var boundCenterUrl: String = ""
             private val ivComposite: ImageView = itemView.findViewById(R.id.ivRadioComposite)
             private val tvName: TextView = itemView.findViewById(R.id.tvRadioName)
-            private val tvTitle: TextView = itemView.findViewById(R.id.tvRadioTitle)
 
             fun bind(entry: PlayCountStore.PlayCountEntry) {
                 tvName.text = "Radio de ${entry.title}"
-                tvTitle.text = entry.title
                 val clickListener = View.OnClickListener { onPlaylistClicked(entry) }
                 itemView.setOnClickListener(clickListener)
                 cardRadio.setOnClickListener(clickListener)
@@ -2422,52 +2803,54 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 val (leftUrl, rightUrl) = sides
 
                 boundCenterUrl = centerUrl
-                if (centerUrl.isNotEmpty() && isAdded) {
-                    val cachedColor = radioDominantColorCache[centerUrl]
-                    if (cachedColor != null) {
-                        // Skip rebuilding the gradient if this card already shows this exact color
-                        // (recycled holder rebinding to the same radio, notifyDataSetChanged, etc.).
-                        if (vBg.getTag(R.id.tag_radio_bg_color) != cachedColor) {
-                            vBg.setTag(R.id.tag_radio_bg_color, cachedColor)
-                            vBg.background = buildRadioCardGradient(cachedColor)
-                        }
-                    } else {
-                        try {
-                            Glide.with(this@PrincipalFragment)
-                                .asBitmap()
-                                .load(centerUrl)
-                                .diskCacheStrategy(DiskCacheStrategy.ALL)
-                                .override(64, 64)
-                                .centerCrop()
-                                .into(object : com.bumptech.glide.request.target.CustomTarget<android.graphics.Bitmap>() {
-                                    override fun onResourceReady(resource: android.graphics.Bitmap, transition: com.bumptech.glide.request.transition.Transition<in android.graphics.Bitmap>?) {
-                                        Palette.from(resource).generate { palette ->
-                                            val dominant = palette?.getDarkMutedColor(
-                                                palette.getMutedColor(0xFF333333.toInt())
-                                            ) ?: 0xFF333333.toInt()
-                                            persistDominantColor(entry.playlistId, centerUrl, dominant)
-                                            // Recycled holder may already show another playlist —
-                                            // keep the cached color but don't paint the wrong card.
-                                            if (boundCenterUrl != centerUrl) return@generate
-                                            vBg.setTag(R.id.tag_radio_bg_color, dominant)
-                                            vBg.background = buildRadioCardGradient(dominant)
-                                        }
-                                    }
-                                    override fun onLoadCleared(placeholder: android.graphics.drawable.Drawable?) {}
-                                })
-                        } catch (_: Exception) {}
+
+                // El color raw entra en la firma del composite: al resolverse el Palette la
+                // tarjeta se recompone sola con su paleta real (campo + barras).
+                fun paint(rawColor: Int) {
+                    // Gris de carga (no el color de una vez); el color entra con el composite.
+                    val loadingGray = 0xFF282A30.toInt()
+                    if (vBg.getTag(R.id.tag_radio_bg_color) != loadingGray) {
+                        vBg.setTag(R.id.tag_radio_bg_color, loadingGray)
+                        vBg.setBackgroundColor(loadingGray)
                     }
+                    RadioArtComposer.load(
+                        ivComposite,
+                        entry.playlistId,
+                        centerUrl,
+                        leftUrl,
+                        rightUrl,
+                        radioCardWidthPx,
+                        rawColor
+                    )
                 }
 
-                // Single cached 3-circle composite instead of 3 live Glide loads (RadioArtComposer).
-                RadioArtComposer.load(
-                    ivComposite,
-                    entry.playlistId,
-                    centerUrl,
-                    leftUrl,
-                    rightUrl,
-                    radioCardWidthPx
-                )
+                val cachedColor = radioDominantColorCache[centerUrl]
+                paint(cachedColor ?: RadioArt.DEFAULT_RAW)
+                if (cachedColor == null && centerUrl.isNotEmpty() && isAdded) {
+                    try {
+                        Glide.with(this@PrincipalFragment)
+                            .asBitmap()
+                            .load(centerUrl)
+                            .diskCacheStrategy(DiskCacheStrategy.ALL)
+                            .override(64, 64)
+                            .centerCrop()
+                            .into(object : com.bumptech.glide.request.target.CustomTarget<android.graphics.Bitmap>() {
+                                override fun onResourceReady(resource: android.graphics.Bitmap, transition: com.bumptech.glide.request.transition.Transition<in android.graphics.Bitmap>?) {
+                                    Palette.from(resource).generate { palette ->
+                                        val dominant = palette?.getDarkMutedColor(
+                                            palette.getMutedColor(0xFF333333.toInt())
+                                        ) ?: 0xFF333333.toInt()
+                                        persistDominantColor(entry.playlistId, centerUrl, dominant)
+                                        // Recycled holder may already show another playlist —
+                                        // keep the cached color but don't paint the wrong card.
+                                        if (boundCenterUrl != centerUrl) return@generate
+                                        paint(dominant)
+                                    }
+                                }
+                                override fun onLoadCleared(placeholder: android.graphics.drawable.Drawable?) {}
+                            })
+                    } catch (_: Exception) {}
+                }
             }
         }
     }
@@ -2549,12 +2932,19 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         }
 
         override fun onBindViewHolder(holder: CellVH, position: Int) {
+            if (position >= items.size) {
+                bindPlaceholder(holder)
+                return
+            }
             val entry = items[position]
 
             val isPlaylist = !entry.playlistId.isNullOrEmpty() && entry.videoId == entry.playlistId
             val isLiked = isPlaylist && isLikedPlaylistId(entry.playlistId)
             val isFav = isPlaylist && FavoritesArt.isFavorites(entry.playlistId)
 
+            // Una celda reciclada desde un placeholder trae scaleType CENTER y clickable=false.
+            holder.ivThumb.scaleType = ImageView.ScaleType.CENTER_CROP
+            holder.clCell.isClickable = true
             holder.tvTitle.text = if (isLiked) "Música que te gustó" else entry.title
 
             // Liked / Favoritos: gradient + icon, no artwork. Both branches set bg+icon
@@ -2580,7 +2970,10 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
                 if (isPlaylist && isAdded) {
                     LocalArtworkResolver.detach(holder.ivThumb)
-                    val gridUrls = resolvePlaylistGridUrls(entry.playlistId)
+                    // Portada oficial de YT registrada → esa imagen, nunca el collage 2x2.
+                    val officialUrl = OfficialCoverStore.get(holder.itemView.context, entry.playlistId)
+                    val gridUrls = if (!officialUrl.isNullOrEmpty()) emptyList()
+                        else resolvePlaylistGridUrls(entry.playlistId)
                     if (gridUrls.size >= 4) {
                         val signature = "${entry.playlistId}_${gridUrls[0]}"
                         if (signature != currentTag) {
@@ -2590,7 +2983,8 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                             PlaylistGridArtLoader.load(holder.ivThumb, gridUrls, sizePx)
                         }
                     } else {
-                        val fallbackUrl = gridUrls.firstOrNull() ?: entry.imageUrl
+                        val fallbackUrl = officialUrl?.takeIf { it.isNotEmpty() }
+                            ?: gridUrls.firstOrNull() ?: entry.imageUrl
                         if (!fallbackUrl.isNullOrEmpty() && fallbackUrl != currentTag) {
                             holder.ivThumb.setTag(R.id.tag_artwork_signature, fallbackUrl)
                             try { Glide.with(this@PrincipalFragment).load(fallbackUrl).placeholder(R.color.surface_high).transform(SHARED_YT_CROP, SHARED_CENTER_CROP).into(holder.ivThumb) } catch (_: Exception) {}
@@ -2618,14 +3012,39 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             holder.clCell.setOnClickListener { onShortcutClicked(entry) }
         }
 
+        // El grid del pager SIEMPRE pinta las 9 celdas: las posiciones sin entrada real se
+        // rellenan con placeholders (ver bindPlaceholder) para que ninguna página se vea vacía.
+        override fun getItemCount() = SHORTCUTS_PER_PAGE
+
         override fun onBindViewHolder(holder: CellVH, position: Int, payloads: MutableList<Any>) {
             // Lightweight path used by refreshShortcutEqIcons(): only flip the play/eq icon,
             // leaving artwork and click listeners untouched so nothing flashes on tap.
             if (payloads.isNotEmpty() && payloads.contains(PAYLOAD_EQ)) {
-                bindEqState(holder, items[position])
+                if (position < items.size) bindEqState(holder, items[position])
                 return
             }
             super.onBindViewHolder(holder, position, payloads)
+        }
+
+        /** Celda placeholder: mantiene el 3x3 SIEMPRE lleno cuando una página trae menos de 9
+         *  accesos (p.ej. una pestaña con 1 sola música) — cuadro con solo el fondo redondeado,
+         *  sin icono, en vez de un hueco vacío. Sin click ni textos. */
+        private fun bindPlaceholder(holder: CellVH) {
+            LocalArtworkResolver.detach(holder.ivThumb)
+            if (holder.ivThumb.getTag(R.id.tag_artwork_signature) != null) {
+                try { Glide.with(holder.ivThumb).clear(holder.ivThumb) } catch (_: Exception) {}
+                holder.ivThumb.setTag(R.id.tag_artwork_signature, null)
+            }
+            holder.ivThumb.scaleType = ImageView.ScaleType.CENTER
+            holder.ivThumb.setImageDrawable(null)
+            holder.vLikedBg.visibility = View.GONE
+            holder.ivLikedIcon.visibility = View.GONE
+            holder.tvTitle.text = ""
+            holder.ivPlay.visibility = View.GONE
+            holder.eqView.setAnimating(false)
+            holder.eqView.visibility = View.GONE
+            holder.clCell.setOnClickListener(null)
+            holder.clCell.isClickable = false
         }
 
         private fun bindEqState(holder: CellVH, entry: PlayCountStore.PlayCountEntry) {
@@ -2646,8 +3065,6 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             }
         }
 
-        override fun getItemCount() = items.size
-
         inner class CellVH(itemView: View) : RecyclerView.ViewHolder(itemView) {
             // The inner ConstraintLayout is clickable=true, so it consumes the touch — the click
             // listener MUST be set on it, not on the root itemView, or taps never fire.
@@ -2661,7 +3078,11 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         }
     }
 
-    private inner class CoversPagerAdapter : RecyclerView.Adapter<CoversPagerAdapter.PageVH>() {
+    /** Pager de rows de canciones (4 por página, item_cover_track_row): lo comparten "Covers y
+     *  remixes" y "Selección rápida" — cada instancia lee su propia lista viva del fragment. */
+    private inner class TrackRowsPagerAdapter(
+        private val backing: MutableList<YouTubeMusicService.TrackResult>
+    ) : RecyclerView.Adapter<TrackRowsPagerAdapter.PageVH>() {
         override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): PageVH {
             val page = LinearLayout(parent.context).apply {
                 orientation = LinearLayout.VERTICAL
@@ -2673,7 +3094,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         override fun onBindViewHolder(holder: PageVH, position: Int) {
             val page = holder.itemView as LinearLayout
             val start = position * COVERS_PER_PAGE
-            val end = Math.min(start + COVERS_PER_PAGE, coversResults.size)
+            val end = Math.min(start + COVERS_PER_PAGE, backing.size)
             val count = end - start
 
             // Reuse the page's existing row views instead of removeAllViews()+inflate on every
@@ -2687,7 +3108,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             for (i in 0 until page.childCount) {
                 val row = page.getChildAt(i)
                 if (i < count) {
-                    val track = coversResults[start + i]
+                    val track = backing[start + i]
                     row.visibility = View.VISIBLE
                     val ivArt: ImageView = row.findViewById(R.id.ivCoverArt)
                     val tvTitle: TextView = row.findViewById(R.id.tvCoverTitle)
@@ -2695,7 +3116,9 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                     tvTitle.text = track.title
                     tvSubtitle.text = SongSubtitle.forRow(track.subtitle, track.title, track.duration)
                     if (!track.thumbnailUrl.isNullOrEmpty() && isAdded) {
-                        try { Glide.with(this@PrincipalFragment).load(track.thumbnailUrl).placeholder(R.color.surface_high).transform(SHARED_YT_CROP, SHARED_CENTER_CROP).into(ivArt) } catch (_: Exception) {}
+                        // Sin CENTER_CROP: las miniaturas 16:9 se muestran completas (fitCenter en
+                        // el XML) en vez de recortadas a 1:1.
+                        try { Glide.with(this@PrincipalFragment).load(track.thumbnailUrl).placeholder(R.color.surface_high).transform(SHARED_YT_CROP).into(ivArt) } catch (_: Exception) {}
                     } else {
                         try { Glide.with(this@PrincipalFragment).clear(ivArt) } catch (_: Exception) {}
                         ivArt.setImageDrawable(null)
@@ -2710,7 +3133,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         }
 
         override fun getItemCount(): Int {
-            return if (coversResults.isEmpty()) 0 else Math.ceil(coversResults.size / COVERS_PER_PAGE.toFloat().toDouble()).toInt()
+            return if (backing.isEmpty()) 0 else Math.ceil(backing.size / COVERS_PER_PAGE.toFloat().toDouble()).toInt()
         }
 
         inner class PageVH(itemView: View) : RecyclerView.ViewHolder(itemView)

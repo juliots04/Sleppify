@@ -13,6 +13,7 @@ import android.widget.TextView
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.bumptech.glide.Glide
+import com.example.sleppify.utils.YouTubeCropTransformation
 import com.google.android.material.bottomsheet.BottomSheetDialogFragment
 
 class TrackReplacementSheet : BottomSheetDialogFragment() {
@@ -110,7 +111,7 @@ class TrackReplacementSheet : BottomSheetDialogFragment() {
                 try {
                     Glide.with(iv)
                         .load(finalImageUrl)
-                        .centerCrop()
+                        .transform(SHARED_YT_CROP)
                         .into(iv)
                 } catch (e: Exception) {
                     android.util.Log.w("TrackReplaceSheet", "Failed to load thumbnail", e)
@@ -238,7 +239,7 @@ class TrackReplacementSheet : BottomSheetDialogFragment() {
             try {
                 Glide.with(holder.ivThumbnail)
                     .load(item.thumbnailUrl)
-                    .centerCrop()
+                    .transform(SHARED_YT_CROP)
                     .into(holder.ivThumbnail)
             } catch (e: Exception) {
                 android.util.Log.w("TrackReplaceSheet", "Failed to load candidate thumbnail", e)
@@ -260,6 +261,9 @@ class TrackReplacementSheet : BottomSheetDialogFragment() {
     companion object {
         private const val TAG = "TrackReplacementSheet"
         private const val MAX_CANDIDATES = 5
+
+        /** Shared singleton — avoids allocation per bind and ensures consistent Glide cache keys. */
+        private val SHARED_YT_CROP = YouTubeCropTransformation()
 
         private const val ARG_PLAYLIST_ID = "playlist_id"
         private const val ARG_PLAYLIST_TYPE = "playlist_type"

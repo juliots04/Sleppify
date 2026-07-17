@@ -18,13 +18,35 @@
         android:orientation="horizontal"
         android:gravity="center_vertical"
         android:layout_marginBottom="24dp">
-        <ImageView
-            android:id="@+id/ivBsTrackArt"
+        <FrameLayout
             android:layout_width="48dp"
-            android:layout_height="48dp"
-            android:scaleType="centerCrop"
-            android:background="@color/surface_high"
-            />
+            android:layout_height="48dp">
+
+            <ImageView
+                android:id="@+id/ivBsTrackArt"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:scaleType="fitCenter"
+                android:background="@color/surface_high"
+                />
+
+            <!-- Insignia "RADIO" sobre el composite (solo sheets de radio, ver RadioArt.bindThumb). -->
+            <TextView
+                android:id="@+id/tvBsRadioBadge"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="top|end"
+                android:layout_marginTop="3dp"
+                android:layout_marginEnd="3dp"
+                android:text="RADIO"
+                android:textColor="#FFFFFF"
+                android:textSize="6sp"
+                android:textStyle="bold"
+                android:fontFamily="@font/inter_variable"
+                android:letterSpacing="0.2"
+                android:includeFontPadding="false"
+                android:visibility="gone" />
+        </FrameLayout>
         <LinearLayout
             android:layout_width="0dp"
             android:layout_weight="1"

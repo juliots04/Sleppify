@@ -68,7 +68,10 @@ object PlaylistDetailLauncher {
         // cover instead of guessing (no 2x2, no 3-circle radio) — used by the single-cover carousels
         // (recomendadas/Recaps) and recaps in "recientes". Empty for every id-based caller. Added
         // LAST (after params) so @JvmOverloads keeps every existing Java call arity valid.
-        artHint: String? = null
+        artHint: String? = null,
+        // Vista "Descargas": el detalle filtra a solo canciones descargadas y suma "N descargadas"
+        // al header. Añadido ÚLTIMO por @JvmOverloads; los callers Java usan [openDownloadedOnly].
+        downloadedOnly: Boolean = false
     ) {
         if (activity == null || activity.isFinishing) return
         if (fragmentManager.isStateSaved) return
@@ -115,7 +118,7 @@ object PlaylistDetailLauncher {
         // token dropped: resolveYoutubeAccessToken("") falls back to prefs.
         val fragment = PlaylistDetailFragment.newInstance(
             normId, normTitle, normSubtitle, normThumb, "",
-            params?.trim().orEmpty(), artHint?.trim().orEmpty()
+            params?.trim().orEmpty(), artHint?.trim().orEmpty(), downloadedOnly
         )
         val tx = fragmentManager.beginTransaction().setReorderingAllowed(true)
         if (removeExisting && existing != null && existing.isAdded) {
@@ -124,6 +127,28 @@ object PlaylistDetailLauncher {
         tx.add(CONTAINER_ID, fragment, TAG)
             .addToBackStack(TAG)
             .commit()
+    }
+
+    /**
+     * Abre el detalle en modo "solo descargadas" (rows de la pastilla Descargas). Helper dedicado
+     * porque los callers Java no pueden alcanzar el último default de [open] sin pasar todos los
+     * anteriores. El subtítulo va neutro a propósito: el "10 descargadas" de la row NO debe viajar
+     * como subtítulo (parseMeta lo usaría como ownerLabel del header).
+     */
+    @JvmStatic
+    fun openDownloadedOnly(
+        activity: FragmentActivity?,
+        fragmentManager: FragmentManager,
+        id: String?,
+        title: String? = null,
+        thumbnailUrl: String? = null
+    ) {
+        open(
+            activity, fragmentManager, id, title,
+            subtitle = "",
+            thumbnailUrl = thumbnailUrl,
+            downloadedOnly = true
+        )
     }
 
     private fun showChrome(activity: FragmentActivity) {

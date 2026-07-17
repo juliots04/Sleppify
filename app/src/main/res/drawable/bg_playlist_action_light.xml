@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Estado ACTIVO de los botones circulares del header de playlist (p.ej. aleatorio encendido):
+     fondo blanco sólido; el icono encima se tinta negro. Contraparte de bg_playlist_action_dark. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="oval">
+    <solid android:color="#FFFFFFFF" />
+</shape>

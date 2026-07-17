@@ -125,7 +125,11 @@ public class SongPlayerFragment extends Fragment {
     private static final long TRACK_ERROR_RETRY_DELAY_MS = 750L;
     private static final int CONNECT_TIMEOUT_MS = 8000;
     private static final int READ_TIMEOUT_MS = 15000;
-    private static final long SOURCE_PREPARE_TIMEOUT_MS = 30000L;
+    // 15s (antes 30s): un stream directo sano alcanza STATE_READY en pocos segundos; 30s dejaba al
+    // usuario 30s en silencio ante una URL colgada antes de reaccionar. Al vencer, el reintento
+    // fuerza el cliente ANDROID_VR (ver forceAltClientVideoIds), que suele reproducir donde la URL
+    // de NewPipe se colgaba.
+    private static final long SOURCE_PREPARE_TIMEOUT_MS = 15000L;
     private static final long SOCIAL_STATS_FETCH_DEFER_MS = 1800L;
     private static final long COMMENTS_PREFETCH_DEFER_MS = 2200L;
     private static final long PLAYBACK_BOOTSTRAP_GRACE_MS = 1800L;
@@ -139,6 +143,9 @@ public class SongPlayerFragment extends Fragment {
 
     private final List<PlayerTrack> tracks = new ArrayList<>();
     private static final int MAX_NEXT_UP = 50;
+    /** Filas de la hoja «A continuación» bindeadas ANTES de show(); el resto (hasta
+     *  {@link #MAX_NEXT_UP}) se agrega cuando la animación de apertura ya asentó. */
+    private static final int QUEUE_SHEET_INITIAL_ROWS = 12;
     private final List<PlayerTrack> nextUpTracks = new ArrayList<>();
     private final List<PlayerTrack> originalQueueOrder = new ArrayList<>();
     @Nullable
@@ -172,6 +179,12 @@ public class SongPlayerFragment extends Fragment {
     private Bitmap lastSongCoverBitmap = null;
     private int lastSongDominantColor = 0xFF121212;
     private boolean lastSongColorValid = false;
+    // videoId al que pertenecen lastSongCoverBitmap/lastSongDominantColor. El restore de
+    // Video→Canción solo puede aplicar el cache si sigue siendo la pista cargada — sin esta
+    // marca, un cambio de pista ocurrido EN modo video restauraba la carátula/color del track
+    // anterior al volver a Canción.
+    @Nullable
+    private String lastSongArtVideoId = null;
     // True while a switch-to-video swap has committed but the first video frame has not rendered yet.
     // Keeps the song cover up as a poster over the (still-black) PlayerView so there is no black flash;
     // the swap player's first-frame listener clears it and fades the cover out.
@@ -217,6 +230,8 @@ public class SongPlayerFragment extends Fragment {
     // read synchronously, so a liked song never shows un-liked on re-entry.
     private static final String PREF_DISLIKED_VIDEO_IDS = "player_disliked_video_ids";
     private final YouTubeMusicService likeMusicService = new YouTubeMusicService();
+    // Probe de disponibilidad de video musical en vuelo (una sola petición por canción).
+    private String pendingCounterpartVideoId;
     private View actionRadio;
     private View actionShare;
     private View actionDownloadTrack;
@@ -235,7 +250,12 @@ public class SongPlayerFragment extends Fragment {
     private ExoMediaPlayer pendingModeSwapPlayer;
     /** Adelanto de seek al preparar el player del swap: compensa el tiempo de commit. */
     private static final int HOT_SWAP_SEEK_LEAD_MS = 450;
+    /** TECHO del commit del swap: el intercambio se comete apenas el player nuevo tiene
+     *  {@link #HOT_SWAP_COMMIT_BUFFER_MS} de buffer por delante del objetivo (poll de 50ms);
+     *  este delay solo aplica si una fuente lenta nunca llega a ese buffer. */
     private static final long HOT_SWAP_COMMIT_DELAY_MS = 400L;
+    /** Buffer mínimo por delante del objetivo para considerar el player del swap listo. */
+    private static final int HOT_SWAP_COMMIT_BUFFER_MS = 300;
     private static final long HOT_SWAP_TIMEOUT_MS = 12000L;
     /** Fallback: if the first video frame never renders after a switch-to-video commit (a stalled
      *  stream), stop holding the song cover as a poster after this and fade to the video anyway. A
@@ -250,13 +270,27 @@ public class SongPlayerFragment extends Fragment {
     /** Tarea de precalentado (C2) de la cabecera del video en curso; cancelable. */
     @Nullable
     private ExoMediaPlayer.WarmHandle videoWarmHandle;
-    /** videoId cuya cabecera de video se precalentó — habilita la ruta rápida del hot-swap. */
+    /** videoId cuya cabecera de video se precalentó (C2). Informativo: la ruta rápida del
+     *  hot-swap ya no depende de este flag — consulta los bytes REALES en exo_stream_cache,
+     *  que cubre tanto el warm C2 como los bytes cacheados de una reproducción previa. */
     @Nullable
     private String warmedVideoId;
 
     private NextUpAdapter nextUpAdapter;
     @Nullable
     private ItemTouchHelper nextUpItemTouchHelper;
+    // Hoja «A continuación» REUTILIZADA entre aperturas: construir el BottomSheetDialog + inflar
+    // su layout en cada tap era el grueso de la latencia de apertura. Se descarta en
+    // onDestroyView porque referencia el contexto/inflater de la vista vieja.
+    @Nullable
+    private BottomSheetDialog queueSheetDialog;
+    @Nullable
+    private RecyclerView rvQueueSheet;
+    @Nullable
+    private TextView tvEmptyQueueSheet;
+    /** Precalentado (debounced) de carátulas de la cola para la hoja «A continuación». */
+    @Nullable
+    private Runnable nextUpPrewarmRunnable;
 
     @Nullable
     private OnBackPressedCallback backPressedCallback;
@@ -801,6 +835,9 @@ public class SongPlayerFragment extends Fragment {
         if (tvModeAudio != null) tvModeAudio.setOnClickListener(v -> onPlaybackModeSelected(false));
         if (tvModeVideo != null) tvModeVideo.setOnClickListener(v -> onPlaybackModeSelected(true));
         playerVideoMode = StreamResolver.isPreferVideoMode();
+        // Candado "No reproducir videos": oculta la pastilla y desarma el modo video si el
+        // ajuste está activo (p.ej. quedó armado de una sesión anterior o de otro dispositivo).
+        applyNoMusicVideosSetting();
         updatePlaybackModePillUi();
 
         // Apply status-bar inset to the internal nav bar so buttons sit below the status bar
@@ -890,7 +927,11 @@ public class SongPlayerFragment extends Fragment {
                     userSeeking = false;
                     scheduleSeekBarThumbHide();
                     lastSnapshotPersistSecond = -1;
-                    cancelOfflineCrossfade();
+                    // Solo el crossfade: un seek dentro de la pista actual NO invalida el
+                    // pre-buffer gapless del siguiente track. Liberarlo aquí (release de Media3,
+                    // hasta ~500ms en main) congelaba el frame del gesto, y el ticker lo
+                    // recreaba medio segundo después — thrash en cada seek.
+                    cancelCrossfadeOnly();
                     if (localExoMediaPlayer != null) {
                         try {
                             if (pbVideoLoading != null && !usingOfflineSource && isVideoTrackId(loadedVideoId)) {
@@ -911,12 +952,28 @@ public class SongPlayerFragment extends Fragment {
             });
         };
 
-        // ✅ PHASE 2: Heavy initialization — SharedPreferences, track hydration, MediaSession, playback
-        Runnable phase2 = () -> {
+        // ✅ PHASE 2a: Data/I-O only — prefs, playback modes, queue hydration and the stream/
+        // offline pre-resolución. Sin mutaciones de vista, así puede correr DURANTE la animación
+        // de entrada: la resolución NewPipe (~0.5-3s) y los parseos del archivo offline se
+        // solapan con la animación en vez de arrancar recién cuando termina.
+        Runnable phase2a = () -> {
             if (!isAdded()) return;
 
             playerStatePrefs = requireContext().getSharedPreferences(PREFS_PLAYER_STATE, Activity.MODE_PRIVATE);
             settingsPrefs = requireContext().getSharedPreferences(CloudSyncManager.PREFS_SETTINGS, Activity.MODE_PRIVATE);
+            loadPlaybackModesFromSettings();
+            hydrateTracksFromArgs();
+            currentIndex = Math.max(0, Math.min(currentIndex, tracks.size() - 1));
+            preResolveCurrentTrackSource();
+        };
+
+        // ✅ PHASE 2b: Heavy/view work — crossfade attach, MediaSession, bind, playback. On the
+        // visible path this stays behind the 320ms entry-animation guard (low-end devices jank
+        // if the bind/Glide burst lands mid-animation), but by then phase2a already has the
+        // source resolution in flight or cached.
+        Runnable phase2 = () -> {
+            if (!isAdded()) return;
+
             crossfadeManager.attach(
                     requireContext().getApplicationContext(),
                     settingsPrefs,
@@ -925,14 +982,11 @@ public class SongPlayerFragment extends Fragment {
                     streamResolverExecutor
             );
             crossfadeManager.invalidateDurationCache();
-            loadPlaybackModesFromSettings();
             setupSocialActions();
             updatePlaybackModeButtons();
 
-            hydrateTracksFromArgs();
             setupMediaSession();
 
-            currentIndex = Math.max(0, Math.min(currentIndex, tracks.size() - 1));
             bindCurrentTrack(true);
             playCurrentTrack();
         };
@@ -940,10 +994,15 @@ public class SongPlayerFragment extends Fragment {
         if (createdHidden) {
             // Hidden path (mini-player restore): no entry animation, run immediately
             phase1.run();
-            view.post(phase2);
+            view.post(() -> {
+                phase2a.run();
+                phase2.run();
+            });
         } else {
-            // Visible path: defer to allow entry animation to complete
+            // Visible path: view wiring + data/pre-resolve immediately; heavy view work deferred
+            // so the entry animation stays smooth while network/disk already run underneath.
             view.post(phase1);
+            view.post(phase2a);
             view.postDelayed(phase2, 320L);
         }
     }
@@ -1104,6 +1163,20 @@ public class SongPlayerFragment extends Fragment {
         cancelNextUpReveal();
         cancelPendingSocialStatsFetch();
         cancelPendingStreamResolver();
+        // La hoja de cola reutilizada referencia el contexto/inflater de ESTA vista — se
+        // descarta entera; la próxima vista la reconstruye en su primera apertura.
+        if (nextUpPrewarmRunnable != null) {
+            localProgressHandler.removeCallbacks(nextUpPrewarmRunnable);
+            nextUpPrewarmRunnable = null;
+        }
+        if (queueSheetDialog != null) {
+            try { queueSheetDialog.dismiss(); } catch (Exception ignored) { }
+            queueSheetDialog = null;
+        }
+        rvQueueSheet = null;
+        tvEmptyQueueSheet = null;
+        nextUpAdapter = null;
+        nextUpItemTouchHelper = null;
         // Un hot-swap de modo Audio/Video a medio preparar no debe filtrar su player.
         if (pendingModeSwapPlayer != null) {
             try { pendingModeSwapPlayer.release(); } catch (Exception ignored) { }
@@ -1142,6 +1215,7 @@ public class SongPlayerFragment extends Fragment {
         // Release the cached song cover reference (Glide owns the bitmap; do NOT recycle it). The
         // view is recreated on the same retained instance, so a fresh bind repopulates the cache.
         lastSongCoverBitmap = null;
+        lastSongArtVideoId = null;
         lastSongColorValid = false;
         swapAwaitingFirstFrame = false;
         flPlayerHero = null;
@@ -1229,7 +1303,9 @@ public class SongPlayerFragment extends Fragment {
             public void onSeekTo(long pos) {
                 currentSeconds = Math.max(0, (int) (pos / 1000L));
                 lastSnapshotPersistSecond = -1;
-                cancelOfflineCrossfade();
+                // Igual que el seek de la seekbar: preservar el pre-buffer gapless (ver
+                // cancelCrossfadeOnly) — un seek no cambia cuál es el siguiente track.
+                cancelCrossfadeOnly();
                 if (localExoMediaPlayer != null) {
                     try {
                         if (!usingOfflineSource && pbVideoLoading != null && isVideoTrackId(loadedVideoId)) {
@@ -1818,6 +1894,37 @@ public class SongPlayerFragment extends Fragment {
         }
     }
 
+    /** Fire-and-forget: adelanta el trabajo de I/O de la pista seleccionada ANTES de que phase2
+     *  llame a playCurrentTrack. Online: deja la resolución NewPipe corriendo con dedup
+     *  (preResolveQueue registra el in-flight que resolveStreamUrl esperará). Offline: paga la
+     *  validación (MediaMetadataRetriever) y el probe de video en background, así el arranque
+     *  encuentra ambos caches calientes en vez de parsear el archivo en el main thread. */
+    private void preResolveCurrentTrackSource() {
+        if (!isAdded() || tracks.isEmpty() || currentIndex < 0 || currentIndex >= tracks.size()) {
+            return;
+        }
+        final String videoId = tracks.get(currentIndex).videoId;
+        final String durationLabel = tracks.get(currentIndex).duration;
+        if (TextUtils.isEmpty(videoId) || LocalFilesStore.isLocalVideoId(videoId)) return;
+        final Context appCtx = requireContext().getApplicationContext();
+        backgroundExecutor.execute(() -> {
+            try {
+                if (!StreamResolver.isPreferVideoMode()
+                        && OfflineAudioStore.hasOfflineAudio(appCtx, videoId)) {
+                    OfflineAudioStore.hasValidatedOfflineAudio(appCtx, videoId, durationLabel);
+                    File offline = OfflineAudioStore.getExistingOfflineAudioFile(appCtx, videoId);
+                    if (offline.isFile() && offline.length() > 0L) {
+                        ensureOfflineVideoProbeCached(videoId, offline);
+                    }
+                    return;
+                }
+                StreamResolver.preResolveQueue(appCtx, Collections.singletonList(videoId));
+            } catch (Exception e) {
+                Log.w(TAG, "preResolveCurrentTrackSource failed", e);
+            }
+        });
+    }
+
     private void playCurrentTrack() {
         if (!isAdded() || tracks.isEmpty()) {
             return;
@@ -1889,6 +1996,9 @@ public class SongPlayerFragment extends Fragment {
             usingOfflineSource = true;
             localSourcePreparing = false;
             localExoMediaPlayer = new ExoMediaPlayer(requireContext().getApplicationContext(), sharedExoPlayer);
+            // Player audible: reporta SU sesión al EQ solo-app (el shared nunca dispara
+            // onAudioSessionIdChanged porque su id se generó una sola vez en initialize()).
+            localExoMediaPlayer.markAsActiveForEq();
             localExoMediaPlayer.setOnPreparedListener(mp -> {
                 localSourcePreparing = false;
             });
@@ -1972,6 +2082,8 @@ public class SongPlayerFragment extends Fragment {
         localSourcePreparing = false;
 
         localExoMediaPlayer = preBuffered;
+        // Promoción del pre-buffer gapless a player audible: ahora SU sesión es la del EQ.
+        preBuffered.markAsActiveForEq();
         preBuffered.isCrossfadeComponent = false;
         preBuffered.setVolume(1f, 1f);
         preBuffered.setOnCompletionListener(mp -> handleLocalPlaybackCompletion());
@@ -2036,11 +2148,30 @@ public class SongPlayerFragment extends Fragment {
         if (!isAdded()) {
             return;
         }
+        // Error de fuente en el player compartido: el próximo intento de esta pista fuerza ANDROID_VR.
+        markForceAltClient(loadedVideoId);
         tryReresolveOrSkipCurrentTrack("Error en reproductor compartido. Reintentando.", false);
     }
 
+    // videoIds cuya URL primaria (NewPipe) resolvió pero FALLÓ al reproducirse (prepare colgado,
+    // error de fuente). El próximo resolve de estos fuerza el cliente ANDROID_VR. Se limpia al
+    // reproducir con éxito. Acotado para no crecer sin límite.
+    private final java.util.LinkedHashSet<String> forceAltClientVideoIds = new java.util.LinkedHashSet<>();
+
+    /** Marca un videoId para resolverse por el cliente alternativo (ANDROID_VR) en el próximo intento. */
+    private void markForceAltClient(@Nullable String videoId) {
+        if (TextUtils.isEmpty(videoId)) return;
+        forceAltClientVideoIds.add(videoId);
+        if (forceAltClientVideoIds.size() > 50) {
+            java.util.Iterator<String> it = forceAltClientVideoIds.iterator();
+            it.next();
+            it.remove();
+        }
+    }
+
     private void resolveAndPlayOnlineTrack(@NonNull PlayerTrack track, long requestToken) {
-        resolveAndPlayOnlineTrack(track, requestToken, false);
+        // Si la reproducción de la URL primaria de esta pista ya falló antes, forzar ANDROID_VR.
+        resolveAndPlayOnlineTrack(track, requestToken, forceAltClientVideoIds.contains(track.videoId));
     }
 
     private void resolveAndPlayOnlineTrack(@NonNull PlayerTrack track, long requestToken, boolean forceAlternativeClient) {
@@ -2081,6 +2212,10 @@ public class SongPlayerFragment extends Fragment {
                 if (!TextUtils.isEmpty(resolvedUrl)) {
                     startMediaPlaybackFromSource(track, resolvedUrl, requestToken, () -> {
                         StreamResolver.invalidate(track.videoId);
+                        // La URL resolvió pero su reproducción falló/colgó: el próximo intento de
+                        // ESTA pista debe usar el cliente ANDROID_VR (URL directa más reproducible)
+                        // en vez de re-pedir la misma URL de NewPipe que se colgó.
+                        markForceAltClient(track.videoId);
                         tryReresolveOrSkipCurrentTrack("Fallo de reproducción directa: re-resolviendo.", false);
                     });
                 } else {
@@ -2416,11 +2551,27 @@ public class SongPlayerFragment extends Fragment {
     }
 
     private void invalidateNextTrackPreparations() {
+        invalidateNextTrackPreparations(true);
+    }
+
+    /** @param reprefetchNow false difiere el re-prefetch del siguiente track ~2.5s (misma pauta
+     *  que el arranque de pista). El hot-swap de modo lo usa: prefetchNextTrackStream lanza 2
+     *  resoluciones al MISMO pool de 3 hilos que el resolve del swap está por usar, y hacerlas
+     *  en el tap le robaba el hilo al intercambio. */
+    private void invalidateNextTrackPreparations(boolean reprefetchNow) {
         cancelGaplessPreBuffer();
         cancelVideoStreamWarm();
         prefetchedNextVideoId = null;
         prefetchedNextUrl = null;
-        prefetchNextTrackStream();
+        if (reprefetchNow) {
+            prefetchNextTrackStream();
+        } else {
+            localProgressHandler.postDelayed(() -> {
+                if (isAdded()) {
+                    prefetchNextTrackStream();
+                }
+            }, 2500L);
+        }
     }
 
     private void attemptPlaybackFromSources(
@@ -2538,6 +2689,8 @@ public class SongPlayerFragment extends Fragment {
             Log.d(TAG, "[PLAYBACK_DBG] using OWN ExoPlayer (no shared) for videoId=" + track.videoId);
         }
         localExoMediaPlayer = player;
+        // Player audible del start normal (shared u own): reporta su sesión al EQ solo-app.
+        player.markAsActiveForEq();
         player.setAudioAttributes(new AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_MEDIA)
                 .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
@@ -2638,6 +2791,9 @@ public class SongPlayerFragment extends Fragment {
                         }
                     }
                     if (networkSource) StreamResolver.markSuccess(track.videoId);
+                    // Reprodujo bien: si estaba marcada para ANDROID_VR forzado, quitarla (el
+                    // camino rápido de NewPipe vuelve a valer para futuras reproducciones).
+                    forceAltClientVideoIds.remove(track.videoId);
                     consecutiveStreamFailures = 0; // Reset counter on successful playback
                     audioTrackReinitToken = -1;
                     startLocalProgressTicker();
@@ -2887,7 +3043,10 @@ public class SongPlayerFragment extends Fragment {
             Log.w(TAG, "Failed to stop player", e);
         }
         try {
-            player.release();
+            // releaseAsync: el stop/detach corre ya; el ExoPlayer.release() pesado (hasta ~500ms
+            // en main) se difiere a otro mensaje del looper, fuera del frame del caller (gesto
+            // de seek, commit de swap, cambio de pista).
+            player.releaseAsync();
         } catch (Exception e) {
             Log.w(TAG, "Failed to release player", e);
         }
@@ -2906,18 +3065,29 @@ public class SongPlayerFragment extends Fragment {
             return new ArrayList<>(orderedSources);
         }
 
-        if (isAdded()
-                && OfflineAudioStore.hasValidatedOfflineAudio(requireContext(), track.videoId, track.duration)) {
+        if (isAdded() && OfflineAudioStore.hasOfflineAudio(requireContext(), track.videoId)) {
             File file = OfflineAudioStore.getExistingOfflineAudioFile(requireContext(), track.videoId);
             if (file.isFile() && file.length() > 0L) {
                 orderedSources.add(file.getAbsolutePath());
-                // Resolve "does this offline file contain video?" SYNCHRONOUSLY here, before playback
-                // attaches the surface. isVideoTrack() reads offlineVideoProbeCache, and the surface is
-                // attached exactly once at videoRouter.onTrackStarted(..., isVideoTrack). The old async
-                // probe returned false on that first call, so a downloaded music-video attached NO video
-                // surface and showed its cover photo forever (re-attaching later hits the router's
-                // sameUnderlying branch, which never re-adds the PlayerView). Caching it now fixes that.
-                ensureOfflineVideoProbeCached(track.videoId, file);
+                // Decisión de arranque solo con el chequeo BARATO de existencia: la validación
+                // completa (MediaMetadataRetriever) y el probe de video (MediaExtractor) eran dos
+                // parseos síncronos del archivo entero EN EL MAIN THREAD antes del primer play —
+                // ExoPlayer lo parsea igual en prepare() y un archivo corrupto cae por el camino
+                // normal de error → re-resuelve online, así que no se pierde robustez.
+                //
+                // Probe de video en background: la superficie se adjunta con el valor cacheado
+                // (false en el primer play); si el probe async descubre que el .mp4 SÍ trae video,
+                // su callback re-anuncia el track al router, cuya rama sameUnderlying ahora
+                // permite el attach tardío (el bug histórico del video descargado que mostraba
+                // su carátula para siempre ya no puede volver por esta vía).
+                if (!offlineVideoProbeCache.containsKey(track.videoId)) {
+                    offlineFileHasVideoTrack(track.videoId);
+                }
+                final Context appCtx = requireContext().getApplicationContext();
+                final String validateId = track.videoId;
+                final String validateDuration = track.duration;
+                backgroundExecutor.execute(() ->
+                        OfflineAudioStore.hasValidatedOfflineAudio(appCtx, validateId, validateDuration));
             }
         }
         return new ArrayList<>(orderedSources);
@@ -3415,6 +3585,15 @@ public class SongPlayerFragment extends Fragment {
     }
 
     private void cancelOfflineCrossfade() {
+        cancelCrossfadeOnly();
+        cancelGaplessPreBuffer();
+    }
+
+    /** Cancela el crossfade en curso (volumen, ticker, player entrante) SIN tocar el pre-buffer
+     *  gapless. Los seeks dentro de la pista actual usan esta variante: el siguiente track sigue
+     *  siendo el mismo, así que su player pre-buffereado sigue siendo válido — y liberarlo
+     *  implicaba un ExoPlayer.release() bloqueante en pleno gesto. */
+    private void cancelCrossfadeOnly() {
         crossfadeManager.cancelAndRestoreVolume(localExoMediaPlayer);
         localCrossfadeInProgress = false;
         localCrossfadeIsNetwork = false;
@@ -3428,7 +3607,6 @@ public class SongPlayerFragment extends Fragment {
             releaseSingleExoMediaPlayer(localCrossfadeIncomingPlayer);
             localCrossfadeIncomingPlayer = null;
         }
-        cancelGaplessPreBuffer();
     }
 
     private void handleCrossfadeFinished(@NonNull ExoMediaPlayer incoming, int nextIndex, boolean wasNetwork) {
@@ -3438,6 +3616,8 @@ public class SongPlayerFragment extends Fragment {
         }
 
         localExoMediaPlayer = incoming;
+        // Promoción del crossfade: el entrante pasa a ser el audible — mueve el EQ a su sesión.
+        localExoMediaPlayer.markAsActiveForEq();
         localExoMediaPlayer.isCrossfadeComponent = false;
         usingOfflineSource = !wasNetwork;
         accumulatedListenMs = 0;
@@ -3718,6 +3898,7 @@ public class SongPlayerFragment extends Fragment {
 
         refreshSocialActionsForCurrentTrack(track);
         refreshFavoriteActionForCurrentTrack();
+        refreshVideoPillAvailability(track);
         if (!isLocalFile) refreshDownloadChipState();
         scheduleCommentsPrefetch(track, isLocalFile);
 
@@ -3743,6 +3924,37 @@ public class SongPlayerFragment extends Fragment {
             playerArtworkBootstrapPending = false;
         }
 
+        loadArtworkForCurrentTrack(track);
+
+        // Load notification/MediaSession artwork only
+        loadNotificationArtworkOnly(track);
+        if (bootstrapArtwork) {
+            refreshNextUp();
+        }
+
+        updateMediaSessionMetadata();
+        updateMediaSessionState();
+        if (bootstrapArtwork) {
+            cancelNextUpReveal();
+            nextUpTracks.clear();
+            if (nextUpAdapter != null) {
+                nextUpAdapter.setItems(nextUpTracks);
+            }
+        } else {
+            refreshNextUp();
+        }
+        syncMiniStateWithPlaylist();
+        persistPlaybackSnapshot(false);
+    }
+
+    /** Carga la carátula + color dominante de la pista en el hero (rama música) o aplica la
+     *  presentación de video (rama video). Extraído de bindCurrentTrackInternal para que el
+     *  restore de Video→Canción pueda relanzar SOLO la carga de arte cuando el cover quedó sin
+     *  drawable y sin cache válido — sin re-bindear tiempos/metadata de la pista en curso. */
+    private void loadArtworkForCurrentTrack(@NonNull PlayerTrack track) {
+        if (!isAdded()) {
+            return;
+        }
         boolean isLocalVideo = isVideoPresentation(track);
 
         if (ivPlayerCover != null) {
@@ -3802,8 +4014,20 @@ public class SongPlayerFragment extends Fragment {
                             // video (se ve como «canción»/audio, BUG 2) y el Palette de abajo repintaría
                             // el fondo con el color dominante en vez de negro (BUG 1).
                             // updatePlayerSurfaceForSource ya dejó el video (16:9, fondo negro, carátula
-                            // oculta); una entrega tardía de carátula NO debe corromperlo.
-                            if (currentSourceIsVideo) return;
+                            // oculta); una entrega tardía de carátula NO debe corromperlo. PERO la
+                            // entrega igual se CACHEA (solo se saltan las mutaciones de vista): el
+                            // restore de Video→Canción depende de este cache, y descartar el bitmap
+                            // aquí era lo que dejaba el hero negro sin carátula ni color al volver.
+                            if (currentSourceIsVideo) {
+                                lastSongCoverBitmap = resource;
+                                lastSongArtVideoId = track.videoId;
+                                Palette.from(resource).generate(palette -> {
+                                    if (palette == null || artworkGen != playerArtworkGeneration) return;
+                                    lastSongDominantColor = palette.getDominantColor(0xFF121212);
+                                    lastSongColorValid = true;
+                                });
+                                return;
+                            }
 
                             // Shape the hero to match THIS artwork during the alpha-0 swap below.
                             // Reshaping while the previous bitmap is still visible re-crops that
@@ -3833,6 +4057,7 @@ public class SongPlayerFragment extends Fragment {
                             // Cache the song cover so a later Video→Canción swap (which does not
                             // re-bind artwork) can restore it instantly and deterministically.
                             lastSongCoverBitmap = resource;
+                            lastSongArtVideoId = track.videoId;
                             ivPlayerCover.animate().alpha(1f).setDuration(coverHasContent ? 240 : 260).start();
                             if (pbVideoLoading != null) {
                                 pbVideoLoading.setVisibility(View.GONE);
@@ -3842,14 +4067,16 @@ public class SongPlayerFragment extends Fragment {
                             // dominant swatch is used as-is per design preference).
                             Palette.from(resource).generate(palette -> {
                                 if (palette == null || !isAdded() || artworkGen != playerArtworkGeneration) return;
+                                int dominantColor = palette.getDominantColor(0xFF121212);
+                                // Cache so a later Video→Canción swap restores this exact color instantly.
+                                // El cache corre ANTES del guard de video: aunque el fondo deba seguir
+                                // negro ahora, el color queda listo para el restore.
+                                lastSongDominantColor = dominantColor;
+                                lastSongColorValid = true;
                                 // BUG 1: Palette.generate es async; si entre tanto se entró a VIDEO
                                 // (swap de modo), el fondo debe quedar negro puro — no repintar con el
                                 // color dominante.
                                 if (currentSourceIsVideo) return;
-                                int dominantColor = palette.getDominantColor(0xFF121212);
-                                // Cache so a later Video→Canción swap restores this exact color instantly.
-                                lastSongDominantColor = dominantColor;
-                                lastSongColorValid = true;
 
                                 if (playerBackgroundContainer != null) {
                                     animateBackgroundTransition(buildDominantGradient(dominantColor));
@@ -3874,6 +4101,7 @@ public class SongPlayerFragment extends Fragment {
                             // No artwork for this track: drop any cached song bitmap/color so a later
                             // return-to-song restore never resurrects the PREVIOUS track's cover/color.
                             lastSongCoverBitmap = null;
+                            lastSongArtVideoId = null;
                             lastSongColorValid = false;
                             if (playerBackgroundContainer != null) {
                                 animateBackgroundTransition(new android.graphics.drawable.ColorDrawable(0xFF161616));
@@ -3920,26 +4148,6 @@ public class SongPlayerFragment extends Fragment {
                 }
             }
         }
-
-        // Load notification/MediaSession artwork only
-        loadNotificationArtworkOnly(track);
-        if (bootstrapArtwork) {
-            refreshNextUp();
-        }
-
-        updateMediaSessionMetadata();
-        updateMediaSessionState();
-        if (bootstrapArtwork) {
-            cancelNextUpReveal();
-            nextUpTracks.clear();
-            if (nextUpAdapter != null) {
-                nextUpAdapter.setItems(nextUpTracks);
-            }
-        } else {
-            refreshNextUp();
-        }
-        syncMiniStateWithPlaylist();
-        persistPlaybackSnapshot(false);
     }
 
     private String getHdImageUrl(String url, String videoId) {
@@ -5506,6 +5714,15 @@ public class SongPlayerFragment extends Fragment {
                 if (currentIndex >= 0 && currentIndex < tracks.size()
                         && TextUtils.equals(tracks.get(currentIndex).videoId, probeVideoId)
                         && TextUtils.equals(loadedVideoId, probeVideoId)) {
+                    // El attach original corrió con isVideo=false (cache miss del probe). Si el
+                    // archivo SÍ trae video, re-anunciar el track al router ANTES de refrescar la
+                    // presentación: su rama sameUnderlying permite el attach tardío cuando
+                    // videoActive pasa de false a true para el mismo player, así el hero nunca
+                    // queda negro (superficie sin adjuntar) mientras suena el audio.
+                    if (result && usingOfflineSource && localExoMediaPlayer != null) {
+                        currentSourceIsVideo = true;
+                        videoRouter.onTrackStarted(localExoMediaPlayer, probeVideoId, true);
+                    }
                     updatePlayerSurfaceForSource();
                 }
             });
@@ -5517,6 +5734,17 @@ public class SongPlayerFragment extends Fragment {
 
     private void onPlaybackModeSelected(boolean videoMode) {
         if (videoMode == playerVideoMode || modeSwapInProgress) return;
+        // Candado duro "No reproducir videos musicales" (default ON, sincronizado en Firebase):
+        // bloquea el cambio a video en su origen. StreamResolver tiene el mismo gate, así que
+        // ningún camino (restauración, prefetch, swap) puede servir video con el ajuste activo.
+        if (videoMode && noMusicVideosEnabled()) {
+            if (isAdded()) {
+                AppSnackbar.showInView(getPlayerToastRoot(),
+                        "Los videos musicales están desactivados en Ajustes",
+                        null, null, playerToastBottomMarginPx());
+            }
+            return;
+        }
 
         PlayerTrack track = (currentIndex >= 0 && currentIndex < tracks.size())
                 ? tracks.get(currentIndex) : null;
@@ -5527,13 +5755,25 @@ public class SongPlayerFragment extends Fragment {
             }
             return;
         }
+        // Bloqueo por DATOS (counterpart del /next): la canción no tiene video musical — sin esto
+        // el swap "triunfaba" reproduciendo el mp4 de portada estática del upload Topic.
+        if (videoMode && track != null
+                && MusicVideoAvailability.get(track.videoId) == MusicVideoAvailability.State.NO) {
+            if (isAdded()) {
+                AppSnackbar.showInView(getPlayerToastRoot(),
+                        "Video no disponible para esta canción",
+                        null, null, playerToastBottomMarginPx());
+            }
+            return;
+        }
 
         playerVideoMode = videoMode;
         StreamResolver.setPreferVideoMode(videoMode);
         updatePlaybackModePillUi();
         // Los prefetch/pre-buffers del siguiente track se hicieron con el modo anterior —
-        // invalidarlos para que se re-preparen con la fuente correcta.
-        invalidateNextTrackPreparations();
+        // invalidarlos para que se re-preparen con la fuente correcta. El re-prefetch se
+        // difiere para no competir con el resolve del hot-swap en el pool de 3 hilos.
+        invalidateNextTrackPreparations(false);
 
         if (track == null || TextUtils.isEmpty(track.videoId) || localExoMediaPlayer == null) {
             return; // nada sonando: la próxima reproducción ya usará el modo nuevo
@@ -5545,6 +5785,41 @@ public class SongPlayerFragment extends Fragment {
             return; // transición en curso: el track entrante ya resolverá con el modo nuevo
         }
         hotSwapPlaybackMode(track, videoMode);
+    }
+
+    /** Lee el ajuste "No reproducir videos musicales" (default ON — ver CloudSyncManager). */
+    private boolean noMusicVideosEnabled() {
+        try {
+            return requireContext().getSharedPreferences(AppConstants.PREFS_SETTINGS, Context.MODE_PRIVATE)
+                    .getBoolean(CloudSyncManager.KEY_NO_MUSIC_VIDEOS, true);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Aplica el candado "No reproducir videos musicales": oculta/muestra la pastilla
+     * Canción|Video y, si un video está sonando con el candado activo, vuelve a canción EN
+     * CALIENTE (sin pausar). Lo llaman Ajustes al togglear el switch y onViewCreated al montar.
+     * Seguro con el player vacío o el fragment despegado.
+     */
+    public void applyNoMusicVideosSetting() {
+        boolean blocked = noMusicVideosEnabled();
+        View root = getView();
+        View pill = root != null ? root.findViewById(R.id.pillPlaybackMode) : null;
+        if (pill != null) pill.setVisibility(blocked ? View.GONE : View.VISIBLE);
+        if (!blocked) return;
+        if (playerVideoMode && localExoMediaPlayer != null && !modeSwapInProgress) {
+            onPlaybackModeSelected(false); // swap en caliente Video→Canción
+        } else if (playerVideoMode) {
+            // Nada intercambiable sonando (o swap en curso): al menos desarma el modo para la
+            // próxima resolución; el gate del resolver cubre cualquier carrera restante.
+            playerVideoMode = false;
+            StreamResolver.setPreferVideoMode(false);
+            updatePlaybackModePillUi();
+        } else {
+            StreamResolver.setPreferVideoMode(false);
+        }
     }
 
     private void updatePlaybackModePillUi() {
@@ -5563,6 +5838,43 @@ public class SongPlayerFragment extends Fragment {
             tvModeAudio.setBackgroundResource(R.drawable.bg_player_mode_segment_active_left);
             tvModeVideo.setBackground(null);
         }
+    }
+
+    /**
+     * Pastilla Canción|Video según disponibilidad REAL de video (counterpart del /next de YT
+     * Music, ver MusicVideoAvailability): sin video → «Video» atenuado y el tap avisa en vez de
+     * reproducir el mp4 de portada estática. Si aún no se sabe (UNKNOWN), se dispara UN probe por
+     * canción y la pastilla queda habilitada mientras tanto (el fallo de swap sigue siendo la red
+     * de seguridad).
+     */
+    private void refreshVideoPillAvailability(@Nullable PlayerTrack track) {
+        if (tvModeVideo == null) return;
+        if (track == null || TextUtils.isEmpty(track.videoId)
+                || LocalFilesStore.isLocalVideoId(track.videoId) || noMusicVideosEnabled()) {
+            applyVideoAvailabilityToPill(MusicVideoAvailability.State.UNKNOWN);
+            return;
+        }
+        MusicVideoAvailability.State state = MusicVideoAvailability.get(track.videoId);
+        applyVideoAvailabilityToPill(state);
+        if (state != MusicVideoAvailability.State.UNKNOWN) return;
+        if (TextUtils.equals(pendingCounterpartVideoId, track.videoId)) return;
+        pendingCounterpartVideoId = track.videoId;
+        final String probeId = track.videoId;
+        radioMusicService.fetchVideoCounterpart(getWebCookie(), probeId, resolved -> {
+            if (TextUtils.equals(pendingCounterpartVideoId, probeId)) pendingCounterpartVideoId = null;
+            if (!isAdded()) return;
+            PlayerTrack current = (currentIndex >= 0 && currentIndex < tracks.size())
+                    ? tracks.get(currentIndex) : null;
+            if (current != null && TextUtils.equals(current.videoId, probeId)) {
+                applyVideoAvailabilityToPill(resolved);
+            }
+        });
+    }
+
+    /** NO hay video → «Video» atenuado (el tap lo intercepta onPlaybackModeSelected). */
+    private void applyVideoAvailabilityToPill(MusicVideoAvailability.State state) {
+        if (tvModeVideo == null) return;
+        tvModeVideo.setAlpha(state == MusicVideoAvailability.State.NO ? 0.35f : 1f);
     }
 
     /** Vuelve la pastilla al modo contrario tras un fallo de swap y avisa. */
@@ -5596,6 +5908,12 @@ public class SongPlayerFragment extends Fragment {
         cancelVideoStreamWarm();
         warmedVideoId = null;
         if (TextUtils.isEmpty(videoId) || LocalFilesStore.isLocalVideoId(videoId)) return;
+        // Candado "No reproducir videos": no gastar red (C1) ni cache (C2) en un video
+        // que el usuario tiene bloqueado por Ajustes.
+        if (noMusicVideosEnabled()) return;
+        // Sin video musical (counterpart /next): la pastilla está bloqueada para esta canción,
+        // no gastar red ni caché calentando un stream que nunca se pedirá.
+        if (MusicVideoAvailability.get(videoId) == MusicVideoAvailability.State.NO) return;
         // Ya estamos en modo Video: el stream de video se cachea al reproducirlo, no hay que forzar.
         if (StreamResolver.isPreferVideoMode()) return;
         Context ctx = getContext();
@@ -5647,13 +5965,6 @@ public class SongPlayerFragment extends Fragment {
         final Context appCtx = requireContext().getApplicationContext();
         modeSwapInProgress = true;
 
-        // Ruta rápida (C1+C2): solo al ir a VIDEO, cuando la URL de video ya se conoce (side-cache
-        // → resolveStreamUrl NO hará red) y su cabecera ya se precalentó en el cache. Entonces el
-        // player del swap prepara casi desde disco → adelanto de seek y delay de commit reducidos.
-        final boolean fastSwap = videoMode
-                && StreamResolver.getPrefetchedVideoUrl(swapVideoId) != null
-                && TextUtils.equals(warmedVideoId, swapVideoId);
-
         // Resolve on the 3-thread resolver pool, NOT the single-thread backgroundExecutor: switching
         // to video used to queue behind the offline MediaExtractor probe and other serial work, which
         // is a big part of why the swap felt heavy. Same lifecycle (both shutdownNow in onDestroy).
@@ -5664,12 +5975,41 @@ public class SongPlayerFragment extends Fragment {
                 java.io.File offline = OfflineAudioStore.getExistingOfflineAudioFile(appCtx, swapVideoId);
                 if (offline.isFile() && offline.length() > 0L) {
                     source = offline.getAbsolutePath();
+                    // El commit leerá isVideoTrack → offlineVideoProbeCache. Resolver el probe
+                    // AQUÍ (ya estamos en background) da al commit la respuesta definitiva; el
+                    // viejo flip async post-commit dejaba el hero negro (presentación de video
+                    // sin superficie adjunta) cuando el .mp4 descargado sí traía video.
+                    ensureOfflineVideoProbeCached(swapVideoId, offline);
+                    // El playback real vuelve a audio SIN pasar por resolveStreamUrl: degradar la
+                    // entrada VIDEO global para que isVideoSource() no siga reportando video.
+                    StreamResolver.demoteVideoEntry(swapVideoId);
                 }
             }
             if (source == null) {
                 source = StreamResolver.resolveStreamUrl(appCtx, swapVideoId);
             }
             final String resolved = source;
+            // Ruta rápida: fuente local/offline, o stream cuya cabecera YA está en el
+            // exo_stream_cache (warm C2 en WiFi, o bytes que quedaron cacheados al reproducirlo
+            // antes — el caso Video→Canción, donde el audio recién sonó y sus bytes están en
+            // disco). Derivarla del CACHE REAL y no del flag de warm (solo-WiFi) habilita los
+            // tiempos rápidos también con datos móviles.
+            boolean headCached = false;
+            if (resolved != null) {
+                if (!isHttpStreamSource(resolved)) {
+                    headCached = true;
+                } else {
+                    try {
+                        // La clave del cache es la ESTABLE (gv:id:itag para googlevideo), no la
+                        // URL cruda — con la URL este fast-path nunca acertaba para streams.
+                        headCached = ExoMediaPlayer.getSharedCache(appCtx)
+                                .getCachedBytes(ExoMediaPlayer.stableCacheKey(
+                                        android.net.Uri.parse(resolved)), 0, 65_536L) > 0L;
+                    } catch (Exception ignored) {
+                    }
+                }
+            }
+            final boolean fastSwap = headCached;
             localProgressHandler.post(() -> {
                 if (!isAdded() || !TextUtils.equals(loadedVideoId, swapVideoId) || localExoMediaPlayer == null) {
                     modeSwapInProgress = false; // cambió la canción mientras resolvíamos
@@ -5712,6 +6052,10 @@ public class SongPlayerFragment extends Fragment {
         pendingModeSwapPlayer = next;
         next.isCrossfadeComponent = true;
         next.setVolume(0f, 0f); // se prepara en silencio; suena recién en el commit
+        // Seek EXACT mientras se sincroniza en silencio: el intercambio sin pausa depende de
+        // posiciones casi exactas entre viejo y nuevo; CLOSEST_SYNC (el default del constructor)
+        // se restablece al adoptarlo como player activo en commitHotSwap.
+        next.setSeekToClosestSync(false);
         next.setAudioAttributes(new AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_MEDIA)
                 .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
@@ -5750,18 +6094,42 @@ public class SongPlayerFragment extends Fragment {
                 }
                 return;
             }
-            // Sincronizar por delante de la posición actual (compensa el delay del commit)
-            // y comprometer el intercambio tras un pequeño margen de re-buffer. En la ruta rápida
-            // (cabecera precalentada) el re-buffer es casi inmediato → adelanto/commit menores.
-            int seekLead = fastSwap ? HOT_SWAP_SEEK_LEAD_FAST_MS : HOT_SWAP_SEEK_LEAD_MS;
-            long commitDelay = fastSwap ? HOT_SWAP_COMMIT_DELAY_FAST_MS : HOT_SWAP_COMMIT_DELAY_MS;
-            int pos = localExoMediaPlayer.getCurrentPosition();
-            mp.seekTo(pos + seekLead);
-            localProgressHandler.postDelayed(() -> {
-                if (!settled.compareAndSet(false, true)) return;
-                localProgressHandler.removeCallbacks(swapTimeout);
-                commitHotSwap(mp, track, videoMode, networkSource, source);
-            }, commitDelay);
+            // Sincronizar por delante de la posición actual (compensa el tiempo de commit) y
+            // comprometer POR DISPONIBILIDAD: apenas el nuevo player tiene ~300ms de buffer por
+            // delante del objetivo (poll de 50ms) se hace el intercambio — una fuente local o
+            // con cabecera cacheada comete en el primer poll. El delay histórico queda solo
+            // como techo; si se agota, el commit corre igual y su re-sincronización fina
+            // corrige el drift.
+            final int seekLead = fastSwap ? HOT_SWAP_SEEK_LEAD_FAST_MS : HOT_SWAP_SEEK_LEAD_MS;
+            final long maxCommitDelay = fastSwap ? HOT_SWAP_COMMIT_DELAY_FAST_MS : HOT_SWAP_COMMIT_DELAY_MS;
+            final int target = localExoMediaPlayer.getCurrentPosition() + seekLead;
+            mp.seekTo(target);
+            final long commitDeadlineMs = SystemClock.elapsedRealtime() + maxCommitDelay;
+            final Runnable commitWhenBuffered = new Runnable() {
+                @Override
+                public void run() {
+                    if (settled.get()) return;
+                    boolean buffered;
+                    try {
+                        int bufferedPos = mp.getBufferedPosition();
+                        int duration = mp.getDuration();
+                        // Listo cuando hay margen por delante del objetivo, o cuando el buffer
+                        // llegó al final del stream (objetivo cerca del fin de la pista).
+                        buffered = bufferedPos >= target + HOT_SWAP_COMMIT_BUFFER_MS
+                                || (duration > 0 && bufferedPos >= duration - 250);
+                    } catch (Exception e) {
+                        buffered = false;
+                    }
+                    if (!buffered && SystemClock.elapsedRealtime() < commitDeadlineMs) {
+                        localProgressHandler.postDelayed(this, 50L);
+                        return;
+                    }
+                    if (!settled.compareAndSet(false, true)) return;
+                    localProgressHandler.removeCallbacks(swapTimeout);
+                    commitHotSwap(mp, track, videoMode, networkSource, source);
+                }
+            };
+            localProgressHandler.post(commitWhenBuffered);
         });
 
         try {
@@ -5815,7 +6183,12 @@ public class SongPlayerFragment extends Fragment {
         if (keepPlaying) next.start();
 
         localExoMediaPlayer = next;
+        // Promoción del swap de modo (canción/video): el nuevo player audible reporta al EQ.
+        next.markAsActiveForEq();
         next.isCrossfadeComponent = false;
+        // Ya sincronizado y adoptado: volver a CLOSEST_SYNC para que los seeks del usuario
+        // sobre este player (ahora el activo) retomen rápido en fuentes con video.
+        next.setSeekToClosestSync(true);
         usingOfflineSource = !networkSource;
         // Capture the committed source type BEFORE we tell the router / refresh presentation, using
         // the SAME isVideoTrack(track) the surface attach (below) uses. This is what makes a reverted
@@ -5841,7 +6214,9 @@ public class SongPlayerFragment extends Fragment {
             return true;
         });
 
-        try { old.release(); } catch (Exception ignored) { }
+        // Diferido: liberar el player viejo dentro del frame del commit era parte de la pausa
+        // perceptible del intercambio (ExoPlayer.release() bloquea hasta ~500ms en main).
+        try { old.releaseAsync(); } catch (Exception ignored) { }
 
         try {
             AudioEffectsService.sendApply(requireContext().getApplicationContext());
@@ -5943,15 +6318,43 @@ public class SongPlayerFragment extends Fragment {
                     restoreMusicHeroShape();
                     ivPlayerCover.setVisibility(View.VISIBLE);
                     // Restore the cover + its dominant-color gradient instantly ONLY when the cover
-                    // still holds this song's bitmap — i.e. a same-track Video→Canción swap. If it was
-                    // cleared, a track-change bind is loading new artwork; leave it transparent so
-                    // onResourceReady fades the correct cover/color in (forcing the cached previous-song
-                    // color here would flash the wrong backdrop).
-                    if (ivPlayerCover.getDrawable() != null) {
+                    // still holds THIS song's bitmap (lastSongArtVideoId) — i.e. a same-track
+                    // Video→Canción swap. Restoring an unverified drawable here used to resurrect
+                    // the PREVIOUS track's art when the track had changed while in video mode.
+                    if (ivPlayerCover.getDrawable() != null
+                            && TextUtils.equals(lastSongArtVideoId, loadedVideoId)) {
                         ivPlayerCover.setAlpha(1f);
                         if (!StreamResolver.isPreferVideoMode()
                                 && lastSongColorValid && playerBackgroundContainer != null) {
                             animateBackgroundTransition(buildDominantGradient(lastSongDominantColor));
+                        }
+                    } else if (lastSongCoverBitmap != null && !lastSongCoverBitmap.isRecycled()
+                            && TextUtils.equals(lastSongArtVideoId, loadedVideoId)) {
+                        // El drawable se anuló al entrar a video, pero la carátula de ESTA pista
+                        // está cacheada (las entregas en modo video también se cachean): aplicarla
+                        // con su forma y color al instante — el hero nunca queda negro esperando
+                        // una carga que jamás se relanzó.
+                        Bitmap b = lastSongCoverBitmap;
+                        ivPlayerCover.animate().cancel();
+                        applyHeroShapeForAspect((float) b.getWidth() / Math.max(1, b.getHeight()),
+                                b.getWidth(), b.getHeight(), playerArtworkGeneration);
+                        ivPlayerCover.setImageBitmap(b);
+                        ivPlayerCover.setAlpha(1f);
+                        if (lastSongColorValid && playerBackgroundContainer != null) {
+                            animateBackgroundTransition(buildDominantGradient(lastSongDominantColor));
+                        }
+                    } else {
+                        // Sin cache válido para esta pista: NINGUNA carga va a rellenar el cover
+                        // sola (la entrega original pudo descartarse en modo video) — relanzar la
+                        // carga de arte en vez de quedar negro para siempre. Se limpia el drawable
+                        // primero: podría ser el arte VIEJO de otra pista y no debe flashear
+                        // mientras la carga nueva está en vuelo.
+                        ivPlayerCover.setImageDrawable(null);
+                        ivPlayerCover.setAlpha(0f);
+                        PlayerTrack loadTrack = (currentIndex >= 0 && currentIndex < tracks.size())
+                                ? tracks.get(currentIndex) : null;
+                        if (loadTrack != null) {
+                            loadArtworkForCurrentTrack(loadTrack);
                         }
                     }
                 } else {
@@ -6693,6 +7096,44 @@ public class SongPlayerFragment extends Fragment {
         nextUpRevealCursor = 0;
     }
 
+    /** Programa (con debounce) el precalentado de carátulas de la cola. Diferido para no
+     *  competir con la carga de la carátula grande ni el buffering del stream recién arrancado
+     *  — mismo criterio que el prefetch del siguiente track en onPrepared. */
+    private void scheduleNextUpArtworkPrewarm() {
+        if (nextUpPrewarmRunnable != null) {
+            localProgressHandler.removeCallbacks(nextUpPrewarmRunnable);
+        }
+        nextUpPrewarmRunnable = () -> {
+            nextUpPrewarmRunnable = null;
+            prewarmNextUpArtwork();
+        };
+        localProgressHandler.postDelayed(nextUpPrewarmRunnable, 1500L);
+    }
+
+    /** Pre-carga en el cache de Glide las carátulas de las próximas ~10 pistas con LA MISMA
+     *  receta que el bind de NextUpAdapter (transform + RGB_565 + 160px → misma clave de cache),
+     *  así abrir «A continuación» pega en memoria y las miniaturas no aparecen tarde durante la
+     *  animación de apertura. Las pistas locales resuelven su arte por archivo y se omiten. */
+    private void prewarmNextUpArtwork() {
+        if (!isAdded() || tracks.size() <= 1) {
+            return;
+        }
+        int limit = Math.min(tracks.size() - 1, 10);
+        for (int offset = 1; offset <= limit; offset++) {
+            PlayerTrack t = tracks.get((currentIndex + offset) % tracks.size());
+            if (t == null || LocalFilesStore.isLocalVideoId(t.videoId) || TextUtils.isEmpty(t.imageUrl)) {
+                continue;
+            }
+            Glide.with(this)
+                    .load(t.imageUrl.trim())
+                    .transform(SHARED_YT_CROP)
+                    .format(DecodeFormat.PREFER_RGB_565)
+                    .override(160, 160)
+                    .diskCacheStrategy(DiskCacheStrategy.ALL)
+                    .preload(160, 160);
+        }
+    }
+
     private void appendNextUpBatch(int totalCount, int batchSize) {
         if (nextUpAdapter == null || tracks.size() <= 1 || batchSize <= 0) {
             return;
@@ -6719,6 +7160,9 @@ public class SongPlayerFragment extends Fragment {
 
     private void refreshNextUp() {
         cancelNextUpReveal();
+        // El head de la cola cambió: dejar las carátulas de las próximas pistas calientes en el
+        // cache de Glide para que la hoja «A continuación» abra con binds instantáneos.
+        scheduleNextUpArtworkPrewarm();
         nextUpTracks.clear();
         if (nextUpAdapter == null) {
             return;
@@ -7212,28 +7656,37 @@ public class SongPlayerFragment extends Fragment {
             ImageView ivCheck = row.findViewById(R.id.ivSaveCheck);
             tvName.setText(ytItem.title == null ? "" : ytItem.title);
             tvCount.setText(ytItem.subtitle == null ? "Playlist" : ytItem.subtitle);
-            java.util.List<String> ytUrls = loadPersistedGridUrls(ctx, ytPlaylistId);
-            if (ytUrls.size() < 4) {
-                ytUrls = new ArrayList<>();
-                java.util.List<FavoritesPlaylistStore.FavoriteTrack> ytMirrorTracks =
-                        CustomPlaylistsStore.INSTANCE.getYtMirrorTracks(ctx, ytPlaylistId);
-                for (FavoritesPlaylistStore.FavoriteTrack t : ytMirrorTracks) {
-                    if (!TextUtils.isEmpty(t.imageUrl)) {
-                        if (!ytUrls.contains(t.imageUrl)) ytUrls.add(t.imageUrl);
-                        if (ytUrls.size() >= 4) break;
+            // Portada OFICIAL de YT (registrada al parsear home/biblioteca): manda sobre el
+            // collage 2x2 sintetizado, igual que en el resto de superficies.
+            if (!ytFallbackThumb.isEmpty()) {
+                OfficialCoverStore.save(ctx, ytPlaylistId, ytFallbackThumb);
+            }
+            String ytOfficial = OfficialCoverStore.get(ctx, ytPlaylistId);
+            if (TextUtils.isEmpty(ytOfficial)) ytOfficial = ytFallbackThumb;
+            if (!TextUtils.isEmpty(ytOfficial)) {
+                Glide.with(this).load(ytOfficial)
+                        .format(com.bumptech.glide.load.DecodeFormat.PREFER_RGB_565)
+                        .override(200, 200).centerCrop().into(ivThumb);
+            } else {
+                java.util.List<String> ytUrls = loadPersistedGridUrls(ctx, ytPlaylistId);
+                if (ytUrls.size() < 4) {
+                    ytUrls = new ArrayList<>();
+                    java.util.List<FavoritesPlaylistStore.FavoriteTrack> ytMirrorTracks =
+                            CustomPlaylistsStore.INSTANCE.getYtMirrorTracks(ctx, ytPlaylistId);
+                    for (FavoritesPlaylistStore.FavoriteTrack t : ytMirrorTracks) {
+                        if (!TextUtils.isEmpty(t.imageUrl)) {
+                            if (!ytUrls.contains(t.imageUrl)) ytUrls.add(t.imageUrl);
+                            if (ytUrls.size() >= 4) break;
+                        }
                     }
                 }
-            }
-            if (ytUrls.size() >= 4) {
-                PlaylistGridArtLoader.load(ivThumb, ytUrls, thumbSizePx);
-            } else if (!ytUrls.isEmpty()) {
-                Glide.with(this).load(ytUrls.get(0))
-                        .format(com.bumptech.glide.load.DecodeFormat.PREFER_RGB_565)
-                        .override(200, 200).centerCrop().into(ivThumb);
-            } else if (!ytFallbackThumb.isEmpty()) {
-                Glide.with(this).load(ytFallbackThumb)
-                        .format(com.bumptech.glide.load.DecodeFormat.PREFER_RGB_565)
-                        .override(200, 200).centerCrop().into(ivThumb);
+                if (ytUrls.size() >= 4) {
+                    PlaylistGridArtLoader.load(ivThumb, ytUrls, thumbSizePx);
+                } else if (!ytUrls.isEmpty()) {
+                    Glide.with(this).load(ytUrls.get(0))
+                            .format(com.bumptech.glide.load.DecodeFormat.PREFER_RGB_565)
+                            .override(200, 200).centerCrop().into(ivThumb);
+                }
             }
             boolean isIn = CustomPlaylistsStore.INSTANCE.isTrackInYtMirror(ctx, ytPlaylistId, track.videoId);
             if (ivCheck != null) ivCheck.setVisibility(isIn ? View.VISIBLE : View.GONE);
@@ -7455,22 +7908,91 @@ public class SongPlayerFragment extends Fragment {
     private void showQueueBottomSheet() {
         if (!isAdded()) return;
 
+        // Diálogo REUTILIZADO: se construye una sola vez por vista (buildQueueBottomSheet);
+        // las aperturas siguientes solo reponen datos. Construir + inflar en cada tap era el
+        // grueso de la latencia de apertura.
+        if (queueSheetDialog == null) {
+            buildQueueBottomSheet();
+        }
+        if (queueSheetDialog == null || nextUpAdapter == null) return;
+
+        // Queue computation is O(n) on an in-memory ArrayList — no need for a background thread
+        List<PlayerTrack> computedQueue = new ArrayList<>();
+        if (!tracks.isEmpty() && currentIndex >= 0 && currentIndex < tracks.size()) {
+            computedQueue.add(tracks.get(currentIndex));
+        }
+        for (int i = 1; i < tracks.size(); i++) {
+            int idx = (currentIndex + i) % tracks.size();
+            computedQueue.add(tracks.get(idx));
+        }
+        final int totalCount = Math.min(computedQueue.size(), MAX_NEXT_UP);
+        final int initialCount = Math.min(totalCount, QUEUE_SHEET_INITIAL_ROWS);
+
+        // Poblar ANTES de show(): el primer layout pass ya bindea los datos finales — sin un
+        // segundo notifyDataSetChanged re-layouteando en plena animación de expansión. El
+        // reset de estado pre-show (scroll a 0 + items frescos) es lo que hace innecesario el
+        // viejo alpha-0 + fade de 150ms del «ghost flash» de la segunda apertura.
+        cancelNextUpReveal();
         nextUpTracks.clear();
+        nextUpTracks.addAll(computedQueue.subList(0, initialCount));
+        nextUpAdapter.setItems(nextUpTracks);
+        if (rvQueueSheet != null) {
+            rvQueueSheet.scrollToPosition(0);
+        }
+        boolean queueEmpty = nextUpTracks.isEmpty();
+        if (rvQueueSheet != null) {
+            rvQueueSheet.setVisibility(queueEmpty ? View.GONE : View.VISIBLE);
+        }
+        if (tvEmptyQueueSheet != null) {
+            tvEmptyQueueSheet.setVisibility(queueEmpty ? View.VISIBLE : View.GONE);
+        }
+
+        // Relleno escalonado: solo lo visible (~12 filas) se bindea antes del show(); el resto
+        // (hasta MAX_NEXT_UP) entra vía notifyItemRangeInserted cuando la animación ya asentó.
+        if (totalCount > initialCount) {
+            final List<PlayerTrack> rest = new ArrayList<>(computedQueue.subList(initialCount, totalCount));
+            nextUpRevealRunnable = () -> {
+                nextUpRevealRunnable = null;
+                if (nextUpAdapter == null || queueSheetDialog == null || !queueSheetDialog.isShowing()) {
+                    return;
+                }
+                // La cola pudo cambiar mientras tanto (tap, cambio de pista); solo append si el
+                // head sigue intacto — un refreshNextUp intermedio ya canceló este runnable.
+                if (nextUpTracks.size() != initialCount || nextUpAdapter.getItems().size() != initialCount) {
+                    return;
+                }
+                nextUpTracks.addAll(rest);
+                nextUpAdapter.getItems().addAll(rest);
+                nextUpAdapter.notifyItemRangeInserted(initialCount, rest.size());
+            };
+            localProgressHandler.postDelayed(nextUpRevealRunnable, 350L);
+        }
+
+        queueSheetDialog.show();
+    }
+
+    /** Construye (una vez por vista) la hoja «A continuación»: diálogo, layout, adapter y drag.
+     *  El contenido ya no se oculta con alpha-0 + fade: ese workaround del «ghost flash» de la
+     *  segunda apertura solo era necesario porque cada apertura inflaba un diálogo nuevo. */
+    private void buildQueueBottomSheet() {
+        if (!isAdded()) return;
 
         BottomSheetDialog bottomSheetDialog = new BottomSheetDialog(requireContext());
         View bsv = getLayoutInflater().inflate(R.layout.bottom_sheet_player_queue, null);
         bottomSheetDialog.setContentView(bsv);
 
         RecyclerView rvQueue = bsv.findViewById(R.id.rvQueue);
-        TextView tvEmptyQueue = bsv.findViewById(R.id.tvEmptyQueue);
+        tvEmptyQueueSheet = bsv.findViewById(R.id.tvEmptyQueue);
         ProgressBar pbQueueLoading = bsv.findViewById(R.id.pbQueueLoading);
+        // Los datos se poblan antes de show() — el spinner de carga ya no tiene ventana.
+        pbQueueLoading.setVisibility(View.GONE);
         LinearLayoutManager layoutManager = new LinearLayoutManager(requireContext());
         rvQueue.setLayoutManager(layoutManager);
-        rvQueue.setHasFixedSize(false);
-
-        pbQueueLoading.setVisibility(View.VISIBLE);
-        rvQueue.setVisibility(View.GONE);
-        tvEmptyQueue.setVisibility(View.GONE);
+        // Filas de alto fijo en un RecyclerView match_parent: holders extra en cache para que
+        // el primer scroll no vuelva a inflar.
+        rvQueue.setHasFixedSize(true);
+        rvQueue.setItemViewCacheSize(12);
+        rvQueueSheet = rvQueue;
 
         nextUpAdapter = new NextUpAdapter(position -> {
             if (position == 0) {
@@ -7485,14 +8007,16 @@ public class SongPlayerFragment extends Fragment {
                         break;
                     }
                 }
-                
+
                 if (realIdx != -1) {
                     currentIndex = realIdx;
                     isPlaying = true;
                     currentSeconds = 0;
                     bindCurrentTrack(false);
                     playCurrentTrack();
-                    bottomSheetDialog.dismiss();
+                    if (queueSheetDialog != null) {
+                        queueSheetDialog.dismiss();
+                    }
                 }
             }
         }, holder -> {
@@ -7500,11 +8024,8 @@ public class SongPlayerFragment extends Fragment {
                 nextUpItemTouchHelper.startDrag(holder);
             }
         });
-        
-        rvQueue.setAdapter(nextUpAdapter);
 
-        // Pre-hide the sheet content to prevent ghost flash on second open
-        bsv.setAlpha(0f);
+        rvQueue.setAdapter(nextUpAdapter);
 
         bottomSheetDialog.setOnShowListener(dialog -> {
             BottomSheetDialog d = (BottomSheetDialog) dialog;
@@ -7518,9 +8039,6 @@ public class SongPlayerFragment extends Fragment {
                 } catch (Throwable ignored) {
                 }
                 behavior.setState(BottomSheetBehavior.STATE_EXPANDED);
-                bottomSheet.post(() -> {
-                    bsv.animate().alpha(1f).setDuration(150L).start();
-                });
             }
         });
 
@@ -7564,39 +8082,9 @@ public class SongPlayerFragment extends Fragment {
         nextUpItemTouchHelper = new ItemTouchHelper(dragCallback);
         nextUpItemTouchHelper.attachToRecyclerView(rvQueue);
 
-        bottomSheetDialog.setOnDismissListener(dialog -> {
-            nextUpAdapter = null;
-            nextUpItemTouchHelper = null;
-        });
-
-        bottomSheetDialog.show();
-
-        // Queue computation is O(n) on an in-memory ArrayList — no need for a background thread
-        List<PlayerTrack> computedQueue = new ArrayList<>();
-        if (!tracks.isEmpty() && currentIndex >= 0 && currentIndex < tracks.size()) {
-            computedQueue.add(tracks.get(currentIndex));
-        }
-        for (int i = 1; i < tracks.size(); i++) {
-            int idx = (currentIndex + i) % tracks.size();
-            computedQueue.add(tracks.get(idx));
-        }
-
-        nextUpTracks.clear();
-        if (computedQueue.size() > MAX_NEXT_UP) {
-            nextUpTracks.addAll(computedQueue.subList(0, MAX_NEXT_UP));
-        } else {
-            nextUpTracks.addAll(computedQueue);
-        }
-        nextUpAdapter.setItems(nextUpTracks);
-
-        pbQueueLoading.setVisibility(View.GONE);
-        if (nextUpTracks.isEmpty()) {
-            rvQueue.setVisibility(View.GONE);
-            tvEmptyQueue.setVisibility(View.VISIBLE);
-        } else {
-            rvQueue.setVisibility(View.VISIBLE);
-            tvEmptyQueue.setVisibility(View.GONE);
-        }
+        // NOTA: sin onDismissListener que anule adapter/helper — el diálogo se reutiliza tal
+        // cual en la próxima apertura; todo se descarta junto en onDestroyView.
+        queueSheetDialog = bottomSheetDialog;
     }
     private void setupSwipeToDismiss(View root) {
         if (!(root instanceof SwipeInterceptLayout)) return;
@@ -7742,7 +8230,8 @@ public class SongPlayerFragment extends Fragment {
         // Release video surface from router
         videoRouter.onPlayerReleased();
         try {
-            localExoMediaPlayer.release();
+            // Diferido: el release pesado nunca bloquea el arranque de la pista siguiente.
+            localExoMediaPlayer.releaseAsync();
         } catch (Exception e) {
             Log.w(TAG, "Failed to release local player", e);
         }

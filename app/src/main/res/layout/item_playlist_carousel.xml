@@ -72,6 +72,7 @@
         android:textSize="14sp"
         android:textStyle="bold"
         android:fontFamily="@font/inter_variable"
+        android:minLines="2"
         android:maxLines="2"
         android:ellipsize="end"
         android:includeFontPadding="false" />

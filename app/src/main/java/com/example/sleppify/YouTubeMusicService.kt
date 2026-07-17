@@ -203,7 +203,11 @@ class YouTubeMusicService @JvmOverloads constructor(
     class HomeBrowseResult(
         @JvmField val genericMixes: MutableList<MixResult>,
         @JvmField val personalMixes: MutableList<MixResult>,
-        @JvmField val allSections: MutableList<HomeSection>
+        @JvmField val allSections: MutableList<HomeSection>,
+        // Canciones del shelf "Selección rápida" del home (musicResponsiveListItemRenderer rows,
+        // no cards) — el resto de secciones son playlists/mixes. Defaulted so the existing 3-arg
+        // constructor call keeps working.
+        @JvmField val quickPicks: MutableList<TrackResult> = mutableListOf()
     )
 
     class HomeSection(
@@ -2022,6 +2026,12 @@ class YouTubeMusicService @JvmOverloads constructor(
         connection.setRequestProperty("Referer", "https://music.youtube.com/")
         if (cookieHeader.isNotEmpty()) {
             connection.setRequestProperty("Cookie", cookieHeader)
+            // Cookie autenticada SIN SAPISIDHASH = 401 intermitente ("No se pudo cargar la
+            // radio"). Misma firma que postInnerTubeBrowse.
+            val sapisidAuth = StreamResolver.buildSapisidHash("https://music.youtube.com")
+            if (sapisidAuth.isNotEmpty()) {
+                connection.setRequestProperty("Authorization", sapisidAuth)
+            }
         }
 
         try {
@@ -2105,6 +2115,11 @@ class YouTubeMusicService @JvmOverloads constructor(
         connection.setRequestProperty("Referer", "https://music.youtube.com/")
         if (cookieHeader.isNotEmpty()) {
             connection.setRequestProperty("Cookie", cookieHeader)
+            // Misma firma SAPISIDHASH que la petición inicial (cookie sin firma = 401).
+            val sapisidAuth = StreamResolver.buildSapisidHash("https://music.youtube.com")
+            if (sapisidAuth.isNotEmpty()) {
+                connection.setRequestProperty("Authorization", sapisidAuth)
+            }
         }
 
         try {
@@ -2131,6 +2146,7 @@ class YouTubeMusicService @JvmOverloads constructor(
                 val renderer = item.optJSONObject("playlistPanelVideoRenderer")
                 if (renderer != null) {
                     appendPlaylistPanelTrack(renderer, tracks)
+                    harvestVideoAvailability(renderer, null)
                     continue
                 }
 
@@ -2139,12 +2155,86 @@ class YouTubeMusicService @JvmOverloads constructor(
                     ?.optJSONObject("playlistPanelVideoRenderer")
                 if (primary != null) {
                     appendPlaylistPanelTrack(primary, tracks)
+                    // El wrapper trae la pareja canción↔video en `counterpart` — antes se tiraba.
+                    val counterpart = wrapper.optJSONArray("counterpart")
+                        ?.optJSONObject(0)
+                        ?.optJSONObject("counterpartRenderer")
+                        ?.optJSONObject("playlistPanelVideoRenderer")
+                    harvestVideoAvailability(primary, counterpart)
                 }
             }
         } catch (e: Exception) {
             Log.w("YouTubeMusicService", "parseMixTracks error: ${e.message}")
         }
         return tracks
+    }
+
+    /**
+     * Cosecha de "¿esta canción tiene video musical?" desde la data del /next que YA recibimos
+     * (misma semántica que ytmusicapi parsers/watch.py): un wrapper con `counterpart` = existe la
+     * pareja canción↔video (ambos ids marcan YES, guardando qué id reproduce el video); un
+     * renderer suelto tipo ATV = NO hay video; un renderer suelto tipo OMV/UGC = él mismo ES el
+     * video. Alimenta la pastilla Canción|Video del player sin ninguna petición extra.
+     */
+    private fun harvestVideoAvailability(renderer: JSONObject, counterpart: JSONObject?) {
+        try {
+            val videoId = renderer.optString("videoId", "").trim()
+            if (videoId.isEmpty()) return
+            val cpId = counterpart?.optString("videoId", "")?.trim().orEmpty()
+            if (cpId.isNotEmpty()) {
+                val selfType = musicVideoTypeOf(renderer)
+                // Si el item es la CANCIÓN (ATV), el video es su counterpart; si el item ya es el
+                // VIDEO, el video es él mismo.
+                val videoSide = if (selfType == "MUSIC_VIDEO_TYPE_ATV" || selfType.isEmpty()) cpId else videoId
+                MusicVideoAvailability.put(videoId, true, videoSide)
+                MusicVideoAvailability.put(cpId, true, videoSide)
+            } else {
+                when (musicVideoTypeOf(renderer)) {
+                    "MUSIC_VIDEO_TYPE_ATV" -> MusicVideoAvailability.put(videoId, false)
+                    "MUSIC_VIDEO_TYPE_OMV", "MUSIC_VIDEO_TYPE_UGC",
+                    "MUSIC_VIDEO_TYPE_OFFICIAL_SOURCE_MUSIC" ->
+                        MusicVideoAvailability.put(videoId, true, videoId)
+                    // Sin musicVideoType no se concluye nada (queda UNKNOWN).
+                }
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun musicVideoTypeOf(renderer: JSONObject?): String =
+        renderer?.optJSONObject("navigationEndpoint")
+            ?.optJSONObject("watchEndpoint")
+            ?.optJSONObject("watchEndpointMusicSupportedConfigs")
+            ?.optJSONObject("watchEndpointMusicConfig")
+            ?.optString("musicVideoType", "")
+            .orEmpty()
+
+    interface VideoCounterpartCallback {
+        fun onResult(state: MusicVideoAvailability.State)
+    }
+
+    /**
+     * Probe ligero de disponibilidad de video musical para una canción que no vino de un /next ya
+     * parseado: pide su radio (RDAMVM<id>) al /next y cosecha el counterpart/musicVideoType de
+     * TODOS los items (la cola entera se aprovecha). Funciona sin cookie. Callback en MAIN con el
+     * estado final del store para [videoId].
+     */
+    fun fetchVideoCounterpart(cookieHeader: String, videoId: String, callback: VideoCounterpartCallback) {
+        val id = videoId.trim()
+        if (id.isEmpty()) {
+            callback.onResult(MusicVideoAvailability.State.UNKNOWN)
+            return
+        }
+        executor.execute {
+            try {
+                // performWatchPlaylistRequest ya pasa por parseMixTracks, que cosecha la
+                // disponibilidad de cada item de la cola como efecto colateral.
+                performWatchPlaylistRequest(cookieHeader.trim(), "RDAMVM$id", "")
+            } catch (_: Exception) {
+                // Sin red / 4xx: el estado se queda UNKNOWN y el caller decide.
+            }
+            mainHandler.post { callback.onResult(MusicVideoAvailability.get(id)) }
+        }
     }
 
     private fun appendUniqueTracks(target: MutableList<TrackResult>, additions: List<TrackResult>) {
@@ -3099,32 +3189,49 @@ class YouTubeMusicService @JvmOverloads constructor(
     }
 
     private fun extractContinuationToken(root: JSONObject): String? {
-        return root.optJSONObject("contents")
+        val sectionList = root.optJSONObject("contents")
             ?.optJSONObject("singleColumnBrowseResultsRenderer")
             ?.optJSONArray("tabs")
             ?.optJSONObject(0)
             ?.optJSONObject("tabRenderer")
             ?.optJSONObject("content")
             ?.optJSONObject("sectionListRenderer")
+        val legacy = sectionList
             ?.optJSONArray("continuations")
             ?.optJSONObject(0)
             ?.optJSONObject("nextContinuationData")
             ?.optString("continuation", "")?.takeIf { it.isNotEmpty() }
+        if (legacy != null) return legacy
+        // Forma MODERNA: un continuationItemRenderer al final del sectionList. Sin esto, cuando
+        // YT sirve el home con la forma nueva solo llegaba el primer lote (~4-6 secciones) y el
+        // resto del home (p.ej. secciones personalizadas) nunca aparecía.
+        return extractContinuationTokenFromItems(sectionList?.optJSONArray("contents"))
     }
 
     private fun extractContinuationTokenFromContinuation(contJson: JSONObject): String? {
-        return contJson.optJSONObject("continuationContents")
+        val legacy = contJson.optJSONObject("continuationContents")
             ?.optJSONObject("sectionListContinuation")
             ?.optJSONArray("continuations")
             ?.optJSONObject(0)
             ?.optJSONObject("nextContinuationData")
             ?.optString("continuation", "")?.takeIf { it.isNotEmpty() }
+        if (legacy != null) return legacy
+        // Forma moderna: el token viaja como continuationItemRenderer entre los items appendeados.
+        return extractContinuationTokenFromItems(modernContinuationItems(contJson))
     }
+
+    /** Items de una continuation moderna (onResponseReceivedActions → appendContinuationItemsAction). */
+    private fun modernContinuationItems(contJson: JSONObject): JSONArray? =
+        contJson.optJSONArray("onResponseReceivedActions")
+            ?.optJSONObject(0)
+            ?.optJSONObject("appendContinuationItemsAction")
+            ?.optJSONArray("continuationItems")
 
     private fun parseContinuationSections(contJson: JSONObject, result: HomeBrowseResult) {
         val sections = contJson.optJSONObject("continuationContents")
             ?.optJSONObject("sectionListContinuation")
             ?.optJSONArray("contents")
+            ?: modernContinuationItems(contJson)
             ?: return
 
         for (s in 0 until sections.length()) {
@@ -3164,6 +3271,37 @@ class YouTubeMusicService @JvmOverloads constructor(
         return result
     }
 
+    /**
+     * One "Selección rápida" song row → TrackResult. Same extraction shape as
+     * [parseArtistTopSongs] (playlistItemData/overlay videoId + flexColumn runs); quick-pick rows
+     * carry no fixedColumn duration. Returns null for rows without a playable videoId.
+     */
+    private fun parseQuickPickRow(r: JSONObject): TrackResult? {
+        var videoId = r.optJSONObject("playlistItemData")?.optString("videoId", "")?.trim() ?: ""
+        if (videoId.isEmpty()) {
+            videoId = r.optJSONObject("overlay")
+                ?.optJSONObject("musicItemThumbnailOverlayRenderer")
+                ?.optJSONObject("content")
+                ?.optJSONObject("musicPlayButtonRenderer")
+                ?.optJSONObject("playNavigationEndpoint")
+                ?.optJSONObject("watchEndpoint")
+                ?.optString("videoId", "")?.trim() ?: ""
+        }
+        if (videoId.isEmpty()) return null
+        val flex = r.optJSONArray("flexColumns")
+        val title = artistRunsToText(
+            flex?.optJSONObject(0)
+                ?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")?.optJSONObject("text")
+        )
+        if (title.isEmpty()) return null
+        val artist = artistRunsToText(
+            flex?.optJSONObject(1)
+                ?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")?.optJSONObject("text")
+        )
+        val thumb = artistThumbUrl(r.optJSONObject("thumbnail")?.optJSONObject("musicThumbnailRenderer"))
+        return TrackResult("video", videoId, title, artist, thumb)
+    }
+
     private fun parseCarouselIntoResult(carousel: JSONObject, result: HomeBrowseResult) {
         val headerTitle = carousel.optJSONObject("header")
             ?.optJSONObject("musicCarouselShelfBasicHeaderRenderer")
@@ -3177,7 +3315,16 @@ class YouTubeMusicService @JvmOverloads constructor(
 
         for (i in 0 until items.length()) {
             val item = items.optJSONObject(i) ?: continue
-            val renderer = item.optJSONObject("musicTwoRowItemRenderer") ?: continue
+            val renderer = item.optJSONObject("musicTwoRowItemRenderer")
+            if (renderer == null) {
+                // Quick-picks ("Selección rápida"): the only home shelf made of song rows
+                // (musicResponsiveListItemRenderer) instead of cards. Detected by renderer type —
+                // not the localized header — so continuation batches route here too.
+                item.optJSONObject("musicResponsiveListItemRenderer")?.let { row ->
+                    parseQuickPickRow(row)?.let { result.quickPicks.add(it) }
+                }
+                continue
+            }
 
             val browseEndpoint = renderer.optJSONObject("navigationEndpoint")
                 ?.optJSONObject("watchPlaylistEndpoint")
@@ -3302,7 +3449,15 @@ class YouTubeMusicService @JvmOverloads constructor(
         connection.setRequestProperty("User-Agent", "Mozilla/5.0")
         connection.setRequestProperty("Origin", "https://music.youtube.com")
         connection.setRequestProperty("Referer", "https://music.youtube.com/")
-        connection.setRequestProperty("Cookie", cookieHeader)
+        if (cookieHeader.isNotEmpty()) {
+            connection.setRequestProperty("Cookie", cookieHeader)
+            // Cookie autenticada SIN SAPISIDHASH = 401 intermitente de InnerTube, que aquí se
+            // tragaba como lista vacía y hacía DESAPARECER la sección "Covers y remixes".
+            val sapisidAuth = StreamResolver.buildSapisidHash("https://music.youtube.com")
+            if (sapisidAuth.isNotEmpty()) {
+                connection.setRequestProperty("Authorization", sapisidAuth)
+            }
+        }
 
         connection.outputStream.use { it.write(body) }
         val statusCode = connection.responseCode

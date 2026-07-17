@@ -10,6 +10,7 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.SeekParameters
 
 /**
  * Singleton manager para una instancia compartida de ExoPlayer.
@@ -74,6 +75,14 @@ object ExoPlayerManager {
                             .setAudioAttributes(audioAttributes, true)
                             .setHandleAudioBecomingNoisy(true)
                             .build()
+                            .also { player ->
+                                // CLOSEST_SYNC: sources con pista de video (stream muxed itag-18,
+                                // .mp4 offline) retoman en el keyframe más cercano en vez de
+                                // decodificar desde el keyframe previo hasta el frame exacto —
+                                // eso era gran parte de la latencia del seek. El audio puro no
+                                // tiene keyframes distantes, así que no lo afecta.
+                                player.setSeekParameters(SeekParameters.CLOSEST_SYNC)
+                            }
                         initialized = true
                     } catch (e: Exception) {
                         Log.e(TAG, "Falló la inicialización del ExoPlayer compartido", e)

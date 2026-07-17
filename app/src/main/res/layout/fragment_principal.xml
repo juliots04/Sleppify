@@ -354,6 +354,79 @@
                 android:overScrollMode="never"
                 android:visibility="gone" />
 
+            <!-- Cold-start skeleton for the Selección rápida section (same rows as covers). -->
+            <include
+                android:id="@+id/llQuickPicksSkeleton"
+                layout="@layout/skeleton_home_covers"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:visibility="gone" />
+
+            <!-- Section: Selección rápida (quick picks del home de YT Music; mismas rows que
+                 Covers y remixes, alimentada por el mismo fetchHomeBrowse de recomendadas). -->
+            <LinearLayout
+                android:id="@+id/llQuickPicksHeader"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@android:color/transparent"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingHorizontal="16dp"
+                android:paddingTop="20dp"
+                android:paddingBottom="10dp"
+                android:visibility="gone">
+
+                <TextView
+                    android:id="@+id/tvQuickPicksLabel"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:fontFamily="@font/inter_variable"
+                    android:text="Selección rápida"
+                    android:textColor="@color/text_primary"
+                    android:textSize="18sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:id="@+id/btnQuickPicksPlayAll"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:fontFamily="@font/inter_variable"
+                    android:text="Reproducir todo"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="12sp"
+                    android:background="?attr/selectableItemBackgroundBorderless"
+                    android:clickable="true"
+                    android:focusable="true"
+                    android:paddingHorizontal="8dp" />
+            </LinearLayout>
+
+            <androidx.viewpager2.widget.ViewPager2
+                android:id="@+id/vpQuickPicks"
+                android:layout_width="match_parent"
+                android:layout_height="248dp"
+                android:background="@android:color/transparent"
+                android:clipToPadding="false"
+                android:overScrollMode="never"
+                android:visibility="gone" />
+
+            <com.google.android.material.tabs.TabLayout
+                android:id="@+id/tabDotsQuickPicks"
+                android:layout_width="match_parent"
+                android:layout_height="20dp"
+                android:layout_gravity="center_horizontal"
+                android:layout_marginTop="2dp"
+                android:background="@android:color/transparent"
+                app:tabBackground="@drawable/selector_dot_indicator"
+                app:tabGravity="center"
+                app:tabIndicator="@null"
+                app:tabIndicatorHeight="0dp"
+                app:tabMaxWidth="18dp"
+                app:tabMinWidth="18dp"
+                app:tabPaddingEnd="4dp"
+                app:tabPaddingStart="4dp"
+                android:visibility="gone" />
+
             <!-- Cold-start skeleton for the Playlist recientes carousel. -->
             <include
                 android:id="@+id/llPlaylistsSkeleton"

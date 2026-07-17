@@ -18,7 +18,7 @@
         android:layout_marginStart="4dp"
         android:layout_marginEnd="12dp"
         android:background="@color/surface_high"
-        android:scaleType="centerCrop" />
+        android:scaleType="fitCenter" />
 
     <LinearLayout
         android:layout_width="0dp"

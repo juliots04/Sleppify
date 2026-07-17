@@ -1,84 +1,117 @@
-# Sleppify Updates — panel de actualizaciones (alwaysdata)
+# Sleppify Updates — panel (Astro SSR + MySQL)
 
-Carpeta lista para subir al hosting. La app consulta `version.json` al abrir; el panel es
-donde publicas versiones nuevas. Sin Firebase, sin notificaciones: todo va por el hosting.
+Panel autohospedado para publicar las actualizaciones de la app. La app consulta
+`GET /version.json` y, si el `versionCode` remoto supera al instalado, descarga el APK y lanza el
+instalador. Reescrito de PHP a **Astro (SSR con Node)**.
 
-## Instalación (una sola vez)
+## Qué trae de nuevo
 
-1. **Base MySQL**: en alwaysdata → *Bases de datos* → *MySQL*, crea una base
-   (ej. `TUCUENTA_sleppify`).
-2. **`config.php`**: pon host/base/usuario/contraseña de MySQL (los de alwaysdata).
-3. **`database.sql`**: ábrelo en phpMyAdmin (pestaña **Importar**) sobre esa base — crea
-   las tablas `panel_users` y `releases`. Todavía no crea tu usuario del panel.
-4. **Sube esta carpeta** por FTP/WebDAV, por ejemplo a `www/updates/`.
-5. **`set_password.php`**: edita la constante `RESET_KEY` dentro del archivo por
-   cualquier texto largo tuyo, sube el archivo, y ábrelo en el navegador
-   (`https://tu-dominio/updates/set_password.php`). Pon esa clave + tu usuario +
-   contraseña → crea tu login con `password_hash()` nativo de PHP (bcrypt), la misma
-   función que usa `index.php` para verificar — así el hash **nunca puede desajustarse**
-   entre MySQL y PHP.
-6. **Borra `set_password.php` del hosting** (puedes volver a subirlo más tarde si
-   necesitas resetear la contraseña).
-7. Entra en `https://tu-dominio/updates/` con tu usuario. Listo.
+- **Login que no se cae**: sesión _stateless_ en una cookie firmada (HMAC), sin ficheros de sesión
+  en disco — eso era la causa del “carga pero se refresca solo” en alwaysdata.
+- **Usuario admin automático**: se crea solo en el primer login si la tabla de usuarios está vacía
+  (`ADMIN_USER`/`ADMIN_PASS`, por defecto `admin` / `Supern0va123?`). No hay que precomputar hashes.
+- **Panel mejorado**: diseño oscuro con animaciones, vista previa 1:1 del popup de la app en vivo,
+  validaciones de versión/código/novedades, barra de subida real.
+- **Título del popup editable** desde el panel (el “🔥 NUEVA VERSIÓN DISPONIBLE”).
+- **Opcional vs obligatoria**: si la marcas opcional, la app muestra un botón **“Más tarde”**; si es
+  obligatoria, la única salida es actualizar.
 
-> Si ya habías importado una versión anterior de `database.sql` que insertaba un hash
-> SHA-256 calculado en MySQL y el login no aceptaba tus credenciales, ese era el problema:
-> algunos hostings compilan MySQL sin soporte para `SHA2()`, que entonces devuelve `NULL`
-> en silencio. `set_password.php` resuelve eso de raíz.
+## Estructura
 
-> Cuando tengas el link definitivo, hay que ponerlo en la app:
-> `AppUpdateManager.kt` → `UPDATE_BASE_URL` (debe terminar en `/`).
+```
+src/
+  middleware.ts            guard de sesión (/panel exige login)
+  lib/{config,db,auth}.ts  configuración, MySQL (mysql2), scrypt + cookie firmada
+  pages/
+    index.astro            login
+    panel.astro            panel (publicar + preview + historial + ajustes)
+    logout.ts
+    version.json.ts        manifiesto público que lee la app
+    api/login.ts           valida credenciales, emite cookie
+    api/publish.ts         sube APK + registra versión (validaciones + magic bytes)
+    apk/[...file].ts       sirve los APKs de apk/
+apk/                       APKs subidos (persisten en el hosting)
+database.sql               esquema
+.env / .env.example        configuración (DB, SESSION_SECRET, admin)
+```
+
+## Puesta en marcha (local)
+
+```bash
+cp .env.example .env      # y edita SESSION_SECRET
+npm install
+npm run dev               # http://localhost:4321
+```
+
+## Despliegue en alwaysdata (sitio Node)
+
+> ⚠️ **IMPORTANTE — no compiles en el servidor.** El SSH de alwaysdata tiene poca RAM y mata
+> (`Killed`) el `npm install`/`npm run build` completo (vite + esbuild + rollup + sharp). La regla
+> es: **compila en tu PC** y en el servidor instala SOLO lo de runtime (ligero, sin binarios
+> nativos). Verificado: el servidor corre sin esbuild/rollup/vite/sharp.
+
+1. **Base de datos**: en phpMyAdmin importa `database.sql` (crea las tablas). No crees el usuario a
+   mano — se siembra solo en el primer login.
+
+2. **En tu PC** (una vez):
+   ```bash
+   npm install
+   npm run build          # genera dist/  (esto es lo pesado; hazlo aquí, no en el server)
+   ```
+
+3. **Sube a `~/www/`** por SFTP/rsync (FileZilla/WinSCP sirven): `dist/`, `package.json`,
+   `package-lock.json`, `astro.config.mjs`, `database.sql`, `.env` y la carpeta `apk/`.
+   (NO subas `node_modules/` en este paso — se instala en el siguiente, ligero.)
+
+4. **En el servidor (SSH), instala SOLO runtime** (sin nativos → no hace OOM):
+   ```bash
+   cd ~/www
+   npm install --omit=dev --no-optional --no-audit --no-fund --maxsockets 1
+   ```
+   Son ~270 paquetes / ~126 MB de JS, sin descargar esbuild/rollup/sharp. Tarda segundos.
+
+5. **Configura el sitio** (Web > Sitios > Añadir un sitio):
+   - Tipo: **Node.js**
+   - Comando: `node ./dist/server/entry.mjs`
+   - Directorio de trabajo: `~/www`
+   - Variables de entorno: copia las de `.env` (sobre todo `SESSION_SECRET`, `DB_*`). alwaysdata
+     inyecta `PORT`/`HOST`; el adaptador Node standalone los respeta.
+
+6. Apunta el dominio `sleppifymanagerupdate.alwaysdata.net` a ese sitio. La app ya pide
+   `https://sleppifymanagerupdate.alwaysdata.net/version.json`.
+
+> **Plan B si el paso 4 aún hiciera OOM:** no instales nada en el servidor — sube también tu
+> `node_modules/` local junto con `dist/`. Funciona en Linux porque el runtime nunca carga los
+> binarios por-plataforma de Windows (esbuild/rollup/sharp son solo de compilación, verificado).
+> Luego solo `node ./dist/server/entry.mjs`.
+
+> Cada vez que publiques cambios del panel: repite pasos 2–3 (recompila en tu PC y sube el `dist/`
+> nuevo). El `node_modules` del servidor no cambia salvo que toques las dependencias.
 
 ## Publicar una versión
 
-En el panel pones la **versión** (ej. `1.0.1`), el **version code** (entero que siempre
-sube), escribes los **detalles** — la vista previa de la derecha es una réplica exacta de
-la pantalla *Actualizar* de la app (mismos colores, tamaños y viñetas) y hasta simula la
-descarga con % si tocas su botón — eliges el APK y presionas **Publicar versión**.
+1. Entra al panel, rellena versión visible, version code (mayor que el actual), novedades y el
+   título del popup, marca si es obligatoria u opcional, elige el `.apk` y pulsa **Publicar**.
+2. La fila se guarda en `releases` y `GET /version.json` la refleja al instante. Los teléfonos la
+   ven al abrir la app.
 
-Qué hace el hosting al recibirlo (`publish.php`):
-1. Valida sesión + token CSRF.
-2. Valida el formato de versión y que el code sea mayor que el publicado (mira la base primero).
-3. Verifica que el archivo sea un APK real (magic bytes de ZIP) y lo guarda en `apk/`.
-4. Escribe `version.json` de forma **atómica** (tmp + rename): la app nunca lee un JSON a medias.
-5. Registra la versión en la tabla `releases` (historial persistente).
+## Contrato de `version.json`
 
-`.user.ini` sube el límite de subida de PHP a 300 MB para que el APK entre sin problemas.
+```json
+{
+  "versionName": "1.2.0",
+  "versionCode": 5,
+  "apk": "apk/sleppify-v1.2.0-5.apk",
+  "size": 31510488,
+  "notes": "- Novedad 1\n- Novedad 2",
+  "dialogTitle": "🔥 NUEVA VERSIÓN DISPONIBLE",
+  "mandatory": false,
+  "publishedAt": "2026-07-18T01:00:00.000Z"
+}
+```
 
-## Cómo se entera el teléfono (flujo completo)
+La app (`AppUpdateManager.kt`) lee `dialogTitle` (header del popup) y `mandatory` (si es `false`
+muestra “Más tarde”). Los manifiestos antiguos sin esos campos se tratan como obligatorios con el
+título por defecto.
 
-1. Al **abrir la app**, MainActivity consulta `version.json` en silencio (1.4 s después de
-   arrancar, una vez por sesión).
-2. Si `versionCode` remoto > instalado → aparece la **ventana emergente** con la versión y
-   los detalles (mismo diseño AMOLED de la app).
-3. **"Actualizar"** en la ventana lleva directo a *Configuración → Actualizar* **con la
-   descarga ya corriendo** (barra + % en número). **"Más tarde"** la cierra y no vuelve a
-   molestar en esa sesión.
-4. Al llegar a 100% se lanza solo el instalador del sistema (Android siempre pide el toque
-   final de "Instalar" — eso no se puede automatizar por seguridad del sistema).
-5. También se puede buscar manualmente desde *Configuración → Actualizar*.
-
-> Importante: el `versionCode`/`versionName` del APK que compilas
-> (`app/build.gradle.kts`) debe coincidir con lo que publicas en el panel.
-
-## Archivos
-
-| Archivo            | Qué hace |
-|--------------------|----------|
-| `database.sql`     | Esquema (tablas), importar una vez en phpMyAdmin |
-| `set_password.php` | Crea/resetea tu login (bcrypt nativo de PHP) — úsalo y bórralo |
-| `config.php`       | Credenciales MySQL + sal de compatibilidad |
-| `auth.php`     | Sesiones, verificación de contraseña, CSRF |
-| `index.php`    | Login |
-| `panel.php`    | Panel: publicar + vista previa 1:1 + historial (MySQL) |
-| `publish.php`  | Recibe el APK, actualiza `version.json`, registra en la base |
-| `version.json` | Manifiesto público que lee la app |
-| `apk/`         | APKs publicados |
-| `.user.ini`    | Límite de subida de PHP (300 MB) |
-
-## Seguridad
-
-- Login contra MySQL con hash + sal (`hash_equals`, sin timing leaks), sesiones HttpOnly,
-  token CSRF y freno progresivo contra fuerza bruta.
-- `publish.php` exige sesión + CSRF, valida versión/code/magic-bytes.
-- Sin `install.php` ni endpoints abiertos: lo único público es `version.json` y los APK.
+La versión PHP anterior quedó archivada en `_legacy_php/` por si hace falta consultarla.

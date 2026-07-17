@@ -17,8 +17,8 @@
         android:id="@+id/ivNextUpArt"
         android:layout_width="50dp"
         android:layout_height="50dp"
-        android:scaleType="centerCrop"
-        android:background="#202020" />
+        android:scaleType="fitCenter"
+        android:background="@color/surface_high" />
 
     <LinearLayout
         android:layout_width="0dp"

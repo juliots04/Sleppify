@@ -42,17 +42,42 @@
             android:orientation="horizontal"
             android:gravity="center_vertical">
 
-            <TextView
-                android:id="@+id/tvReplyAuthor"
+            <!-- El wrapper lleva el weight (no el nombre) para que el chip de dueño
+                 abrace el texto y la hora nunca salga de pantalla. -->
+            <LinearLayout
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:textColor="@color/text_primary"
-                android:textSize="12sp"
-                android:textStyle="bold"
-                android:fontFamily="@font/inter_variable"
-                android:singleLine="true"
-                android:ellipsize="end" />
+                android:orientation="horizontal"
+                android:gravity="center_vertical">
+
+                <TextView
+                    android:id="@+id/tvReplyAuthor"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:textColor="@color/text_primary"
+                    android:textSize="12sp"
+                    android:textStyle="bold"
+                    android:fontFamily="@font/inter_variable"
+                    android:singleLine="true"
+                    android:ellipsize="end" />
+
+                <ImageView
+                    android:id="@+id/ivReplyBadge"
+                    android:layout_width="12dp"
+                    android:layout_height="12dp"
+                    android:layout_marginStart="4dp"
+                    android:visibility="gone"
+                    app:tint="@color/text_secondary" />
+
+                <ImageView
+                    android:id="@+id/ivReplyMemberBadge"
+                    android:layout_width="13dp"
+                    android:layout_height="13dp"
+                    android:layout_marginStart="4dp"
+                    android:visibility="gone" />
+
+            </LinearLayout>
 
             <TextView
                 android:id="@+id/tvReplyTime"
@@ -96,6 +121,29 @@
                 android:textColor="@color/text_secondary"
                 android:textSize="11sp"
                 android:fontFamily="@font/inter_variable" />
+
+            <!-- Corazón del creador: avatar del canal + corazón rojo pequeño -->
+            <FrameLayout
+                android:id="@+id/flReplyHeart"
+                android:layout_width="18dp"
+                android:layout_height="16dp"
+                android:layout_marginStart="12dp"
+                android:visibility="gone">
+
+                <ImageView
+                    android:id="@+id/ivReplyHeartCreatorAvatar"
+                    android:layout_width="13dp"
+                    android:layout_height="13dp"
+                    android:layout_gravity="top|start"
+                    android:scaleType="centerCrop" />
+
+                <ImageView
+                    android:layout_width="8dp"
+                    android:layout_height="8dp"
+                    android:layout_gravity="bottom|end"
+                    android:src="@drawable/ic_comment_heart" />
+
+            </FrameLayout>
 
         </LinearLayout>
 

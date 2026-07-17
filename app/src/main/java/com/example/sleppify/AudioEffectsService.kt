@@ -519,6 +519,24 @@ class AudioEffectsService : Service() {
         }
 
         /**
+         * Called by ExoMediaPlayer.release() when the player that reported the session dies
+         * (wiring pendiente en ExoMediaPlayer — edición en curso de otro ingeniero). Removes the
+         * persisted session id so resolveTargetSession falls back to GLOBAL instead of attaching
+         * DynamicsProcessing to a dead session (attaching to one succeeds silently — no exception,
+         * no audio, no fallback), and re-applies immediately in app-only mode so the EQ keeps
+         * sounding while a new player reports its session.
+         */
+        @JvmStatic
+        fun notifyPlayerSessionInvalid(context: Context) {
+            val prefs = context.getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            if (!prefs.contains(KEY_PLAYER_SESSION_ID)) return
+            prefs.edit().remove(KEY_PLAYER_SESSION_ID).apply()
+            if (!prefs.getBoolean(KEY_APPLY_GLOBAL, true) && prefs.getBoolean(KEY_ENABLED, false)) {
+                sendApply(context)
+            }
+        }
+
+        /**
          * Sends a stop intent to the service.
          */
         @JvmStatic

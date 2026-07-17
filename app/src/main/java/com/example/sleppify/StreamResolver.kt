@@ -65,6 +65,13 @@ object StreamResolver {
     // video with the audio stream running. Same 3.5h TTL discipline as urlCache.
     private val videoPrefetchCache = ConcurrentHashMap<String, CachedStream>()
 
+    // Espejo de videoPrefetchCache para el lado de AUDIO: preserva la URL DIRECT cuando el modo
+    // video pisa la entrada de urlCache, y se abastece gratis desde la extracción de video (mismo
+    // fetchPage). Sin esto, el swap Video→Canción pagaba un round-trip completo de NewPipe y
+    // volvía con una URL NUEVA (clave distinta en exo_stream_cache → conexión fría al CDN)
+    // aunque los bytes del audio recién reproducido ya estuvieran en disco.
+    private val audioPrefetchCache = ConcurrentHashMap<String, CachedStream>()
+
     // Dedup: in-flight resolutions so parallel callers wait on the same result
     private val inFlightResolutions = ConcurrentHashMap<String, java.util.concurrent.CompletableFuture<String?>>()
 
@@ -128,8 +135,10 @@ object StreamResolver {
             urlCache[videoId]?.let {
                 if (System.currentTimeMillis() - it.timestamp < DIRECT_CACHE_TTL_MS) return
             }
-            // Resolve now so playCurrentTrack finds it ready
-            val url = resolveViaNewPipe(videoId)
+            // Resolve now so playCurrentTrack finds it ready. Con los itags de la calidad
+            // elegida: este warm-up seedea urlCache y resolveStreamUrl lo devuelve tal cual,
+            // así que resolver aquí en máxima calidad saltaba el ajuste del usuario.
+            val url = resolveViaNewPipe(videoId, getPreferredItags(context), context)
             if (!url.isNullOrBlank()) {
                 urlCache[videoId] = CachedStream(url, SourceType.DIRECT, System.currentTimeMillis())
                 persistDiskCache(context, videoId, url)
@@ -155,14 +164,29 @@ object StreamResolver {
             val cached = urlCache[videoId]
             if (cached != null && System.currentTimeMillis() - cached.timestamp < DIRECT_CACHE_TTL_MS) continue
             executor.execute {
+                // Pista descargada en modo Canción: el playback irá al archivo offline — no
+                // gastar red pre-resolviendo un stream que nunca se va a pedir.
+                if (!preferVideoMode && OfflineAudioStore.hasOfflineAudio(appCtx, videoId)) {
+                    return@execute
+                }
+                // Registrar el in-flight ANTES de resolver: un resolveStreamUrl concurrente
+                // (el playback que este pre-resolve intenta adelantar) espera ESTE resultado
+                // vía su rama de dedup en vez de duplicar el fetchPage.
+                val future = java.util.concurrent.CompletableFuture<String?>()
+                if (inFlightResolutions.putIfAbsent(videoId, future) != null) return@execute
                 try {
-                    val url = resolveViaNewPipe(videoId)
+                    // Con los itags de la calidad elegida (ver preResolveCurrentTrack).
+                    val url = resolveViaNewPipe(videoId, getPreferredItags(appCtx), appCtx)
                     if (!url.isNullOrBlank()) {
                         urlCache[videoId] = CachedStream(url, SourceType.DIRECT, System.currentTimeMillis())
                         Log.d(TAG, "preResolveQueue ok videoId=$videoId")
                     }
+                    future.complete(url)
                 } catch (e: Exception) {
                     Log.w(TAG, "preResolveQueue failed videoId=$videoId", e)
+                    future.completeExceptionally(e)
+                } finally {
+                    inFlightResolutions.remove(videoId)
                 }
             }
         }
@@ -186,10 +210,16 @@ object StreamResolver {
 
     @JvmStatic
     fun setAuthCookies(cookieHeader: String?) {
-        authCookieHeader = cookieHeader?.trim() ?: ""
+        val next = cookieHeader?.trim() ?: ""
+        // Cookie SIN cambios (p.ej. restoreCachedStreamingSessionState en cada arranque): no-op.
+        // Antes limpiaba urlCache/prefetch incondicionalmente — una carrera de arranque tiraba a
+        // la basura el pre-resolve que warmUp acababa de sembrar y enfriaba el primer play.
+        if (next == authCookieHeader) return
+        authCookieHeader = next
         if (authCookieHeader.isNotBlank()) {
             urlCache.clear()
             videoPrefetchCache.clear()
+            audioPrefetchCache.clear()
         }
     }
 
@@ -241,7 +271,10 @@ object StreamResolver {
         if (videoId.isNullOrBlank()) return null
         if (videoId.startsWith("local_")) return null
 
-        if (preferVideoMode) {
+        // Candado duro "No reproducir videos musicales": con el ajuste activo NINGÚN camino
+        // sirve un stream de video, aunque preferVideoMode haya quedado armado (es session-only
+        // y el candado debe sobrevivir reinicios de proceso).
+        if (preferVideoMode && !noMusicVideosBlocked(context)) {
             urlCache[videoId]?.let { cached ->
                 if (cached.type == SourceType.VIDEO
                     && System.currentTimeMillis() - cached.timestamp < DIRECT_CACHE_TTL_MS) {
@@ -254,21 +287,49 @@ object StreamResolver {
             // video now) so isVideoSource() reports correctly, and SKIP the network round-trip.
             videoPrefetchCache[videoId]?.let { pf ->
                 if (System.currentTimeMillis() - pf.timestamp < DIRECT_CACHE_TTL_MS) {
+                    stashDirectAsAudioPrefetch(videoId)
                     urlCache[videoId] = CachedStream(pf.url, SourceType.VIDEO, pf.timestamp)
                     Log.d(TAG, "video_prefetch[$videoId] hit (skipped network)")
                     return pf.url
                 }
                 videoPrefetchCache.remove(videoId)
             }
-            val videoUrl = resolveVideoViaNewPipe(videoId)
+            val videoUrl = resolveVideoViaNewPipe(videoId, context)
             if (!videoUrl.isNullOrBlank()) {
                 val now = System.currentTimeMillis()
+                stashDirectAsAudioPrefetch(videoId)
                 urlCache[videoId] = CachedStream(videoUrl, SourceType.VIDEO, now)
                 videoPrefetchCache[videoId] = CachedStream(videoUrl, SourceType.VIDEO, now)
                 Log.d(TAG, "newpipe_video[$videoId] ok (video mode)")
                 return videoUrl
             }
             // No muxed video available → fall through to audio.
+        }
+
+        // 0. Reintento tras un FALLO DE REPRODUCCIÓN (no de resolución): la URL de NewPipe resolvió
+        // bien pero su stream se cuelga/throttlea en el prepare de ExoPlayer (metadata al final del
+        // contenedor, throttling del parámetro `n`, etc.). Con forceAlternativeClient se SALTA la
+        // caché y NewPipe y se va directo al cliente ANDROID_VR, que entrega URLs directas más
+        // reproducibles. Ver [[newpipe-fallback-android-vr]].
+        if (forceAlternativeClient) {
+            urlCache.remove(videoId)
+            audioPrefetchCache.remove(videoId)
+            val itags = getPreferredItags(context)
+            val fb = try {
+                resolveViaInnerTubeFallback(videoId, itags)?.url
+            } catch (e: Exception) {
+                Log.w(TAG, "forced ANDROID_VR[$videoId] failed: ${e.message}")
+                null
+            }
+            if (!fb.isNullOrBlank()) {
+                val now = System.currentTimeMillis()
+                urlCache[videoId] = CachedStream(fb, SourceType.DIRECT, now)
+                persistDiskCache(context, videoId, fb)
+                Log.d(TAG, "resolve[$videoId] via ANDROID_VR (forced alt client)")
+                return fb
+            }
+            // Si ANDROID_VR también falla, caer al camino normal (NewPipe) como último recurso.
+            Log.w(TAG, "resolve[$videoId] forced alt client empty — falling back to NewPipe path")
         }
 
         // 1. Cache check (in-memory, seeded by warmUp or previous resolve)
@@ -279,6 +340,19 @@ object StreamResolver {
                 return cached.url
             }
             urlCache.remove(videoId)
+        }
+
+        // 1b. Side-cache de audio: la URL DIRECT preservada al entrar a modo video, o extraída
+        // gratis durante una resolución de video (mismo fetchPage). Promoverla evita el round-trip
+        // de NewPipe del swap Video→Canción y reutiliza la MISMA URL cuya cabecera ya está en
+        // exo_stream_cache → prepare casi desde disco.
+        audioPrefetchCache[videoId]?.let { pf ->
+            if (System.currentTimeMillis() - pf.timestamp < DIRECT_CACHE_TTL_MS) {
+                urlCache[videoId] = CachedStream(pf.url, SourceType.DIRECT, pf.timestamp)
+                Log.d(TAG, "audio_prefetch[$videoId] hit (skipped network)")
+                return pf.url
+            }
+            audioPrefetchCache.remove(videoId)
         }
 
         // 2. Dedup: if another thread is already resolving this videoId, wait for it
@@ -294,30 +368,63 @@ object StreamResolver {
             }
         }
 
-        // 3. NewPipe (audio-only resolver)
+        // 3. NewPipe (audio-only resolver), con FALLBACK a InnerTube ANDROID_VR si falla
         val itags = getPreferredItags(context)
         val future = java.util.concurrent.CompletableFuture<String?>()
         inFlightResolutions[videoId] = future
         try {
-            val directUrl = resolveViaNewPipe(videoId, itags)
+            var directUrl: String? = null
+            try {
+                directUrl = resolveViaNewPipe(videoId, itags, context)
+            } catch (e: Exception) {
+                Log.w(TAG, "newpipe[$videoId] failed: ${e.javaClass.simpleName} — ${e.message}")
+            }
+            if (directUrl.isNullOrBlank()) {
+                // Fallback (NUNCA el camino principal): NewPipe roto por un cambio de YouTube o
+                // sin streams — pedir el /player de InnerTube con el cliente ANDROID_VR.
+                directUrl = resolveViaInnerTubeFallback(videoId, itags)?.url
+            }
             if (!directUrl.isNullOrBlank()) {
                 val now = System.currentTimeMillis()
                 urlCache[videoId] = CachedStream(directUrl, SourceType.DIRECT, now)
                 persistDiskCache(context, videoId, directUrl)
-                Log.d(TAG, "newpipe[$videoId] ok")
                 future.complete(directUrl)
                 return directUrl
             }
             future.complete(null)
-        } catch (e: Exception) {
-            Log.w(TAG, "newpipe[$videoId] failed: ${e.javaClass.simpleName} — ${e.message}")
-            future.completeExceptionally(e)
         } finally {
             inFlightResolutions.remove(videoId)
         }
 
-        Log.w(TAG, "newpipe[$videoId] no stream resolved")
+        Log.w(TAG, "resolve[$videoId] no stream resolved (newpipe + fallback)")
         return null
+    }
+
+    /** Lee el ajuste "No reproducir videos musicales" (default ON). Ver gate en [resolveStreamUrl]. */
+    private fun noMusicVideosBlocked(context: Context): Boolean = try {
+        context.getSharedPreferences(AppConstants.PREFS_SETTINGS, Context.MODE_PRIVATE)
+            .getBoolean(CloudSyncManager.KEY_NO_MUSIC_VIDEOS, true)
+    } catch (e: Exception) {
+        false
+    }
+
+    /**
+     * Invalida TODAS las URLs ya resueltas (memoria + side-caches + la entrada de disco). Se
+     * llama al cambiar la calidad de audio/video en Ajustes: las URLs cacheadas quedaron
+     * resueltas con los itags/altura de la calidad anterior y sobrevivirían hasta el TTL de 3.5h.
+     */
+    @JvmStatic
+    fun clearResolvedUrlCache(context: Context) {
+        urlCache.clear()
+        videoPrefetchCache.clear()
+        audioPrefetchCache.clear()
+        try {
+            context.getSharedPreferences(DISK_CACHE_PREFS, Context.MODE_PRIVATE)
+                .edit().clear().apply()
+        } catch (e: Exception) {
+            Log.w(TAG, "clearResolvedUrlCache disk clear failed", e)
+        }
+        Log.d(TAG, "resolved-url caches cleared (quality change)")
     }
 
     /**
@@ -367,6 +474,7 @@ object StreamResolver {
         if (videoId.isNullOrBlank()) return
         urlCache.remove(videoId)
         videoPrefetchCache.remove(videoId)
+        audioPrefetchCache.remove(videoId)
     }
 
     @JvmStatic
@@ -379,6 +487,7 @@ object StreamResolver {
         if (videoId.isNullOrBlank()) return
         urlCache.remove(videoId)
         videoPrefetchCache.remove(videoId)
+        audioPrefetchCache.remove(videoId)
     }
 
     // ─── NewPipe internals ────────────────────────────────────────────────
@@ -409,7 +518,7 @@ object StreamResolver {
             val audioStreams: List<AudioStream> = extractor.audioStreams ?: emptyList()
             if (audioStreams.isEmpty()) {
                 Log.w(TAG, "download[$videoId] no audio streams")
-                return null
+                return downloadSourceViaFallback(videoId)
             }
 
             // Only streams that expose a real, directly-fetchable URL. Prefer progressive
@@ -432,8 +541,14 @@ object StreamResolver {
             AudioDownloadSource(chosen.content, isWebm, chosen.itag)
         } catch (e: Exception) {
             Log.w(TAG, "download[$videoId] resolve failed: ${e.javaClass.simpleName} — ${e.message}")
-            null
+            downloadSourceViaFallback(videoId)
         }
+    }
+
+    /** Fallback de descarga vía InnerTube ANDROID_VR (mismo criterio de contenedor que NewPipe). */
+    private fun downloadSourceViaFallback(videoId: String): AudioDownloadSource? {
+        val fb = resolveViaInnerTubeFallback(videoId, PREFERRED_ITAGS) ?: return null
+        return AudioDownloadSource(fb.url, fb.itag in OPUS_ITAGS, fb.itag)
     }
 
     /**
@@ -442,12 +557,25 @@ object StreamResolver {
      * reliable). Returns null when the track has no directly-playable muxed stream — the caller then
      * falls back to audio. Must run on a background thread.
      */
-    private fun resolveVideoViaNewPipe(videoId: String): String? {
+    private fun resolveVideoViaNewPipe(videoId: String, context: Context? = null): String? {
         return try {
             ensureNewPipeInitialized()
             val extractor = ServiceList.YouTube.getStreamExtractor("https://www.youtube.com/watch?v=$videoId")
             extractor.fetchPage()
-            extractMuxedVideoUrl(extractor)
+            // C1 inverso: este fetchPage ya está pagado — extraer también la URL de audio
+            // preferida y abastecer el side-cache, así el camino de vuelta (Video→Canción)
+            // resuelve con CERO red en vez de otro round-trip de NewPipe.
+            try {
+                val audioItags = context?.let { getPreferredItags(it) } ?: PREFERRED_ITAGS
+                val audioUrl = extractPreferredAudioUrl(extractor, audioItags)
+                if (!audioUrl.isNullOrBlank()) {
+                    audioPrefetchCache[videoId] =
+                        CachedStream(audioUrl, SourceType.DIRECT, System.currentTimeMillis())
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "audio_prefetch[$videoId] failed: ${e.message}")
+            }
+            extractMuxedVideoUrl(extractor, getPreferredVideoHeight(context))
         } catch (e: Exception) {
             Log.w(TAG, "video[$videoId] resolve failed: ${e.javaClass.simpleName} — ${e.message}")
             null
@@ -462,17 +590,46 @@ object StreamResolver {
      * This is the core of C1: pulling a second URL out of a StreamInfo we already paid one
      * fetchPage() for is nearly free, so the audio resolve can also stock the video side-cache.
      */
-    private fun extractMuxedVideoUrl(extractor: StreamExtractor): String? {
+    private fun extractMuxedVideoUrl(extractor: StreamExtractor, targetHeight: Int = DEFAULT_VIDEO_TARGET_HEIGHT): String? {
         val muxed = extractor.videoStreams ?: emptyList()
         val playable = muxed.filter { !it.content.isNullOrBlank() }
         val progressive = playable.filter { it.deliveryMethod == DeliveryMethod.PROGRESSIVE_HTTP }
             .ifEmpty { playable }
         if (progressive.isEmpty()) return null
-        val byItag = progressive.associateBy { it.itag }
-        val chosen = byItag[18]
-            ?: progressive.minByOrNull { parseResolutionHeight(it.resolution) }
+        // Mejor stream muxed cuya altura no exceda el objetivo del usuario (empate → itag 18,
+        // el mp4 clásico y más fiable). Los de resolución desconocida (MAX_VALUE) nunca entran
+        // como candidatos; si ningún stream cabe en el objetivo, el de menor resolución
+        // disponible (el comportamiento previo) para que el video siempre reproduzca.
+        val byHeight = progressive.map { it to parseResolutionHeight(it.resolution) }
+        val chosen = byHeight.filter { it.second <= targetHeight }
+            .maxWithOrNull(compareBy({ it.second }, { it.first.itag == 18 }))?.first
+            ?: byHeight.minByOrNull { it.second }?.first
             ?: return null
         return chosen.content
+    }
+
+    // "Normal (360p)" — el itag 18 clásico. Techo para "Alta" = 4320 (la mejor muxed disponible
+    // sin dejar pasar streams de resolución desconocida, que parsean a Int.MAX_VALUE).
+    private const val DEFAULT_VIDEO_TARGET_HEIGHT = 360
+
+    /**
+     * Altura máxima de video según el ajuste "Calidad de video" del usuario para la red actual
+     * (Wi-Fi vs datos). Con context null (rutas legacy sin Context) se mantiene el clásico 360p.
+     */
+    private fun getPreferredVideoHeight(context: Context?): Int {
+        if (context == null) return DEFAULT_VIDEO_TARGET_HEIGHT
+        return try {
+            val prefs = context.getSharedPreferences(AppConstants.PREFS_SETTINGS, Context.MODE_PRIVATE)
+            val key = if (isOnWifi(context)) CloudSyncManager.KEY_VIDEO_QUALITY_WIFI
+                      else CloudSyncManager.KEY_VIDEO_QUALITY_MOBILE
+            when (prefs.getString(key, CloudSyncManager.STREAMING_QUALITY_MEDIUM)) {
+                CloudSyncManager.STREAMING_QUALITY_LOW -> 240
+                CloudSyncManager.STREAMING_QUALITY_HIGH -> 4320
+                else -> DEFAULT_VIDEO_TARGET_HEIGHT
+            }
+        } catch (e: Exception) {
+            DEFAULT_VIDEO_TARGET_HEIGHT
+        }
     }
 
     /** "360p" / "720p60" → 360 / 720; unknown resolutions sort last. */
@@ -486,6 +643,38 @@ object StreamResolver {
     fun isVideoSource(videoId: String?): Boolean {
         if (videoId.isNullOrBlank()) return false
         return urlCache[videoId]?.type == SourceType.VIDEO
+    }
+
+    /** Copia la entrada DIRECT vigente de urlCache al side-cache de audio (si sigue fresca) antes
+     *  de que el modo video la pise. urlCache conserva la semántica «tipo de la ÚLTIMA URL
+     *  entregada para playback»; el side-cache es solo la memoria del camino de vuelta. */
+    private fun stashDirectAsAudioPrefetch(videoId: String) {
+        urlCache[videoId]?.let { cached ->
+            if (cached.type == SourceType.DIRECT
+                && System.currentTimeMillis() - cached.timestamp < DIRECT_CACHE_TTL_MS) {
+                audioPrefetchCache[videoId] = cached
+            }
+        }
+    }
+
+    /**
+     * Deshace la entrada VIDEO de urlCache cuando el playback REAL volvió a audio SIN pasar por
+     * resolveStreamUrl (p.ej. el hot-swap Video→Canción tomó el archivo offline directamente).
+     * Restaura la entrada DIRECT desde el side-cache de audio si sigue fresca; si no, elimina la
+     * VIDEO. Sin esto, isVideoSource() seguiría reportando video para un commit que suena como
+     * audio y el siguiente consumidor del cache heredaría el tipo equivocado.
+     */
+    @JvmStatic
+    fun demoteVideoEntry(videoId: String?) {
+        if (videoId.isNullOrBlank()) return
+        val cached = urlCache[videoId] ?: return
+        if (cached.type != SourceType.VIDEO) return
+        val audio = audioPrefetchCache[videoId]
+        if (audio != null && System.currentTimeMillis() - audio.timestamp < DIRECT_CACHE_TTL_MS) {
+            urlCache[videoId] = CachedStream(audio.url, SourceType.DIRECT, audio.timestamp)
+        } else {
+            urlCache.remove(videoId)
+        }
     }
 
     /**
@@ -518,10 +707,10 @@ object StreamResolver {
      * actually flips. Metadata-only (does not download media bytes). Must run on a background thread.
      */
     @JvmStatic
-    fun prefetchVideoUrl(@Suppress("UNUSED_PARAMETER") context: Context, videoId: String?): String? {
+    fun prefetchVideoUrl(context: Context, videoId: String?): String? {
         if (videoId.isNullOrBlank() || videoId.startsWith("local_")) return null
         getPrefetchedVideoUrl(videoId)?.let { return it }
-        val url = resolveVideoViaNewPipe(videoId)
+        val url = resolveVideoViaNewPipe(videoId, context)
         if (!url.isNullOrBlank()) {
             videoPrefetchCache[videoId] = CachedStream(url, SourceType.VIDEO, System.currentTimeMillis())
             Log.d(TAG, "prefetchVideoUrl[$videoId] side-cached")
@@ -529,7 +718,101 @@ object StreamResolver {
         return url
     }
 
-    private fun resolveViaNewPipe(videoId: String, preferredItags: IntArray = PREFERRED_ITAGS): String? {
+    // ─── Fallback InnerTube (cliente ANDROID_VR) ─────────────────────────
+
+    // Cuando NewPipe falla (un cambio de YouTube rompió el extractor, bot-check, parsing), se pide
+    // el /player de InnerTube DIRECTAMENTE con el cliente ANDROID_VR: según la guía PO-Token de
+    // yt-dlp (2026) es el único cliente que NO exige PO token, y al ser cliente Android entrega
+    // URLs de googlevideo ya descifradas (sin signatureCipher, sin JS). Verificado en vivo:
+    // /player OK + GET 206 con bytes de audio reales, servidos con cualquier User-Agent (la URL
+    // se ata a la IP). Única limitación conocida: videos "made for kids" no disponibles.
+    // Es un FALLBACK, nunca el camino principal — NewPipe sigue siendo la resolución primaria.
+    private const val VR_CLIENT_VERSION = "1.62.27"
+    private const val VR_USER_AGENT =
+        "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+
+    /** URL de audio directa + itag elegidos del fallback (el itag decide el contenedor al descargar). */
+    private data class FallbackAudio(val url: String, val itag: Int)
+
+    private fun resolveViaInnerTubeFallback(videoId: String, preferredItags: IntArray): FallbackAudio? {
+        return try {
+            val body = org.json.JSONObject().apply {
+                put("context", org.json.JSONObject().put("client", org.json.JSONObject().apply {
+                    put("clientName", "ANDROID_VR")
+                    put("clientVersion", VR_CLIENT_VERSION)
+                    put("deviceMake", "Oculus")
+                    put("deviceModel", "Quest 3")
+                    put("osName", "Android")
+                    put("osVersion", "12L")
+                    put("androidSdkVersion", 32)
+                    put("hl", "es")
+                }))
+                put("videoId", videoId)
+                put("contentCheckOk", true)
+                put("racyCheckOk", true)
+            }.toString().toByteArray(Charsets.UTF_8)
+
+            val connection = (URL("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
+                .openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                connectTimeout = 8000
+                readTimeout = 10000
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json")
+                setRequestProperty("User-Agent", VR_USER_AGENT)
+            }
+            val responseText = try {
+                connection.outputStream.use { it.write(body) }
+                if (connection.responseCode != HttpURLConnection.HTTP_OK) {
+                    Log.w(TAG, "fallback[$videoId] player HTTP ${connection.responseCode}")
+                    return null
+                }
+                connection.inputStream.bufferedReader().use { it.readText() }
+            } finally {
+                connection.disconnect()
+            }
+
+            val root = org.json.JSONObject(responseText)
+            val status = root.optJSONObject("playabilityStatus")?.optString("status", "") ?: ""
+            if (status != "OK") {
+                Log.w(TAG, "fallback[$videoId] playability=$status")
+                return null
+            }
+            val formats = root.optJSONObject("streamingData")
+                ?.optJSONArray("adaptiveFormats") ?: return null
+            val byItag = HashMap<Int, FallbackAudio>()
+            var anyAudio: FallbackAudio? = null
+            for (i in 0 until formats.length()) {
+                val f = formats.optJSONObject(i) ?: continue
+                if (!f.optString("mimeType", "").startsWith("audio/")) continue
+                val u = f.optString("url", "")
+                if (u.isEmpty()) continue // cifrada — no debería ocurrir con ANDROID_VR
+                val candidate = FallbackAudio(u, f.optInt("itag", -1))
+                byItag[candidate.itag] = candidate
+                if (anyAudio == null) anyAudio = candidate
+            }
+            var chosen: FallbackAudio? = null
+            for (itag in preferredItags) {
+                val candidate = byItag[itag]
+                if (candidate != null) {
+                    chosen = candidate
+                    break
+                }
+            }
+            if (chosen == null) chosen = anyAudio
+            if (chosen != null) Log.d(TAG, "fallback[$videoId] ok (ANDROID_VR itag=${chosen.itag})")
+            chosen
+        } catch (e: Exception) {
+            Log.w(TAG, "fallback[$videoId] failed: ${e.javaClass.simpleName} — ${e.message}")
+            null
+        }
+    }
+
+    private fun resolveViaNewPipe(
+        videoId: String,
+        preferredItags: IntArray = PREFERRED_ITAGS,
+        context: Context? = null
+    ): String? {
         ensureNewPipeInitialized()
         val url = "https://www.youtube.com/watch?v=$videoId"
         val extractor: StreamExtractor = ServiceList.YouTube.getStreamExtractor(url)
@@ -539,7 +822,7 @@ object StreamResolver {
         // fetchPage). Lets a later Audio→Video swap skip the network round-trip. Does NOT touch
         // urlCache, so the primary source type stays DIRECT while audio plays.
         try {
-            val videoUrl = extractMuxedVideoUrl(extractor)
+            val videoUrl = extractMuxedVideoUrl(extractor, getPreferredVideoHeight(context))
             if (!videoUrl.isNullOrBlank()) {
                 videoPrefetchCache[videoId] = CachedStream(videoUrl, SourceType.VIDEO, System.currentTimeMillis())
             }
@@ -547,11 +830,23 @@ object StreamResolver {
             Log.w(TAG, "video_prefetch[$videoId] failed: ${e.message}")
         }
 
-        val audioStreams: List<AudioStream> = extractor.audioStreams ?: emptyList()
-        if (audioStreams.isEmpty()) {
+        val audioUrl = extractPreferredAudioUrl(extractor, preferredItags)
+        if (audioUrl.isNullOrBlank()) {
             Log.w(TAG, "newpipe[$videoId] no audio streams")
             return null
         }
+        // Abastece el side-cache de audio también en la resolución normal: si más tarde el modo
+        // video pisa la entrada DIRECT de urlCache, el camino de vuelta sigue sin tocar la red.
+        audioPrefetchCache[videoId] = CachedStream(audioUrl, SourceType.DIRECT, System.currentTimeMillis())
+        return audioUrl
+    }
+
+    /** Elige la mejor URL de audio directa de un [extractor] YA fetcheado (mismo criterio de
+     *  itags que la resolución normal). Contraparte de [extractMuxedVideoUrl] para el lado de
+     *  audio: sacar una segunda URL de un StreamInfo ya pagado es prácticamente gratis. */
+    private fun extractPreferredAudioUrl(extractor: StreamExtractor, preferredItags: IntArray): String? {
+        val audioStreams: List<AudioStream> = extractor.audioStreams ?: emptyList()
+        if (audioStreams.isEmpty()) return null
 
         val itagMap = mutableMapOf<Int, String>()
         for (stream in audioStreams) {

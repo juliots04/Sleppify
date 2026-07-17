@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- Disco relleno con nota musical calada (evenOdd) — insignia de artista oficial -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M12,2C6.48,2 2,6.48 2,12s4.48,10 10,10 10,-4.48 10,-10S17.52,2 12,2zM12,7v6.53c-0.37,-0.21 -0.79,-0.33 -1.25,-0.33 -1.38,0 -2.5,1.12 -2.5,2.5s1.12,2.5 2.5,2.5 2.5,-1.12 2.5,-2.5V9.5h2.5V7H12z" />
+</vector>

@@ -45,6 +45,14 @@ object YouTubeImageProcessor {
         if (width < 50 || height < 50) return source
         if (width.toLong() * height > MAX_SCAN_PIXELS) return source
 
+        // Las fuentes CUADRADAS (carátulas lh3/googleusercontent) ya son el arte final — nunca se
+        // recortan. Este recorte existe solo para quitar el letterbox de los frames de video
+        // (16:9 / 4:3 de i.ytimg). Escanear dentro de un cuadrado convertía carátulas de fondo
+        // plano (p.ej. arte blanco) en un zoom del centro: el detector de márgenes confundía el
+        // fondo de la propia carátula con bandas, y la fila se veía recortada mientras el player
+        // (que pinta la imagen completa) la mostraba bien.
+        if (height in (width * 9 / 10)..(width * 11 / 10)) return source
+
         // Read every pixel we'll inspect in ONE native call. The previous implementation probed
         // margins with thousands of individual Bitmap.getPixel() calls — each a JNI hop that
         // locks the pixel buffer — which was the dominant CPU cost while scrolling and starved
@@ -114,10 +122,28 @@ object YouTubeImageProcessor {
             return source
         }
 
+        // Un bar de letterbox REAL es geométrico: fino (las bandas de YT son 12.5% o ~21.9% por
+        // lado — nunca más de ~30%) y SIMÉTRICO (arriba≈abajo, izquierda≈derecha). Márgenes
+        // gruesos o asimétricos son fondo de la propia imagen (arte con cielo, fondos planos):
+        // en ese caso el eje NO se recorta, en vez de comerse parte del arte.
+        val topMargin = cropTop
+        val bottomMargin = height - cropBottom
+        val maxVerticalBar = height * 3 / 10
+        val verticalSymmetric = Math.abs(topMargin - bottomMargin) <= max(4, max(topMargin, bottomMargin) / 3)
+        if (topMargin <= 0 || bottomMargin <= 0 || topMargin > maxVerticalBar ||
+            bottomMargin > maxVerticalBar || !verticalSymmetric
+        ) {
+            cropTop = 0
+            cropBottom = height
+        }
+
         val minHorizontalMarginPx = max(2, width / 20) // 5% of width
         val leftMargin = cropLeft
         val rightMargin = width - cropRight
-        val hasStrongHorizontalMargins = leftMargin >= minHorizontalMarginPx && rightMargin >= minHorizontalMarginPx
+        val maxHorizontalBar = width * 3 / 10
+        val horizontalSymmetric = Math.abs(leftMargin - rightMargin) <= max(4, max(leftMargin, rightMargin) / 3)
+        val hasStrongHorizontalMargins = leftMargin >= minHorizontalMarginPx && rightMargin >= minHorizontalMarginPx &&
+            leftMargin <= maxHorizontalBar && rightMargin <= maxHorizontalBar && horizontalSymmetric
         if (!hasStrongHorizontalMargins) {
             cropLeft = 0
             cropRight = width

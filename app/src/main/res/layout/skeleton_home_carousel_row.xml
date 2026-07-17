@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Cold-start skeleton for a home carousel section (Playlist recientes / Estaciones / Recomendadas).
      Mirrors the real structure 1:1: section header (16dp start, 20dp top / 10dp bottom rhythm, 18sp
-     bold ≈ 18dp block) followed by a row of 46%-width square cards with the real 16dp corner radius
+     bold ≈ 18dp block) followed by a row of 43%-width square cards with the real 16dp corner radius
      (sized in code via skeletonCard1/2/3) and a 1-line name block below, like
      item_playlist_carousel / item_radio_carousel. The ShimmerFrameLayout root sweeps the
      YouTube-style highlight across the blocks (self-animating, all instances in sync). -->
@@ -33,7 +33,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:orientation="vertical"
-                android:layout_marginHorizontal="6dp">
+                android:layout_marginHorizontal="8dp">
 
                 <View
                     android:id="@+id/skeletonCard1"
@@ -52,7 +52,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:orientation="vertical"
-                android:layout_marginHorizontal="6dp">
+                android:layout_marginHorizontal="8dp">
 
                 <View
                     android:id="@+id/skeletonCard2"
@@ -71,7 +71,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:orientation="vertical"
-                android:layout_marginHorizontal="6dp">
+                android:layout_marginHorizontal="8dp">
 
                 <View
                     android:id="@+id/skeletonCard3"

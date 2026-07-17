@@ -111,7 +111,12 @@ object PlayCountStore {
         val result = aggregatePlaylists(context)
         result.sortWith(compareByDescending<PlayCountEntry> { it.lastPlayedAtMs }
             .thenByDescending { it.count })
-        return result.take(limit)
+        // "Archivos locales" NO es una playlist de YouTube: nunca debe salir en el carrusel de
+        // playlists recientes del home (los shortcuts ya lo excluyen; esto cierra el otro hueco).
+        return result.asSequence()
+            .filter { it.playlistId != LocalFilesStore.PLAYLIST_ID && !LocalFilesStore.isLocalAlbumId(it.playlistId) }
+            .take(limit)
+            .toList()
     }
 
     /**

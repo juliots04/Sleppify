@@ -58,6 +58,12 @@ object SongPlayerLauncher {
 
         val safeIndex = startIndex.coerceIn(0, ids.size - 1)
 
+        // Pre-resuelve la pista tocada YA (fire-and-forget, hilos propios de preResolveQueue):
+        // la resolución NewPipe (~0.5-3s) corre en paralelo con la transacción/animación del
+        // fragment, así playCurrentTrack suele encontrar la URL en el cache de memoria (o espera
+        // el in-flight deduplicado) en vez de arrancar la red recién después de la animación.
+        StreamResolver.preResolveQueue(activity.applicationContext, listOf(ids[safeIndex]))
+
         if (existing != null && existing.isAdded) {
             if (returnTargetTag != null) existing.externalSetReturnTargetTag(returnTargetTag)
             if (fromStart) {

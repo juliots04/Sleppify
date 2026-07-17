@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Flecha del título "Biblioteca": triángulo blanco relleno apuntando hacia abajo dentro de un
+     círculo negro semitransparente pequeño (~21dp), sin borde. Abre la hoja del selector
+     Biblioteca / Archivos Locales (drawableEnd de tvFragBrandTitle). El offset superior
+     (android:top) baja el glifo respecto al centrado vertical del compound drawable para que
+     quede a la altura del texto, no centrado con la línea completa. -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Círculo 21dp: insets sobre la caja de 25dp del vector para encogerlo manteniendo el
+         mismo centro vertical (y=20.5dp) que tenía la versión de 25dp. -->
+    <item
+        android:left="2dp"
+        android:right="2dp"
+        android:top="10dp"
+        android:bottom="2dp">
+        <shape android:shape="oval">
+            <solid android:color="#66000000" />
+            <size
+                android:width="21dp"
+                android:height="21dp" />
+        </shape>
+    </item>
+    <item android:top="8dp">
+        <vector
+            android:width="25dp"
+            android:height="25dp"
+            android:viewportWidth="24"
+            android:viewportHeight="24">
+            <path
+                android:fillColor="#FFFFFFFF"
+                android:pathData="M7.2,9.7 L12,14.9 L16.8,9.7 Z" />
+        </vector>
+    </item>
+</layer-list>

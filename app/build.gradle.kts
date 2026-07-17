@@ -17,8 +17,8 @@ android {
         // IMPORTANTE: sube versionCode en CADA release y publícalo IGUAL en el panel.
         // El chequeo compara este entero con el del hosting; si el APK instalado tiene un
         // code menor que el publicado, la app ofrece la actualización una y otra vez.
-        versionCode = 5
-        versionName = "1.0.3"
+        versionCode = 2
+        versionName = "1.0.1"
         buildConfigField("int", "VERSION_CODE", "${versionCode!!}")
         buildConfigField("String", "VERSION_NAME", "\"${versionName!!}\"")
         buildConfigField("String", "YOUTUBE_DATA_API_KEY", "\"$youtubeDataApiKey\"")

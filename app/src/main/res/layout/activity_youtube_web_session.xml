@@ -1,4 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- Sesión web de YouTube Music. Dos capas: el WebView (webSessionContainer, se crea lazy al
+     tocar el botón) y el onboarding (loginOverlay). Ids consumidos por
+     YouTubeMusicWebSessionActivity: webSessionContainer, loginOverlay, btnOverlayLogin,
+     imgAmbient — NO renombrar. -->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
@@ -16,7 +20,7 @@
         android:layout_height="match_parent"
         android:background="@android:color/black">
 
-        <!-- Fondo animado -->
+        <!-- Fondo ambiental (gradiente radial rojo→negro, respirando con R.anim.bg_breathe) -->
         <ImageView
             android:id="@+id/imgAmbient"
             android:layout_width="match_parent"
@@ -27,160 +31,243 @@
         <ScrollView
             android:layout_width="match_parent"
             android:layout_height="match_parent"
-            android:fillViewport="true">
-            
+            android:fillViewport="true"
+            android:scrollbars="none">
+
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:orientation="vertical"
-                android:padding="32dp"
+                android:paddingHorizontal="28dp"
+                android:paddingTop="24dp"
+                android:paddingBottom="20dp"
                 android:gravity="center_horizontal">
+
+                <!-- Marca arriba, discreta -->
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Sleppify"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="15sp"
+                    android:textStyle="bold"
+                    android:fontFamily="@font/manrope_variable"
+                    android:letterSpacing="0.12"
+                    android:alpha="0.85" />
 
                 <Space
                     android:layout_width="match_parent"
                     android:layout_height="0dp"
                     android:layout_weight="1" />
 
-                <!-- Logo circular de YouTube Music -->
                 <ImageView
-                    android:layout_width="80dp"
-                    android:layout_height="80dp"
+                    android:layout_width="86dp"
+                    android:layout_height="86dp"
                     android:src="@drawable/ic_yt_music_logo"
-                    android:layout_marginBottom="24dp" />
+                    android:layout_marginBottom="22dp"
+                    android:contentDescription="@null" />
 
                 <TextView
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:text="Conecta con YouTube Music"
+                    android:text="Conecta tu música"
                     android:textColor="@android:color/white"
-                    android:textSize="26sp"
+                    android:textSize="28sp"
                     android:textStyle="bold"
+                    android:fontFamily="@font/manrope_variable"
                     android:textAlignment="center"
-                    android:layout_marginBottom="16dp" />
+                    android:layout_marginBottom="10dp" />
 
                 <TextView
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:text="Sleppify utiliza YouTube Music para potenciar tu biblioteca musical. Inicia sesión para acceder a:"
-                    android:textColor="#B3B3B3"
+                    android:text="Inicia sesión con tu cuenta de YouTube Music y Sleppify se encarga del resto."
+                    android:textColor="@color/text_secondary"
                     android:textSize="15sp"
+                    android:fontFamily="@font/inter_variable"
                     android:textAlignment="center"
                     android:lineSpacingExtra="4dp"
-                    android:layout_marginBottom="32dp" />
+                    android:paddingHorizontal="12dp"
+                    android:layout_marginBottom="26dp" />
 
+                <!-- Tarjeta de beneficios -->
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:orientation="horizontal"
-                    android:layout_marginBottom="16dp"
-                    android:gravity="center_vertical">
-                    <ImageView
-                        android:layout_width="24dp"
-                        android:layout_height="24dp"
-                        android:src="@drawable/ic_check_gray" />
-                    <TextView
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:text="Tus playlists y canciones favoritas"
-                        android:textColor="#E0E0E0"
-                        android:textSize="15sp"
-                        android:layout_marginStart="16dp" />
-                </LinearLayout>
+                    android:orientation="vertical"
+                    android:background="@drawable/bg_login_benefits_card"
+                    android:paddingHorizontal="20dp"
+                    android:paddingVertical="18dp"
+                    android:layout_marginBottom="30dp">
 
-                <LinearLayout
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:orientation="horizontal"
-                    android:layout_marginBottom="16dp"
-                    android:gravity="center_vertical">
-                    <ImageView
-                        android:layout_width="24dp"
-                        android:layout_height="24dp"
-                        android:src="@drawable/ic_check_gray" />
-                    <TextView
-                        android:layout_width="wrap_content"
+                    <LinearLayout
+                        android:layout_width="match_parent"
                         android:layout_height="wrap_content"
-                        android:text="El catálogo completo sin límites"
-                        android:textColor="#E0E0E0"
-                        android:textSize="15sp"
-                        android:layout_marginStart="16dp" />
-                </LinearLayout>
+                        android:orientation="horizontal"
+                        android:gravity="center_vertical"
+                        android:layout_marginBottom="14dp">
 
-                <LinearLayout
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:orientation="horizontal"
-                    android:layout_marginBottom="16dp"
-                    android:gravity="center_vertical">
-                    <ImageView
-                        android:layout_width="24dp"
-                        android:layout_height="24dp"
-                        android:src="@drawable/ic_check_gray" />
-                    <TextView
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:text="Reproducción en segundo plano offline"
-                        android:textColor="#E0E0E0"
-                        android:textSize="15sp"
-                        android:layout_marginStart="16dp" />
-                </LinearLayout>
+                        <FrameLayout
+                            android:layout_width="30dp"
+                            android:layout_height="30dp"
+                            android:background="@drawable/bg_login_benefit_chip">
+                            <ImageView
+                                android:layout_width="14dp"
+                                android:layout_height="14dp"
+                                android:layout_gravity="center"
+                                android:src="@drawable/ic_check_small"
+                                app:tint="#FF6B6B" />
+                        </FrameLayout>
 
-                <LinearLayout
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:orientation="horizontal"
-                    android:layout_marginBottom="16dp"
-                    android:gravity="center_vertical">
-                    <ImageView
-                        android:layout_width="24dp"
-                        android:layout_height="24dp"
-                        android:src="@drawable/ic_check_gray" />
-                    <TextView
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:text="Descargas sin límite"
-                        android:textColor="#E0E0E0"
-                        android:textSize="15sp"
-                        android:layout_marginStart="16dp" />
-                </LinearLayout>
+                        <TextView
+                            android:layout_width="0dp"
+                            android:layout_weight="1"
+                            android:layout_height="wrap_content"
+                            android:text="Tus playlists y canciones favoritas"
+                            android:textColor="@color/text_primary"
+                            android:textSize="14sp"
+                            android:fontFamily="@font/inter_variable"
+                            android:layout_marginStart="14dp" />
+                    </LinearLayout>
 
-                <LinearLayout
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:orientation="horizontal"
-                    android:layout_marginBottom="48dp"
-                    android:gravity="center_vertical">
-                    <ImageView
-                        android:layout_width="24dp"
-                        android:layout_height="24dp"
-                        android:src="@drawable/ic_check_gray" />
-                    <TextView
-                        android:layout_width="wrap_content"
+                    <LinearLayout
+                        android:layout_width="match_parent"
                         android:layout_height="wrap_content"
-                        android:text="Crossfade entre canciones y más"
-                        android:textColor="#E0E0E0"
-                        android:textSize="15sp"
-                        android:layout_marginStart="16dp" />
+                        android:orientation="horizontal"
+                        android:gravity="center_vertical"
+                        android:layout_marginBottom="14dp">
+
+                        <FrameLayout
+                            android:layout_width="30dp"
+                            android:layout_height="30dp"
+                            android:background="@drawable/bg_login_benefit_chip">
+                            <ImageView
+                                android:layout_width="14dp"
+                                android:layout_height="14dp"
+                                android:layout_gravity="center"
+                                android:src="@drawable/ic_check_small"
+                                app:tint="#FF6B6B" />
+                        </FrameLayout>
+
+                        <TextView
+                            android:layout_width="0dp"
+                            android:layout_weight="1"
+                            android:layout_height="wrap_content"
+                            android:text="El catálogo completo, sin límites"
+                            android:textColor="@color/text_primary"
+                            android:textSize="14sp"
+                            android:fontFamily="@font/inter_variable"
+                            android:layout_marginStart="14dp" />
+                    </LinearLayout>
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal"
+                        android:gravity="center_vertical"
+                        android:layout_marginBottom="14dp">
+
+                        <FrameLayout
+                            android:layout_width="30dp"
+                            android:layout_height="30dp"
+                            android:background="@drawable/bg_login_benefit_chip">
+                            <ImageView
+                                android:layout_width="14dp"
+                                android:layout_height="14dp"
+                                android:layout_gravity="center"
+                                android:src="@drawable/ic_check_small"
+                                app:tint="#FF6B6B" />
+                        </FrameLayout>
+
+                        <TextView
+                            android:layout_width="0dp"
+                            android:layout_weight="1"
+                            android:layout_height="wrap_content"
+                            android:text="Reproducción en segundo plano y offline"
+                            android:textColor="@color/text_primary"
+                            android:textSize="14sp"
+                            android:fontFamily="@font/inter_variable"
+                            android:layout_marginStart="14dp" />
+                    </LinearLayout>
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal"
+                        android:gravity="center_vertical"
+                        android:layout_marginBottom="14dp">
+
+                        <FrameLayout
+                            android:layout_width="30dp"
+                            android:layout_height="30dp"
+                            android:background="@drawable/bg_login_benefit_chip">
+                            <ImageView
+                                android:layout_width="14dp"
+                                android:layout_height="14dp"
+                                android:layout_gravity="center"
+                                android:src="@drawable/ic_check_small"
+                                app:tint="#FF6B6B" />
+                        </FrameLayout>
+
+                        <TextView
+                            android:layout_width="0dp"
+                            android:layout_weight="1"
+                            android:layout_height="wrap_content"
+                            android:text="Descargas sin límite"
+                            android:textColor="@color/text_primary"
+                            android:textSize="14sp"
+                            android:fontFamily="@font/inter_variable"
+                            android:layout_marginStart="14dp" />
+                    </LinearLayout>
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal"
+                        android:gravity="center_vertical">
+
+                        <FrameLayout
+                            android:layout_width="30dp"
+                            android:layout_height="30dp"
+                            android:background="@drawable/bg_login_benefit_chip">
+                            <ImageView
+                                android:layout_width="14dp"
+                                android:layout_height="14dp"
+                                android:layout_gravity="center"
+                                android:src="@drawable/ic_check_small"
+                                app:tint="#FF6B6B" />
+                        </FrameLayout>
+
+                        <TextView
+                            android:layout_width="0dp"
+                            android:layout_weight="1"
+                            android:layout_height="wrap_content"
+                            android:text="Crossfade entre canciones y más"
+                            android:textColor="@color/text_primary"
+                            android:textSize="14sp"
+                            android:fontFamily="@font/inter_variable"
+                            android:layout_marginStart="14dp" />
+                    </LinearLayout>
+
                 </LinearLayout>
 
                 <com.google.android.material.button.MaterialButton
                     android:id="@+id/btnOverlayLogin"
-                    android:layout_width="wrap_content"
-                    android:minWidth="310dp"
-                    android:layout_height="60dp"
+                    android:layout_width="match_parent"
+                    android:layout_height="58dp"
                     android:text="Continuar en YouTube Music"
                     android:textColor="@android:color/white"
                     app:backgroundTint="@null"
                     android:background="@drawable/bg_youtube_button"
                     app:icon="@drawable/ic_yt_music_logo"
                     app:iconGravity="textStart"
-                    app:iconPadding="10dp"
-                    app:iconSize="38dp"
+                    app:iconPadding="12dp"
+                    app:iconSize="30dp"
                     app:iconTint="@null"
-                    android:paddingStart="16dp"
-                    android:paddingEnd="20dp"
+                    android:paddingStart="20dp"
+                    android:paddingEnd="24dp"
                     android:textAllCaps="false"
-                    android:fontFamily="sans-serif-medium"
+                    android:fontFamily="@font/inter_variable"
                     android:textStyle="bold"
                     android:textSize="16sp"
                     android:elevation="8dp" />
@@ -188,13 +275,14 @@
                 <TextView
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:text="Sleppify es un proyecto de código abierto. No interceptamos, recopilamos ni almacenamos tus credenciales o datos personales de uso. Todo el proceso de sesión ocurre directamente y de forma segura en los servidores de Google y YouTube."
-                    android:textColor="#808080"
+                    android:text="Sleppify es un proyecto de código abierto. No interceptamos ni almacenamos tus credenciales: la sesión ocurre directamente en los servidores de Google."
+                    android:textColor="#8A8F9C"
                     android:textSize="12sp"
+                    android:fontFamily="@font/inter_variable"
                     android:textAlignment="center"
-                    android:layout_marginTop="32dp"
-                    android:layout_marginBottom="16dp"
-                    android:lineSpacingExtra="3dp" />
+                    android:lineSpacingExtra="3dp"
+                    android:paddingHorizontal="8dp"
+                    android:layout_marginTop="22dp" />
 
                 <Space
                     android:layout_width="match_parent"

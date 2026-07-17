@@ -89,11 +89,22 @@ public final class VideoSurfaceRouter {
                 && player.getExoPlayer() == activePlayer.getExoPlayer();
 
         if (sameUnderlying) {
+            boolean wasVideoActive = videoActive;
             activePlayer = player;
             activeVideoId = videoId;
             videoActive = isVideo;
             if (!videoActive) {
                 detachAndHide();
+            } else if (!wasVideoActive || playerView == null || playerView.getParent() == null) {
+                // Late attach: the same player was first announced as AUDIO (e.g. the offline
+                // video-probe had not resolved yet) and now flips to video. The plain early
+                // return here used to skip the attach forever — the historical "downloaded
+                // music-video shows its cover forever" bug. Attaching now is safe from the
+                // double-start problem this branch guards against: the player had no surface,
+                // so there is no decoder flush to trigger (PlayerView.setPlayer no-ops when
+                // the same player is already set).
+                attachToCurrentContainer(player);
+                if (callback != null) callback.onVideoConfirmed();
             } else {
                 if (callback != null) callback.onVideoConfirmed();
             }

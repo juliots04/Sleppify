@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Artist album card, matching the home-carousel design (item_playlist_carousel): the card is
-     sized programmatically to 46% of the SHORT screen axis with 6dp start/end margins (see
+     sized programmatically to 43% of the SHORT screen axis with 8dp start/end margins (see
      ArtistDetailFragment.AlbumAdapter.onCreateViewHolder), so the layout carries no fixed width
      or horizontal padding — the 1:1 cover equals the item width pixel-for-pixel. -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"

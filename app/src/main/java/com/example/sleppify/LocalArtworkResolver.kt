@@ -150,14 +150,15 @@ object LocalArtworkResolver {
     }
 
     private fun bindBytes(imageView: ImageView, videoId: String, bytes: ByteArray, sizePx: Int) {
+        // Arte embebido REAL: llena el thumbnail (centerCrop) como cualquier carátula de red.
         imageView.scaleType = ImageView.ScaleType.CENTER_CROP
         imageView.setBackgroundColor(Color.TRANSPARENT)
         var req = Glide.with(imageView)
             .load(bytes)
             .signature(ObjectKey("localart:$videoId"))
             .diskCacheStrategy(DiskCacheStrategy.NONE)
-            .placeholder(R.drawable.ic_music)
-            .error(R.drawable.ic_music)
+            .placeholder(R.drawable.ic_local_track_tile)
+            .error(R.drawable.ic_local_track_tile)
             .centerCrop()
         if (sizePx > 0) req = req.override(sizePx, sizePx)
         req.into(imageView)
@@ -165,8 +166,10 @@ object LocalArtworkResolver {
 
     private fun showIcon(imageView: ImageView) {
         Glide.with(imageView).clear(imageView)
-        imageView.scaleType = ImageView.ScaleType.FIT_CENTER
-        imageView.setImageResource(R.drawable.ic_music)
+        // Placeholder discreto (nota pequeña sobre recuadro sutil) llenando el thumbnail — antes
+        // era una nota gigante a FIT_CENTER que dominaba la fila.
+        imageView.scaleType = ImageView.ScaleType.FIT_XY
+        imageView.setImageResource(R.drawable.ic_local_track_tile)
     }
 
     /**

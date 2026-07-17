@@ -38,7 +38,12 @@ object AppUpdateManager {
         @JvmField val versionCode: Int,
         @JvmField val apkUrl: String,
         @JvmField val notes: String,
-        @JvmField val sizeBytes: Long
+        @JvmField val sizeBytes: Long,
+        // Header editable de la ventana emergente (lo fija el panel; p.ej. "🔥 NUEVA VERSIÓN").
+        @JvmField val dialogTitle: String,
+        // true = obligatoria (sin "Más tarde", no cancelable); false = opcional (aparece "Más
+        // tarde" y el diálogo se puede cerrar). Manifiestos viejos sin el campo = obligatoria.
+        @JvmField val mandatory: Boolean
     )
 
     @Volatile
@@ -120,12 +125,17 @@ object AppUpdateManager {
             val apk = json.optString("apk", "")
             val notes = json.optString("notes", "")
             val size = json.optLong("size", 0L)
+            // Header del popup: "dialogTitle" (nuevo panel) o "header" (alias), con fallback al
+            // texto por defecto. Obligatoria por defecto (compat con manifiestos antiguos).
+            val dialogTitle = json.optString("dialogTitle", json.optString("header", ""))
+                .ifBlank { "🔥 NUEVA VERSIÓN DISPONIBLE" }
+            val mandatory = json.optBoolean("mandatory", true)
 
             if (remoteCode <= BuildConfig.VERSION_CODE || apk.isBlank()) {
                 return null // al día
             }
             val apkUrl = if (apk.startsWith("http")) apk else UPDATE_BASE_URL + apk
-            return UpdateInfo(remoteName, remoteCode, apkUrl, notes, size)
+            return UpdateInfo(remoteName, remoteCode, apkUrl, notes, size, dialogTitle, mandatory)
         }
     }
 

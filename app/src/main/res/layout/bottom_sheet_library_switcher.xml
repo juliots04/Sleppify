@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Selector de vista de la biblioteca (reemplaza al antiguo pill "Archivos"): hoja mínima, casi
+     rectangular (el fondo con esquinas superiores de 8dp se aplica en código, ver
+     showLibrarySwitcherSheet), con dos filas de solo texto y un check en la vista activa. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/llLibrarySwitcherRoot"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:paddingBottom="8dp">
+
+    <!-- Separador superior: línea blanca translúcida de extremo a extremo en todo el borde de
+         arriba de la hoja, para que el inicio del sheet no se funda en negro con el contenido. -->
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1.5dp"
+        android:background="#33FFFFFF" />
+
+    <Space
+        android:layout_width="match_parent"
+        android:layout_height="8dp" />
+
+    <LinearLayout
+        android:id="@+id/rowSwitchLibrary"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="?attr/selectableItemBackground"
+        android:clickable="true"
+        android:focusable="true"
+        android:gravity="center_vertical"
+        android:minHeight="48dp"
+        android:orientation="horizontal"
+        android:paddingHorizontal="20dp">
+
+        <TextView
+            android:id="@+id/tvSwitchLibrary"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:fontFamily="@font/inter_variable"
+            android:text="Biblioteca"
+            android:textColor="@android:color/white"
+            android:textSize="15sp"
+            android:textStyle="bold" />
+
+        <ImageView
+            android:id="@+id/ivSwitchLibraryCheck"
+            android:layout_width="22dp"
+            android:layout_height="22dp"
+            android:importantForAccessibility="no"
+            android:src="@drawable/ic_check_small" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:id="@+id/rowSwitchLocalFiles"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="?attr/selectableItemBackground"
+        android:clickable="true"
+        android:focusable="true"
+        android:gravity="center_vertical"
+        android:minHeight="48dp"
+        android:orientation="horizontal"
+        android:paddingHorizontal="20dp">
+
+        <TextView
+            android:id="@+id/tvSwitchLocalFiles"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:fontFamily="@font/inter_variable"
+            android:text="Archivos Locales"
+            android:textColor="@android:color/white"
+            android:textSize="15sp"
+            android:textStyle="bold" />
+
+        <ImageView
+            android:id="@+id/ivSwitchFilesCheck"
+            android:layout_width="22dp"
+            android:layout_height="22dp"
+            android:importantForAccessibility="no"
+            android:src="@drawable/ic_check_small"
+            android:visibility="invisible" />
+    </LinearLayout>
+</LinearLayout>

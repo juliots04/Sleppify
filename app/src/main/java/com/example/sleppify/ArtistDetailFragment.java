@@ -776,11 +776,11 @@ public class ArtistDetailFragment extends Fragment {
         }
     }
 
-    /** Card width for artist albums: 46% of the SHORT screen axis, matching the home carousels. */
+    /** Card width for artist albums: 43% of the SHORT screen axis, matching the home carousels. */
     private int albumCardWidthPx() {
         if (albumCardWidthPx <= 0) {
             DisplayMetrics dm = getResources().getDisplayMetrics();
-            albumCardWidthPx = (int) (Math.min(dm.widthPixels, dm.heightPixels) * 0.46f);
+            albumCardWidthPx = (int) (Math.min(dm.widthPixels, dm.heightPixels) * 0.43f);
         }
         return albumCardWidthPx;
     }
@@ -796,12 +796,12 @@ public class ArtistDetailFragment extends Fragment {
         public AlbumVH onCreateViewHolder(@NonNull ViewGroup parent, int viewType) {
             View v = LayoutInflater.from(parent.getContext())
                     .inflate(R.layout.item_artist_album, parent, false);
-            // Force each card to the home-carousel width with 6dp side margins (the layout is
+            // Force each card to the home-carousel width with 8dp side margins (the layout is
             // match_parent so the width is owned here, like PrincipalFragment's carousels).
             RecyclerView.LayoutParams lp = new RecyclerView.LayoutParams(
                     albumCardWidthPx(), ViewGroup.LayoutParams.WRAP_CONTENT);
-            lp.setMarginStart(dp(6));
-            lp.setMarginEnd(dp(6));
+            lp.setMarginStart(dp(8));
+            lp.setMarginEnd(dp(8));
             v.setLayoutParams(lp);
             return new AlbumVH(v);
         }

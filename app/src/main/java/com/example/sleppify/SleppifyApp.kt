@@ -22,25 +22,44 @@ class SleppifyApp : Application() {
         // Store app context so ExoPlayerManager can lazy-init on first use
         ExoPlayerManager.setAppContext(this)
 
-        // Only run heavy initialization if the user already has a YouTube Music session.
-        // On first install (no session), defer until after successful web login.
-        if (hasExistingSession()) {
-            performHeavyInit()
-        } else {
-            // performHeavyInit (which pre-warms the data caches) is deferred until after web login,
-            // but PlaybackHistoryStore is still read on the cold-start UI path (the mini-player's
-            // first updateUi). Pre-warm it off the main thread now so that first read is O(1)
-            // instead of a synchronous prefs-XML disk hit on the first frame.
-            val warmExec = Executors.newSingleThreadExecutor()
-            warmExec.execute {
-                try { PlaybackHistoryStore.load(this) } catch (e: Exception) {
-                    Log.w("SleppifyApp", "PlaybackHistoryStore pre-warm (no session) failed", e)
-                }
+        // Disponibilidad de video musical por canción (pastilla Canción|Video): carga el caché
+        // persistido y habilita la persistencia de lo que cosechen los /next.
+        MusicVideoAvailability.init(this)
+
+        // App-scoped recent-searches store: its FirebaseAuth listener restores/hydrates recents
+        // (per-account prefs + gated Firestore sync) even while the Search module is closed —
+        // the fragment only observes it. DIFERIDO tras el primer frame: FirebaseAuth.getInstance()
+        // fuerza el init de Firebase en el main thread y no aporta nada al arranque visual (el
+        // usuario no puede llegar a Search en ~1 s).
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            try {
+                RecentSearchesStore.init(this)
+            } catch (e: Exception) {
+                Log.w("SleppifyApp", "RecentSearchesStore init failed", e)
             }
-            // Let the one-shot warm-up run, then terminate the worker thread instead of leaking an
-            // idle non-daemon core thread for the whole process lifetime.
-            warmExec.shutdown()
+        }, 1200L)
+
+        // Decisión de heavy-init MOVIDA a un worker: hasExistingSession() era la PRIMERA carga
+        // del XML de PREFS_PLAYER_STATE y corría síncrona en Application.onCreate (ruta crítica
+        // del primer frame). Ahora el worker decide off-main y, si hay sesión, postea
+        // performHeavyInit al main (Glide.get se recomienda en main; llega ~10-30 ms después,
+        // antes de cualquier uso real). PlaybackHistoryStore se pre-calienta en ambas ramas —
+        // el cold-start UI path lo lee (primer updateUi del mini-player).
+        val warmExec = Executors.newSingleThreadExecutor()
+        warmExec.execute {
+            val hasSession = try { hasExistingSession() } catch (_: Exception) { false }
+            try { PlaybackHistoryStore.load(this) } catch (e: Exception) {
+                Log.w("SleppifyApp", "PlaybackHistoryStore pre-warm failed", e)
+            }
+            if (hasSession) {
+                android.os.Handler(android.os.Looper.getMainLooper()).post { performHeavyInit() }
+            }
+            // Sin sesión: performHeavyInit queda diferido hasta después del login web
+            // (performDeferredInit), igual que antes.
         }
+        // Let the one-shot warm-up run, then terminate the worker thread instead of leaking an
+        // idle non-daemon core thread for the whole process lifetime.
+        warmExec.shutdown()
     }
 
     /**

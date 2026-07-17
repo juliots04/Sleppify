@@ -24,6 +24,7 @@ import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.bumptech.glide.Glide
+import com.example.sleppify.utils.YouTubeCropTransformation
 import com.google.android.material.bottomsheet.BottomSheetDialog
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.imageview.ShapeableImageView
@@ -56,6 +57,9 @@ class SettingsFragment : Fragment() {
         private const val STATE_CURRENT_SECTION = "settings_current_section"
         private const val STATE_ENTRY_SECTION = "settings_entry_section"
         private const val STATE_PENDING_ENTRY = "settings_pending_entry"
+
+        /** Shared singleton — avoids allocation per bind and ensures consistent Glide cache keys. */
+        private val SHARED_YT_CROP = YouTubeCropTransformation()
     }
 
     // --- Navigation state ---
@@ -110,6 +114,8 @@ class SettingsFragment : Fragment() {
     // Data saver sub-section
     private lateinit var tvQualityMobileValue: TextView
     private lateinit var tvQualityWifiValue: TextView
+    private lateinit var tvVideoQualityMobileValue: TextView
+    private lateinit var tvVideoQualityWifiValue: TextView
     private lateinit var swLimitMobileData: MaterialSwitch
     private lateinit var swWifiOnlyPlayback: MaterialSwitch
     private lateinit var swNoMusicVideos: MaterialSwitch
@@ -137,7 +143,46 @@ class SettingsFragment : Fragment() {
         } else {
             LocalFilesStore.setEnabled(requireContext(), false)
             renderShowDeviceFiles()
-            AppSnackbar.show(activity, "Se necesita permiso para acceder a la música")
+            // Denegación permanente REAL (auto-denegado al instante, sin diálogo): la única vía
+            // es la pantalla de info de la app; la activación queda en cola y onResume la
+            // completa al volver si el permiso ya está concedido. Si el diálogo SÍ se mostró
+            // (>500 ms hasta el callback), el rechazo del usuario se respeta sin abrir nada.
+            if (!shouldShowRequestPermissionRationale(audioPermission()) &&
+                android.os.SystemClock.elapsedRealtime() - audioPermissionRequestAtMs < 500L
+            ) {
+                pendingEnableAfterSettings = true
+                android.widget.Toast.makeText(
+                    requireContext(),
+                    "Activa el permiso \"Música y audio\" para ver tus archivos locales",
+                    android.widget.Toast.LENGTH_LONG
+                ).show()
+                openAppInfoForAudioPermission()
+            }
+        }
+    }
+
+    // Activación de archivos locales en cola tras ir a la pantalla de info de la app.
+    private var pendingEnableAfterSettings = false
+
+    // Marca del launch del permiso: distingue el auto-deny instantáneo del sistema (denegación
+    // permanente, <500 ms) de un rechazo consciente en el diálogo (ver callback de arriba).
+    private var audioPermissionRequestAtMs = 0L
+
+    private fun audioPermission(): String =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+            android.Manifest.permission.READ_MEDIA_AUDIO
+        else android.Manifest.permission.READ_EXTERNAL_STORAGE
+
+    private fun openAppInfoForAudioPermission() {
+        if (!isAdded) return
+        try {
+            startActivity(
+                android.content.Intent(
+                    android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    android.net.Uri.fromParts("package", requireContext().packageName, null)
+                )
+            )
+        } catch (_: Exception) {
         }
     }
 
@@ -227,6 +272,19 @@ class SettingsFragment : Fragment() {
 
     override fun onResume() {
         super.onResume()
+        // Activación en cola de archivos locales: si el usuario concedió el permiso desde la
+        // pantalla de info de la app, completar ahora la acción que había pedido.
+        if (pendingEnableAfterSettings) {
+            pendingEnableAfterSettings = false
+            if (isAdded && androidx.core.content.ContextCompat.checkSelfPermission(
+                    requireContext(), audioPermission()
+                ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+            ) {
+                LocalFilesStore.setEnabled(requireContext(), true)
+                scanAndCacheLocalFiles()
+                renderShowDeviceFiles()
+            }
+        }
         if (currentSection == SECTION_PLAYBACK) renderPlaybackSection()
         if (currentSection == SECTION_ACCOUNT) renderAccountSection()
     }
@@ -521,6 +579,7 @@ class SettingsFragment : Fragment() {
         val permission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
             android.Manifest.permission.READ_MEDIA_AUDIO
         else android.Manifest.permission.READ_EXTERNAL_STORAGE
+        audioPermissionRequestAtMs = android.os.SystemClock.elapsedRealtime()
         audioPermissionLauncher.launch(permission)
     }
 
@@ -537,15 +596,23 @@ class SettingsFragment : Fragment() {
     private fun setupDataSaverSection(view: View) {
         tvQualityMobileValue = view.findViewById(R.id.tvQualityMobileValue)
         tvQualityWifiValue = view.findViewById(R.id.tvQualityWifiValue)
+        tvVideoQualityMobileValue = view.findViewById(R.id.tvVideoQualityMobileValue)
+        tvVideoQualityWifiValue = view.findViewById(R.id.tvVideoQualityWifiValue)
         swLimitMobileData = view.findViewById(R.id.swLimitMobileData)
         swWifiOnlyPlayback = view.findViewById(R.id.swWifiOnlyPlayback)
         swNoMusicVideos = view.findViewById(R.id.swNoMusicVideos)
 
         view.findViewById<View>(R.id.rowQualityMobile)?.setOnClickListener {
-            showQualityDialog(CloudSyncManager.KEY_STREAMING_QUALITY_MOBILE, "Calidad del audio en redes móviles", tvQualityMobileValue)
+            showQualityDialog(CloudSyncManager.KEY_STREAMING_QUALITY_MOBILE, "Calidad del audio en redes móviles", tvQualityMobileValue, audioQualityOptions, audioQualityLabels)
         }
         view.findViewById<View>(R.id.rowQualityWifi)?.setOnClickListener {
-            showQualityDialog(CloudSyncManager.KEY_STREAMING_QUALITY_WIFI, "Calidad del audio con Wi-Fi", tvQualityWifiValue)
+            showQualityDialog(CloudSyncManager.KEY_STREAMING_QUALITY_WIFI, "Calidad del audio con Wi-Fi", tvQualityWifiValue, audioQualityOptions, audioQualityLabels)
+        }
+        view.findViewById<View>(R.id.rowVideoQualityMobile)?.setOnClickListener {
+            showQualityDialog(CloudSyncManager.KEY_VIDEO_QUALITY_MOBILE, "Calidad de video en redes móviles", tvVideoQualityMobileValue, videoQualityOptions, videoQualityLabels)
+        }
+        view.findViewById<View>(R.id.rowVideoQualityWifi)?.setOnClickListener {
+            showQualityDialog(CloudSyncManager.KEY_VIDEO_QUALITY_WIFI, "Calidad de video con Wi-Fi", tvVideoQualityWifiValue, videoQualityOptions, videoQualityLabels)
         }
     }
 
@@ -556,6 +623,12 @@ class SettingsFragment : Fragment() {
         )
         tvQualityWifiValue.text = qualityDisplayName(
             settingsPrefs.getString(CloudSyncManager.KEY_STREAMING_QUALITY_WIFI, CloudSyncManager.STREAMING_QUALITY_MEDIUM) ?: CloudSyncManager.STREAMING_QUALITY_MEDIUM
+        )
+        tvVideoQualityMobileValue.text = videoQualityDisplayName(
+            settingsPrefs.getString(CloudSyncManager.KEY_VIDEO_QUALITY_MOBILE, CloudSyncManager.STREAMING_QUALITY_MEDIUM) ?: CloudSyncManager.STREAMING_QUALITY_MEDIUM
+        )
+        tvVideoQualityWifiValue.text = videoQualityDisplayName(
+            settingsPrefs.getString(CloudSyncManager.KEY_VIDEO_QUALITY_WIFI, CloudSyncManager.STREAMING_QUALITY_MEDIUM) ?: CloudSyncManager.STREAMING_QUALITY_MEDIUM
         )
 
         swLimitMobileData.apply {
@@ -577,6 +650,14 @@ class SettingsFragment : Fragment() {
             isChecked = settingsPrefs.getBoolean(CloudSyncManager.KEY_NO_MUSIC_VIDEOS, true)
             setOnCheckedChangeListener { _, c ->
                 settingsPrefs.edit().putBoolean(CloudSyncManager.KEY_NO_MUSIC_VIDEOS, c).apply()
+                // Candado en vivo: si el player está montado, aplica ya (oculta/muestra la
+                // pastilla Canción|Video y, si un video está sonando, vuelve a canción en
+                // caliente). Si no está montado, onViewCreated del player lo aplica al montar.
+                val player = parentFragmentManager
+                    .findFragmentByTag(AppConstants.TAG_SONG_PLAYER) as? SongPlayerFragment
+                if (player != null && player.isAdded) {
+                    player.applyNoMusicVideosSetting()
+                }
             }
         }
     }
@@ -589,25 +670,52 @@ class SettingsFragment : Fragment() {
         else -> "Normal"
     }
 
-    private fun showQualityDialog(prefKey: String, title: String, valueTextView: TextView) {
+    private fun videoQualityDisplayName(key: String): String = when (key) {
+        CloudSyncManager.STREAMING_QUALITY_LOW -> "Baja (144p)"
+        CloudSyncManager.STREAMING_QUALITY_HIGH -> "Alta (la mejor disponible)"
+        else -> "Normal (360p)"
+    }
+
+    private val audioQualityOptions = arrayOf(
+        CloudSyncManager.STREAMING_QUALITY_LOW,
+        CloudSyncManager.STREAMING_QUALITY_MEDIUM,
+        CloudSyncManager.STREAMING_QUALITY_HIGH,
+        CloudSyncManager.STREAMING_QUALITY_VERY_HIGH
+    )
+    private val audioQualityLabels = arrayOf("Baja", "Normal", "Alta", "Siempre alta")
+
+    // Video: solo hay streams muxed progresivos (normalmente 360p, a veces 720p) —
+    // etiquetas honestas, sin prometer resoluciones que la arquitectura no puede servir.
+    private val videoQualityOptions = arrayOf(
+        CloudSyncManager.STREAMING_QUALITY_LOW,
+        CloudSyncManager.STREAMING_QUALITY_MEDIUM,
+        CloudSyncManager.STREAMING_QUALITY_HIGH
+    )
+    private val videoQualityLabels = arrayOf("Baja (144p)", "Normal (360p)", "Alta (la mejor disponible)")
+
+    private fun showQualityDialog(
+        prefKey: String,
+        title: String,
+        valueTextView: TextView,
+        options: Array<String>,
+        labels: Array<String>
+    ) {
         if (!isAdded) return
         val ctx = requireContext()
         val currentValue = settingsPrefs.getString(prefKey, CloudSyncManager.STREAMING_QUALITY_MEDIUM)
             ?: CloudSyncManager.STREAMING_QUALITY_MEDIUM
 
-        val options = arrayOf(
-            CloudSyncManager.STREAMING_QUALITY_LOW,
-            CloudSyncManager.STREAMING_QUALITY_MEDIUM,
-            CloudSyncManager.STREAMING_QUALITY_HIGH,
-            CloudSyncManager.STREAMING_QUALITY_VERY_HIGH
-        )
-        val labels = arrayOf("Baja", "Normal", "Alta", "Siempre alta")
         var selectedIndex = options.indexOf(currentValue).coerceAtLeast(0)
 
         val dialogView = android.widget.LinearLayout(ctx).apply {
             orientation = android.widget.LinearLayout.VERTICAL
             setPadding(dp(24), dp(24), dp(24), dp(12))
-            setBackgroundColor(android.graphics.Color.parseColor("#FF1A1A1A"))
+            // La window es transparente, así que las esquinas redondeadas las pinta este drawable
+            // (un setBackgroundColor plano dejaba el diálogo con esquinas cuadradas).
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(android.graphics.Color.parseColor("#FF1A1A1A"))
+                cornerRadius = dp(16).toFloat()
+            }
         }
 
         val tvTitle = TextView(ctx).apply {
@@ -628,13 +736,20 @@ class SettingsFragment : Fragment() {
             val rb = android.widget.RadioButton(ctx).apply {
                 text = labels[i]
                 setTextColor(android.graphics.Color.WHITE)
+                textSize = 16f
                 buttonTintList = android.content.res.ColorStateList.valueOf(
                     ctx.getColor(R.color.stitch_blue)
                 )
                 id = i
                 isChecked = (i == selectedIndex)
+                // Filas cómodas y tappables de borde a borde (el stock quedaba ~32dp, apretado).
+                setPadding(dp(12), dp(14), dp(12), dp(14))
+                minHeight = dp(52)
             }
-            radioGroup.addView(rb)
+            radioGroup.addView(rb, android.widget.RadioGroup.LayoutParams(
+                android.widget.RadioGroup.LayoutParams.MATCH_PARENT,
+                android.widget.RadioGroup.LayoutParams.WRAP_CONTENT
+            ))
         }
         dialogView.addView(radioGroup)
 
@@ -669,6 +784,10 @@ class SettingsFragment : Fragment() {
             if (checkedId in options.indices) {
                 selectedIndex = checkedId
                 settingsPrefs.edit().putString(prefKey, options[selectedIndex]).apply()
+                // Las URLs ya resueltas quedaron con los itags/altura de la calidad ANTERIOR y
+                // sobrevivirían hasta el TTL de 3.5h — invalidarlas para que el cambio aplique
+                // desde la próxima pista.
+                context?.let { StreamResolver.clearResolvedUrlCache(it.applicationContext) }
                 valueTextView.text = labels[selectedIndex]
                 dialog.dismiss()
             }
@@ -745,7 +864,7 @@ class SettingsFragment : Fragment() {
         if (LocalFilesStore.isLocalVideoId(entry.videoId)) {
             LocalArtworkResolver.loadInto(ivArt, entry.videoId)
         } else if (entry.imageUrl.isNotEmpty()) {
-            Glide.with(ivArt).load(entry.imageUrl).centerCrop().placeholder(R.color.surface_high).into(ivArt)
+            Glide.with(ivArt).load(entry.imageUrl).transform(SHARED_YT_CROP).placeholder(R.color.surface_high).into(ivArt)
         }
         view.findViewById<View>(R.id.ivBsOfflineState)?.visibility = View.GONE
 
@@ -1250,7 +1369,7 @@ class SettingsFragment : Fragment() {
                     LocalArtworkResolver.loadInto(ivThumb, entry.videoId)
                 } else if (entry.imageUrl.isNotEmpty()) {
                     LocalArtworkResolver.detach(ivThumb)
-                    Glide.with(ivThumb).load(entry.imageUrl).centerCrop().placeholder(R.color.surface_high).into(ivThumb)
+                    Glide.with(ivThumb).load(entry.imageUrl).transform(SHARED_YT_CROP).placeholder(R.color.surface_high).into(ivThumb)
                 } else {
                     LocalArtworkResolver.detach(ivThumb)
                     ivThumb.setImageDrawable(ColorDrawable(ContextCompat.getColor(ivThumb.context, R.color.surface_high)))
@@ -1286,7 +1405,7 @@ class SettingsFragment : Fragment() {
                     LocalArtworkResolver.loadInto(ivThumb, entry.videoId)
                 } else if (entry.imageUrl.isNotEmpty()) {
                     LocalArtworkResolver.detach(ivThumb)
-                    Glide.with(ivThumb).load(entry.imageUrl).centerCrop().placeholder(R.color.surface_high).into(ivThumb)
+                    Glide.with(ivThumb).load(entry.imageUrl).transform(SHARED_YT_CROP).placeholder(R.color.surface_high).into(ivThumb)
                 } else {
                     LocalArtworkResolver.detach(ivThumb)
                     ivThumb.setImageDrawable(ColorDrawable(ContextCompat.getColor(ivThumb.context, R.color.surface_high)))

@@ -35,7 +35,15 @@ class CommentsBottomSheet(
         val authorProfileUrl: String,
         val text: String,
         val likeCount: String,
-        val publishedAt: String
+        val publishedAt: String,
+        val isVerified: Boolean = false,
+        val isArtist: Boolean = false,
+        val isChannelOwner: Boolean = false,
+        val isHearted: Boolean = false,
+        val creatorHeartAvatarUrl: String = "",
+        val heartTooltip: String = "",
+        val memberBadgeUrl: String = "",
+        val memberBadgeLabel: String = ""
     )
 
     data class CommentItem(
@@ -48,7 +56,17 @@ class CommentsBottomSheet(
         var replies: List<ReplyItem> = emptyList(),
         var repliesExpanded: Boolean = false,
         val replyCount: Int = 0,
-        val replyContinuationToken: String? = null
+        val replyContinuationToken: String? = null,
+        val isPinned: Boolean = false,
+        val pinnedLabel: String = "",
+        val isVerified: Boolean = false,
+        val isArtist: Boolean = false,
+        val isChannelOwner: Boolean = false,
+        val isHearted: Boolean = false,
+        val creatorHeartAvatarUrl: String = "",
+        val heartTooltip: String = "",
+        val memberBadgeUrl: String = "",
+        val memberBadgeLabel: String = ""
     )
 
     private val executor = Executors.newSingleThreadExecutor()
@@ -235,6 +253,12 @@ class CommentsBottomSheet(
             behavior.isFitToContents = false
             behavior.halfExpandedRatio = 0.55f
             behavior.skipCollapsed = true
+            // Explicit peek: the default PEEK_HEIGHT_AUTO (parentHeight − parentWidth·9/16,
+            // ~70% of a portrait screen) parked the COLLAPSED stop ABOVE half, so a swipe
+            // down from EXPANDED settled there first and the callback's bounce to half
+            // played as a visible second slide. peekHeight=0 keeps COLLAPSED at the very
+            // bottom and releases from full settle at HALF_EXPANDED in one motion.
+            behavior.setPeekHeight(0, false)
             behavior.state = BottomSheetBehavior.STATE_HALF_EXPANDED
 
             // Symmetric collapse: opening goes half → full, so swiping down from full must
@@ -246,8 +270,10 @@ class CommentsBottomSheet(
                     when (newState) {
                         BottomSheetBehavior.STATE_EXPANDED -> behavior.isHideable = false
                         BottomSheetBehavior.STATE_HALF_EXPANDED -> behavior.isHideable = true
-                        // Non-hideable drags can settle on the tiny default peek sliver;
-                        // bounce back to half so the sheet never strands down there.
+                        // With peekHeight=0 the collapsed stop is a bottom sliver that only
+                        // a drag released far below half can reach (or a few dp higher on
+                        // gesture-nav inset clamping); bounce back to half so the sheet
+                        // never strands down there.
                         BottomSheetBehavior.STATE_COLLAPSED ->
                             behavior.state = BottomSheetBehavior.STATE_HALF_EXPANDED
                     }
@@ -559,18 +585,24 @@ class CommentsBottomSheet(
         val root = JSONObject(body)
         var nextCont: String? = null
 
-        // Build a map of commentEntityPayload from frameworkUpdates (2025+ format)
+        // Build a map of commentEntityPayload from frameworkUpdates (2025+ format).
+        // Sibling engagementToolbarStateEntityPayload mutations carry the creator-heart
+        // state; each comment joins to its entry via properties.toolbarStateKey.
         val entityMap = mutableMapOf<String, JSONObject>()
+        val toolbarStateMap = mutableMapOf<String, JSONObject>()
         val mutations = root.optJSONObject("frameworkUpdates")
             ?.optJSONObject("entityBatchUpdate")
             ?.optJSONArray("mutations")
         if (mutations != null) {
             for (m in 0 until mutations.length()) {
                 val mutation = mutations.optJSONObject(m) ?: continue
-                val payload = mutation.optJSONObject("payload")
-                    ?.optJSONObject("commentEntityPayload") ?: continue
                 val key = mutation.optString("entityKey", "")
-                if (key.isNotEmpty()) entityMap[key] = payload
+                if (key.isEmpty()) continue
+                val payloadObj = mutation.optJSONObject("payload") ?: continue
+                payloadObj.optJSONObject("commentEntityPayload")
+                    ?.let { entityMap[key] = it }
+                payloadObj.optJSONObject("engagementToolbarStateEntityPayload")
+                    ?.let { toolbarStateMap[key] = it }
             }
         }
 
@@ -628,6 +660,24 @@ class CommentsBottomSheet(
                             ?.optJSONArray("sources")?.optJSONObject(0)?.optString("url", "")
                             ?: avatarObj?.optString("thumbnailUrl", "") ?: ""
 
+                        // Badges (new format): flags live on author; the creator heart joins
+                        // through properties.toolbarStateKey; pinnedText sits on the viewModel.
+                        val isVerified = authorObj?.optBoolean("isVerified", false) ?: false
+                        val isArtist = authorObj?.optBoolean("isArtist", false) ?: false
+                        val isChannelOwner = authorObj?.optBoolean("isCreator", false) ?: false
+                        val memberBadgeUrl = authorObj?.optString("sponsorBadgeUrl", "") ?: ""
+                        val memberBadgeLabel = authorObj?.optString("sponsorBadgeA11y", "") ?: ""
+                        val toolbarStateKey = props?.optString("toolbarStateKey", "") ?: ""
+                        val isHearted = toolbarStateMap[toolbarStateKey]
+                            ?.optString("heartState", "") == "TOOLBAR_HEART_STATE_HEARTED"
+                        val creatorHeartAvatarUrl = toolbar?.optString("creatorThumbnailUrl", "") ?: ""
+                        val heartTooltip = toolbar?.optString("heartActiveTooltip", "") ?: ""
+                        // pinnedText is usually a plain string; key presence alone marks pinned
+                        // (object-shaped variants fall back to the default "Fijado" label).
+                        val pinnedRaw = viewModel.opt("pinnedText")
+                        val isPinned = pinnedRaw != null && pinnedRaw != JSONObject.NULL
+                        val pinnedLabel = (pinnedRaw as? String) ?: ""
+
                         // Extract reply continuation token for lazy loading
                         var replyCont: String? = null
                         var replyCount = 0
@@ -660,7 +710,17 @@ class CommentsBottomSheet(
                             likeCount = likeCount,
                             publishedAt = publishedTime,
                             replyCount = replyCount,
-                            replyContinuationToken = replyCont
+                            replyContinuationToken = replyCont,
+                            isPinned = isPinned,
+                            pinnedLabel = pinnedLabel,
+                            isVerified = isVerified,
+                            isArtist = isArtist,
+                            isChannelOwner = isChannelOwner,
+                            isHearted = isHearted,
+                            creatorHeartAvatarUrl = creatorHeartAvatarUrl,
+                            heartTooltip = heartTooltip,
+                            memberBadgeUrl = memberBadgeUrl,
+                            memberBadgeLabel = memberBadgeLabel
                         ))
                         continue
                     }
@@ -679,6 +739,30 @@ class CommentsBottomSheet(
                     ?: ""
                 val likeCountText = extractText(commentRenderer.optJSONObject("voteCount"))
                 val publishedText = extractText(commentRenderer.optJSONObject("publishedTimeText"))
+
+                // Badges (legacy format): dedicated renderers on the commentRenderer itself
+                val legacyOwner = commentRenderer.optBoolean("authorIsChannelOwner", false)
+                val pinnedBadge = commentRenderer.optJSONObject("pinnedCommentBadge")
+                    ?.optJSONObject("pinnedCommentBadgeRenderer")
+                val legacyPinnedLabel = extractText(pinnedBadge?.optJSONObject("label"))
+                val badgeIcon = commentRenderer.optJSONObject("authorCommentBadge")
+                    ?.optJSONObject("authorCommentBadgeRenderer")
+                    ?.optJSONObject("icon")?.optString("iconType", "") ?: ""
+                val legacyVerified = badgeIcon == "CHECK" || badgeIcon == "CHECK_CIRCLE_THICK"
+                val legacyArtist = badgeIcon == "OFFICIAL_ARTIST_BADGE" || badgeIcon == "AUDIO_BADGE"
+                val sponsorBadge = commentRenderer.optJSONObject("sponsorCommentBadge")
+                    ?.optJSONObject("sponsorCommentBadgeRenderer")
+                val legacyMemberUrl = sponsorBadge?.optJSONObject("customBadge")
+                    ?.optJSONArray("thumbnails")?.optJSONObject(0)?.optString("url", "") ?: ""
+                val legacyMemberLabel = sponsorBadge?.optString("tooltip", "") ?: ""
+                val heartRenderer = commentRenderer.optJSONObject("actionButtons")
+                    ?.optJSONObject("commentActionButtonsRenderer")
+                    ?.optJSONObject("creatorHeart")
+                    ?.optJSONObject("creatorHeartRenderer")
+                val legacyHearted = heartRenderer?.optBoolean("isHearted", false) ?: false
+                val legacyHeartAvatar = heartRenderer?.optJSONObject("creatorThumbnail")
+                    ?.optJSONArray("thumbnails")?.optJSONObject(0)?.optString("url", "") ?: ""
+                val legacyHeartTooltip = heartRenderer?.optString("heartedTooltip", "") ?: ""
 
                 // Extract reply continuation token for lazy loading (legacy)
                 var legacyReplyCont: String? = null
@@ -713,7 +797,17 @@ class CommentsBottomSheet(
                     likeCount = likeCountText,
                     publishedAt = publishedText,
                     replyCount = legacyReplyCount,
-                    replyContinuationToken = legacyReplyCont
+                    replyContinuationToken = legacyReplyCont,
+                    isPinned = pinnedBadge != null,
+                    pinnedLabel = legacyPinnedLabel,
+                    isVerified = legacyVerified,
+                    isArtist = legacyArtist,
+                    isChannelOwner = legacyOwner,
+                    isHearted = legacyHearted,
+                    creatorHeartAvatarUrl = legacyHeartAvatar,
+                    heartTooltip = legacyHeartTooltip,
+                    memberBadgeUrl = legacyMemberUrl,
+                    memberBadgeLabel = legacyMemberLabel
                 ))
             }
         }
@@ -730,18 +824,23 @@ class CommentsBottomSheet(
             val body = postInnertube(INNERTUBE_NEXT, payload) ?: return result
             val root = JSONObject(body)
 
-            // Build entity map for replies from mutations
+            // Build entity map for replies from mutations, plus the sibling
+            // engagementToolbarStateEntityPayload map for the creator-heart state
             val replyEntityMap = mutableMapOf<String, JSONObject>()
+            val replyToolbarStateMap = mutableMapOf<String, JSONObject>()
             val mutations = root.optJSONObject("frameworkUpdates")
                 ?.optJSONObject("entityBatchUpdate")
                 ?.optJSONArray("mutations")
             if (mutations != null) {
                 for (m in 0 until mutations.length()) {
                     val mutation = mutations.optJSONObject(m) ?: continue
-                    val ep = mutation.optJSONObject("payload")
-                        ?.optJSONObject("commentEntityPayload") ?: continue
                     val key = mutation.optString("entityKey", "")
-                    if (key.isNotEmpty()) replyEntityMap[key] = ep
+                    if (key.isEmpty()) continue
+                    val payloadObj = mutation.optJSONObject("payload") ?: continue
+                    payloadObj.optJSONObject("commentEntityPayload")
+                        ?.let { replyEntityMap[key] = it }
+                    payloadObj.optJSONObject("engagementToolbarStateEntityPayload")
+                        ?.let { replyToolbarStateMap[key] = it }
                 }
             }
 
@@ -770,6 +869,10 @@ class CommentsBottomSheet(
                             val rToolbar = payload2.optJSONObject("toolbar")
                             val rAuthor = authorObj?.optString("displayName", "")
                                 ?: props?.optString("authorButtonA11y", "") ?: ""
+                            // Badges: same author flags/toolbar join as top-level comments
+                            val rTsKey = props?.optString("toolbarStateKey", "") ?: ""
+                            val rHearted = replyToolbarStateMap[rTsKey]
+                                ?.optString("heartState", "") == "TOOLBAR_HEART_STATE_HEARTED"
                             result.add(ReplyItem(
                                 authorName = rAuthor,
                                 authorInitial = rAuthor.firstOrNull()?.uppercaseChar()?.toString() ?: "?",
@@ -778,13 +881,30 @@ class CommentsBottomSheet(
                                     ?.optJSONObject(0)?.optString("url", "") ?: "",
                                 text = props?.optJSONObject("content")?.optString("content", "") ?: "",
                                 likeCount = rToolbar?.optString("likeCountNotliked", "") ?: "",
-                                publishedAt = props?.optString("publishedTime", "") ?: ""
+                                publishedAt = props?.optString("publishedTime", "") ?: "",
+                                isVerified = authorObj?.optBoolean("isVerified", false) ?: false,
+                                isArtist = authorObj?.optBoolean("isArtist", false) ?: false,
+                                isChannelOwner = authorObj?.optBoolean("isCreator", false) ?: false,
+                                isHearted = rHearted,
+                                creatorHeartAvatarUrl = rToolbar?.optString("creatorThumbnailUrl", "") ?: "",
+                                heartTooltip = rToolbar?.optString("heartActiveTooltip", "") ?: "",
+                                memberBadgeUrl = authorObj?.optString("sponsorBadgeUrl", "") ?: "",
+                                memberBadgeLabel = authorObj?.optString("sponsorBadgeA11y", "") ?: ""
                             ))
                             continue
                         }
                         // Legacy format: commentRenderer
                         val cr = replyItem.optJSONObject("commentRenderer") ?: continue
                         val rAuthor = extractText(cr.optJSONObject("authorText"))
+                        val rBadgeIcon = cr.optJSONObject("authorCommentBadge")
+                            ?.optJSONObject("authorCommentBadgeRenderer")
+                            ?.optJSONObject("icon")?.optString("iconType", "") ?: ""
+                        val rSponsor = cr.optJSONObject("sponsorCommentBadge")
+                            ?.optJSONObject("sponsorCommentBadgeRenderer")
+                        val rHeart = cr.optJSONObject("actionButtons")
+                            ?.optJSONObject("commentActionButtonsRenderer")
+                            ?.optJSONObject("creatorHeart")
+                            ?.optJSONObject("creatorHeartRenderer")
                         result.add(ReplyItem(
                             authorName = rAuthor,
                             authorInitial = rAuthor.firstOrNull()?.uppercaseChar()?.toString() ?: "?",
@@ -792,7 +912,17 @@ class CommentsBottomSheet(
                                 ?.optJSONArray("thumbnails")?.optJSONObject(0)?.optString("url", "") ?: "",
                             text = extractText(cr.optJSONObject("contentText")),
                             likeCount = extractText(cr.optJSONObject("voteCount")),
-                            publishedAt = extractText(cr.optJSONObject("publishedTimeText"))
+                            publishedAt = extractText(cr.optJSONObject("publishedTimeText")),
+                            isVerified = rBadgeIcon == "CHECK" || rBadgeIcon == "CHECK_CIRCLE_THICK",
+                            isArtist = rBadgeIcon == "OFFICIAL_ARTIST_BADGE" || rBadgeIcon == "AUDIO_BADGE",
+                            isChannelOwner = cr.optBoolean("authorIsChannelOwner", false),
+                            isHearted = rHeart?.optBoolean("isHearted", false) ?: false,
+                            creatorHeartAvatarUrl = rHeart?.optJSONObject("creatorThumbnail")
+                                ?.optJSONArray("thumbnails")?.optJSONObject(0)?.optString("url", "") ?: "",
+                            heartTooltip = rHeart?.optString("heartedTooltip", "") ?: "",
+                            memberBadgeUrl = rSponsor?.optJSONObject("customBadge")
+                                ?.optJSONArray("thumbnails")?.optJSONObject(0)?.optString("url", "") ?: "",
+                            memberBadgeLabel = rSponsor?.optString("tooltip", "") ?: ""
                         ))
                     }
                 }
@@ -860,6 +990,66 @@ class CommentsBottomSheet(
         } else {
             try { Glide.with(context).clear(ivAvatar) } catch (_: Exception) {}
             ivAvatar.visibility = View.GONE
+        }
+    }
+
+    /**
+     * Author-row badges shared by comments and replies. Holders recycle, so every badge
+     * sets BOTH branches — including resetting the owner chip background/padding.
+     */
+    private fun bindAuthorBadges(
+        tvAuthor: TextView, ivBadge: ImageView, ivMemberBadge: ImageView,
+        isVerified: Boolean, isArtist: Boolean, isChannelOwner: Boolean,
+        memberBadgeUrl: String, memberBadgeLabel: String
+    ) {
+        if (isVerified || isArtist) {
+            ivBadge.setImageResource(
+                if (isArtist) R.drawable.ic_comment_artist else R.drawable.ic_comment_verified
+            )
+            ivBadge.contentDescription = if (isArtist) "Artista oficial" else "Verificado"
+            ivBadge.visibility = View.VISIBLE
+        } else {
+            ivBadge.visibility = View.GONE
+        }
+        if (memberBadgeUrl.isNotEmpty()) {
+            ivMemberBadge.contentDescription = memberBadgeLabel.ifEmpty { "Miembro" }
+            ivMemberBadge.visibility = View.VISIBLE
+            try {
+                Glide.with(context)
+                    .load(memberBadgeUrl)
+                    .override(28, 28)
+                    .diskCacheStrategy(DiskCacheStrategy.ALL)
+                    .into(ivMemberBadge)
+            } catch (_: Exception) {
+                ivMemberBadge.visibility = View.GONE
+            }
+        } else {
+            try { Glide.with(context).clear(ivMemberBadge) } catch (_: Exception) {}
+            ivMemberBadge.visibility = View.GONE
+        }
+        if (isChannelOwner) {
+            val density = context.resources.displayMetrics.density
+            val padH = (6 * density).toInt()
+            val padV = (1 * density).toInt()
+            tvAuthor.setBackgroundResource(R.drawable.bg_comment_owner_chip)
+            tvAuthor.setPadding(padH, padV, padH, padV)
+        } else {
+            tvAuthor.background = null
+            tvAuthor.setPadding(0, 0, 0, 0)
+        }
+    }
+
+    /** Hearted-by-creator marker: creator avatar with a small red heart overlaid. */
+    private fun bindCreatorHeart(
+        flHeart: View, ivHeartAvatar: ImageView,
+        isHearted: Boolean, creatorHeartAvatarUrl: String, heartTooltip: String
+    ) {
+        if (isHearted) {
+            flHeart.contentDescription = heartTooltip.ifEmpty { "Le encantó al creador" }
+            flHeart.visibility = View.VISIBLE
+            loadAvatarInto(creatorHeartAvatarUrl, ivHeartAvatar)
+        } else {
+            flHeart.visibility = View.GONE
         }
     }
 
@@ -946,6 +1136,12 @@ class CommentsBottomSheet(
             private val tvTime: TextView = view.findViewById(R.id.tvCommentTime)
             private val tvText: TextView = view.findViewById(R.id.tvCommentText)
             private val tvLikes: TextView = view.findViewById(R.id.tvCommentLikes)
+            private val llPinned: View = view.findViewById(R.id.llCommentPinned)
+            private val tvPinned: TextView = view.findViewById(R.id.tvCommentPinned)
+            private val ivBadge: ImageView = view.findViewById(R.id.ivCommentBadge)
+            private val ivMemberBadge: ImageView = view.findViewById(R.id.ivCommentMemberBadge)
+            private val flHeart: View = view.findViewById(R.id.flCommentHeart)
+            private val ivHeartAvatar: ImageView = view.findViewById(R.id.ivHeartCreatorAvatar)
             fun bind(item: CommentItem) {
                 tvAuthor.text = item.authorName
                 tvTime.text = item.publishedAt
@@ -953,6 +1149,20 @@ class CommentsBottomSheet(
                 tvLikes.text = item.likeCount
                 tvLikes.visibility = if (item.likeCount.isEmpty()) View.GONE else View.VISIBLE
                 loadAvatarInto(item.authorProfileUrl, ivAvatar)
+                if (item.isPinned) {
+                    tvPinned.text = item.pinnedLabel.ifEmpty { "Fijado" }
+                    llPinned.visibility = View.VISIBLE
+                } else {
+                    llPinned.visibility = View.GONE
+                }
+                bindAuthorBadges(
+                    tvAuthor, ivBadge, ivMemberBadge, item.isVerified, item.isArtist,
+                    item.isChannelOwner, item.memberBadgeUrl, item.memberBadgeLabel
+                )
+                bindCreatorHeart(
+                    flHeart, ivHeartAvatar, item.isHearted,
+                    item.creatorHeartAvatarUrl, item.heartTooltip
+                )
             }
         }
 
@@ -962,6 +1172,10 @@ class CommentsBottomSheet(
             private val tvTime: TextView = view.findViewById(R.id.tvReplyTime)
             private val tvText: TextView = view.findViewById(R.id.tvReplyText)
             private val tvLikes: TextView = view.findViewById(R.id.tvReplyLikes)
+            private val ivBadge: ImageView = view.findViewById(R.id.ivReplyBadge)
+            private val ivMemberBadge: ImageView = view.findViewById(R.id.ivReplyMemberBadge)
+            private val flHeart: View = view.findViewById(R.id.flReplyHeart)
+            private val ivHeartAvatar: ImageView = view.findViewById(R.id.ivReplyHeartCreatorAvatar)
             fun bind(item: ReplyItem) {
                 tvAuthor.text = item.authorName
                 tvTime.text = item.publishedAt
@@ -969,6 +1183,14 @@ class CommentsBottomSheet(
                 tvLikes.text = item.likeCount
                 tvLikes.visibility = if (item.likeCount.isEmpty()) View.GONE else View.VISIBLE
                 loadAvatarInto(item.authorProfileUrl, ivAvatar)
+                bindAuthorBadges(
+                    tvAuthor, ivBadge, ivMemberBadge, item.isVerified, item.isArtist,
+                    item.isChannelOwner, item.memberBadgeUrl, item.memberBadgeLabel
+                )
+                bindCreatorHeart(
+                    flHeart, ivHeartAvatar, item.isHearted,
+                    item.creatorHeartAvatarUrl, item.heartTooltip
+                )
             }
         }
 

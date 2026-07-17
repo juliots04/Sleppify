@@ -158,6 +158,13 @@ class MainActivity : AppCompatActivity() {
     private var pendingNavItemId = View.NO_ID
     private var suppressNavListener = false
 
+    // Historial de módulos raíz (Principal/Search/Música) para el back del sistema: cada vez que
+    // el usuario cambia de módulo se apila el módulo que ABANDONA; el back lo recorre hacia atrás
+    // (con Principal como último peldaño) antes de salir/mandar la app a segundo plano. Se
+    // persiste en el instance state para que sobreviva a la muerte del proceso en segundo plano —
+    // antes de esto, el back tras volver a la app cerraba directamente a la pantalla de inicio.
+    private val moduleNavHistory = ArrayDeque<Int>()
+    private var suppressNavHistoryPush = false
 
     private val authManagerLazy: AuthManager by lazy { AuthManager.getInstance(this) }
 
@@ -238,6 +245,7 @@ class MainActivity : AppCompatActivity() {
 
             if (handleSongPlayerBackPressed()) return
             if (handlePlaylistDetailBackPressed()) return
+            if (handleModuleBackNavigation()) return
 
             if (shouldMoveTaskToBackForOngoingPlayback()) {
                 moveTaskToBack(true)
@@ -271,6 +279,10 @@ class MainActivity : AppCompatActivity() {
             inSettings = settingsFragment != null
             inEqualizerFromSettings = equalizerFragment != null
             inScannerFromSettings = scannerFragment != null
+            savedInstanceState.getIntArray("module_nav_history")?.let { saved ->
+                moduleNavHistory.clear()
+                for (id in saved) if (isMainModuleNavId(id)) moduleNavHistory.addLast(id)
+            }
         }
 
         settingsPrefs = getSharedPreferences(CloudSyncManager.PREFS_SETTINGS, Context.MODE_PRIVATE)
@@ -280,27 +292,35 @@ class MainActivity : AppCompatActivity() {
         // Caches are pre-warmed by SleppifyApp on a background thread.
         // By now they are likely ready (O(1) read from in-memory cache).
 
-        // Always open directly on Principal — no login gate.
+        // Cold start abre en Principal; una RECREACIÓN de la Activity (rotación, vuelta a la app
+        // tras muerte por memoria, cambio de tema) restaura el módulo donde estaba el usuario.
+        // Antes se forzaba Principal en cada recreación (y onRestoreInstanceState forzaba Música):
+        // dos políticas contradictorias que hacían que el footer "cambiara solo" de módulo.
         // Don't clobber a restored Settings shell: when recreated INTO Settings (inSettings set
         // from the restored fragment just above), the FragmentManager already restored Settings
-        // visible, and showMainShell() early-returns for overlays — so forcing Principal here would
+        // visible, and showMainShell() early-returns for overlays — so forcing a module here would
         // only corrupt the footer/module state that Back-out-of-Settings relies on.
         if (!inSettings) {
+            val restoredNav = savedInstanceState?.getInt("current_main_nav_item_id", View.NO_ID) ?: View.NO_ID
+            val startNav = if (isMainModuleNavId(restoredNav)) restoredNav else R.id.nav_principal
             suppressNavListener = true
-            bottomNav.selectedItemId = R.id.nav_principal
+            bottomNav.selectedItemId = startNav
             suppressNavListener = false
-            currentMainNavItemId = R.id.nav_principal
-            switchToMainModule(R.id.nav_principal)
+            currentMainNavItemId = startNav
+            switchToMainModule(startNav)
         }
         showMainShell()
 
         // Pre-create MusicPlayerFragment hidden so its onViewCreated triggers the
         // web session auto-launch (login prompt). Previously it was created immediately
         // because Biblioteca was the default module; now Principal is first.
-        fragmentContainer.post {
-            if (isFinishing || isDestroyed) return@post
+        // DIFERIDO 600 ms: su onViewCreated hace ~30 findViewById + adapter + GoogleSignIn justo
+        // después del primer frame de Principal y le robaba ese hueco al primer contenido; el
+        // auto-launch del login (postDelayed interno de 800 ms) sigue saliendo enseguida.
+        fragmentContainer.postDelayed({
+            if (isFinishing || isDestroyed) return@postDelayed
             if (supportFragmentManager.findFragmentByTag(TAG_MODULE_MUSIC) == null) {
-                val music = getOrCreateMainModuleFragment(R.id.nav_music) ?: return@post
+                val music = getOrCreateMainModuleFragment(R.id.nav_music) ?: return@postDelayed
                 supportFragmentManager.beginTransaction()
                     .setReorderingAllowed(true)
                     .add(R.id.fragmentContainer, music, TAG_MODULE_MUSIC)
@@ -308,7 +328,7 @@ class MainActivity : AppCompatActivity() {
                     .setMaxLifecycle(music, Lifecycle.State.STARTED)
                     .commitAllowingStateLoss()
             }
-        }
+        }, 600L)
 
         // Defer heavy startup work to background thread
         lifecycleScope.launch {
@@ -321,9 +341,9 @@ class MainActivity : AppCompatActivity() {
             if (authManagerLazy.isSignedIn()) {
                 authManagerLazy.getCurrentUser()?.let { handleSignedInUser(it, null) }
             }
-            // Actualizaciones sin Firebase ni notificaciones: al abrir la app se consulta el
-            // version.json del hosting en silencio y, si hay versión nueva, salta la ventana
-            // emergente con los detalles (una vez por proceso).
+            // Actualizaciones: consulta el version.json del hosting. El popup solo sale cuando la
+            // cuenta ya está COMPLETAMENTE montada (ver maybeShowStartupUpdatePopup) — nunca durante
+            // el primer arranque/configuración, que era lo que la dejaba a medias.
             delay(1400)
             maybeShowStartupUpdatePopup()
         }
@@ -401,6 +421,9 @@ class MainActivity : AppCompatActivity() {
             }
             if (inSettings) returnFromSettings()
             if (isSearchFragmentVisible()) {
+                // closeSearchFragment no apila (también lo invoca el back de Search); el cambio
+                // Search → módulo por tap del footer se registra aquí.
+                pushModuleNavHistory(R.id.nav_search, item.itemId)
                 currentMainNavItemId = item.itemId
                 closeSearchFragment()
                 return@setOnItemSelectedListener true
@@ -464,15 +487,71 @@ class MainActivity : AppCompatActivity() {
         outState.putInt("current_main_nav_item_id", currentMainNavItemId)
         outState.putBoolean("in_settings", inSettings)
         outState.putInt("settings_return_nav_item_id", settingsReturnNavItemId)
+        outState.putIntArray("module_nav_history", moduleNavHistory.toIntArray())
     }
 
     override fun onRestoreInstanceState(savedInstanceState: Bundle) {
         super.onRestoreInstanceState(savedInstanceState)
-        // Always land on music — do not restore whichever module was last open.
-        // (See matching policy in onCreate.)
-        currentMainNavItemId = R.id.nav_music
+        // Restaurar el MISMO módulo que onCreate ya montó desde el estado guardado. Forzar aquí
+        // un módulo distinto (antes: siempre Música, mientras onCreate forzaba Principal) dejaba
+        // el footer y currentMainNavItemId desincronizados — el "se cambia solo de módulo".
+        val restoredNav = savedInstanceState.getInt("current_main_nav_item_id", View.NO_ID)
+        if (isMainModuleNavId(restoredNav)) {
+            currentMainNavItemId = restoredNav
+        }
         inSettings = savedInstanceState.getBoolean("in_settings", false)
         settingsReturnNavItemId = savedInstanceState.getInt("settings_return_nav_item_id", R.id.nav_music)
+    }
+
+    /** True para los ids de módulo raíz del bottom nav (los únicos restaurables al recrear). */
+    private fun isMainModuleNavId(itemId: Int): Boolean =
+        itemId == R.id.nav_principal || itemId == R.id.nav_search || itemId == R.id.nav_music
+
+    /** Módulo raíz actualmente EN PANTALLA. Search abierto cuenta como nav_search aunque
+     *  [currentMainNavItemId] siga apuntando al módulo subyacente (así funciona su cierre). */
+    private fun visibleMainNavId(): Int =
+        if (isSearchFragmentVisible()) R.id.nav_search else currentMainNavItemId
+
+    /** Apila el módulo que se abandona al navegar a otro. No-op durante los pops del back
+     *  ([suppressNavHistoryPush]) para que volver atrás no re-apile lo que acaba de sacar. */
+    private fun pushModuleNavHistory(fromNav: Int, toNav: Int) {
+        if (suppressNavHistoryPush) return
+        if (fromNav == toNav || !isMainModuleNavId(fromNav) || !isMainModuleNavId(toNav)) return
+        moduleNavHistory.addLast(fromNav)
+        while (moduleNavHistory.size > 16) moduleNavHistory.removeFirst()
+    }
+
+    /** Back del sistema a nivel de módulos: vuelve al módulo anterior del historial, con
+     *  Principal como último peldaño. Devuelve false solo en Principal sin historial — únicamente
+     *  ahí el back sale de la app (o la manda a segundo plano si hay reproducción). */
+    private fun handleModuleBackNavigation(): Boolean {
+        val current = visibleMainNavId()
+        var target = View.NO_ID
+        while (moduleNavHistory.isNotEmpty()) {
+            val cand = moduleNavHistory.removeLast()
+            if (cand != current && isMainModuleNavId(cand)) {
+                target = cand
+                break
+            }
+        }
+        if (target == View.NO_ID) {
+            if (current == R.id.nav_principal) return false
+            target = R.id.nav_principal
+        }
+        suppressNavHistoryPush = true
+        try {
+            when {
+                target == R.id.nav_search -> openSearchFragment()
+                isSearchFragmentVisible() -> {
+                    currentMainNavItemId = target
+                    closeSearchFragment()
+                }
+                else -> switchToMainModule(target)
+            }
+        } finally {
+            suppressNavHistoryPush = false
+        }
+        return true
     }
 
     fun handlePlayFromSearchIntent(intent: Intent) {
@@ -898,6 +977,10 @@ class MainActivity : AppCompatActivity() {
                 // cold start and would otherwise stay black until the user navigated away and back.
                 refreshPrincipalContentIfVisible()
                 onSuccess?.run()
+                // Cuenta COMPLETAMENTE montada (cookie + Google + Firebase hidratado + biblioteca):
+                // recién ahora es seguro ofrecer la actualización a un usuario que se acaba de
+                // configurar — al FINAL, nunca a mitad del primer arranque.
+                maybeShowUpdatePopupAfterSetup()
             }
         }
 
@@ -962,6 +1045,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // Última combinación (signedIn|uri) ya pintada en el header — loadProfilePhoto se dispara
+    // desde varios puntos cerca del primer frame (configureHeaderActionForMainModules,
+    // showMainShell, cada onResume); sin esta memo cada disparo re-lanzaba el mismo Glide.
+    private var lastProfilePhotoState: String? = null
+
     private fun loadProfilePhoto() {
         val prefs = getSharedPreferences(AppConstants.PREFS_STREAMING_CACHE, MODE_PRIVATE)
         val cachedUrl = prefs.getString("cached_google_profile_photo_url", "") ?: ""
@@ -969,20 +1057,29 @@ class MainActivity : AppCompatActivity() {
             ?: if (cachedUrl.isNotEmpty()) android.net.Uri.parse(cachedUrl) else null
 
         val signedIn = authManagerLazy.isSignedIn()
+        val state = "$signedIn|${photoUri?.toString() ?: ""}"
         if (signedIn) {
+            // Las visibilidades se restauran SIEMPRE (otros módulos ocultan estos botones);
+            // solo la carga de Glide se memoiza.
             btnSignInHeader?.visibility = View.GONE
             btnProfilePhoto.visibility = View.VISIBLE
             if (photoUri != null) {
-                com.bumptech.glide.Glide.with(this)
-                    .load(photoUri)
-                    .diskCacheStrategy(com.bumptech.glide.load.engine.DiskCacheStrategy.ALL)
-                    .circleCrop()
-                    .into(btnProfilePhoto)
+                if (state != lastProfilePhotoState) {
+                    lastProfilePhotoState = state
+                    com.bumptech.glide.Glide.with(this)
+                        .load(photoUri)
+                        .diskCacheStrategy(com.bumptech.glide.load.engine.DiskCacheStrategy.ALL)
+                        .circleCrop()
+                        .into(btnProfilePhoto)
+                }
             } else {
-                // Sin foto aún: vacío, nunca un placeholder.
+                // Sin foto aún: vacío, nunca un placeholder. Reset del memo para que la foto
+                // cargue en cuanto exista.
+                lastProfilePhotoState = null
                 btnProfilePhoto.setImageDrawable(null)
             }
         } else {
+            lastProfilePhotoState = null
             btnProfilePhoto.visibility = View.GONE
             btnProfilePhoto.setImageDrawable(null)
             btnSignInHeader?.visibility = View.VISIBLE
@@ -1030,14 +1127,45 @@ class MainActivity : AppCompatActivity() {
 
     // ───────────────────── Actualizaciones (sin Firebase) ─────────────────────
 
-    /** Chequeo silencioso al abrir la app: si hay versión nueva, muestra la ventana emergente. */
+    /**
+     * Muestra la ventana de nueva versión SOLO cuando la cuenta está COMPLETAMENTE montada (sesión
+     * web de YT Music guardada + sesión de Google/Firebase iniciada). Así el popup nunca aparece
+     * durante el primer arranque/configuración — que era lo que, al pulsar "Actualizar" a media
+     * configuración, reiniciaba el proceso y dejaba la cuenta sin montar (3x3 y playlists vacías).
+     * Para un usuario recién instalado se re-dispara al terminar el login (ver [handleSignedInUser]/
+     * [onWebSessionEstablished]), así lo ve al FINAL de la configuración, ya con todo cargado.
+     */
     private fun maybeShowStartupUpdatePopup() {
         if (updatePopupShownThisProcess) return
+        // Gate: cuenta completamente montada. Si aún no (primer arranque en curso), no molestar;
+        // se reintentará al completarse el login.
+        if (!hasSessionCookie() || !authManagerLazy.isSignedIn()) {
+            Log.d("SleppifyUpdate", "popup diferido: cuenta aún no montada del todo")
+            return
+        }
         AppUpdateManager.checkForUpdate(applicationContext) { update, _ ->
             if (update == null || isFinishing || isDestroyed || updatePopupShownThisProcess) return@checkForUpdate
             updatePopupShownThisProcess = true
             showUpdateAvailablePopup(update)
         }
+    }
+
+    /** True si hay una sesión web de YT Music guardada (cookie no vacía). */
+    private fun hasSessionCookie(): Boolean = try {
+        getSharedPreferences(AppConstants.PREFS_PLAYER_STATE, MODE_PRIVATE)
+            .getString(AppConstants.PREF_LAST_YOUTUBE_WEB_COOKIE, "")?.trim().orEmpty().isNotEmpty()
+    } catch (e: Exception) {
+        false
+    }
+
+    /** Reintenta mostrar el popup de actualización una vez la cuenta terminó de montarse (login web
+     *  + Google). Lo llaman los puntos que completan la configuración; no-op si ya se mostró o si
+     *  todavía falta algo. Un pequeño retardo deja asentar la UI antes del diálogo. */
+    fun maybeShowUpdatePopupAfterSetup() {
+        if (updatePopupShownThisProcess) return
+        mainHandler.postDelayed({
+            if (!isFinishing && !isDestroyed) maybeShowStartupUpdatePopup()
+        }, 1200L)
     }
 
     /**
@@ -1049,12 +1177,16 @@ class MainActivity : AppCompatActivity() {
         if (isFinishing || isDestroyed) return
         updateDialog?.dismiss() // nunca dos a la vez
         val view = layoutInflater.inflate(R.layout.dialog_update_available, null)
+        // Header editable desde el panel (con fallback ya resuelto en AppUpdateManager).
+        view.findViewById<TextView>(R.id.tvUpdateDialogTitle).text = update.dialogTitle
         // "🔥 Nueva versión" es fijo; la versión va en la pastilla de la derecha.
         view.findViewById<TextView>(R.id.tvUpdateDialogPill).text = update.versionName
         // Novedades (formatNotesAsBullets ya da "Mejoras y correcciones." si vienen vacías).
         view.findViewById<TextView>(R.id.tvUpdateDialogNotes).text =
             AppUpdateManager.formatNotesAsBullets(update.notes, 4)
 
+        // Opcional (mandatory=false): el diálogo se puede cerrar y aparece "Más tarde".
+        val optional = !update.mandatory
         val dialog = android.app.Dialog(this).apply {
             requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
             setContentView(view)
@@ -1063,16 +1195,20 @@ class MainActivity : AppCompatActivity() {
                 (resources.displayMetrics.widthPixels * 0.92).toInt(),
                 android.view.ViewGroup.LayoutParams.WRAP_CONTENT
             )
-            setCancelable(false)
+            setCancelable(optional)
             setCanceledOnTouchOutside(false)
             setOnDismissListener { if (updateDialog === this) updateDialog = null }
         }
         updateDialog = dialog
 
         val btnGo = view.findViewById<TextView>(R.id.btnUpdateDialogGo)
+        val btnLater = view.findViewById<TextView>(R.id.btnUpdateDialogLater)
         val llProgress = view.findViewById<View>(R.id.llUpdateDialogProgress)
         val pbDownload = view.findViewById<android.widget.ProgressBar>(R.id.pbUpdateDialog)
         val tvPercent = view.findViewById<TextView>(R.id.tvUpdateDialogPercent)
+
+        btnLater.visibility = if (optional) View.VISIBLE else View.GONE
+        btnLater.setOnClickListener { dialog.dismiss() }
 
         btnGo.setOnClickListener {
             // Sin el permiso de "instalar apps desconocidas" el instalador no abre: pedirlo primero.
@@ -1084,6 +1220,8 @@ class MainActivity : AppCompatActivity() {
             // Descarga in-situ: el botón se cambia por la barra de progreso, mismo proceso que la
             // antigua sección Actualizar (AppUpdateManager descarga y lanza el instalador al 100%).
             btnGo.visibility = View.GONE
+            btnLater.visibility = View.GONE
+            dialog.setCancelable(false) // ya descargando: no cerrar a media descarga
             llProgress.visibility = View.VISIBLE
             pbDownload.progress = 0
             tvPercent.text = "0%"
@@ -1442,15 +1580,21 @@ class MainActivity : AppCompatActivity() {
 
     fun openSearchFragment() {
         if (isFinishing || isDestroyed) return
-        // Show activity overlay briefly; SearchFragment has its own scoped overlay too.
-        showModuleLoadingOverlay()
-        suppressNavListener = true
-        bottomNav.selectedItemId = R.id.nav_search
-        suppressNavListener = false
+        pushModuleNavHistory(visibleMainNavId(), R.id.nav_search)
 
         val target = (supportFragmentManager.findFragmentByTag(TAG_MODULE_SEARCH) as? SearchFragment)
             ?.also { searchFragment = it }
             ?: SearchFragment.newInstance().also { searchFragment = it }
+
+        // Warm re-entry (the fragment is kept alive on close): its view is resident and shows
+        // instantly, so skip the activity overlay — flashing it on every re-entry is what made
+        // Search feel like a fresh load each time. First create keeps the overlay (SearchFragment
+        // has its own scoped one too).
+        val isWarmReentry = target.isAdded && target.view != null
+        if (!isWarmReentry) showModuleLoadingOverlay()
+        suppressNavListener = true
+        bottomNav.selectedItemId = R.id.nav_search
+        suppressNavListener = false
 
         supportFragmentManager.beginTransaction().apply {
             setReorderingAllowed(true)
@@ -1466,14 +1610,21 @@ class MainActivity : AppCompatActivity() {
             hideIfVisible(this, songPlayerFragment, target)
             hideIfVisible(this, settingsFragment, target)
 
-            if (target.isAdded) show(target) else add(R.id.fragmentContainer, target, TAG_MODULE_SEARCH).addToBackStack(TAG_MODULE_SEARCH)
+            // No addToBackStack: Search is a resident module now (hidden on close, never popped).
+            // System-back while it is visible is handled by SearchFragment's OnBackPressedCallback.
+            if (target.isAdded) show(target) else add(R.id.fragmentContainer, target, TAG_MODULE_SEARCH)
             setMaxLifecycle(target, Lifecycle.State.RESUMED)
             commit()
         }
 
         topAppBar.visibility = View.GONE
-        
-        fragmentContainer.post { fragmentContainer.post { revealModuleContent() } }
+
+        if (!isWarmReentry) {
+            fragmentContainer.post { fragmentContainer.post { revealModuleContent() } }
+        } else if (moduleLoadingOverlay.visibility == View.VISIBLE) {
+            // A stray overlay from another flow must not stay stuck over the warm fragment.
+            revealModuleContent()
+        }
     }
 
     fun closeSearchFragment() {
@@ -1486,15 +1637,19 @@ class MainActivity : AppCompatActivity() {
         val target = getMainModuleFragment(selectedId) ?: getOrCreateMainModuleFragment(selectedId)
         val isNew = target?.isAdded == false
 
-        // Hide SearchFragment FIRST so isHidden=true before popBackStack triggers onResume,
-        // preventing SearchFragment.onResume from hiding the topAppBar on the returning module.
+        // Keep SearchFragment ALIVE on close: hide it and cap at STARTED (like the other resident
+        // modules) instead of the old popBackStackImmediate INCLUSIVE that destroyed it. Destroying
+        // it wiped recents/results/suggestions state and forced full inflation + setup + a
+        // Firestore GET on every re-entry. Hiding FIRST keeps isHidden=true so SearchFragment's
+        // lifecycle callbacks never hide the topAppBar on the returning module; its own back
+        // callback disables itself in onHiddenChanged(true), so system-back flows on to the
+        // module now on screen.
+        (supportFragmentManager.findFragmentByTag(TAG_MODULE_SEARCH))?.let { searchFragment = it }
         supportFragmentManager.beginTransaction().apply {
             setReorderingAllowed(true)
             searchFragment?.let { if (it.isAdded) { hide(it); setMaxLifecycle(it, Lifecycle.State.STARTED) } }
             commitNow()
         }
-
-        supportFragmentManager.popBackStackImmediate(TAG_MODULE_SEARCH, androidx.fragment.app.FragmentManager.POP_BACK_STACK_INCLUSIVE)
 
         val playlistDetail = supportFragmentManager.findFragmentByTag(TAG_PLAYLIST_DETAIL)
         val wasPlaylistDetailActive = playlistDetail != null && playlistDetail.isAdded
@@ -1651,6 +1806,9 @@ class MainActivity : AppCompatActivity() {
             return true
         }
         isNavigating = true
+        // Único choke point de cambio de módulo (tap del footer y navegaciones programáticas):
+        // registra el módulo visible que se abandona. from==to (restauraciones, re-taps) es no-op.
+        pushModuleNavHistory(visibleMainNavId(), itemId)
 
         // Reset stale sub-navigation flags — but only if the EQ overlay is no longer shown,
         // otherwise resetting inEqualizerFromSettings here would orphan the overlay with no
@@ -1987,7 +2145,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun resolveSongPlayerReturnTarget(preferredTag: String?): Fragment? {
-        if (!preferredTag.isNullOrEmpty()) {
+        // Un tag de MÓDULO raíz capturado al abrir el player queda obsoleto si el usuario cambió
+        // de módulo con la cola sonando (abrió desde Principal, navegó a Biblioteca, reabrió el
+        // player desde la mini-barra y lo cerró): mostrar ese módulo viejo cambiaba el contenido
+        // visible SIN tocar el footer — el "se cambia solo de módulo". Los tags de módulo se
+        // ignoran a favor del módulo actualmente seleccionado; los overlays con estado propio
+        // (Settings, detalle de playlist) sí se respetan.
+        val preferredIsMainModule = preferredTag == TAG_MODULE_PRINCIPAL ||
+            preferredTag == TAG_MODULE_MUSIC || preferredTag == TAG_MODULE_SEARCH
+        if (!preferredTag.isNullOrEmpty() && !preferredIsMainModule) {
             supportFragmentManager.findFragmentByTag(preferredTag)?.let { if (it.isAdded) return it }
         }
         supportFragmentManager.findFragmentByTag(TAG_PLAYLIST_DETAIL)?.let { if (it.isAdded && !it.isHidden) return it }
