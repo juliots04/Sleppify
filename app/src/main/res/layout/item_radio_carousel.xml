@@ -32,9 +32,9 @@
                 app:layout_constraintStart_toStartOf="parent"
                 app:layout_constraintEnd_toEndOf="parent" />
 
-            <!-- Diseño completo pre-compuesto en UNA imagen cacheada (RadioArtComposer, estilo
-                 YT Music: degradado + barras de onda con picos + 3 círculos, el central al
-                 frente). Sin chip de play, sin insignia RADIO ni título dentro de la tarjeta. -->
+            <!-- Diseño completo pre-compuesto en UNA imagen cacheada (RadioArtComposer v8:
+                 degradado + barras de ecualizador asimétricas + 3 círculos separados, el central
+                 grande). Sin chip de play, sin insignia RADIO ni título dentro de la tarjeta. -->
             <ImageView
                 android:id="@+id/ivRadioComposite"
                 android:layout_width="0dp"

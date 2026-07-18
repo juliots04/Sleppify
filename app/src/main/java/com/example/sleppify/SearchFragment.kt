@@ -727,58 +727,15 @@ class SearchFragment : Fragment() {
                     return
                 }
                 if (requestId != latestSearchRequestId) return
-                Log.w(TAG, "[SEARCH] INNERTUBE error in ${android.os.SystemClock.elapsedRealtime() - tInnertube}ms — $error — falling back to YT Data API")
-                // Fallback al API de datos oficial de YouTube en caso de fallo de Innertube
-                val tFallback = android.os.SystemClock.elapsedRealtime()
-                youTubeMusicService.searchTracksPaged(query, SEARCH_PAGE_SIZE, pageToken.takeIf { it.isNotEmpty() }, object : YouTubeMusicService.SearchPageCallback {
-                    override fun onSuccess(pageResult: YouTubeMusicService.SearchPageResult) {
-                        if (activity == null || !isAdded) {
-                            searching = false
-                            searchPaginationInFlight = false
-                            return
-                        }
-                        if (requestId != latestSearchRequestId) return
-                        Log.d(TAG, "[SEARCH] FALLBACK ok in ${android.os.SystemClock.elapsedRealtime() - tFallback}ms — ${pageResult.tracks.size} tracks totalElapsed=${android.os.SystemClock.elapsedRealtime() - t0}ms")
-                        if (append) searchPaginationInFlight = false
+                Log.w(TAG, "[SEARCH] INNERTUBE error in ${android.os.SystemClock.elapsedRealtime() - tInnertube}ms — $error")
+                if (append) searchPaginationInFlight = false
 
-                        resultsFromInnertube = false
-                        nextSearchPageToken = pageResult.nextPageToken
-                        hasMoreSearchPages = nextSearchPageToken.isNotEmpty()
-                        useInnertubePagination = false
-
-                        appendUniqueTracks(pageResult.tracks)
-                        // Sort only the first page: re-sorting the whole accumulated list on
-                        // every appended page visibly reshuffled results mid-scroll.
-                        applyActiveFilter(query, forceSort = !append)
-
-                        if (allTracks.isEmpty() && !append) {
-                            setSearchLoadingState(false, "No encontré resultados para: $query")
-                        } else if (!append) {
-                            setSearchLoadingState(false, "")
-                            attachTopResultArtworkToRecent(query)
-                            revealModuleContent()
-                            hideKeyboard()
-                        }
-                    }
-
-                    override fun onError(error: String) {
-                        if (activity == null || !isAdded) {
-                            searching = false
-                            searchPaginationInFlight = false
-                            return
-                        }
-                        if (requestId != latestSearchRequestId) return
-                        Log.w(TAG, "[SEARCH] FALLBACK error in ${android.os.SystemClock.elapsedRealtime() - tFallback}ms — $error totalElapsed=${android.os.SystemClock.elapsedRealtime() - t0}ms")
-                        if (append) searchPaginationInFlight = false
-                        
-                        if (allTracks.isEmpty()) {
-                            setSearchLoadingState(false, "Error: $error")
-                        } else {
-                            setSearchLoadingState(false, "")
-                            if (append) AppSnackbar.show(activity, "Error al cargar más resultados")
-                        }
-                    }
-                })
+                if (allTracks.isEmpty()) {
+                    setSearchLoadingState(false, "Error: $error")
+                } else {
+                    setSearchLoadingState(false, "")
+                    if (append) AppSnackbar.show(activity, "Error al cargar más resultados")
+                }
             }
         })
     }

@@ -19,8 +19,9 @@ import androidx.fragment.app.FragmentManager
  *    conventions ("Radio: X" / "X Radio" / "X") down to a clean seed title.
  *  - the transaction: remove-existing + add + addToBackStack under the one "playlist_detail" tag,
  *    with an opt-in reuse-if-alive branch for the player's "view queue playlist" button.
- *  - the chrome: MainActivity.showModuleLoadingOverlay() + hideTopAppBarForPlaylistDetail() on
- *    EVERY path.
+ *  - the chrome: hideTopAppBarForPlaylistDetail() on EVERY path. El overlay de módulo (spinner de
+ *    actividad) NO se muestra: el detalle usa SOLO su propio loading state para no parpadear dos
+ *    spinners al abrir.
  *
  * The OAuth token arg is dropped — PlaylistDetailFragment.resolveYoutubeAccessToken("") already
  * recovers it from prefs. HD-thumbnail derivation is intentionally NOT done here: the header binder
@@ -153,7 +154,11 @@ object PlaylistDetailLauncher {
 
     private fun showChrome(activity: FragmentActivity) {
         (activity as? MainActivity)?.let {
-            it.showModuleLoadingOverlay()
+            // NO mostrar el overlay de módulo (spinner a pantalla completa de la actividad) al abrir
+            // el detalle: hacía parpadear ese spinner un instante antes de que el detalle mostrara SU
+            // PROPIO loading state (flPlaylistLoadingOverlay, en onViewCreated). Se deja SOLO el del
+            // detalle. PlaylistDetailFragment ya llama hideModuleLoadingOverlayImmediate() igualmente,
+            // así que si otro flujo dejó el overlay arriba, el detalle lo baja.
             it.hideTopAppBarForPlaylistDetail()
         }
     }

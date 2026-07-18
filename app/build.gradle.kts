@@ -5,8 +5,6 @@ plugins {
 
 android {
     namespace = "com.example.sleppify"
-    val youtubeDataApiKey = (project.findProperty("YOUTUBE_DATA_API_KEY") as String?) ?: ""
-    val sleppifyDownloadServiceUrl = (project.findProperty("SLEPPIFY_DOWNLOAD_SERVICE_URL") as String?) ?: ""
 
     compileSdk = 35
 
@@ -17,12 +15,10 @@ android {
         // IMPORTANTE: sube versionCode en CADA release y publícalo IGUAL en el panel.
         // El chequeo compara este entero con el del hosting; si el APK instalado tiene un
         // code menor que el publicado, la app ofrece la actualización una y otra vez.
-        versionCode = 2
-        versionName = "1.0.1"
+        versionCode = 11
+        versionName = "1.1.1"
         buildConfigField("int", "VERSION_CODE", "${versionCode!!}")
         buildConfigField("String", "VERSION_NAME", "\"${versionName!!}\"")
-        buildConfigField("String", "YOUTUBE_DATA_API_KEY", "\"$youtubeDataApiKey\"")
-        buildConfigField("String", "SLEPPIFY_DOWNLOAD_SERVICE_URL", "\"$sleppifyDownloadServiceUrl\"")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

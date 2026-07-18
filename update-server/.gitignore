@@ -1,6 +1,0 @@
-node_modules/
-dist/
-.astro/
-.env
-# APKs subidos en runtime (no versionar binarios grandes); se conservan en el hosting.
-apk/*.apk

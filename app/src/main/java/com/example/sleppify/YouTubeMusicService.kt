@@ -238,14 +238,6 @@ class YouTubeMusicService @JvmOverloads constructor(
 
     // ----- Private data holders -----
 
-    private class ApiErrorDetails(val reason: String, val message: String)
-
-    private class TrackTempData(val title: String, val artist: String, val thumbnailUrl: String)
-
-    private class VideoPlaybackInfo(val rawDuration: String, val embeddable: Boolean)
-
-    private class PublicVideoFilterInfo(val embeddable: Boolean, val durationSeconds: Int)
-
     private class WatchPlaylistResult(
         val tracks: List<TrackResult>,
         val relatedBrowseId: String,
@@ -253,47 +245,6 @@ class YouTubeMusicService @JvmOverloads constructor(
     )
 
     // ----- Public API -----
-
-    fun searchTracks(query: String, maxResults: Int, callback: SearchCallback) {
-        searchTracksPaged(query, maxResults, null, object : SearchPageCallback {
-            override fun onSuccess(pageResult: SearchPageResult) {
-                callback.onSuccess(pageResult.tracks)
-            }
-
-            override fun onError(error: String) {
-                callback.onError(error)
-            }
-        })
-    }
-
-    fun searchTracksPaged(
-        query: String,
-        maxResults: Int,
-        pageToken: String?,
-        callback: SearchPageCallback
-    ) {
-        val normalized = query.trim()
-        if (normalized.isEmpty()) {
-            callback.onError("Escribe algo para buscar.")
-            return
-        }
-
-        val apiKey = (BuildConfig.YOUTUBE_DATA_API_KEY ?: "").trim()
-        if (apiKey.isEmpty()) {
-            callback.onError("Configura YOUTUBE_DATA_API_KEY para habilitar busqueda.")
-            return
-        }
-
-        executor.execute {
-            try {
-                val pageResult = performSearchRequest(normalized, maxOf(1, maxResults), apiKey, pageToken)
-                mainHandler.post { callback.onSuccess(pageResult) }
-            } catch (e: Exception) {
-                val error = e.message ?: "No se pudo completar la busqueda."
-                mainHandler.post { callback.onError(error) }
-            }
-        }
-    }
 
     /** Primary search via YouTube Music Innertube API — no API key needed, no quota. */
     fun searchTracksViaInnertube(query: String, maxResults: Int, cookieHeader: String = "", callback: SearchPageCallback) {
@@ -751,15 +702,17 @@ class YouTubeMusicService @JvmOverloads constructor(
     }
 
     fun fetchMyPlaylists(accessToken: String, maxResults: Int, callback: PlaylistsCallback) {
-        val token = accessToken.trim()
-        if (token.isEmpty()) {
-            callback.onError("No hay token OAuth para cargar la biblioteca.")
+        // Migrado de la Data API OAuth a InnerTube browse (FEmusic_liked_playlists) con la cookie web.
+        // El accessToken queda ignorado (compat de firma). Sin cuota.
+        val cookieHeader = StreamResolver.getAuthCookieHeader().trim()
+        if (cookieHeader.isEmpty()) {
+            callback.onError("No hay sesión web para cargar la biblioteca.")
             return
         }
 
         executor.execute {
             try {
-                val playlists = performMyPlaylistsRequest(token, maxOf(1, maxResults))
+                val playlists = performLibraryPlaylistsBrowseRequest(cookieHeader)
                 mainHandler.post { callback.onSuccess(playlists) }
             } catch (e: Exception) {
                 val error = e.message ?: "No se pudo cargar la biblioteca."
@@ -775,7 +728,8 @@ class YouTubeMusicService @JvmOverloads constructor(
         callback: SimpleResultCallback
     ) {
         val token = accessToken.trim()
-        if (token.isEmpty() || playlistId.isEmpty() || videoId.isEmpty()) {
+        // El añadir a playlist ahora va por InnerTube (cookie web), no por el token OAuth.
+        if (playlistId.isEmpty() || videoId.isEmpty()) {
             callback.onResult(false, "Parametros invalidos.")
             return
         }
@@ -797,29 +751,25 @@ class YouTubeMusicService @JvmOverloads constructor(
         maxResults: Int,
         callback: PlaylistTracksCallback
     ) {
-        val token = accessToken.trim()
-        if (token.isEmpty()) {
-            callback.onError("No hay token OAuth para cargar canciones.")
-            return
-        }
-
         val normalizedPlaylistId = playlistId.trim()
         if (normalizedPlaylistId.isEmpty()) {
             callback.onError("Playlist invalida.")
             return
         }
 
+        // Migrado de la Data API OAuth a InnerTube browse (VL<id>, con continuaciones) usando la
+        // cookie web. "Me gusta" (SPECIAL_LIKED_VIDEOS_ID) resuelve a la playlist LM (Liked Music).
+        val cookieHeader = StreamResolver.getAuthCookieHeader().trim()
+        if (cookieHeader.isEmpty()) {
+            callback.onError("No hay sesión web para cargar canciones.")
+            return
+        }
+
         executor.execute {
             try {
-                var tracks: List<PlaylistTrackResult> =
-                    if (SPECIAL_LIKED_VIDEOS_ID == normalizedPlaylistId) {
-                        val musicLikes = performMusicLikesTracksRequest(token, maxOf(1, maxResults))
-                        if (musicLikes.isEmpty()) {
-                            performLikedVideosTracksRequest(token, maxOf(1, maxResults))
-                        } else musicLikes
-                    } else {
-                        performPlaylistTracksRequest(token, normalizedPlaylistId, maxOf(1, maxResults))
-                    }
+                val resolvedId =
+                    if (SPECIAL_LIKED_VIDEOS_ID == normalizedPlaylistId) "LM" else normalizedPlaylistId
+                val tracks = performPlaylistTracksBrowseRequest(cookieHeader, resolvedId, maxOf(1, maxResults))
                 mainHandler.post { callback.onSuccess(tracks) }
             } catch (e: Exception) {
                 val error = e.message ?: "No se pudo cargar canciones."
@@ -895,26 +845,10 @@ class YouTubeMusicService @JvmOverloads constructor(
         playlistId: String,
         callback: PlaylistMetaCallback
     ) {
-        val token = accessToken.trim()
-        val normalizedPlaylistId = playlistId.trim()
-        if (token.isEmpty() || normalizedPlaylistId.isEmpty()) {
-            callback.onError("Sin datos para leer metadata de playlist.")
-            return
-        }
-
-        executor.execute {
-            try {
-                val result = fetchPlaylistById(token, normalizedPlaylistId)
-                if (result == null) {
-                    mainHandler.post { callback.onError("No se encontro metadata de playlist.") }
-                    return@execute
-                }
-                mainHandler.post { callback.onSuccess(result) }
-            } catch (e: Exception) {
-                val error = e.message ?: "No se pudo leer metadata de playlist."
-                mainHandler.post { callback.onError(error) }
-            }
-        }
+        // La metadata detallada opcional (visibilidad/fecha de publicación) venía de la Data API OAuth.
+        // Al eliminar la dependencia de la API ya no se consulta; el encabezado conserva su metadata
+        // de respaldo (el conteo de canciones se deriva de las canciones cargadas vía browse).
+        callback.onError("Metadata detallada no disponible sin la Data API.")
     }
 
     fun getYoutubeReadonlyScope(): String = YT_SCOPE_READONLY
@@ -1045,18 +979,20 @@ class YouTubeMusicService @JvmOverloads constructor(
         videoIds: List<String>,
         callback: VideoDurationCallback
     ) {
-        val token = accessToken.trim()
-        if (token.isEmpty() || videoIds.isEmpty()) {
+        if (videoIds.isEmpty()) {
             callback.onSuccess(emptyMap())
             return
         }
 
         executor.execute {
             try {
-                val infoMap = fetchVideoPlaybackInfoByIdsInBatches(token, videoIds)
                 val result = HashMap<String, String>()
-                for ((id, info) in infoMap) {
-                    val formatted = formatYoutubeDuration(info.rawDuration)
+                // Vía InnerTube /player (ANDROID_VR) — sin cuota. Cap para no disparar cientos de
+                // peticiones en listas enormes (es un enriquecimiento best-effort de duraciones).
+                for (rawId in videoIds.take(60)) {
+                    val id = rawId.trim()
+                    if (id.isEmpty()) continue
+                    val formatted = fetchDurationViaInnertubePlayer(id)
                     if (formatted.isNotEmpty() && formatted != "--:--") {
                         result[id] = formatted
                     }
@@ -1069,709 +1005,54 @@ class YouTubeMusicService @JvmOverloads constructor(
         }
     }
 
-    // ----- HTTP helper -----
-
-    @Throws(Exception::class)
-    private inline fun <T> executeGet(
-        endpoint: String,
-        authorization: String? = null,
-        parser: (JSONObject) -> T
-    ): T {
-        val connection = openGetConnection(endpoint, authorization)
-        try {
-            val statusCode = connection.responseCode
-            val body = readResponse(connection, statusCode >= 400)
-            if (statusCode != HttpURLConnection.HTTP_OK) {
-                throw IllegalStateException(buildApiErrorMessage(body, statusCode))
-            }
-            return parser(JSONObject(body))
-        } finally {
-            connection.disconnect()
-        }
-    }
-
-    // ----- Network request implementations -----
-
-    @Throws(Exception::class)
-    private fun performSearchRequest(
-        query: String,
-        maxResults: Int,
-        apiKey: String,
-        pageToken: String?
-    ): SearchPageResult {
-        var endpoint = "$API_BASE_URL/search?part=snippet" +
-                "&type=video" +
-                "&videoCategoryId=10" +
-                "&videoEmbeddable=true" +
-                "&maxResults=" + minOf(50, maxResults) +
-                "&q=" + safeUrlEncode(query) +
-                "&key=" + safeUrlEncode(apiKey)
-
-        val normalizedPageToken = pageToken?.trim().orEmpty()
-        if (normalizedPageToken.isNotEmpty()) {
-            endpoint += "&pageToken=" + safeUrlEncode(normalizedPageToken)
-        }
-
-        return executeGet(endpoint) { root ->
-            val items = root.optJSONArray("items")
-            val nextPageToken = root.optString("nextPageToken", "").trim()
-            var result = ArrayList<TrackResult>()
-            if (items == null) return@executeGet SearchPageResult(result, nextPageToken)
-
-            items.forEachObject { item ->
-                val idObject = item.optJSONObject("id") ?: return@forEachObject
-                val snippet = item.optJSONObject("snippet") ?: return@forEachObject
-
-                val kind = idObject.optString("kind", "")
-                if (!kind.endsWith("#video")) return@forEachObject
-
-                val resultType = "video"
-                val contentId = idObject.optString("videoId", "").trim()
-                if (contentId.isEmpty()) return@forEachObject
-
-                val title = snippet.optString("title", "").trim()
-                if (title.isEmpty()) return@forEachObject
-
-                val channelTitle = snippet.optString("channelTitle", "").trim()
-                if (!shouldIncludeMusicSearchResult(title, channelTitle)) return@forEachObject
-
-                val subtitle = buildSearchSubtitle(resultType, channelTitle)
-                val thumbnailUrl = extractYouTubeThumbnail(snippet.optJSONObject("thumbnails"))
-
-                result.add(TrackResult(resultType, contentId, title, subtitle, thumbnailUrl))
-            }
-
-            if (result.isNotEmpty()) {
-                val videoIds = ArrayList<String>()
-                for (item in result) {
-                    if (item.isVideo() && !TextUtils.isEmpty(item.videoId)) {
-                        videoIds.add(item.videoId)
-                    }
-                }
-
-                if (videoIds.isNotEmpty()) {
-                    try {
-                        val filterMap = fetchPublicVideoFiltersByIds(apiKey, videoIds)
-                        if (filterMap.isNotEmpty()) {
-                            val filtered = ArrayList<TrackResult>(result.size)
-                            for (item in result) {
-                                if (!item.isVideo() || TextUtils.isEmpty(item.videoId)) {
-                                    filtered.add(item)
-                                    continue
-                                }
-
-                                val info = filterMap[item.videoId]
-                                if (info == null) {
-                                    filtered.add(item)
-                                    continue
-                                }
-
-                                if (!info.embeddable) continue
-                                if (info.durationSeconds in 1 until MIN_PUBLIC_MUSIC_DURATION_SECONDS) continue
-
-                                filtered.add(item)
-                            }
-                            result = filtered
-                        }
-                    } catch (_: Exception) {
-                        // Si falla el filtro de embebibles, mantenemos resultados para no bloquear búsqueda.
-                    }
-                }
-            }
-
-            SearchPageResult(result, nextPageToken)
-        }
-    }
-
-    @Throws(Exception::class)
-    private fun performMyPlaylistsRequest(accessToken: String, maxResults: Int): List<PlaylistResult> {
-        val targetCount = maxOf(1, maxResults)
-        var pageToken = ""
-        val result = ArrayList<PlaylistResult>()
-
-        while (result.size < targetCount) {
-            val pageSize = minOf(YOUTUBE_PAGE_MAX_RESULTS, targetCount - result.size)
-            var endpoint = "$API_BASE_URL/playlists?part=snippet,contentDetails,status" +
-                    "&mine=true" +
-                    "&maxResults=$pageSize"
-            if (pageToken.isNotEmpty()) {
-                endpoint += "&pageToken=" + safeUrlEncode(pageToken)
-            }
-
-            val nextToken = executeGet(endpoint, "Bearer $accessToken") { root ->
-                val items = root.optJSONArray("items") ?: JSONArray()
-                items.forEachObject { item ->
-                    val playlistId = item.optString("id", "").trim()
-                    val snippet = item.optJSONObject("snippet") ?: return@forEachObject
-                    val contentDetails = item.optJSONObject("contentDetails") ?: return@forEachObject
-                    if (playlistId.isEmpty()) return@forEachObject
-
-                    val title = snippet.optString("title", "").trim()
-                    if (title.isEmpty()) return@forEachObject
-
-                    val itemCount = contentDetails.optInt("itemCount", 0)
-                    val owner = snippet.optString("channelTitle", "").trim()
-                    val thumbnailUrl = extractYouTubeThumbnail(snippet.optJSONObject("thumbnails"))
-                    val status = item.optJSONObject("status")
-                    val privacyStatus = status?.optString("privacyStatus", "")?.trim().orEmpty()
-                    val publishedAt = snippet.optString("publishedAt", "").trim()
-
-                    result.add(
-                        PlaylistResult(
-                            playlistId, title, owner, itemCount,
-                            thumbnailUrl, privacyStatus, publishedAt
-                        )
-                    )
-                    if (result.size >= targetCount) return@forEachObject
-                }
-                root.optString("nextPageToken", "").trim()
-            }
-
-            pageToken = nextToken
-            if (pageToken.isEmpty()) break
-        }
-
-        var likesResult: PlaylistResult? = null
-        val musicLikes = fetchPlaylistById(accessToken, MUSIC_LIKES_PLAYLIST_ID)
-        if (musicLikes != null) {
-            likesResult = toSpecialLikesCollection(musicLikes, "Tu cuenta de YouTube Music")
-        }
-
-        if (likesResult == null) {
-            val likesPlaylistId = resolveLikesPlaylistId(accessToken)
-            if (likesPlaylistId.isNotEmpty()) {
-                val youtubeLikes = fetchPlaylistById(accessToken, likesPlaylistId)
-                if (youtubeLikes != null) {
-                    likesResult = toSpecialLikesCollection(youtubeLikes, "Tu cuenta de YouTube")
-                }
-            }
-        }
-
-        if (likesResult == null) {
-            likesResult = buildFallbackLikedVideosCollection(accessToken)
-        }
-
-        if (likesResult != null) {
-            upsertPlaylistAtTop(result, likesResult)
-        }
-
-        return result
-    }
-
-    @Throws(Exception::class)
-    private fun resolveLikesPlaylistId(accessToken: String): String {
-        val endpoint = "$API_BASE_URL/channels?part=contentDetails&mine=true&maxResults=1"
-        return executeGet(endpoint, "Bearer $accessToken") { root ->
-            val items = root.optJSONArray("items")
-            if (items == null || items.length() == 0) return@executeGet ""
-            val first = items.optJSONObject(0) ?: return@executeGet ""
-            val contentDetails = first.optJSONObject("contentDetails") ?: return@executeGet ""
-            val relatedPlaylists = contentDetails.optJSONObject("relatedPlaylists") ?: return@executeGet ""
-            relatedPlaylists.optString("likes", "").trim()
-        }
-    }
-
-    @Throws(Exception::class)
-    private fun fetchPlaylistById(accessToken: String, playlistId: String): PlaylistResult? {
-        val endpoint = "$API_BASE_URL/playlists?part=snippet,contentDetails,status" +
-                "&id=" + safeUrlEncode(playlistId) +
-                "&maxResults=1"
-
-        return executeGet<PlaylistResult?>(endpoint, "Bearer $accessToken") { root ->
-            val items = root.optJSONArray("items")
-            if (items == null || items.length() == 0) return@executeGet null
-
-            val item = items.optJSONObject(0) ?: return@executeGet null
-
-            val resolvedId = item.optString("id", "").trim()
-            val snippet = item.optJSONObject("snippet") ?: return@executeGet null
-            val contentDetails = item.optJSONObject("contentDetails") ?: return@executeGet null
-            if (resolvedId.isEmpty()) return@executeGet null
-
-            var title = snippet.optString("title", "").trim()
-            if (title.isEmpty()) title = SPECIAL_LIKED_VIDEOS_TITLE
-
-            val owner = snippet.optString("channelTitle", "").trim()
-            val itemCount = maxOf(0, contentDetails.optInt("itemCount", 0))
-            val thumbnailUrl = extractYouTubeThumbnail(snippet.optJSONObject("thumbnails"))
-            val status = item.optJSONObject("status")
-            val privacyStatus = status?.optString("privacyStatus", "")?.trim().orEmpty()
-            val publishedAt = snippet.optString("publishedAt", "").trim()
-
-            val lowered = title.lowercase(Locale.US)
-            if (lowered.contains("liked") || lowered.contains("gusta")) {
-                title = SPECIAL_LIKED_VIDEOS_TITLE
-            }
-
-            PlaylistResult(
-                resolvedId, title, owner, itemCount,
-                thumbnailUrl, privacyStatus, publishedAt
-            )
-        }
-    }
-
-    @Throws(Exception::class)
-    private fun buildFallbackLikedVideosCollection(accessToken: String): PlaylistResult? {
-        val endpoint = "$API_BASE_URL/videos?part=snippet&myRating=like&maxResults=1"
-        return executeGet<PlaylistResult?>(endpoint, "Bearer $accessToken") { root ->
-            val pageInfo = root.optJSONObject("pageInfo")
-            val total = if (pageInfo == null) 0 else maxOf(0, pageInfo.optInt("totalResults", 0))
-
-            val items = root.optJSONArray("items")
-            if (total <= 0 && (items == null || items.length() == 0)) return@executeGet null
-
-            var thumbnailUrl = ""
-            if (items != null && items.length() > 0) {
-                val first = items.optJSONObject(0)
-                if (first != null) {
-                    val snippet = first.optJSONObject("snippet")
-                    if (snippet != null) {
-                        thumbnailUrl = extractYouTubeThumbnail(snippet.optJSONObject("thumbnails"))
-                    }
-                }
-            }
-
-            PlaylistResult(
-                SPECIAL_LIKED_VIDEOS_ID,
-                SPECIAL_LIKED_VIDEOS_TITLE,
-                "Tu cuenta de YouTube",
-                total,
-                thumbnailUrl,
-                "private",
-                ""
-            )
-        }
-    }
-
-    private fun upsertPlaylistAtTop(list: MutableList<PlaylistResult>, playlist: PlaylistResult) {
-        val existingIndex = list.indexOfFirst { it.playlistId == playlist.playlistId }
-        if (existingIndex >= 0) list.removeAt(existingIndex)
-        list.add(0, playlist)
-    }
-
-    @Throws(Exception::class)
-    private fun performPlaylistTracksRequest(
-        accessToken: String,
-        playlistId: String,
-        maxResults: Int
-    ): List<PlaylistTrackResult> {
-        val targetCount = maxOf(1, maxResults)
-        var pageToken = ""
-        val videoMap = LinkedHashMap<String, TrackTempData>()
-        // Defense in depth: /playlistItems wants the bare playlist id, but browse-derived ids arrive
-        // 'VL'-prefixed (VLPL…). Strip a leading 'VL' (never the bare 2-char "VL") so those resolve.
-        val apiPlaylistId = if (playlistId.length > 2 && playlistId.startsWith("VL")) {
-            playlistId.substring(2)
-        } else playlistId
-
-        while (videoMap.size < targetCount) {
-            val pageSize = minOf(YOUTUBE_PAGE_MAX_RESULTS, targetCount - videoMap.size)
-            var endpoint = "$API_BASE_URL/playlistItems?part=snippet,contentDetails" +
-                    "&playlistId=" + safeUrlEncode(apiPlaylistId) +
-                    "&maxResults=$pageSize"
-            if (pageToken.isNotEmpty()) {
-                endpoint += "&pageToken=" + safeUrlEncode(pageToken)
-            }
-
-            val nextToken = executeGet(endpoint, "Bearer $accessToken") { root ->
-                val items = root.optJSONArray("items")
-                items?.forEachObject { item ->
-                    val contentDetails = item.optJSONObject("contentDetails") ?: return@forEachObject
-                    val snippet = item.optJSONObject("snippet") ?: return@forEachObject
-
-                    val videoId = contentDetails.optString("videoId", "").trim()
-                    if (videoId.isEmpty()) return@forEachObject
-
-                    val title = snippet.optString("title", "").trim()
-                    if (title.isEmpty() ||
-                        "deleted video".equals(title, ignoreCase = true) ||
-                        "private video".equals(title, ignoreCase = true)
-                    ) return@forEachObject
-
-                    var artist = snippet.optString("videoOwnerChannelTitle", "").trim()
-                    if (artist.isEmpty()) artist = snippet.optString("channelTitle", "").trim()
-                    if (artist.isEmpty()) artist = "Unknown artist"
-
-                    val thumbnailUrl = extractYouTubeThumbnail(snippet.optJSONObject("thumbnails"))
-                    videoMap[videoId] = TrackTempData(title, artist, thumbnailUrl)
-                    if (videoMap.size >= targetCount) return@forEachObject
-                }
-                root.optString("nextPageToken", "").trim()
-            }
-
-            pageToken = nextToken
-            if (pageToken.isEmpty()) break
-        }
-
-        val result = ArrayList<PlaylistTrackResult>()
-        val playbackInfoMap = fetchVideoPlaybackInfoByIdsInBatches(accessToken, ArrayList(videoMap.keys))
-        for ((videoId, data) in videoMap) {
-            val playbackInfo = playbackInfoMap[videoId]
-            if (playbackInfo != null && !playbackInfo.embeddable) continue
-
-            val durationSeconds = parseYoutubeDurationSeconds(playbackInfo?.rawDuration)
-            if (durationSeconds in 1 until MIN_PUBLIC_MUSIC_DURATION_SECONDS) continue
-            if (!shouldIncludeMusicSearchResult(data.title, data.artist)) continue
-
-            var duration = formatYoutubeDuration(playbackInfo?.rawDuration)
-            if (TextUtils.isEmpty(duration)) duration = "--:--"
-
-            result.add(PlaylistTrackResult(videoId, data.title, data.artist, duration, data.thumbnailUrl))
-            if (result.size >= targetCount) break
-        }
-
-        return result
-    }
-
-    @Throws(Exception::class)
-    private fun performLikedVideosTracksRequest(
-        accessToken: String,
-        maxResults: Int
-    ): List<PlaylistTrackResult> {
-        val targetCount = maxOf(1, maxResults)
-        var pageToken = ""
-        val seenVideoIds = HashSet<String>()
-        val result = ArrayList<PlaylistTrackResult>()
-
-        while (result.size < targetCount) {
-            val pageSize = minOf(YOUTUBE_PAGE_MAX_RESULTS, targetCount - result.size)
-            var endpoint = "$API_BASE_URL/videos?part=snippet,contentDetails,status" +
-                    "&myRating=like" +
-                    "&maxResults=$pageSize"
-            if (pageToken.isNotEmpty()) {
-                endpoint += "&pageToken=" + safeUrlEncode(pageToken)
-            }
-
-            val nextToken = executeGet(endpoint, "Bearer $accessToken") { root ->
-                val items = root.optJSONArray("items")
-                items?.forEachObject { item ->
-                    val videoId = item.optString("id", "").trim()
-                    val snippet = item.optJSONObject("snippet") ?: return@forEachObject
-                    val contentDetails = item.optJSONObject("contentDetails")
-                    val status = item.optJSONObject("status")
-                    if (videoId.isEmpty() || !seenVideoIds.add(videoId)) return@forEachObject
-
-                    if (status != null && !status.optBoolean("embeddable", true)) return@forEachObject
-
-                    val title = snippet.optString("title", "").trim()
-                    if (title.isEmpty() ||
-                        "deleted video".equals(title, ignoreCase = true) ||
-                        "private video".equals(title, ignoreCase = true)
-                    ) return@forEachObject
-
-                    var artist = snippet.optString("channelTitle", "").trim()
-                    if (artist.isEmpty()) artist = "Unknown artist"
-
-                    val rawDuration = contentDetails?.optString("duration", "")?.trim().orEmpty()
-                    val durationSec = parseYoutubeDurationSeconds(rawDuration)
-                    if (durationSec in 1 until MIN_PUBLIC_MUSIC_DURATION_SECONDS) return@forEachObject
-                    if (!shouldIncludeMusicSearchResult(title, artist)) return@forEachObject
-
-                    var duration = formatYoutubeDuration(rawDuration)
-                    if (duration.isEmpty()) duration = "--:--"
-
-                    val thumbnailUrl = extractYouTubeThumbnail(snippet.optJSONObject("thumbnails"))
-                    result.add(PlaylistTrackResult(videoId, title, artist, duration, thumbnailUrl))
-                    if (result.size >= targetCount) return@forEachObject
-                }
-                root.optString("nextPageToken", "").trim()
-            }
-
-            pageToken = nextToken
-            if (pageToken.isEmpty()) break
-        }
-
-        return result
-    }
-
-    private fun performMusicLikesTracksRequest(
-        accessToken: String,
-        maxResults: Int
-    ): List<PlaylistTrackResult> {
+    /** Duración de un video vía InnerTube /player (cliente ANDROID_VR, sin PO token ni cuota). */
+    private fun fetchDurationViaInnertubePlayer(videoId: String): String {
         return try {
-            performPlaylistTracksRequest(accessToken, MUSIC_LIKES_PLAYLIST_ID, maxResults)
-        } catch (_: Exception) {
-            ArrayList()
-        }
-    }
+            val body = JSONObject().apply {
+                put("context", JSONObject().put("client", JSONObject().apply {
+                    put("clientName", "ANDROID_VR")
+                    put("clientVersion", "1.62.27")
+                    put("deviceMake", "Oculus")
+                    put("deviceModel", "Quest 3")
+                    put("osName", "Android")
+                    put("osVersion", "12L")
+                    put("androidSdkVersion", 32)
+                    put("hl", "es")
+                }))
+                put("videoId", videoId)
+                put("contentCheckOk", true)
+                put("racyCheckOk", true)
+            }.toString().toByteArray(StandardCharsets.UTF_8)
 
-    private fun toSpecialLikesCollection(
-        source: PlaylistResult,
-        ownerName: String
-    ): PlaylistResult = PlaylistResult(
-        SPECIAL_LIKED_VIDEOS_ID,
-        SPECIAL_LIKED_VIDEOS_TITLE,
-        ownerName,
-        source.itemCount,
-        source.thumbnailUrl,
-        source.privacyStatus,
-        source.publishedAt
-    )
-
-    @Throws(Exception::class)
-    private fun fetchVideoPlaybackInfoByIdsInBatches(
-        accessToken: String,
-        videoIds: List<String>
-    ): Map<String, VideoPlaybackInfo> {
-        val result = HashMap<String, VideoPlaybackInfo>()
-        if (videoIds.isEmpty()) return result
-
-        var start = 0
-        while (start < videoIds.size) {
-            val end = minOf(start + YOUTUBE_PAGE_MAX_RESULTS, videoIds.size)
-            val batch = ArrayList(videoIds.subList(start, end))
-            result.putAll(fetchVideoPlaybackInfoByIds(accessToken, batch))
-            start += YOUTUBE_PAGE_MAX_RESULTS
-        }
-        return result
-    }
-
-    @Throws(Exception::class)
-    private fun fetchVideoPlaybackInfoByIds(
-        accessToken: String,
-        videoIds: List<String>
-    ): Map<String, VideoPlaybackInfo> {
-        if (videoIds.isEmpty()) return emptyMap()
-
-        val ids = videoIds.take(50).joinToString(",")
-        val endpoint = "$API_BASE_URL/videos?part=contentDetails,status" +
-                "&id=" + safeUrlEncode(ids)
-
-        return executeGet(endpoint, "Bearer $accessToken") { root ->
-            val playbackInfoMap = HashMap<String, VideoPlaybackInfo>()
-            val items = root.optJSONArray("items") ?: return@executeGet playbackInfoMap
-
-            items.forEachObject { item ->
-                val id = item.optString("id", "").trim()
-                if (id.isEmpty()) return@forEachObject
-
-                val contentDetails = item.optJSONObject("contentDetails")
-                val status = item.optJSONObject("status")
-
-                val rawDuration = contentDetails?.optString("duration", "")?.trim().orEmpty()
-                val embeddable = status == null || status.optBoolean("embeddable", true)
-                playbackInfoMap[id] = VideoPlaybackInfo(rawDuration, embeddable)
+            val connection = (URL("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
+                .openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                connectTimeout = 8000
+                readTimeout = 10000
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json")
+                setRequestProperty(
+                    "User-Agent",
+                    "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+                )
             }
-            playbackInfoMap
-        }
-    }
-
-    @Throws(Exception::class)
-    private fun fetchPublicVideoFiltersByIds(
-        apiKey: String,
-        videoIds: List<String>
-    ): Map<String, PublicVideoFilterInfo> {
-        if (videoIds.isEmpty()) return emptyMap()
-
-        val ids = videoIds.take(50).joinToString(",")
-        val endpoint = "$API_BASE_URL/videos?part=contentDetails,status" +
-                "&id=" + safeUrlEncode(ids) +
-                "&key=" + safeUrlEncode(apiKey)
-
-        return executeGet(endpoint) { root ->
-            val filterMap = HashMap<String, PublicVideoFilterInfo>()
-            val items = root.optJSONArray("items") ?: return@executeGet filterMap
-
-            items.forEachObject { item ->
-                val id = item.optString("id", "").trim()
-                if (id.isEmpty()) return@forEachObject
-
-                val contentDetails = item.optJSONObject("contentDetails")
-                val rawDuration = contentDetails?.optString("duration", "")?.trim().orEmpty()
-                val durationSeconds = parseYoutubeDurationSeconds(rawDuration)
-
-                val status = item.optJSONObject("status")
-                val embeddable = status == null || status.optBoolean("embeddable", true)
-                filterMap[id] = PublicVideoFilterInfo(embeddable, durationSeconds)
+            val responseText = try {
+                connection.outputStream.use { it.write(body) }
+                if (connection.responseCode != HttpURLConnection.HTTP_OK) return ""
+                connection.inputStream.bufferedReader().use { it.readText() }
+            } finally {
+                connection.disconnect()
             }
-            filterMap
-        }
-    }
-
-    private fun parseYoutubeDurationSeconds(rawDuration: String?): Int {
-        if (rawDuration.isNullOrEmpty()) return 0
-        val hours = extractDurationComponent(rawDuration, 'H')
-        val minutes = extractDurationComponent(rawDuration, 'M')
-        val seconds = extractDurationComponent(rawDuration, 'S')
-        return maxOf(0, hours * 3600 + minutes * 60 + seconds)
-    }
-
-    private fun formatYoutubeDuration(rawDuration: String?): String {
-        if (rawDuration.isNullOrEmpty()) return "--:--"
-
-        val hours = extractDurationComponent(rawDuration, 'H')
-        val minutes = extractDurationComponent(rawDuration, 'M')
-        val seconds = extractDurationComponent(rawDuration, 'S')
-
-        return if (hours > 0) {
-            String.format(Locale.US, "%d:%02d:%02d", hours, minutes, seconds)
-        } else {
-            String.format(Locale.US, "%d:%02d", minutes, seconds)
-        }
-    }
-
-    private fun extractDurationComponent(rawDuration: String, component: Char): Int {
-        val markerIndex = rawDuration.indexOf(component)
-        if (markerIndex <= 0) return 0
-
-        var start = markerIndex - 1
-        while (start >= 0 && rawDuration[start].isDigit()) {
-            start--
-        }
-
-        val number = rawDuration.substring(start + 1, markerIndex)
-        if (number.isEmpty()) return 0
-
-        return try {
-            number.toInt()
-        } catch (_: NumberFormatException) {
-            0
-        }
-    }
-
-    @Throws(Exception::class)
-    private fun openGetConnection(endpoint: String, authorization: String? = null): HttpURLConnection {
-        val url = URL(endpoint)
-        val connection = url.openConnection() as HttpURLConnection
-        connection.requestMethod = "GET"
-        connection.connectTimeout = 14000
-        connection.readTimeout = 18000
-        connection.useCaches = false
-        connection.setRequestProperty("Accept", "application/json")
-        connection.setRequestProperty("User-Agent", "Sleppify-Android/1.0")
-        if (!authorization.isNullOrEmpty()) {
-            connection.setRequestProperty("Authorization", authorization)
-        }
-        return connection
-    }
-
-    private fun buildSearchSubtitle(resultType: String, channelTitle: String): String {
-        return when (resultType) {
-            "playlist" -> if (channelTitle.isEmpty()) "Playlist" else "Playlist • $channelTitle"
-            "channel" -> if (channelTitle.isEmpty()) "Artista" else "Artista • $channelTitle"
-            else -> channelTitle
-        }
-    }
-
-    private fun shouldIncludeMusicSearchResult(title: String, channelTitle: String?): Boolean {
-        val normalizedTitle = title.lowercase(Locale.US)
-
-        if (containsAny(normalizedTitle, "#shorts", " shorts", "shorts ")) return false
-
-        if (containsAny(
-                normalizedTitle,
-                "podcast", "interview", "entrevista", "explica", "explains",
-                "reaction", "trailer", "teaser", "documental", "noticias", "news"
-            )
-        ) return false
-
-        return true
-    }
-
-    private fun extractYouTubeThumbnail(thumbnails: JSONObject?): String {
-        if (thumbnails == null) return ""
-        // Prefer medium (320×180) — sharp enough for list thumbnails (50dp ≈ 150px)
-        // and search results, while being ~10x smaller than maxres (1280×720).
-        // Glide .override() handles final sizing; the player cover has its own URL chain.
-        val qualityOrder = arrayOf("medium", "high", "default", "standard", "maxres")
-        for (quality in qualityOrder) {
-            val url = readThumbnailUrl(thumbnails, quality)
-            if (url.isNotEmpty()) return url
-        }
-        return ""
-    }
-
-    private fun readThumbnailUrl(thumbnails: JSONObject, quality: String): String {
-        val obj = thumbnails.optJSONObject(quality) ?: return ""
-        return obj.optString("url", "").trim()
-    }
-
-    private fun buildApiErrorMessage(rawBody: String, statusCode: Int): String {
-        val details = parseApiError(rawBody)
-        val reasonNormalized = details.reason.lowercase(Locale.US)
-        val messageNormalized = details.message.lowercase(Locale.US)
-
-        if (statusCode == 401) {
-            return "Token de YouTube expirado o invalido. Reconecta tu cuenta."
-        }
-        if (statusCode == 403) {
-            return buildForbiddenApiErrorMessage(reasonNormalized, messageNormalized, details)
-        }
-
-        if (details.message.isNotEmpty()) {
-            return if (details.reason.isNotEmpty()) {
-                "YouTube API $statusCode (${details.reason}): ${details.message}"
-            } else {
-                "YouTube API $statusCode: ${details.message}"
-            }
-        }
-        return "YouTube API $statusCode: solicitud no valida."
-    }
-
-    private fun buildForbiddenApiErrorMessage(
-        reasonNormalized: String,
-        messageNormalized: String,
-        details: ApiErrorDetails
-    ): String {
-        if (containsAny(
-                reasonNormalized,
-                "quotaexceeded", "dailylimitexceeded", "ratelimitexceeded", "userratelimitexceeded"
-            ) ||
-            containsAny(messageNormalized, "quota", "rate limit", "daily limit")
-        ) {
-            return "Cuota de YouTube agotada. Intenta mas tarde o revisa la cuota en Google Cloud."
-        }
-
-        if (containsAny(reasonNormalized, "accessnotconfigured", "servicedisabled") ||
-            containsAny(messageNormalized, "api has not been used", "api is disabled", "service disabled")
-        ) {
-            return "YouTube Data API no esta habilitada para este proyecto en Google Cloud."
-        }
-
-        if (containsAny(
-                reasonNormalized,
-                "insufficientpermissions", "forbidden", "playlistforbidden", "authorizationrequired"
-            ) ||
-            containsAny(
-                messageNormalized,
-                "insufficient permission", "not properly authorized", "youtube.readonly"
-            )
-        ) {
-            return "Faltan permisos OAuth de YouTube. Pulsa Conectar y acepta youtube.readonly."
-        }
-
-        if (details.message.isNotEmpty()) {
-            val reasonLabel = if (details.reason.isEmpty()) "forbidden" else details.reason
-            return "YouTube API 403 ($reasonLabel): ${details.message}"
-        }
-
-        return "Sin permiso para YouTube API (403)."
-    }
-
-    private fun parseApiError(rawBody: String): ApiErrorDetails {
-        if (rawBody.isEmpty()) return ApiErrorDetails("", "")
-
-        return try {
-            val root = JSONObject(rawBody)
-            val error = root.optJSONObject("error") ?: return ApiErrorDetails("", "")
-
-            var message = error.optString("message", "").trim()
-            var reason = ""
-
-            val errors = error.optJSONArray("errors")
-            if (errors != null && errors.length() > 0) {
-                val first = errors.optJSONObject(0)
-                if (first != null) {
-                    reason = first.optString("reason", "").trim()
-                    if (message.isEmpty()) {
-                        message = first.optString("message", "").trim()
-                    }
-                }
-            }
-
-            ApiErrorDetails(reason, message)
-        } catch (_: Exception) {
-            ApiErrorDetails("", "")
+            val root = JSONObject(responseText)
+            val secs = root.optJSONObject("videoDetails")?.optString("lengthSeconds", "")?.toIntOrNull() ?: return ""
+            if (secs <= 0) return ""
+            val h = secs / 3600
+            val m = (secs % 3600) / 60
+            val s = secs % 60
+            if (h > 0) String.format(java.util.Locale.US, "%d:%02d:%02d", h, m, s)
+            else String.format(java.util.Locale.US, "%d:%02d", m, s)
+        } catch (e: Exception) {
+            ""
         }
     }
 
@@ -1802,33 +1083,34 @@ class YouTubeMusicService @JvmOverloads constructor(
         playlistId: String,
         videoId: String
     ): Boolean {
-        val url = URL("$API_BASE_URL/playlistItems?part=snippet")
-        val conn = url.openConnection() as HttpURLConnection
-        try {
-            conn.requestMethod = "POST"
-            conn.setRequestProperty("Authorization", "Bearer $token")
-            conn.setRequestProperty("Content-Type", "application/json")
-            conn.doOutput = true
-
-            val snippet = JSONObject()
-            snippet.put("playlistId", playlistId)
-            val resourceId = JSONObject()
-            resourceId.put("kind", "youtube#video")
-            resourceId.put("videoId", videoId)
-            snippet.put("resourceId", resourceId)
-
-            val root = JSONObject()
-            root.put("snippet", snippet)
-
-            conn.outputStream.use { os ->
-                val input = root.toString().toByteArray(StandardCharsets.UTF_8)
-                os.write(input, 0, input.size)
-            }
-
-            val code = conn.responseCode
-            return code in 200..299
-        } finally {
-            conn.disconnect()
+        // Migrado de la Data API OAuth (/playlistItems) a InnerTube edit_playlist con la cookie web
+        // (firmada con SAPISIDHASH por postInnerTubeBrowse). El token queda ignorado. Sin cuota.
+        val cookieHeader = StreamResolver.getAuthCookieHeader().trim()
+        if (cookieHeader.isEmpty()) return false
+        val bareId = if (playlistId.length > 2 && playlistId.startsWith("VL")) playlistId.substring(2) else playlistId
+        val endpoint = "https://music.youtube.com/youtubei/v1/browse/edit_playlist?prettyPrint=false"
+        val body = JSONObject().apply {
+            put("context", JSONObject().apply {
+                put("client", JSONObject().apply {
+                    put("clientName", "WEB_REMIX")
+                    put("clientVersion", buildClientVersion())
+                    put("hl", "es")
+                })
+            })
+            put("playlistId", bareId)
+            put("actions", JSONArray().apply {
+                put(JSONObject().apply {
+                    put("action", "ACTION_ADD_VIDEO")
+                    put("addedVideoId", videoId)
+                })
+            })
+        }.toString().toByteArray(StandardCharsets.UTF_8)
+        return try {
+            val response = postInnerTubeBrowse(endpoint, body, cookieHeader)
+            JSONObject(response).optString("status", "").equals("STATUS_SUCCEEDED", ignoreCase = true)
+        } catch (e: Exception) {
+            Log.w(TAG, "edit_playlist add failed: ${e.message}")
+            false
         }
     }
 
@@ -2028,7 +1310,7 @@ class YouTubeMusicService @JvmOverloads constructor(
             connection.setRequestProperty("Cookie", cookieHeader)
             // Cookie autenticada SIN SAPISIDHASH = 401 intermitente ("No se pudo cargar la
             // radio"). Misma firma que postInnerTubeBrowse.
-            val sapisidAuth = StreamResolver.buildSapisidHash("https://music.youtube.com")
+            val sapisidAuth = StreamResolver.buildSapisidHashForCookie(cookieHeader, "https://music.youtube.com")
             if (sapisidAuth.isNotEmpty()) {
                 connection.setRequestProperty("Authorization", sapisidAuth)
             }
@@ -2116,7 +1398,7 @@ class YouTubeMusicService @JvmOverloads constructor(
         if (cookieHeader.isNotEmpty()) {
             connection.setRequestProperty("Cookie", cookieHeader)
             // Misma firma SAPISIDHASH que la petición inicial (cookie sin firma = 401).
-            val sapisidAuth = StreamResolver.buildSapisidHash("https://music.youtube.com")
+            val sapisidAuth = StreamResolver.buildSapisidHashForCookie(cookieHeader, "https://music.youtube.com")
             if (sapisidAuth.isNotEmpty()) {
                 connection.setRequestProperty("Authorization", sapisidAuth)
             }
@@ -2330,6 +1612,16 @@ class YouTubeMusicService @JvmOverloads constructor(
 
         val videoId = renderer.optString("videoId", "").trim()
         if (videoId.isEmpty() || tracks.any { it.videoId == videoId }) return
+
+        // Filtrar contenido NO musical que YouTube a veces cuela en un mix/radio (un video de
+        // Minecraft, un gameplay, etc.): los items de YT Music llevan
+        // `watchEndpointMusicSupportedConfigs` dentro de su watchEndpoint; un video normal de
+        // YouTube NO lo lleva. Si el item tiene watchEndpoint pero SIN esa config de música, es un
+        // video ajeno → NO va a la cola. (Items sin watchEndpoint quedan; no se filtran de más.)
+        val watchEndpoint = renderer.optJSONObject("navigationEndpoint")?.optJSONObject("watchEndpoint")
+        if (watchEndpoint != null && !watchEndpoint.has("watchEndpointMusicSupportedConfigs")) {
+            return
+        }
 
         val title = renderer.optJSONObject("title")
             ?.optJSONArray("runs")
@@ -3030,12 +2322,224 @@ class YouTubeMusicService @JvmOverloads constructor(
         return thumbs.optJSONObject(thumbs.length() - 1)?.optString("url", "") ?: ""
     }
 
+    // ----- Biblioteca vía InnerTube browse (reemplaza la Data API OAuth) -----
+
+    /** Body de browse WEB_REMIX; browseId para la página inicial o continuation para paginar. */
+    private fun buildLibraryBrowseBody(browseId: String?, continuation: String?): ByteArray {
+        return JSONObject().apply {
+            put("context", JSONObject().apply {
+                put("client", JSONObject().apply {
+                    put("clientName", "WEB_REMIX")
+                    put("clientVersion", buildClientVersion())
+                    put("hl", "es")
+                })
+            })
+            if (continuation != null) put("continuation", continuation)
+            else if (browseId != null) put("browseId", browseId)
+        }.toString().toByteArray(StandardCharsets.UTF_8)
+    }
+
+    /** Lista de playlists de la biblioteca del usuario (FEmusic_liked_playlists). */
+    @Throws(Exception::class)
+    private fun performLibraryPlaylistsBrowseRequest(cookieHeader: String): List<PlaylistResult> {
+        val endpoint = "https://music.youtube.com/youtubei/v1/browse?prettyPrint=false"
+        val responseBody = postInnerTubeBrowse(endpoint, buildLibraryBrowseBody("FEmusic_liked_playlists", null), cookieHeader)
+        val root = JSONObject(responseBody)
+        val result = parseLibraryPlaylists(root)
+        Log.d(TAG, "library_playlists_browse parsed=${result.size}")
+        return result
+    }
+
+    private fun parseLibraryPlaylists(root: JSONObject): List<PlaylistResult> {
+        val out = ArrayList<PlaylistResult>()
+        val seen = HashSet<String>()
+        var likedMusic: PlaylistResult? = null
+
+        fun consider(renderer: JSONObject) {
+            val browseId = renderer.optJSONObject("navigationEndpoint")
+                ?.optJSONObject("browseEndpoint")
+                ?.optString("browseId", "")?.trim() ?: ""
+            // Sólo tarjetas que navegan a una playlist (VL<id>); ignora "Nueva playlist", etc.
+            if (!browseId.startsWith("VL") || browseId.length <= 2) return
+            val playlistId = browseId.substring(2)
+            if (playlistId.isEmpty()) return
+
+            val title = renderer.optJSONObject("title")?.optJSONArray("runs")?.optJSONObject(0)
+                ?.optString("text", "")?.trim() ?: ""
+            if (title.isEmpty()) return
+
+            val subtitleRuns = renderer.optJSONObject("subtitle")?.optJSONArray("runs")
+            val subtitle = buildString {
+                if (subtitleRuns != null) for (r in 0 until subtitleRuns.length()) {
+                    append(subtitleRuns.optJSONObject(r)?.optString("text", "") ?: "")
+                }
+            }.trim()
+
+            val thumbnailUrl = renderer.optJSONObject("thumbnailRenderer")
+                ?.optJSONObject("musicThumbnailRenderer")?.optJSONObject("thumbnail")
+                ?.optJSONArray("thumbnails")?.let { thumbs ->
+                    if (thumbs.length() > 0) thumbs.optJSONObject(thumbs.length() - 1)?.optString("url", "") ?: "" else ""
+                } ?: ""
+
+            val itemCount = parseLeadingInt(subtitle)
+
+            // "Liked Music" (VLLM) → colección especial "Me gusta" fijada arriba.
+            if (playlistId == "LM") {
+                if (likedMusic == null) {
+                    likedMusic = PlaylistResult(
+                        SPECIAL_LIKED_VIDEOS_ID, SPECIAL_LIKED_VIDEOS_TITLE,
+                        "Tu cuenta de YouTube Music", itemCount, thumbnailUrl, "private", ""
+                    )
+                }
+                return
+            }
+            if (!seen.add(playlistId)) return
+            out.add(PlaylistResult(playlistId, title, subtitle, itemCount, thumbnailUrl, "", ""))
+        }
+
+        val contentRoot = root.optJSONObject("contents")
+        val sectionArrays = mutableListOf<JSONArray>()
+        contentRoot?.optJSONObject("singleColumnBrowseResultsRenderer")
+            ?.optJSONArray("tabs")?.optJSONObject(0)
+            ?.optJSONObject("tabRenderer")?.optJSONObject("content")
+            ?.optJSONObject("sectionListRenderer")?.optJSONArray("contents")
+            ?.let { sectionArrays.add(it) }
+        contentRoot?.optJSONObject("twoColumnBrowseResultsRenderer")?.let { two ->
+            two.optJSONObject("secondaryContents")
+                ?.optJSONObject("sectionListRenderer")?.optJSONArray("contents")
+                ?.let { sectionArrays.add(it) }
+            two.optJSONArray("tabs")?.optJSONObject(0)
+                ?.optJSONObject("tabRenderer")?.optJSONObject("content")
+                ?.optJSONObject("sectionListRenderer")?.optJSONArray("contents")
+                ?.let { sectionArrays.add(it) }
+        }
+
+        for (sections in sectionArrays) {
+            for (s in 0 until sections.length()) {
+                val section = sections.optJSONObject(s) ?: continue
+                val items = section.optJSONObject("gridRenderer")?.optJSONArray("items")
+                    ?: section.optJSONObject("musicShelfRenderer")?.optJSONArray("contents")
+                    ?: section.optJSONObject("itemSectionRenderer")?.optJSONArray("contents")
+                    ?: continue
+                for (i in 0 until items.length()) {
+                    val item = items.optJSONObject(i) ?: continue
+                    val renderer = item.optJSONObject("musicTwoRowItemRenderer")
+                        ?: item.optJSONObject("musicResponsiveListItemRenderer")
+                        ?: continue
+                    consider(renderer)
+                }
+            }
+        }
+
+        // Fallback: layout desconocido → escaneo profundo del árbol.
+        if (out.isEmpty() && likedMusic == null) {
+            for (renderer in deepCollectItemRenderers(root)) consider(renderer)
+        }
+
+        likedMusic?.let { out.add(0, it) }
+        return out
+    }
+
+    /** Extrae el primer entero de un texto tipo "Playlist • 25 canciones" → 25. */
+    private fun parseLeadingInt(text: String): Int {
+        val match = Regex("\\d[\\d.,]*").find(text) ?: return 0
+        return match.value.replace(".", "").replace(",", "").toIntOrNull() ?: 0
+    }
+
+    /** Canciones de una playlist vía InnerTube browse (VL<id>) con paginación por continuaciones. */
+    @Throws(Exception::class)
+    private fun performPlaylistTracksBrowseRequest(
+        cookieHeader: String,
+        playlistId: String,
+        maxResults: Int
+    ): List<PlaylistTrackResult> {
+        val id = playlistId.trim()
+        if (id.isEmpty()) return emptyList()
+        val browseId = if (id.startsWith("VL")) id else "VL$id"
+        val endpoint = "https://music.youtube.com/youtubei/v1/browse?prettyPrint=false"
+        val target = maxOf(1, maxResults)
+        val out = ArrayList<PlaylistTrackResult>()
+        val seen = HashSet<String>()
+
+        fun addRows(rows: List<TrackResult>) {
+            for (t in rows) {
+                if (t.videoId.isEmpty() || !seen.add(t.videoId)) continue
+                val duration = if (TextUtils.isEmpty(t.duration)) "--:--" else t.duration
+                out.add(PlaylistTrackResult(t.videoId, t.title, t.subtitle, duration, t.thumbnailUrl))
+                if (out.size >= target) return
+            }
+        }
+
+        val firstRoot = JSONObject(postInnerTubeBrowse(endpoint, buildLibraryBrowseBody(browseId, null), cookieHeader))
+        val shelf = findPlaylistShelf(firstRoot)
+        shelf?.optJSONArray("contents")?.let { addRows(parseAlbumTrackRows(it)) }
+        var continuation = extractPlaylistShelfContinuation(shelf)
+
+        var guard = 0
+        while (out.size < target && continuation != null && guard < 12) {
+            guard++
+            val contRoot = JSONObject(postInnerTubeBrowse(endpoint, buildLibraryBrowseBody(null, continuation), cookieHeader))
+            val contShelf = contRoot.optJSONObject("continuationContents")
+                ?.optJSONObject("musicPlaylistShelfContinuation")
+                ?: contRoot.optJSONObject("continuationContents")?.optJSONObject("musicShelfContinuation")
+            val rows = contShelf?.optJSONArray("contents")?.let { parseAlbumTrackRows(it) } ?: emptyList()
+            if (rows.isEmpty()) break
+            addRows(rows)
+            continuation = extractPlaylistShelfContinuation(contShelf)
+        }
+
+        return out
+    }
+
+    /** Localiza el objeto musicPlaylistShelfRenderer/musicShelfRenderer (no sus contents). */
+    private fun findPlaylistShelf(root: JSONObject): JSONObject? {
+        val sectionLists = mutableListOf<JSONArray>()
+        root.optJSONObject("contents")?.let { contents ->
+            contents.optJSONObject("singleColumnBrowseResultsRenderer")
+                ?.optJSONArray("tabs")?.optJSONObject(0)
+                ?.optJSONObject("tabRenderer")?.optJSONObject("content")
+                ?.optJSONObject("sectionListRenderer")?.optJSONArray("contents")
+                ?.let { sectionLists.add(it) }
+            contents.optJSONObject("twoColumnBrowseResultsRenderer")?.let { two ->
+                two.optJSONObject("secondaryContents")
+                    ?.optJSONObject("sectionListRenderer")?.optJSONArray("contents")
+                    ?.let { sectionLists.add(it) }
+                two.optJSONArray("tabs")?.optJSONObject(0)
+                    ?.optJSONObject("tabRenderer")?.optJSONObject("content")
+                    ?.optJSONObject("sectionListRenderer")?.optJSONArray("contents")
+                    ?.let { sectionLists.add(it) }
+            }
+        }
+        for (sections in sectionLists) {
+            for (i in 0 until sections.length()) {
+                val section = sections.optJSONObject(i) ?: continue
+                val shelf = section.optJSONObject("musicPlaylistShelfRenderer")
+                    ?: section.optJSONObject("musicShelfRenderer")
+                if (shelf != null) return shelf
+            }
+        }
+        return null
+    }
+
+    private fun extractPlaylistShelfContinuation(node: JSONObject?): String? {
+        val conts = node?.optJSONArray("continuations") ?: return null
+        for (i in 0 until conts.length()) {
+            val token = conts.optJSONObject(i)?.optJSONObject("nextContinuationData")
+                ?.optString("continuation", "")
+            if (!token.isNullOrEmpty()) return token
+        }
+        return null
+    }
+
     private fun postInnerTubeBrowse(endpoint: String, body: ByteArray, cookieHeader: String): String {
         val url = URL(endpoint)
         val connection = url.openConnection() as HttpURLConnection
         connection.requestMethod = "POST"
-        connection.connectTimeout = 14000
-        connection.readTimeout = 18000
+        // 18s de read era excesivo para un carrusel del home: una respuesta lenta congelaba la
+        // sección hasta 18s. 10s falla antes y el reintento con backoff de refreshRecommended
+        // (RECOMMENDED_MAX_RETRIES) cubre los timeouts transitorios.
+        connection.connectTimeout = 8000
+        connection.readTimeout = 10000
         connection.doOutput = true
         connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
         connection.setRequestProperty("Accept", "application/json")
@@ -3044,7 +2548,7 @@ class YouTubeMusicService @JvmOverloads constructor(
         connection.setRequestProperty("Referer", "https://music.youtube.com/")
         if (cookieHeader.isNotEmpty()) {
             connection.setRequestProperty("Cookie", cookieHeader)
-            val sapisidAuth = StreamResolver.buildSapisidHash("https://music.youtube.com")
+            val sapisidAuth = StreamResolver.buildSapisidHashForCookie(cookieHeader, "https://music.youtube.com")
             if (sapisidAuth.isNotEmpty()) {
                 connection.setRequestProperty("Authorization", sapisidAuth)
             }
@@ -3453,7 +2957,7 @@ class YouTubeMusicService @JvmOverloads constructor(
             connection.setRequestProperty("Cookie", cookieHeader)
             // Cookie autenticada SIN SAPISIDHASH = 401 intermitente de InnerTube, que aquí se
             // tragaba como lista vacía y hacía DESAPARECER la sección "Covers y remixes".
-            val sapisidAuth = StreamResolver.buildSapisidHash("https://music.youtube.com")
+            val sapisidAuth = StreamResolver.buildSapisidHashForCookie(cookieHeader, "https://music.youtube.com")
             if (sapisidAuth.isNotEmpty()) {
                 connection.setRequestProperty("Authorization", sapisidAuth)
             }
@@ -3682,56 +3186,24 @@ class YouTubeMusicService @JvmOverloads constructor(
             return
         }
 
-        val apiKey = (BuildConfig.YOUTUBE_DATA_API_KEY ?: "").trim()
-        if (apiKey.isEmpty()) {
-            callback.onError("Configura YOUTUBE_DATA_API_KEY.")
-            return
-        }
-
-        val appContext = context.applicationContext
+        val cookieHeader = StreamResolver.getAuthCookieHeader().trim()
         val maxResults = maxOf(5, maxCandidates * 3)
 
         executor.execute {
             try {
-                val pageResult = performSearchRequest(normalized, maxResults, apiKey, null)
+                // Búsqueda vía InnerTube (WEB_REMIX) — sin API key ni cuota. Los resultados de música
+                // ya traen su duración; filtramos clips demasiado cortos igual que antes.
+                val pageResult = performInnertubeSearchRequest(normalized, maxResults, cookieHeader)
                 val originalId = originalVideoId.trim()
 
-                val eligible = ArrayList<TrackResult>()
+                val candidates = ArrayList<ReplacementCandidate>()
                 for (item in pageResult.tracks) {
                     if (!item.isVideo() || TextUtils.isEmpty(item.videoId)) continue
                     if (item.videoId == originalId) continue
-                    eligible.add(item)
-                    if (eligible.size >= maxResults) break
-                }
 
-                if (eligible.isEmpty()) {
-                    mainHandler.post { callback.onSuccess(emptyList()) }
-                    return@execute
-                }
-
-                val videoIds = eligible.map { it.videoId }
-                val filterMap = try {
-                    fetchPublicVideoFiltersByIds(apiKey, videoIds)
-                } catch (_: Exception) {
-                    emptyMap()
-                }
-
-                val candidates = ArrayList<ReplacementCandidate>()
-                for (item in eligible) {
-                    val info = filterMap[item.videoId]
-                    if (info != null) {
-                        if (!info.embeddable) continue
-                        if (info.durationSeconds in 1 until MIN_PUBLIC_MUSIC_DURATION_SECONDS) continue
-                    }
-
-                    val durationSeconds = info?.durationSeconds ?: 0
-                    val durationStr = if (durationSeconds > 0) {
-                        val h = durationSeconds / 3600
-                        val m = (durationSeconds % 3600) / 60
-                        val s = durationSeconds % 60
-                        if (h > 0) String.format(java.util.Locale.US, "%d:%02d:%02d", h, m, s)
-                        else String.format(java.util.Locale.US, "%d:%02d", m, s)
-                    } else "--:--"
+                    val durationSeconds = clockDurationToSeconds(item.duration)
+                    if (durationSeconds in 1 until MIN_PUBLIC_MUSIC_DURATION_SECONDS) continue
+                    val durationStr = if (item.duration.isNotEmpty() && item.duration != "--:--") item.duration else "--:--"
 
                     candidates.add(
                         ReplacementCandidate(
@@ -3754,16 +3226,30 @@ class YouTubeMusicService @JvmOverloads constructor(
         }
     }
 
+    /** "3:45"/"1:02:03" → segundos. 0 si no se puede parsear (p. ej. "--:--"). */
+    private fun clockDurationToSeconds(clock: String): Int {
+        val trimmed = clock.trim()
+        if (trimmed.isEmpty() || trimmed == "--:--") return 0
+        val parts = trimmed.split(":")
+        return try {
+            when (parts.size) {
+                3 -> parts[0].toInt() * 3600 + parts[1].toInt() * 60 + parts[2].toInt()
+                2 -> parts[0].toInt() * 60 + parts[1].toInt()
+                1 -> parts[0].toInt()
+                else -> 0
+            }
+        } catch (_: NumberFormatException) {
+            0
+        }
+    }
+
     companion object {
-        private const val API_BASE_URL = "https://www.googleapis.com/youtube/v3"
         private const val YT_SCOPE_READONLY = "https://www.googleapis.com/auth/youtube.readonly"
-        private const val MUSIC_LIKES_PLAYLIST_ID = "LM"
 
         @JvmField
         val SPECIAL_LIKED_VIDEOS_ID = "__liked_videos__"
 
         private const val SPECIAL_LIKED_VIDEOS_TITLE = "Me gusta"
-        private const val YOUTUBE_PAGE_MAX_RESULTS = 50
         private const val MIN_PUBLIC_MUSIC_DURATION_SECONDS = 70
         private const val MAX_MIX_CONTINUATIONS = 4
 

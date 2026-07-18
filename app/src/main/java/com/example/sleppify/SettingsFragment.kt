@@ -1092,11 +1092,26 @@ class SettingsFragment : Fragment() {
     // --- Account actions ---
 
     private fun performSignOut() {
+        if (!isAdded) return
+        // Confirmación: cerrar sesión ahora REINICIA la app en frío (antes solo cambiaba un texto y
+        // dejaba la sesión de streaming + servicios vivos, por eso "parecía que no hacía nada").
+        MaterialAlertDialogBuilder(requireContext())
+            .setTitle("Cerrar sesión")
+            .setMessage("Se cerrará tu sesión y la app se reiniciará.")
+            .setNegativeButton("Cancelar", null)
+            .setPositiveButton("Cerrar sesión") { _, _ -> doSignOut() }
+            .show()
+    }
+
+    private fun doSignOut() {
+        if (!isAdded) return
         (activity as? MainActivity)?.pauseActiveMediaAndDownloadsForSessionChange()
         authManager.signOut(requireContext()) { _, _ ->
+            // signOut() solo limpia Firebase + Credential Manager; la sesión InnerTube de música y
+            // los servicios en foreground se cortan en el teardown, y el relanzamiento en frío
+            // suelta el estático StreamResolver.authCookieHeader que sobreviviría en el proceso.
             CloudSyncManager.getInstance(requireContext()).onUserSignedOut()
-            renderAccountSection()
-            (activity as? MainActivity)?.refreshSessionUi()
+            activity?.runOnUiThread { terminateAndRelaunch() }
         }
     }
 
@@ -1143,24 +1158,69 @@ class SettingsFragment : Fragment() {
     private fun performDeleteAccountAndData() {
         if (deleteAccountInFlight || !isAdded) return
         (activity as? MainActivity)?.pauseActiveMediaAndDownloadsForSessionChange()
-        val uid = authManager.getCurrentUser()?.uid ?: return
+        val uid = authManager.getCurrentUser()?.uid
+        if (uid == null) {
+            AppSnackbar.show(activity, "No hay sesión activa para eliminar.")
+            return
+        }
         deleteAccountInFlight = true
         val appContext = requireContext().applicationContext
         val cloudSync = CloudSyncManager.getInstance(appContext)
 
-        cloudSync.deleteUserDataFromCloud(uid) { ok: Boolean, _: String? ->
+        cloudSync.deleteUserDataFromCloud(uid) { ok: Boolean, cloudErr: String? ->
             if (ok && isAdded) {
-                authManager.deleteCurrentUser(requireActivity()) { authOk: Boolean, _: String? ->
+                authManager.deleteCurrentUser(requireActivity()) { authOk: Boolean, authErr: String? ->
                     deleteAccountInFlight = false
-                    if (authOk && isAdded) {
+                    if (authOk) {
                         cloudSync.onUserSignedOut()
                         cloudSync.clearLocalUserDataCompletely()
-                        renderAccountSection()
-                        (activity as? MainActivity)?.refreshSessionUi()
+                        activity?.runOnUiThread { terminateAndRelaunch() }
+                    } else {
+                        // Antes esta rama estaba VACÍA: una re-autenticación cancelada o un error de
+                        // borrado dejaba el botón sin ningún efecto visible. Ahora se muestra el error.
+                        AppSnackbar.show(activity, authErr ?: "No se pudo eliminar la cuenta.")
                     }
                 }
-            } else { deleteAccountInFlight = false }
+            } else {
+                deleteAccountInFlight = false
+                // Antes: rama else silenciosa. Ahora superficie del error de borrado en la nube.
+                if (isAdded) AppSnackbar.show(activity, cloudErr ?: "No se pudieron borrar tus datos en la nube.")
+            }
         }
+    }
+
+    /**
+     * Teardown compartido de cerrar sesión / eliminar cuenta: para los servicios en foreground,
+     * corta la sesión de streaming (cookie InnerTube en prefs + estático en memoria) y RELANZA la
+     * app en frío matando el proceso — así se sueltan TODOS los singletons/estáticos (incluido
+     * StreamResolver.authCookieHeader) y arranca limpia. Es el "kill al final" pedido: antes
+     * cerrar sesión/eliminar solo cambiaba un texto y dejaba servicios + sesión de música vivos.
+     */
+    private fun terminateAndRelaunch() {
+        val ctx = context?.applicationContext ?: activity?.applicationContext ?: return
+        // 1. Parar servicios en foreground + limpiar notificaciones ANTES de matar el proceso
+        //    (si no, el SO puede reponer la notificación de reproducción huérfana).
+        try { PlaybackKeepAliveService.stop(ctx) } catch (_: Throwable) {}
+        try { AudioEffectsService.sendStop(ctx) } catch (_: Throwable) {}
+        try { androidx.core.app.NotificationManagerCompat.from(ctx).cancelAll() } catch (_: Throwable) {}
+        // 2. Cortar la sesión de streaming (cookie InnerTube en prefs + estático de StreamResolver).
+        try { StreamResolver.setAuthCookies("") } catch (_: Throwable) {}
+        try {
+            ctx.getSharedPreferences(AppConstants.PREFS_PLAYER_STATE, android.content.Context.MODE_PRIVATE)
+                .edit().remove(AppConstants.PREF_LAST_YOUTUBE_WEB_COOKIE).apply()
+        } catch (_: Throwable) {}
+        // 3. Relanzar la app en una tarea NUEVA y limpia, cerrar la actual y matar el proceso.
+        //    startActivity + exit(0) no requiere permisos (a diferencia de AlarmManager.setExact,
+        //    que en Android 12+ pide SCHEDULE_EXACT_ALARM): el ActivityManager ya tiene encolado el
+        //    lanzamiento antes del exit, así que el SO arranca un proceso FRESCO para la tarea nueva.
+        try {
+            val launch = ctx.packageManager.getLaunchIntentForPackage(ctx.packageName)?.apply {
+                addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK or android.content.Intent.FLAG_ACTIVITY_CLEAR_TASK)
+            }
+            if (launch != null) ctx.startActivity(launch)
+        } catch (_: Throwable) {}
+        try { activity?.finishAffinity() } catch (_: Throwable) {}
+        Runtime.getRuntime().exit(0)
     }
 
     // --- Downloads actions ---

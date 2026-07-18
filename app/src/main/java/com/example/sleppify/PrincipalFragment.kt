@@ -24,12 +24,12 @@ import androidx.core.content.res.ResourcesCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.fragment.app.Fragment
-import androidx.palette.graphics.Palette
 import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import androidx.viewpager2.widget.ViewPager2
 import com.bumptech.glide.Glide
+import com.bumptech.glide.load.DecodeFormat
 import com.bumptech.glide.load.engine.DiskCacheStrategy
 import com.bumptech.glide.load.resource.bitmap.CenterCrop
 import com.bumptech.glide.load.resource.bitmap.RoundedCorners
@@ -55,7 +55,10 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         // texts and side-url picks (computed with the old logic) are dropped once and recomputed.
         // v6: barras en DOS ROMBOS + color FUSIONADO de las 3 carátulas (la fusión vive en el
         // composite; el color persistido sigue siendo el del centro, solo placeholder de vBg).
-        private const val RADIO_UI_VERSION = 6
+        private const val RADIO_UI_VERSION = 7
+
+        // Reintentos del home browse ante error DURO (401/timeout). Backoff 2s→6s; reset al éxito.
+        private const val RECOMMENDED_MAX_RETRIES = 2
         private const val SHORTCUTS_PER_PAGE = 9
         private const val SHORTCUTS_MAX_PAGES = 3
         // Mínimo de reproducciones reales para entrar al grid de "más escuchadas": evita que
@@ -125,9 +128,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
     private var llRadiosHeader: View? = null
     private var rvRadios: RecyclerView? = null
     private val radioEntries = mutableListOf<RadioHistoryStore.RadioEntry>()
-    private val radioDominantColorCache = HashMap<String, Int>()
     private val radioArtistTextCache = HashMap<String, String>()
-    private val radioSideUrlsCache = HashMap<String, Pair<String, String>>()
     // Normalized (lowercase) names the user knows: followed library artists (minus unfollow
     // tombstones) + the artists they actually play. Used to bias the radio subtitle ("Con X, Y, Z
     // y más") and the side thumbnails toward familiar artists instead of unknown ones.
@@ -158,7 +159,16 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
     private val handler = Handler(Looper.getMainLooper())
     // Off-main-thread worker for disk/DB/JSON reads (PlayCountStore, prefs scans, grid art urls)
     // that were previously done on the UI thread and made entering the module janky.
-    private val bgExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+    // Pool (no un solo hilo): las lecturas de caché de cada sección (loadCached*, preloadRadioCaches)
+    // son independientes y read-only — mutan sus listas SOLO en el hilo principal vía handler.post —,
+    // así que correr hasta 3 en paralelo evita que una lectura pesada (el scan completo de
+    // streaming_cache) retrase el pintado en frío de las secciones siguientes. Antes: FIFO en 1 hilo.
+    private val bgExecutor = java.util.concurrent.Executors.newFixedThreadPool(3) { r ->
+        Thread(r, "principal-bg").apply {
+            isDaemon = true
+            priority = Thread.NORM_PRIORITY - 1
+        }
+    }
     private var cachedSongPlayer: SongPlayerFragment? = null
     private var lastCachedSongPlayerTime = 0L
     private lateinit var youTubeMusicService: YouTubeMusicService
@@ -360,44 +370,53 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         nsv?.post { if (isAdded && nsv != null) updateHeaderOnScroll(nsv.scrollY, 0) }
 
         setupShortcuts()
-        // PRIMERO en la cola del bgExecutor: pinta el 3x3 desde el snapshot de la sesión anterior
-        // casi al instante en frío, antes que las demás lecturas de caché.
+        // PRIMERO: pinta el 3x3 desde el snapshot de la sesión anterior casi al instante en frío.
         loadCachedShortcuts()
         setupCovers()
         loadCachedCovers()
 
-        llRadiosHeader = view.findViewById(R.id.llRadiosHeader)
-        rvRadios = view.findViewById(R.id.rvRadios)
-        preloadRadioCaches()
-        setupRadios()
-
-        llPlaylistsHeader = view.findViewById(R.id.llPlaylistsHeader)
-        rvPlaylists = view.findViewById(R.id.rvPlaylists)
-        setupPlaylists()
-
-        llNewFavesHeader = view.findViewById(R.id.llNewFavesHeader)
-        rvNewFaves = view.findViewById(R.id.rvNewFaves)
-        setupNewFaves()
-        loadCachedNewFaves()
-
-        llRecommendedHeader = view.findViewById(R.id.llRecommendedHeader)
-        rvRecommended = view.findViewById(R.id.rvRecommended)
-        setupRecommended()
-        loadCachedRecommended()
-
-        llQuickPicksHeader = view.findViewById(R.id.llQuickPicksHeader)
-        btnQuickPicksPlayAll = view.findViewById(R.id.btnQuickPicksPlayAll)
-        vpQuickPicks = view.findViewById(R.id.vpQuickPicks)
-        tabDotsQuickPicks = view.findViewById(R.id.tabDotsQuickPicks)
-        setupQuickPicks()
-        loadCachedQuickPicks()
-
-        llRecapsHeader = view.findViewById(R.id.llRecapsHeader)
-        rvRecaps = view.findViewById(R.id.rvRecaps)
-        setupRecaps()
-        loadCachedRecaps()
-
+        // Skeletons ya, en el primer frame, para que las secciones diferidas muestren su placeholder.
         setupHomeSkeletons(view)
+
+        // Cablear las secciones BAJO EL FOLD (adapters + LayoutManagers + TabLayoutMediators) es un
+        // "wiring burst" que no cabe en el frame de primer contenido — era una causa directa de "la
+        // demora al cargar el fragmento". Sus vistas no son visibles al abrir, así que diferir su
+        // montaje UN frame (view.post, ~16ms) es invisible y libera el frame de attach. Los refresh()
+        // de estas secciones ya null-guardan y corren después (onResume +150ms / onHiddenChanged
+        // +120ms), así que el montaje siempre llega antes.
+        view.post {
+            if (!isAdded) return@post
+            llRadiosHeader = view.findViewById(R.id.llRadiosHeader)
+            rvRadios = view.findViewById(R.id.rvRadios)
+            preloadRadioCaches()
+            setupRadios()
+
+            llPlaylistsHeader = view.findViewById(R.id.llPlaylistsHeader)
+            rvPlaylists = view.findViewById(R.id.rvPlaylists)
+            setupPlaylists()
+
+            llNewFavesHeader = view.findViewById(R.id.llNewFavesHeader)
+            rvNewFaves = view.findViewById(R.id.rvNewFaves)
+            setupNewFaves()
+            loadCachedNewFaves()
+
+            llRecommendedHeader = view.findViewById(R.id.llRecommendedHeader)
+            rvRecommended = view.findViewById(R.id.rvRecommended)
+            setupRecommended()
+            loadCachedRecommended()
+
+            llQuickPicksHeader = view.findViewById(R.id.llQuickPicksHeader)
+            btnQuickPicksPlayAll = view.findViewById(R.id.btnQuickPicksPlayAll)
+            vpQuickPicks = view.findViewById(R.id.vpQuickPicks)
+            tabDotsQuickPicks = view.findViewById(R.id.tabDotsQuickPicks)
+            setupQuickPicks()
+            loadCachedQuickPicks()
+
+            llRecapsHeader = view.findViewById(R.id.llRecapsHeader)
+            rvRecaps = view.findViewById(R.id.rvRecaps)
+            setupRecaps()
+            loadCachedRecaps()
+        }
 
         // Safety-net: never leave the cold-start spinner up forever if content never arrives.
         handler.postDelayed({
@@ -515,6 +534,12 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                     refreshCovers()
                     refreshRadios()
                     refreshPlaylists()
+                    // Faltaba aquí: al volver a Principal por cambio de módulo (hide()/show() dispara
+                    // onHiddenChanged, NO onResume) las 4 secciones del home browse no se re-pedían,
+                    // así que un primer load fallido/vacío no se recuperaba nunca hasta background+
+                    // foreground. Ya va throttled + guardado por recommendedEntries.isNotEmpty(), así
+                    // que solo re-pide cuando de verdad siguen vacías.
+                    refreshRecommended()
                 }
             }, 120)
         } else {
@@ -669,13 +694,28 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
     fun refreshFragHeaderProfilePhoto() {
         if (!isAdded || btnFragProfilePhoto == null || btnFragSignIn == null) return
-        val prefs = requireContext().getSharedPreferences(AppConstants.PREFS_STREAMING_CACHE, Activity.MODE_PRIVATE)
-        val cachedUrl = prefs.getString("cached_google_profile_photo_url", "") ?: ""
-        var photoUri: Uri? = FirebaseAuth.getInstance().currentUser?.photoUrl
-        if (photoUri == null && cachedUrl.isNotEmpty()) {
-            photoUri = Uri.parse(cachedUrl)
+        val am = (activity as? MainActivity)?.getAuthManager()
+        // Antes esto corría ENTERO en el hilo principal en el primer attach del fragmento:
+        //  - FirebaseAuth.getInstance().currentUser fuerza el init de Firebase en main (el MISMO
+        //    que SleppifyApp difiere 1200ms), y
+        //  - getString sobre PREFS_STREAMING_CACHE bloquea hasta parsear ese XML grande.
+        // Ambos en el frame de "primer contenido" = parte del "demora al cargar el fragmento".
+        // Resolvemos foto + estado de sesión en bg y solo pintamos en main.
+        submitBg {
+            val appCtx = context?.applicationContext ?: return@submitBg
+            val cachedUrl = try {
+                appCtx.getSharedPreferences(AppConstants.PREFS_STREAMING_CACHE, Activity.MODE_PRIVATE)
+                    .getString("cached_google_profile_photo_url", "") ?: ""
+            } catch (_: Throwable) { "" }
+            val signedIn = try { am?.isSignedIn() == true } catch (_: Throwable) { false }
+            val livePhoto = try { FirebaseAuth.getInstance().currentUser?.photoUrl } catch (_: Throwable) { null }
+            val photoUri: Uri? = livePhoto ?: cachedUrl.takeIf { it.isNotEmpty() }?.let { Uri.parse(it) }
+            handler.post { applyHeaderProfilePhoto(signedIn, photoUri) }
         }
-        val signedIn = (activity as? MainActivity)?.getAuthManager()?.isSignedIn() == true
+    }
+
+    private fun applyHeaderProfilePhoto(signedIn: Boolean, photoUri: Uri?) {
+        if (!isAdded || btnFragProfilePhoto == null || btnFragSignIn == null) return
         if (signedIn) {
             btnFragSignIn?.visibility = View.GONE
             btnFragProfilePhoto?.visibility = View.VISIBLE
@@ -1546,6 +1586,9 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         rvRecommended?.adapter = MixCardAdapter(recommendedEntries) { onRecommendedClicked(it) }
     }
 
+    // Contador de reintentos del home browse (ver RECOMMENDED_MAX_RETRIES). Se resetea al éxito.
+    private var recommendedRetryCount = 0
+
     private fun refreshRecommended(force: Boolean = false) {
         if (!isAdded) return
         val now = System.currentTimeMillis()
@@ -1556,6 +1599,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         youTubeMusicService.fetchHomeBrowse(cookie, object : YouTubeMusicService.HomeBrowseCallback {
             override fun onSuccess(result: YouTubeMusicService.HomeBrowseResult) {
                 if (!isAdded) return
+                recommendedRetryCount = 0
                 // El usuario quiere sobre todo listas generadas por YT / la comunidad y muy pocas
                 // de su propia biblioteca. Clasificamos cada item por el título de su sección
                 // (las secciones de biblioteca en el home de YT Music son "Escucha de nuevo",
@@ -1639,7 +1683,26 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 }
             }
 
-            override fun onError(error: String) { /* keep whatever cache is already shown */ }
+            override fun onError(error: String) {
+                // Antes: no-op silencioso. Un 401 intermitente / timeout dejaba recomendadas,
+                // recaps, quick-picks y new-faves vacíos SIN recuperación. Ahora reintenta con
+                // backoff acotado (tras la corrección de firma SAPISIDHASH un 401 ya es raro) y
+                // conserva la caché mostrada mientras tanto.
+                android.util.Log.w(
+                    "PrincipalFragment",
+                    "home browse failed: $error (intento ${recommendedRetryCount + 1}/$RECOMMENDED_MAX_RETRIES)"
+                )
+                if (!isAdded) return
+                if (recommendedRetryCount >= RECOMMENDED_MAX_RETRIES) {
+                    recommendedRetryCount = 0
+                    return
+                }
+                recommendedRetryCount++
+                val backoff = if (recommendedRetryCount == 1) 2000L else 6000L
+                handler.postDelayed({
+                    if (isAdded && !isHidden) refreshRecommended(force = true)
+                }, backoff)
+            }
         })
     }
 
@@ -1936,7 +1999,15 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 tvName.text = item.title
                 if (item.thumbnailUrl.isNotEmpty() && isAdded) {
                     try {
-                        Glide.with(this@PrincipalFragment).load(item.thumbnailUrl)
+                        // Right-size la portada al ancho REAL de la tarjeta (era la ÚNICA carga del
+                        // app que pedía la variante más grande sin atSize/override/RGB_565 — la causa
+                        // de "las imágenes de playlist demoran"). l72 = un pelo menos de calidad para
+                        // acelerar la transferencia, imperceptible a este tamaño.
+                        Glide.with(this@PrincipalFragment)
+                            .load(ThumbnailUrls.atSize(item.thumbnailUrl, radioCardWidthPx, 72))
+                            .format(DecodeFormat.PREFER_RGB_565)
+                            .override(radioCardWidthPx, radioCardWidthPx)
+                            .diskCacheStrategy(DiskCacheStrategy.ALL)
                             .placeholder(R.color.surface_high)
                             .transform(SHARED_YT_CROP, SHARED_CENTER_CROP)
                             .into(ivCover)
@@ -2233,49 +2304,11 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         val sizePx = radioCardWidthPx
         try {
             for (radio in radios) {
-                val centerUrl = radio.songThumbnail
-                val (leftUrl, rightUrl) = resolveRadioSides(radio, centerUrl)
-                // Build + cache the single composite ahead of first paint (no-op if the
-                // memory/disk cache already has it), so the very first scroll is already instant.
-                // Sin color resuelto aún se precompone con la paleta por defecto; el bind
-                // recompondrá con la real al resolver Palette.
-                val raw = radioDominantColorCache[centerUrl] ?: RadioArt.DEFAULT_RAW
-                RadioArtComposer.precompose(ctx, radio.radioPlaylistId, centerUrl, leftUrl, rightUrl, sizePx, raw)
+                // Construye + cachea el composite Frost antes del primer paint (no-op si ya está en
+                // caché) para que el primer scroll sea instantáneo.
+                RadioArtComposer.precompose(ctx, radio.radioPlaylistId, radio.songThumbnail, radio.songTitle, sizePx)
             }
         } catch (_: Exception) {}
-    }
-
-    /** Deterministically resolves the 2 side-thumbnail URLs for a radio, using the cache first,
-     *  then the radio's own tracks, then the playlist grid fallback. Persists newly-computed sides. */
-    private fun resolveRadioSides(
-        radio: RadioHistoryStore.RadioEntry,
-        centerUrl: String
-    ): Pair<String, String> {
-        radioSideUrlsCache[radio.radioPlaylistId]?.takeIf { it.first.isNotEmpty() }?.let { return it }
-
-        val otherTracks = radio.tracks.filter { it.thumbnailUrl.isNotEmpty() && it.thumbnailUrl != centerUrl }
-        val sides: Pair<String, String> = if (otherTracks.size >= 2) {
-            val seed = radio.radioPlaylistId.hashCode().toLong()
-            // Familiar faces first: tracks by followed/played artists win the two side slots,
-            // deterministic seeded order breaks ties.
-            val seeded = otherTracks.sortedWith(
-                compareByDescending<RadioHistoryStore.RadioTrack> { isKnownArtist(it.artist) }
-                    .thenBy { it.videoId.hashCode().toLong() xor seed }
-            )
-            Pair(seeded[0].thumbnailUrl, seeded.getOrNull(1)?.thumbnailUrl ?: "")
-        } else if (isAdded) {
-            val gridUrls = resolvePlaylistGridUrls(radio.radioPlaylistId).filter { it != centerUrl }
-            when {
-                gridUrls.size >= 2 -> Pair(gridUrls[0], gridUrls[1])
-                gridUrls.size == 1 -> Pair(gridUrls[0], "")
-                else -> Pair("", "")
-            }
-        } else Pair("", "")
-
-        if (sides.first.isNotEmpty()) {
-            persistSideUrls(radio.radioPlaylistId, sides.first, sides.second)
-        }
-        return sides
     }
 
     private fun onRadioClicked(radio: RadioHistoryStore.RadioEntry) {
@@ -2305,9 +2338,6 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         inner class RadioVH(itemView: View) : RecyclerView.ViewHolder(itemView) {
             private val cardRadio: View = itemView.findViewById(R.id.cardRadio)
             private val vBg: View = itemView.findViewById(R.id.vRadioBg)
-            // URL currently bound to this holder — async Palette callbacks compare against it
-            // so a recycled holder is never painted with a stale color.
-            private var boundCenterUrl: String = ""
             private val ivComposite: ImageView = itemView.findViewById(R.id.ivRadioComposite)
             private val tvName: TextView = itemView.findViewById(R.id.tvRadioName)
 
@@ -2334,86 +2364,25 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 itemView.setOnClickListener(clickListener)
                 cardRadio.setOnClickListener(clickListener)
 
-                // Center seed thumbnail drives the card's dominant-color palette (campo degradado
-                // + barras del composite). El color raw entra en la firma del composite: al
-                // resolverse el Palette la tarjeta se recompone sola con su paleta real.
-                val centerUrl = radio.songThumbnail
-                boundCenterUrl = centerUrl
-                val (leftUrl, rightUrl) = resolveRadioSides(radio, centerUrl)
-
-                fun paint(rawColor: Int) {
-                    // Fondo GRIS de carga (como las demás tarjetas), NO el degradado de color: el
-                    // usuario quiere contenedores grises hasta que carguen. El color aparece solo
-                    // cuando el composite termina (entra con fade sobre este gris).
-                    val loadingGray = 0xFF282A30.toInt()
-                    if (vBg.getTag(R.id.tag_radio_bg_color) != loadingGray) {
-                        vBg.setTag(R.id.tag_radio_bg_color, loadingGray)
-                        vBg.setBackgroundColor(loadingGray)
-                    }
-                    RadioArtComposer.load(
-                        ivComposite,
-                        radio.radioPlaylistId,
-                        centerUrl,
-                        leftUrl,
-                        rightUrl,
-                        radioCardWidthPx,
-                        rawColor
-                    )
+                // Fondo gris de carga; el composite Frost (carátula + panel "RADIO" + título) entra
+                // con fade encima cuando termina.
+                val loadingGray = 0xFF282A30.toInt()
+                if (vBg.getTag(R.id.tag_radio_bg_color) != loadingGray) {
+                    vBg.setTag(R.id.tag_radio_bg_color, loadingGray)
+                    vBg.setBackgroundColor(loadingGray)
                 }
-
-                val cachedColor = radioDominantColorCache[centerUrl]
-                paint(cachedColor ?: RadioArt.DEFAULT_RAW)
-                if (cachedColor == null && centerUrl.isNotEmpty() && isAdded) {
-                    try {
-                        Glide.with(this@PrincipalFragment)
-                            .asBitmap()
-                            .load(centerUrl)
-                            .diskCacheStrategy(DiskCacheStrategy.ALL)
-                            .override(64, 64)
-                            .centerCrop()
-                            .into(object : com.bumptech.glide.request.target.CustomTarget<android.graphics.Bitmap>() {
-                                override fun onResourceReady(resource: android.graphics.Bitmap, transition: com.bumptech.glide.request.transition.Transition<in android.graphics.Bitmap>?) {
-                                    Palette.from(resource).generate { palette ->
-                                        val dominant = RadioArtComposer.pickRawColor(palette)
-                                        persistDominantColor(radio.radioPlaylistId, centerUrl, dominant)
-                                        // Recycled holder may already show another radio — the
-                                        // color stays cached, but don't paint the wrong card.
-                                        if (boundCenterUrl != centerUrl) return@generate
-                                        paint(dominant)
-                                    }
-                                }
-                                override fun onLoadCleared(placeholder: android.graphics.drawable.Drawable?) {}
-                            })
-                    } catch (_: Exception) {}
-                }
+                RadioArtComposer.load(
+                    ivComposite,
+                    radio.radioPlaylistId,
+                    radio.songThumbnail,
+                    radio.songTitle,
+                    radioCardWidthPx
+                )
             }
         }
     }
 
     // ========== Radio UI Cache Persistence ==========
-
-    private fun persistDominantColor(radioPlaylistId: String, url: String, color: Int) {
-        radioDominantColorCache[url] = color
-        val ctx = context?.applicationContext ?: return
-        submitBg {
-            ctx.getSharedPreferences(PREFS_RADIO_CACHE, Context.MODE_PRIVATE)
-                .edit()
-                .putInt("color_$radioPlaylistId", color)
-                .putString("colorurl_$radioPlaylistId", url)
-                .apply()
-        }
-    }
-
-    private fun persistSideUrls(radioPlaylistId: String, left: String, right: String) {
-        radioSideUrlsCache[radioPlaylistId] = Pair(left, right)
-        val ctx = context?.applicationContext ?: return
-        submitBg {
-            ctx.getSharedPreferences(PREFS_RADIO_CACHE, Context.MODE_PRIVATE)
-                .edit()
-                .putString("sides_$radioPlaylistId", "$left\n$right")
-                .apply()
-        }
-    }
 
     private fun persistArtistText(radioPlaylistId: String, text: String) {
         radioArtistTextCache[radioPlaylistId] = text
@@ -2448,25 +2417,10 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 }
 
                 val all = prefs.all
-                val colors = HashMap<String, Int>()
-                val sides = HashMap<String, Pair<String, String>>()
                 val artists = HashMap<String, String>()
                 for ((key, value) in all) {
-                    when {
-                        key.startsWith("color_") && !key.startsWith("colorurl_") && value is Int -> {
-                            val id = key.removePrefix("color_")
-                            val url = all["colorurl_$id"] as? String
-                            if (!url.isNullOrEmpty()) colors[url] = value
-                        }
-                        key.startsWith("sides_") && value is String -> {
-                            val id = key.removePrefix("sides_")
-                            val parts = value.split("\n", limit = 2)
-                            if (parts.size == 2) sides[id] = Pair(parts[0], parts[1])
-                        }
-                        key.startsWith("artists_") && value is String -> {
-                            val id = key.removePrefix("artists_")
-                            artists[id] = value
-                        }
+                    if (key.startsWith("artists_") && value is String) {
+                        artists[key.removePrefix("artists_")] = value
                     }
                 }
 
@@ -2500,8 +2454,6 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
                 handler.post {
                     if (!isAdded) return@post
-                    radioDominantColorCache.putAll(colors)
-                    radioSideUrlsCache.putAll(sides)
                     radioArtistTextCache.putAll(artists)
                     knownArtistKeys.clear()
                     knownArtistKeys.addAll(known)
@@ -2511,18 +2463,6 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             }
         }
     }
-
-    private fun darkenColor(color: Int, factor: Float): Int {
-        val r = ((color shr 16 and 0xFF) * factor).toInt().coerceIn(0, 255)
-        val g = ((color shr 8 and 0xFF) * factor).toInt().coerceIn(0, 255)
-        val b = ((color and 0xFF) * factor).toInt().coerceIn(0, 255)
-        return (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-    }
-
-    /** Campo degradado claro→oscuro para las tarjetas/filas de radio (diseño YT Music).
-     *  [rawColor] is the Palette color as cached/persisted. */
-    private fun buildRadioCardGradient(rawColor: Int): android.graphics.drawable.Drawable =
-        RadioArtComposer.fieldDrawable(rawColor)
 
     /** True if [artist] matches (or contains) an artist the user follows or plays. */
     private fun isKnownArtist(artist: String): Boolean {
@@ -2742,7 +2682,9 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                         if (fallbackUrl.isNotEmpty()) {
                             try {
                                 Glide.with(this@PrincipalFragment)
-                                    .load(fallbackUrl)
+                                    .load(ThumbnailUrls.atSize(fallbackUrl, radioCardWidthPx, 72))
+                                    .format(DecodeFormat.PREFER_RGB_565)
+                                    .override(radioCardWidthPx, radioCardWidthPx)
                                     .diskCacheStrategy(DiskCacheStrategy.ALL)
                                     .centerCrop()
                                     .placeholder(R.color.surface_high)
@@ -2759,9 +2701,6 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         inner class RadioPlaylistVH(itemView: View) : RecyclerView.ViewHolder(itemView) {
             private val cardRadio: View = itemView.findViewById(R.id.cardRadio)
             private val vBg: View = itemView.findViewById(R.id.vRadioBg)
-            // URL currently bound to this holder — async Palette callbacks compare against it
-            // so a recycled holder is never painted with a stale color.
-            private var boundCenterUrl: String = ""
             private val ivComposite: ImageView = itemView.findViewById(R.id.ivRadioComposite)
             private val tvName: TextView = itemView.findViewById(R.id.tvRadioName)
 
@@ -2774,83 +2713,18 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 // Use already-loaded radioEntries instead of reading from disk per bind
                 val radio = radioEntries.find { it.radioPlaylistId == entry.playlistId }
                 val centerUrl = radio?.songThumbnail?.takeIf { it.isNotEmpty() } ?: entry.imageUrl
-                val cachedSides = radioSideUrlsCache[entry.playlistId]?.takeIf { it.first.isNotEmpty() }
-                val sides: Pair<String, String> = if (cachedSides != null) {
-                    cachedSides
-                } else {
-                    // 1. Try from in-memory radio tracks (familiar artists win the side slots)
-                    val radioTracks = radio?.tracks?.filter { it.thumbnailUrl.isNotEmpty() && it.thumbnailUrl != centerUrl } ?: emptyList()
-                    if (radioTracks.size >= 2) {
-                        val seed = entry.playlistId.hashCode().toLong()
-                        val seeded = radioTracks.sortedWith(
-                            compareByDescending<RadioHistoryStore.RadioTrack> { isKnownArtist(it.artist) }
-                                .thenBy { it.videoId.hashCode().toLong() xor seed }
-                        )
-                        Pair(seeded[0].thumbnailUrl, seeded.getOrNull(1)?.thumbnailUrl ?: "")
-                    } else if (isAdded) {
-                        // 2. Fallback: streaming cache (playlist_tracks_data / grid_urls)
-                        val gridUrls = resolvePlaylistGridUrls(entry.playlistId).filter { it != centerUrl }
-                        if (gridUrls.size >= 2) Pair(gridUrls[0], gridUrls[1])
-                        else if (gridUrls.size == 1) Pair(gridUrls[0], "")
-                        else Pair("", "")
-                    } else {
-                        Pair("", "")
-                    }
+                val loadingGray = 0xFF282A30.toInt()
+                if (vBg.getTag(R.id.tag_radio_bg_color) != loadingGray) {
+                    vBg.setTag(R.id.tag_radio_bg_color, loadingGray)
+                    vBg.setBackgroundColor(loadingGray)
                 }
-                if (sides.first.isNotEmpty() && cachedSides == null) {
-                    persistSideUrls(entry.playlistId, sides.first, sides.second)
-                }
-                val (leftUrl, rightUrl) = sides
-
-                boundCenterUrl = centerUrl
-
-                // El color raw entra en la firma del composite: al resolverse el Palette la
-                // tarjeta se recompone sola con su paleta real (campo + barras).
-                fun paint(rawColor: Int) {
-                    // Gris de carga (no el color de una vez); el color entra con el composite.
-                    val loadingGray = 0xFF282A30.toInt()
-                    if (vBg.getTag(R.id.tag_radio_bg_color) != loadingGray) {
-                        vBg.setTag(R.id.tag_radio_bg_color, loadingGray)
-                        vBg.setBackgroundColor(loadingGray)
-                    }
-                    RadioArtComposer.load(
-                        ivComposite,
-                        entry.playlistId,
-                        centerUrl,
-                        leftUrl,
-                        rightUrl,
-                        radioCardWidthPx,
-                        rawColor
-                    )
-                }
-
-                val cachedColor = radioDominantColorCache[centerUrl]
-                paint(cachedColor ?: RadioArt.DEFAULT_RAW)
-                if (cachedColor == null && centerUrl.isNotEmpty() && isAdded) {
-                    try {
-                        Glide.with(this@PrincipalFragment)
-                            .asBitmap()
-                            .load(centerUrl)
-                            .diskCacheStrategy(DiskCacheStrategy.ALL)
-                            .override(64, 64)
-                            .centerCrop()
-                            .into(object : com.bumptech.glide.request.target.CustomTarget<android.graphics.Bitmap>() {
-                                override fun onResourceReady(resource: android.graphics.Bitmap, transition: com.bumptech.glide.request.transition.Transition<in android.graphics.Bitmap>?) {
-                                    Palette.from(resource).generate { palette ->
-                                        val dominant = palette?.getDarkMutedColor(
-                                            palette.getMutedColor(0xFF333333.toInt())
-                                        ) ?: 0xFF333333.toInt()
-                                        persistDominantColor(entry.playlistId, centerUrl, dominant)
-                                        // Recycled holder may already show another playlist —
-                                        // keep the cached color but don't paint the wrong card.
-                                        if (boundCenterUrl != centerUrl) return@generate
-                                        paint(dominant)
-                                    }
-                                }
-                                override fun onLoadCleared(placeholder: android.graphics.drawable.Drawable?) {}
-                            })
-                    } catch (_: Exception) {}
-                }
+                RadioArtComposer.load(
+                    ivComposite,
+                    entry.playlistId,
+                    centerUrl,
+                    entry.title,
+                    radioCardWidthPx
+                )
             }
         }
     }
@@ -2987,7 +2861,8 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                             ?: gridUrls.firstOrNull() ?: entry.imageUrl
                         if (!fallbackUrl.isNullOrEmpty() && fallbackUrl != currentTag) {
                             holder.ivThumb.setTag(R.id.tag_artwork_signature, fallbackUrl)
-                            try { Glide.with(this@PrincipalFragment).load(fallbackUrl).placeholder(R.color.surface_high).transform(SHARED_YT_CROP, SHARED_CENTER_CROP).into(holder.ivThumb) } catch (_: Exception) {}
+                            val cellPx = (120 * holder.itemView.context.resources.displayMetrics.density).toInt()
+                            try { Glide.with(this@PrincipalFragment).load(ThumbnailUrls.atSize(fallbackUrl, cellPx, 72)).format(DecodeFormat.PREFER_RGB_565).override(cellPx, cellPx).placeholder(R.color.surface_high).transform(SHARED_YT_CROP, SHARED_CENTER_CROP).into(holder.ivThumb) } catch (_: Exception) {}
                         }
                     }
                 } else if (LocalFilesStore.isLocalVideoId(entry.videoId) && isAdded) {
@@ -3002,7 +2877,8 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                     LocalArtworkResolver.detach(holder.ivThumb)
                     if (entry.imageUrl != currentTag) {
                         holder.ivThumb.setTag(R.id.tag_artwork_signature, entry.imageUrl)
-                        try { Glide.with(this@PrincipalFragment).load(entry.imageUrl).placeholder(R.color.surface_high).transform(SHARED_YT_CROP, SHARED_CENTER_CROP).into(holder.ivThumb) } catch (_: Exception) {}
+                        val cellPx = (120 * holder.itemView.context.resources.displayMetrics.density).toInt()
+                        try { Glide.with(this@PrincipalFragment).load(ThumbnailUrls.atSize(entry.imageUrl, cellPx, 72)).format(DecodeFormat.PREFER_RGB_565).override(cellPx, cellPx).placeholder(R.color.surface_high).transform(SHARED_YT_CROP, SHARED_CENTER_CROP).into(holder.ivThumb) } catch (_: Exception) {}
                     }
                 }
             }

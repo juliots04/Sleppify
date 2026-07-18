@@ -226,10 +226,27 @@ object StreamResolver {
     @JvmStatic
     fun getAuthCookieHeader(): String = authCookieHeader
 
-    /** Builds a SAPISIDHASH Authorization header for YouTube API calls. */
+    /** Builds a SAPISIDHASH Authorization header for YouTube API calls, firmando con el cookie
+     *  global [authCookieHeader]. Solo para llamadas que NO tienen su propio cookie en mano;
+     *  las que sí lo tienen deben usar [buildSapisidHashForCookie] para evitar la carrera. */
     @JvmStatic
-    fun buildSapisidHash(origin: String = "https://music.youtube.com"): String {
-        val sapisid = extractCookieValue("SAPISID")
+    fun buildSapisidHash(origin: String = "https://music.youtube.com"): String =
+        buildSapisidHashForCookie(authCookieHeader, origin)
+
+    /**
+     * SAPISIDHASH firmado con el MISMO cookie que se va a enviar en la petición (no con el global
+     * async [authCookieHeader]). Elimina la carrera de arranque: warmUp() carga el cookie global en
+     * background, así que un browse que salía antes de que terminara se firmaba con "" → sin header
+     * Authorization → 401 intermitente → home/recaps/secciones vacíos. Firmando con el cookie que ya
+     * lleva la petición, la firma NUNCA falta mientras haya cookie. Cae al cookie global solo si el
+     * pasado no trae SAPISID (p.ej. peticiones anónimas que igual pasan "").
+     */
+    @JvmStatic
+    fun buildSapisidHashForCookie(cookieHeader: String?, origin: String = "https://music.youtube.com"): String {
+        val src = cookieHeader?.trim().orEmpty()
+        val sapisid = extractCookieValueFrom(src, "SAPISID")
+            ?: extractCookieValueFrom(src, "__Secure-3PAPISID")
+            ?: extractCookieValue("SAPISID")
             ?: extractCookieValue("__Secure-3PAPISID")
             ?: return ""
         val timestamp = System.currentTimeMillis() / 1000
@@ -368,22 +385,37 @@ object StreamResolver {
             }
         }
 
-        // 3. NewPipe (audio-only resolver), con FALLBACK a InnerTube ANDROID_VR si falla
+        // 3. Resolución de la URL directa.
+        //    PRIMARIO: InnerTube ANDROID_VR (/player) — devuelve URLs YA descifradas en UN solo POST
+        //      (~0.3-0.6s), SIN descargar ni ejecutar el base.js de YouTube.
+        //    FALLBACK: NewPipe, que SÍ baja el base.js (~1.5-2.5MB) y corre un motor JS (Rhino) para
+        //      descifrar firma + parámetro 'n' de cada stream — ~3-6s.
+        //    El orden estaba INVERTIDO y era la causa raíz de los ~8s para empezar a sonar. ANDROID_VR
+        //    ya estaba verificado en vivo como fallback, así que promoverlo a primario es seguro y cae
+        //    a NewPipe para lo que no cubra (p.ej. "made for kids", IP bloqueada).
         val itags = getPreferredItags(context)
         val future = java.util.concurrent.CompletableFuture<String?>()
         inFlightResolutions[videoId] = future
         try {
+            val tStart = System.currentTimeMillis()
             var directUrl: String? = null
+            var via = "android_vr"
             try {
-                directUrl = resolveViaNewPipe(videoId, itags, context)
+                directUrl = resolveViaInnerTubeFallback(videoId, itags)?.url
             } catch (e: Exception) {
-                Log.w(TAG, "newpipe[$videoId] failed: ${e.javaClass.simpleName} — ${e.message}")
+                Log.w(TAG, "android_vr[$videoId] failed: ${e.javaClass.simpleName} — ${e.message}")
             }
             if (directUrl.isNullOrBlank()) {
-                // Fallback (NUNCA el camino principal): NewPipe roto por un cambio de YouTube o
-                // sin streams — pedir el /player de InnerTube con el cliente ANDROID_VR.
-                directUrl = resolveViaInnerTubeFallback(videoId, itags)?.url
+                via = "newpipe"
+                try {
+                    directUrl = resolveViaNewPipe(videoId, itags, context)
+                } catch (e: Exception) {
+                    Log.w(TAG, "newpipe[$videoId] failed: ${e.javaClass.simpleName} — ${e.message}")
+                }
             }
+            // Medición de latencia (filtra en logcat por el TAG de StreamResolver): muestra por qué
+            // ruta se resolvió y cuántos ms tardó. android_vr debería rondar cientos de ms; newpipe segundos.
+            Log.d(TAG, "resolve[$videoId] via=$via took=${System.currentTimeMillis() - tStart}ms ok=${!directUrl.isNullOrBlank()}")
             if (!directUrl.isNullOrBlank()) {
                 val now = System.currentTimeMillis()
                 urlCache[videoId] = CachedStream(directUrl, SourceType.DIRECT, now)
@@ -865,9 +897,13 @@ object StreamResolver {
 
     // ─── Helpers ─────────────────────────────────────────────────────────
 
-    private fun extractCookieValue(cookieName: String): String? {
-        if (authCookieHeader.isBlank()) return null
-        return authCookieHeader.split(";")
+    private fun extractCookieValue(cookieName: String): String? =
+        extractCookieValueFrom(authCookieHeader, cookieName)
+
+    /** Extrae el valor de una cookie desde CUALQUIER cadena de cookies (no solo el global). */
+    private fun extractCookieValueFrom(cookieHeader: String, cookieName: String): String? {
+        if (cookieHeader.isBlank()) return null
+        return cookieHeader.split(";")
             .map { it.trim() }
             .firstOrNull { it.startsWith("$cookieName=") }
             ?.substringAfter("=")

@@ -159,8 +159,13 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
             title = songPlayer.externalGetCurrentTitle();
             subtitle = songPlayer.externalGetCurrentArtist();
             imageUrl = songPlayer.externalGetCurrentImageUrl();
-            miniPlaying = songPlayer.externalIsPlaying();
             playbackLoading = songPlayer.externalIsLoading();
+            // Durante la ventana de carga en frío (la URL aún resolviéndose) el estado REAL es "no
+            // reproduciendo", y este updateUi() del ticker de 500ms revertía el icono a "play" pese a
+            // que el usuario YA pulsó play → parpadeo + hacía falta un 2º toque. Reflejar la INTENCIÓN
+            // mientras carga: reproduciendo si ya suena, o si el usuario quiere reproducir y sigue cargando.
+            miniPlaying = songPlayer.externalIsPlaying()
+                    || (songPlayer.externalIsPlayingIntent() && playbackLoading);
         } else if (snapshotTrack != null) {
             // On cold start, don't show mini-player from snapshot alone;
             // wait until the player is actually attached and ready.

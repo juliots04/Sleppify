@@ -73,6 +73,7 @@ import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
@@ -965,6 +966,9 @@ public class SongPlayerFragment extends Fragment {
             hydrateTracksFromArgs();
             currentIndex = Math.max(0, Math.min(currentIndex, tracks.size() - 1));
             preResolveCurrentTrackSource();
+            // Pinta título/artista/tiempos del hero YA (mientras el reproductor se desliza), en vez
+            // de esperar a phase2 (+320ms) y verse en blanco durante toda la animación de entrada.
+            bindHeroPresentationEarly();
         };
 
         // ✅ PHASE 2b: Heavy/view work — crossfade attach, MediaSession, bind, playback. On the
@@ -3873,6 +3877,32 @@ public class SongPlayerFragment extends Fragment {
         bindCurrentTrackInternal(allowResume, false);
     }
 
+    /**
+     * Bind LIGERO del hero (título/artista/tiempos) para que el reproductor muestre su metadata al
+     * instante mientras se desliza, en vez de quedar en blanco los ~320ms hasta phase2. SOLO texto +
+     * seekbar; carátula/Palette/MediaSession/artwork siguen en phase2 tras la animación de entrada.
+     * bindCurrentTrack los reescribe luego de forma idempotente.
+     */
+    private void bindHeroPresentationEarly() {
+        if (tracks.isEmpty()) return;
+        if (currentIndex < 0 || currentIndex >= tracks.size()) currentIndex = 0;
+        PlayerTrack track = tracks.get(currentIndex);
+        if (tvPlayerTitle != null) {
+            tvPlayerTitle.setText(track.title);
+            tvPlayerTitle.setSelected(true);
+        }
+        if (tvPlayerArtist != null) tvPlayerArtist.setText(track.artist);
+        int total = Math.max(1, parseDurationSeconds(track.duration));
+        if (tvCurrentTime != null) tvCurrentTime.setText(formatSeconds(0));
+        if (tvTotalTime != null) {
+            tvTotalTime.setText(TextUtils.isEmpty(track.duration) ? formatSeconds(total) : track.duration);
+        }
+        if (sbPlaybackProgress != null) {
+            sbPlaybackProgress.setProgress(0);
+            sbPlaybackProgress.setSecondaryProgress(0);
+        }
+    }
+
     private void bindCurrentTrackInternal(boolean allowResume, boolean forceZero) {
         if (tracks.isEmpty()) {
             return;
@@ -4713,18 +4743,10 @@ public class SongPlayerFragment extends Fragment {
     }
 
     private void continueSocialStatsFetch(@NonNull String requestVideoId, @Nullable SocialStats cached) {
-        String apiKey = BuildConfig.YOUTUBE_DATA_API_KEY == null
-                ? ""
-                : BuildConfig.YOUTUBE_DATA_API_KEY.trim();
-        if (apiKey.isEmpty()) {
-            cancelPendingSocialStatsFetch();
-            if (cached == null) {
-                applySocialStatsToUi(SocialStats.unavailable());
-            }
-            return;
-        }
+        // Las estadísticas salen ahora del /next de InnerTube (sin la Data API v3), así que ya NO
+        // se requiere una API key — antes, sin key, no se mostraban stats en absoluto.
         boolean deferFetch = cached == null && isPlaying && !usingOfflineSource;
-        scheduleSocialStatsFetch(requestVideoId, apiKey, cached, deferFetch);
+        scheduleSocialStatsFetch(requestVideoId, "", cached, deferFetch);
     }
 
     private void scheduleSocialStatsFetch(
@@ -4842,41 +4864,254 @@ public class SongPlayerFragment extends Fragment {
         }
     }
 
+    /**
+     * Estadísticas sociales (like + comentarios) vía el /next de InnerTube (cliente WEB) — SIN la
+     * YouTube Data API v3, cuya cuota diaria se agotaba (403) y rompía las stats para todos. Datos
+     * públicos: no requiere OAuth (la cookie/SAPISIDHASH solo mejora la respuesta si hay sesión).
+     * El param apiKey queda ignorado (compat de firma).
+     */
     @NonNull
-    private SocialStats fetchSocialStats(@NonNull String videoId, @NonNull String apiKey) {
-        String endpoint = "https://www.googleapis.com/youtube/v3/videos?part=statistics&id="
-                + Uri.encode(videoId)
-                + "&key="
-                + Uri.encode(apiKey);
-        String body = readTextResponse(endpoint, "application/json");
+    private SocialStats fetchSocialStats(@NonNull String videoId, @NonNull String apiKeyIgnored) {
+        String body = postInnertubeNext(videoId);
         if (body.isEmpty()) {
             return SocialStats.unavailable();
         }
-
         try {
             JSONObject root = new JSONObject(body);
-            JSONArray items = root.optJSONArray("items");
-            if (items == null || items.length() == 0) {
+            long likeCount = extractLikeCountFromNext(root);
+            long commentCount = extractCommentCountFromNext(root);
+            if (likeCount < 0 && commentCount < 0) {
                 return SocialStats.unavailable();
             }
-
-            JSONObject first = items.optJSONObject(0);
-            JSONObject statistics = first == null ? null : first.optJSONObject("statistics");
-            if (statistics == null) {
-                return SocialStats.unavailable();
-            }
-
-            long likeCount = parseSafeLong(statistics.optString("likeCount", ""));
-            long commentCount = parseSafeLong(statistics.optString("commentCount", ""));
             return new SocialStats(
-                    formatCompactCount(likeCount),
+                    likeCount >= 0 ? formatCompactCount(likeCount) : "0",
                     "0",
-                    formatCompactCount(commentCount),
+                    commentCount >= 0 ? formatCompactCount(commentCount) : "0",
                     false
             );
         } catch (Exception ignored) {
             return SocialStats.unavailable();
         }
+    }
+
+    /** POST al /next de InnerTube (cliente WEB). Devuelve el body o "" en error. */
+    @NonNull
+    private String postInnertubeNext(@NonNull String videoId) {
+        HttpURLConnection connection = null;
+        try {
+            JSONObject client = new JSONObject();
+            client.put("clientName", "WEB");
+            client.put("clientVersion", "2.20241111.01.00");
+            client.put("hl", "es");
+            client.put("gl", "US");
+            JSONObject payload = new JSONObject();
+            payload.put("context", new JSONObject().put("client", client));
+            payload.put("videoId", videoId);
+            byte[] bodyBytes = payload.toString().getBytes(StandardCharsets.UTF_8);
+
+            URL url = new URL("https://www.youtube.com/youtubei/v1/next?prettyPrint=false");
+            connection = (HttpURLConnection) url.openConnection();
+            connection.setRequestMethod("POST");
+            connection.setDoOutput(true);
+            connection.setConnectTimeout(CONNECT_TIMEOUT_MS);
+            connection.setReadTimeout(READ_TIMEOUT_MS);
+            connection.setRequestProperty("Content-Type", "application/json");
+            connection.setRequestProperty("Accept", "application/json");
+            connection.setRequestProperty("User-Agent",
+                    "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36");
+            connection.setRequestProperty("Origin", "https://www.youtube.com");
+            connection.setRequestProperty("Referer", "https://www.youtube.com/");
+            String cookie = StreamResolver.getAuthCookieHeader();
+            if (cookie != null && !cookie.isEmpty()) {
+                connection.setRequestProperty("Cookie", cookie);
+                String sapisid = StreamResolver.buildSapisidHash("https://www.youtube.com");
+                if (sapisid != null && !sapisid.isEmpty()) {
+                    connection.setRequestProperty("Authorization", sapisid);
+                }
+            }
+            connection.setUseCaches(false);
+            try (OutputStream os = connection.getOutputStream()) {
+                os.write(bodyBytes);
+            }
+            int code = connection.getResponseCode();
+            if (code < 200 || code >= 300) {
+                Log.w(TAG, "postInnertubeNext non-2xx code=" + code);
+                return "";
+            }
+            try (BufferedInputStream in = new BufferedInputStream(connection.getInputStream());
+                 ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+                byte[] buffer = new byte[8192];
+                int read;
+                while ((read = in.read(buffer)) != -1) {
+                    out.write(buffer, 0, read);
+                }
+                return out.toString(StandardCharsets.UTF_8.name());
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "postInnertubeNext exception", e);
+            return "";
+        } finally {
+            if (connection != null) {
+                connection.disconnect();
+            }
+        }
+    }
+
+    /** Conteo de comentarios del /next (varias rutas: engagementPanels header, o el entry point). */
+    private long extractCommentCountFromNext(@NonNull JSONObject root) {
+        // Ruta 1: engagementPanels[…comments].header.engagementPanelTitleHeaderRenderer.contextualInfo
+        try {
+            JSONArray panels = root.optJSONArray("engagementPanels");
+            if (panels != null) {
+                for (int i = 0; i < panels.length(); i++) {
+                    JSONObject r = panels.optJSONObject(i) == null ? null
+                            : panels.optJSONObject(i).optJSONObject("engagementPanelSectionListRenderer");
+                    if (r == null) continue;
+                    String id = r.optString("panelIdentifier", "") + r.optString("targetId", "");
+                    if (!id.toLowerCase(Locale.US).contains("comment")) continue;
+                    JSONObject title = r.optJSONObject("header") == null ? null
+                            : r.optJSONObject("header").optJSONObject("engagementPanelTitleHeaderRenderer");
+                    if (title == null) continue;
+                    long n = parseCompactCountText(firstRunText(title.optJSONObject("contextualInfo")));
+                    if (n >= 0) return n;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        // Ruta 2: itemSectionRenderer → commentsEntryPointHeaderRenderer.commentCount
+        try {
+            JSONArray contents = watchNextContents(root);
+            if (contents != null) {
+                for (int i = 0; i < contents.length(); i++) {
+                    JSONObject sec = contents.optJSONObject(i) == null ? null
+                            : contents.optJSONObject(i).optJSONObject("itemSectionRenderer");
+                    JSONArray inner = sec == null ? null : sec.optJSONArray("contents");
+                    if (inner == null) continue;
+                    for (int j = 0; j < inner.length(); j++) {
+                        JSONObject h = inner.optJSONObject(j) == null ? null
+                                : inner.optJSONObject(j).optJSONObject("commentsEntryPointHeaderRenderer");
+                        if (h == null) continue;
+                        JSONObject cc = h.optJSONObject("commentCount");
+                        String text = cc == null ? "" : (cc.optString("simpleText", "").isEmpty()
+                                ? firstRunText(cc) : cc.optString("simpleText", ""));
+                        long n = parseCompactCountText(text);
+                        if (n >= 0) return n;
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return -1;
+    }
+
+    /** Conteo de "me gusta" del /next: botón like del videoPrimaryInfoRenderer (mejor esfuerzo). */
+    private long extractLikeCountFromNext(@NonNull JSONObject root) {
+        try {
+            JSONArray contents = watchNextContents(root);
+            if (contents == null) return -1;
+            for (int i = 0; i < contents.length(); i++) {
+                JSONObject vpi = contents.optJSONObject(i) == null ? null
+                        : contents.optJSONObject(i).optJSONObject("videoPrimaryInfoRenderer");
+                if (vpi == null) continue;
+                JSONObject menu = vpi.optJSONObject("videoActions") == null ? null
+                        : vpi.optJSONObject("videoActions").optJSONObject("menuRenderer");
+                JSONArray top = menu == null ? null : menu.optJSONArray("topLevelButtons");
+                if (top == null) continue;
+                // El botón de like es el primer subárbol; busca el primer texto que parsee a número.
+                long n = findFirstCountInTree(top.optJSONObject(0), 0);
+                if (n >= 0) return n;
+            }
+        } catch (Exception ignored) {
+        }
+        return -1;
+    }
+
+    @Nullable
+    private JSONArray watchNextContents(@NonNull JSONObject root) {
+        JSONObject c = root.optJSONObject("contents");
+        JSONObject two = c == null ? null : c.optJSONObject("twoColumnWatchNextResults");
+        JSONObject res = two == null ? null : two.optJSONObject("results");
+        JSONObject res2 = res == null ? null : res.optJSONObject("results");
+        return res2 == null ? null : res2.optJSONArray("contents");
+    }
+
+    @NonNull
+    private String firstRunText(@Nullable JSONObject textObj) {
+        if (textObj == null) return "";
+        String simple = textObj.optString("simpleText", "");
+        if (!simple.isEmpty()) return simple;
+        JSONArray runs = textObj.optJSONArray("runs");
+        if (runs != null && runs.length() > 0) {
+            JSONObject r0 = runs.optJSONObject(0);
+            if (r0 != null) return r0.optString("text", "");
+        }
+        return "";
+    }
+
+    /** Busca recursivamente (acotado) el primer valor de texto que parsee a un conteo compacto,
+     *  dentro del subárbol del botón de like (title/accessibilityText/label). */
+    private long findFirstCountInTree(@Nullable JSONObject node, int depth) {
+        if (node == null || depth > 8) return -1;
+        java.util.Iterator<String> keys = node.keys();
+        while (keys.hasNext()) {
+            String k = keys.next();
+            Object v = node.opt(k);
+            if (v instanceof String) {
+                if (k.equals("title") || k.equals("accessibilityText") || k.equals("label")
+                        || k.equals("simpleText") || k.equals("text")) {
+                    long n = parseCompactCountText((String) v);
+                    if (n >= 0) return n;
+                }
+            } else if (v instanceof JSONObject) {
+                long n = findFirstCountInTree((JSONObject) v, depth + 1);
+                if (n >= 0) return n;
+            } else if (v instanceof JSONArray) {
+                JSONArray arr = (JSONArray) v;
+                for (int i = 0; i < arr.length(); i++) {
+                    long n = findFirstCountInTree(arr.optJSONObject(i), depth + 1);
+                    if (n >= 0) return n;
+                }
+            }
+        }
+        return -1;
+    }
+
+    /** Parsea "1,234" / "1.2K" / "1.2 M" / "3,4 mil" a un long. -1 si no es un conteo. */
+    private long parseCompactCountText(@Nullable String raw) {
+        if (raw == null) return -1;
+        String s = raw.trim().toLowerCase(Locale.US);
+        if (s.isEmpty()) return -1;
+        // Extraer el primer número (con , . como separadores) y un posible sufijo de magnitud.
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("([0-9][0-9.,]*)\\s*(mil|k|m|b|mm)?").matcher(s);
+        if (!m.find()) return -1;
+        String numPart = m.group(1);
+        String suffix = m.group(2) == null ? "" : m.group(2);
+        // Normalizar separadores: quitar los de miles, dejar el decimal. Heurística: si hay coma y
+        // punto, el último es el decimal; si solo uno y separa <=2 dígitos al final con sufijo, es decimal.
+        double base;
+        try {
+            String cleaned = numPart;
+            if (suffix.isEmpty()) {
+                // Conteo entero: quitar todos los separadores.
+                cleaned = cleaned.replace(".", "").replace(",", "");
+                return Long.parseLong(cleaned);
+            } else {
+                // Con sufijo (1.2K): el separador es decimal.
+                cleaned = cleaned.replace(",", ".");
+                base = Double.parseDouble(cleaned);
+            }
+        } catch (Exception e) {
+            return -1;
+        }
+        double mult = 1;
+        switch (suffix) {
+            case "mil": case "k": mult = 1_000d; break;
+            case "m": mult = 1_000_000d; break;
+            case "b": case "mm": mult = 1_000_000_000d; break;
+            default: mult = 1; break;
+        }
+        return (long) (base * mult);
     }
 
     private void applySocialStatsToUi(@NonNull SocialStats stats) {

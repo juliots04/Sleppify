@@ -271,6 +271,12 @@ class MainActivity : AppCompatActivity() {
         audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
         // Auth cookies + NewPipe warmup run on background thread inside warmUp
         StreamResolver.warmUp(this)
+        // Construir el ExoPlayer compartido FUERA del hilo principal: su build() (renderers + audio)
+        // es seguro desde cualquier hilo (siempre opera en el main Looper), así el PRIMER play de la
+        // sesión no paga esa construcción en el UI thread al abrir el reproductor.
+        Thread({
+            try { ExoPlayerManager.initialize(applicationContext) } catch (_: Throwable) {}
+        }, "exo-warmup").apply { isDaemon = true }.start()
         setupListeners()
         configureHeaderActionForMainModules()
         configureAudioAuthorizationFlow()

@@ -22,15 +22,19 @@ object ThumbnailUrls {
     private val GGPHT_SIZED = Regex("https://yt3\\.ggpht\\.com/.*=s(\\d+)")
 
     /**
-     * Returns [url] rewritten to request roughly [sizePx] x [sizePx] from the CDN, or the
-     * original URL when the host doesn't support size params. Safe on null/blank.
+     * Returns [url] rewritten to request roughly [sizePx] x [sizePx] from the CDN at JPEG quality
+     * [quality] (l-flag; 90 por defecto para portadas del player/detalle), or the original URL when
+     * the host doesn't support size params. Safe on null/blank. Las tarjetas del home pasan una
+     * calidad menor (~72) para acelerar la carga con pérdida imperceptible a tamaño de tarjeta.
      */
     @JvmStatic
-    fun atSize(url: String?, sizePx: Int): String? {
+    @JvmOverloads
+    fun atSize(url: String?, sizePx: Int, quality: Int = 90): String? {
         if (url.isNullOrBlank() || sizePx <= 0) return url
 
+        val q = quality.coerceIn(1, 100)
         GUSERCONTENT_SIZED.matchEntire(url)?.let {
-            return url.substringBefore("=w") + "=w$sizePx-h$sizePx-p-l90-rj"
+            return url.substringBefore("=w") + "=w$sizePx-h$sizePx-p-l$q-rj"
         }
         if (GGPHT_SIZED.matches(url)) {
             return "$url-s$sizePx"

@@ -6309,11 +6309,9 @@ public class PlaylistDetailFragment extends Fragment
     }
 
     /**
-     * Renders the radio/mix header: el MISMO composite estilo YT Music que compone el carrusel del
-     * home ({@link RadioArtComposer}: degradado claro→oscuro + barras de onda + 3 círculos iguales
-     * a todo color + chip de play) sobre el mismo campo degradado, para que una radio se vea
-     * idéntica donde sea que aparezca. Sin insignia "RADIO" ni título sobre la portada (nuevo
-     * diseño). Center = the seed cover; los círculos laterales = otros tracks de la radio.
+     * Renders the radio/mix header con el MISMO diseño Frost que el carrusel del home
+     * ({@link RadioArtComposer}: UNA carátula central + panel de vidrio esmerilado con "RADIO" +
+     * título) para que una radio se vea idéntica donde sea que aparezca. Center = the seed cover.
      */
     private void bindRadioHeaderCover(@NonNull PlaylistHeaderAdapter.HeaderViewHolder holder) {
         ImageView cover = holder.ivPlaylistCover;
@@ -6339,46 +6337,18 @@ public class PlaylistDetailFragment extends Fragment
                 && !entry.getSongThumbnail().isEmpty()
                 ? entry.getSongThumbnail()
                 : (!seedHd.isEmpty() ? seedHd : headerPlaylistThumbnail.trim());
-        // Sides + color del campo vía RadioArt (mismas prefs sides_/color_ que compartía con el
-        // home). ensureRawColor deduplica internamente los Palette pass concurrentes por radioId,
-        // así el header conserva su garantía de una sola petición.
-        android.content.Context ctx = cover.getContext();
-        String[] sides = RadioArt.resolveSides(ctx, currentPlaylistId, centerUrl);
-        int raw = RadioArt.rawColor(ctx, currentPlaylistId);
-        if (raw == 0) {
-            // Violeta por defecto mientras el Palette asíncrono calcula + persiste el real.
-            raw = RadioArt.DEFAULT_RAW;
-            final String radioId = currentPlaylistId;
-            RadioArt.ensureRawColor(ctx, radioId, centerUrl, () -> {
-                if (!isAdded() || !radioId.equals(currentPlaylistId)) return;
-                notifyHeaderChanged();
-            });
-        }
-        cover.setBackground(RadioArtComposer.fieldDrawable(raw));
+        // Diseño Frost: UNA carátula + panel "RADIO" + título (idéntico al carrusel del home).
+        String centerSafe = centerUrl == null ? "" : centerUrl;
+        String frostTitle = entry != null && entry.getSongTitle() != null ? entry.getSongTitle() : "";
+        int loadingGray = 0xFF282A30;
         int coverPx = isAdded() ? ThumbnailUrls.dpToPx(requireContext(), 260) : 0;
-        RadioArtComposer.INSTANCE.load(
-                cover,
-                currentPlaylistId,
-                centerUrl == null ? "" : centerUrl,
-                sides[0],
-                sides[1],
-                coverPx > 0 ? coverPx : 720,
-                raw
-        );
+        int artPx = coverPx > 0 ? coverPx : 720;
+        cover.setBackgroundColor(loadingGray);
+        RadioArtComposer.INSTANCE.load(cover, currentPlaylistId, centerSafe, frostTitle, artPx, true);
 
-        // Backdrop: the SAME composed radio art as the foreground cover (was the low-res seed image
-        // behind a crisp composite), over the same tinted field. Reusing coverPx hits the composer's
-        // cache for the bitmap already built for the cover — no extra compose work, identical HD copy.
-        backdrop.setBackground(RadioArtComposer.fieldDrawable(raw));
-        RadioArtComposer.INSTANCE.load(
-                backdrop,
-                currentPlaylistId,
-                centerUrl == null ? "" : centerUrl,
-                sides[0],
-                sides[1],
-                coverPx > 0 ? coverPx : 720,
-                raw
-        );
+        // Backdrop: la MISMA carátula SIN panel (fondo difuminado detrás del cover).
+        backdrop.setBackgroundColor(loadingGray);
+        RadioArtComposer.INSTANCE.load(backdrop, currentPlaylistId, centerSafe, "", artPx, false);
 
         // Nuevo diseño: la portada de radio no lleva insignia "RADIO" ni título encima — el arte
         // (onda + círculos) se identifica solo, igual que la tarjeta del home.
