@@ -31,6 +31,7 @@ object AudioDeviceProfileStore {
     private const val FLOAT_TOLERANCE = 0.01f
 
     private const val PROFILE_DEFAULT_BASS_DB = 0f
+    private const val PROFILE_DEFAULT_OVERALL_GAIN_DB = 0f
     private const val PROFILE_DEFAULT_BASS_TYPE = AudioEffectsService.BASS_TYPE_NATURAL
     private const val PROFILE_DEFAULT_BASS_FREQUENCY_HZ = 62f
     private const val PROFILE_DEFAULT_ENABLED = false
@@ -132,6 +133,7 @@ object AudioDeviceProfileStore {
     private fun hasProfileData(prefs: SharedPreferences, id: String): Boolean {
         return prefs.contains(profileKey(id, AudioEffectsService.KEY_ENABLED)) ||
                prefs.contains(profileKey(id, AudioEffectsService.KEY_BASS_DB)) ||
+               prefs.contains(profileKey(id, AudioEffectsService.KEY_OVERALL_GAIN_DB)) ||
                prefs.contains(profileKey(id, AudioEffectsService.KEY_BASS_TYPE)) ||
                prefs.contains(profileKey(id, AudioEffectsService.KEY_BASS_FREQUENCY_HZ)) ||
                prefs.contains(profileKey(id, KEY_SELECTED_PRESET)) ||
@@ -146,6 +148,9 @@ object AudioDeviceProfileStore {
         if (!sameFloat(prefs.getFloat(AudioEffectsService.KEY_BASS_DB, 0f), 
                        prefs.getFloat(profileKey(id, AudioEffectsService.KEY_BASS_DB), 0f))) return false
         
+        if (!sameFloat(prefs.getFloat(AudioEffectsService.KEY_OVERALL_GAIN_DB, 0f), 
+                       prefs.getFloat(profileKey(id, AudioEffectsService.KEY_OVERALL_GAIN_DB), 0f))) return false
+
         if (prefs.getBoolean(AudioEffectsService.KEY_ENABLED, false) != 
             prefs.getBoolean(profileKey(id, AudioEffectsService.KEY_ENABLED), false)) return false
 
@@ -171,6 +176,7 @@ object AudioDeviceProfileStore {
     private fun copyActiveValuesToProfile(editor: SharedPreferences.Editor, prefs: SharedPreferences, id: String) {
         editor.putBoolean(profileKey(id, AudioEffectsService.KEY_ENABLED), prefs.getBoolean(AudioEffectsService.KEY_ENABLED, false))
         editor.putFloat(profileKey(id, AudioEffectsService.KEY_BASS_DB), prefs.getFloat(AudioEffectsService.KEY_BASS_DB, 0f))
+        editor.putFloat(profileKey(id, AudioEffectsService.KEY_OVERALL_GAIN_DB), prefs.getFloat(AudioEffectsService.KEY_OVERALL_GAIN_DB, 0f))
         editor.putInt(profileKey(id, AudioEffectsService.KEY_BASS_TYPE), prefs.getInt(AudioEffectsService.KEY_BASS_TYPE, AudioEffectsService.BASS_TYPE_NATURAL))
         editor.putFloat(profileKey(id, AudioEffectsService.KEY_BASS_FREQUENCY_HZ), prefs.getFloat(AudioEffectsService.KEY_BASS_FREQUENCY_HZ, AudioEffectsService.BASS_FREQUENCY_DEFAULT_HZ))
         editor.putString(profileKey(id, KEY_SELECTED_PRESET), prefs.getString(KEY_SELECTED_PRESET, "custom"))
@@ -184,6 +190,7 @@ object AudioDeviceProfileStore {
         val presetId = resolveProfilePresetId(prefs, id)
         editor.putBoolean(AudioEffectsService.KEY_ENABLED, prefs.getBoolean(profileKey(id, AudioEffectsService.KEY_ENABLED), false))
         editor.putFloat(AudioEffectsService.KEY_BASS_DB, prefs.getFloat(profileKey(id, AudioEffectsService.KEY_BASS_DB), 0f))
+        editor.putFloat(AudioEffectsService.KEY_OVERALL_GAIN_DB, prefs.getFloat(profileKey(id, AudioEffectsService.KEY_OVERALL_GAIN_DB), 0f))
         editor.putInt(AudioEffectsService.KEY_BASS_TYPE, prefs.getInt(profileKey(id, AudioEffectsService.KEY_BASS_TYPE), AudioEffectsService.BASS_TYPE_NATURAL))
         editor.putFloat(AudioEffectsService.KEY_BASS_FREQUENCY_HZ, prefs.getFloat(profileKey(id, AudioEffectsService.KEY_BASS_FREQUENCY_HZ), AudioEffectsService.BASS_FREQUENCY_DEFAULT_HZ))
         editor.putString(KEY_SELECTED_PRESET, presetId)
@@ -196,6 +203,7 @@ object AudioDeviceProfileStore {
     private fun copyProfileValuesToProfile(editor: SharedPreferences.Editor, prefs: SharedPreferences, src: String, dst: String) {
         editor.putBoolean(profileKey(dst, AudioEffectsService.KEY_ENABLED), prefs.getBoolean(profileKey(src, AudioEffectsService.KEY_ENABLED), false))
         editor.putFloat(profileKey(dst, AudioEffectsService.KEY_BASS_DB), prefs.getFloat(profileKey(src, AudioEffectsService.KEY_BASS_DB), 0f))
+        editor.putFloat(profileKey(dst, AudioEffectsService.KEY_OVERALL_GAIN_DB), prefs.getFloat(profileKey(src, AudioEffectsService.KEY_OVERALL_GAIN_DB), 0f))
         editor.putInt(profileKey(dst, AudioEffectsService.KEY_BASS_TYPE), prefs.getInt(profileKey(src, AudioEffectsService.KEY_BASS_TYPE), AudioEffectsService.BASS_TYPE_NATURAL))
         editor.putFloat(profileKey(dst, AudioEffectsService.KEY_BASS_FREQUENCY_HZ), prefs.getFloat(profileKey(src, AudioEffectsService.KEY_BASS_FREQUENCY_HZ), AudioEffectsService.BASS_FREQUENCY_DEFAULT_HZ))
         
@@ -209,6 +217,7 @@ object AudioDeviceProfileStore {
     private fun writeDefaultValuesToProfile(editor: SharedPreferences.Editor, id: String) {
         editor.putBoolean(profileKey(id, AudioEffectsService.KEY_ENABLED), PROFILE_DEFAULT_ENABLED)
         editor.putFloat(profileKey(id, AudioEffectsService.KEY_BASS_DB), PROFILE_DEFAULT_BASS_DB)
+        editor.putFloat(profileKey(id, AudioEffectsService.KEY_OVERALL_GAIN_DB), PROFILE_DEFAULT_OVERALL_GAIN_DB)
         editor.putInt(profileKey(id, AudioEffectsService.KEY_BASS_TYPE), PROFILE_DEFAULT_BASS_TYPE)
         editor.putFloat(profileKey(id, AudioEffectsService.KEY_BASS_FREQUENCY_HZ), PROFILE_DEFAULT_BASS_FREQUENCY_HZ)
         editor.putString(profileKey(id, KEY_SELECTED_PRESET), PRESET_DEFAULT)
@@ -218,6 +227,7 @@ object AudioDeviceProfileStore {
     private fun writeDefaultValuesToActive(editor: SharedPreferences.Editor) {
         editor.putBoolean(AudioEffectsService.KEY_ENABLED, PROFILE_DEFAULT_ENABLED)
         editor.putFloat(AudioEffectsService.KEY_BASS_DB, PROFILE_DEFAULT_BASS_DB)
+        editor.putFloat(AudioEffectsService.KEY_OVERALL_GAIN_DB, PROFILE_DEFAULT_OVERALL_GAIN_DB)
         editor.putInt(AudioEffectsService.KEY_BASS_TYPE, PROFILE_DEFAULT_BASS_TYPE)
         editor.putFloat(AudioEffectsService.KEY_BASS_FREQUENCY_HZ, PROFILE_DEFAULT_BASS_FREQUENCY_HZ)
         editor.putString(KEY_SELECTED_PRESET, PRESET_DEFAULT)

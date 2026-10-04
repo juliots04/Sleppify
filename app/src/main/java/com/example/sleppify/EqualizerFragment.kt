@@ -46,6 +46,7 @@ class EqualizerFragment : Fragment() {
     private lateinit var cardPresetSelector: View
     private var cardGraphicEq: View? = null
     private var cardBassTuner: View? = null
+    private var cardOverallGain: View? = null
 
     private lateinit var eqCurveView: EqCurveEditorView
     private var switchEqEnabled: MaterialSwitch? = null
@@ -56,6 +57,8 @@ class EqualizerFragment : Fragment() {
     private var cardBassTypeSelector: View? = null
     private lateinit var sliderBassFrequency: Slider
     private lateinit var tvBassFrequencyValue: TextView
+    private lateinit var sliderOverallGain: Slider
+    private lateinit var tvOverallGainValue: TextView
 
     private var restoringUi: Boolean = false
     private var hasLoadedUi: Boolean = false
@@ -116,6 +119,7 @@ class EqualizerFragment : Fragment() {
         cardPresetSelector = view.findViewById(R.id.cardPresetSelector)
         cardGraphicEq = view.findViewById(R.id.cardGraphicEq)
         cardBassTuner = view.findViewById(R.id.cardBassTuner)
+        cardOverallGain = view.findViewById(R.id.cardOverallGain)
 
         eqCurveView = view.findViewById(R.id.eqCurveView)
         switchEqEnabled = view.findViewById(R.id.switchEqEnabled)
@@ -126,21 +130,28 @@ class EqualizerFragment : Fragment() {
         cardBassTypeSelector = view.findViewById(R.id.cardBassTypeSelector)
         sliderBassFrequency = view.findViewById(R.id.sliderBassFrequency)
         tvBassFrequencyValue = view.findViewById(R.id.tvBassFrequencyValue)
+        sliderOverallGain = view.findViewById(R.id.sliderOverallGain)
+        tvOverallGainValue = view.findViewById(R.id.tvOverallGainValue)
 
         sliderBassFrequency.valueFrom = AudioEffectsService.BASS_FREQUENCY_MIN_HZ
         sliderBassFrequency.valueTo = AudioEffectsService.BASS_FREQUENCY_MAX_HZ
+        sliderOverallGain.valueFrom = AudioEffectsService.OVERALL_GAIN_MIN_DB
+        sliderOverallGain.valueTo = AudioEffectsService.OVERALL_GAIN_MAX_DB
 
         setupListeners()
+        applyCardStyles(view)
         refreshOutputDeviceAndProfile(false, true)
         refreshEqModuleState()
         ensureEqServiceActive()
-        applyCardStyles(view)
     }
 
     override fun onHiddenChanged(hidden: Boolean) {
         super.onHiddenChanged(hidden)
         if (!hidden) {
             view?.findViewById<android.widget.ScrollView>(R.id.scrollEqContent)?.scrollTo(0, 0)
+            refreshOutputDeviceAndProfile(true, false)
+            refreshEqModuleState()
+            ensureEqServiceActive()
         }
     }
 
@@ -221,6 +232,11 @@ class EqualizerFragment : Fragment() {
         val bassType = normalizeBassType(preferences.getInt(AudioEffectsService.KEY_BASS_TYPE, BASS_TYPE_DEFAULT))
         tvSelectedBassType?.text = bassTypeLabelFromValue(bassType)
 
+        val overallGainDb = preferences.getFloat(AudioEffectsService.KEY_OVERALL_GAIN_DB, 0f)
+            .coerceIn(AudioEffectsService.OVERALL_GAIN_MIN_DB, AudioEffectsService.OVERALL_GAIN_MAX_DB)
+        sliderOverallGain.value = overallGainDb
+        tvOverallGainValue.text = formatGainDb(overallGainDb)
+
         val bandValues = FloatArray(EQ_BAND_COUNT)
         for (i in bandValues.indices) {
             bandValues[i] = preferences.getFloat(AudioEffectsService.bandDbKey(i), 0f)
@@ -253,6 +269,16 @@ class EqualizerFragment : Fragment() {
         }
         sliderBassFrequency.setOnFocusChangeListener { _, hasFocus ->
             sliderBassFrequency.haloRadius = if (hasFocus) dp(24) else dp(0)
+        }
+        sliderOverallGain.addOnChangeListener { _, value, _ ->
+            tvOverallGainValue.text = formatGainDb(value)
+            if (restoringUi) return@addOnChangeListener
+            preferences.edit().putFloat(AudioEffectsService.KEY_OVERALL_GAIN_DB, value).apply()
+            markOrSaveGainToUserPreset()
+            applyIfEnabled()
+        }
+        sliderOverallGain.setOnFocusChangeListener { _, hasFocus ->
+            sliderOverallGain.haloRadius = if (hasFocus) dp(24) else dp(0)
         }
         cardBassTypeSelector?.setOnClickListener { showBassTypePopup() }
 
@@ -310,6 +336,7 @@ class EqualizerFragment : Fragment() {
         applyEnabledStyle(cardBassTypeSelector, eqEnabled)
         applyEnabledStyle(cardGraphicEq, eqEnabled)
         applyEnabledStyle(cardBassTuner, eqEnabled)
+        applyEnabledStyle(cardOverallGain, eqEnabled)
 
         eqCurveView.apply {
             isEnabled = eqEnabled
@@ -319,7 +346,7 @@ class EqualizerFragment : Fragment() {
         }
         sliderBassGain.isEnabled = eqEnabled
         sliderBassFrequency.isEnabled = eqEnabled
-        applyCardStyles(view)
+        sliderOverallGain.isEnabled = eqEnabled
     }
 
     private fun applyEnabledStyle(target: View?, enabled: Boolean) {
@@ -331,13 +358,8 @@ class EqualizerFragment : Fragment() {
     }
 
     private fun registerOutputDeviceCallback() {
-        val manager = audioManager
-        if (manager == null) {
-            refreshOutputDeviceAndProfile(false, false)
-            return
-        }
+        val manager = audioManager ?: return
         runCatching { manager.registerAudioDeviceCallback(outputDeviceCallback, mainHandler) }
-        refreshOutputDeviceAndProfile(true, false)
     }
 
     private fun unregisterOutputDeviceCallback() {
@@ -595,6 +617,9 @@ class EqualizerFragment : Fragment() {
         tvBassFrequencyValue.text = formatHz(normalizedBassFrequencyHz)
         val normalizedBassType = normalizeBassType(preset.bassType)
         tvSelectedBassType?.text = bassTypeLabelFromValue(normalizedBassType)
+        val presetGain = preset.overallGainDb.coerceIn(AudioEffectsService.OVERALL_GAIN_MIN_DB, AudioEffectsService.OVERALL_GAIN_MAX_DB)
+        sliderOverallGain.value = presetGain
+        tvOverallGainValue.text = formatGainDb(presetGain)
         tvSelectedPreset.text = preset.label
         restoringUi = false
 
@@ -636,6 +661,14 @@ class EqualizerFragment : Fragment() {
             editor.putInt(AudioEffectsService.KEY_BASS_TYPE, bassType)
             tvSelectedBassType?.text = bassTypeLabelFromValue(bassType)
         }
+        val gainDbKey = KEY_USER_PRESET_GAIN_DB_PREFIX + profileId
+        if (preferences.contains(gainDbKey)) {
+            val gainDb = preferences.getFloat(gainDbKey, 0f)
+                .coerceIn(AudioEffectsService.OVERALL_GAIN_MIN_DB, AudioEffectsService.OVERALL_GAIN_MAX_DB)
+            editor.putFloat(AudioEffectsService.KEY_OVERALL_GAIN_DB, gainDb)
+            sliderOverallGain.value = gainDb
+            tvOverallGainValue.text = formatGainDb(gainDb)
+        }
 
         editor.apply()
         restoringUi = false
@@ -653,6 +686,7 @@ class EqualizerFragment : Fragment() {
 
                 val editor = preferences.edit()
                 editor.remove(KEY_PROFILE_CUSTOM_PRESET_NAME_PREFIX + preset.profileId)
+                editor.remove(KEY_USER_PRESET_GAIN_DB_PREFIX + preset.profileId)
                 for (i in 0 until EQ_BAND_COUNT) {
                     editor.remove(userPresetBandKey(preset.profileId, i))
                 }
@@ -1075,12 +1109,14 @@ class EqualizerFragment : Fragment() {
         val hasBassDb = preferences.contains(AudioEffectsService.KEY_BASS_DB)
         val hasBassType = preferences.contains(AudioEffectsService.KEY_BASS_TYPE)
         val hasBassFrequency = preferences.contains(AudioEffectsService.KEY_BASS_FREQUENCY_HZ)
-        if (hasBassDb && hasBassType && hasBassFrequency) return
+        val hasOverallGain = preferences.contains(AudioEffectsService.KEY_OVERALL_GAIN_DB)
+        if (hasBassDb && hasBassType && hasBassFrequency && hasOverallGain) return
 
         val editor = preferences.edit()
         if (!hasBassDb) editor.putFloat(AudioEffectsService.KEY_BASS_DB, 0f)
         if (!hasBassType) editor.putInt(AudioEffectsService.KEY_BASS_TYPE, BASS_TYPE_DEFAULT)
         if (!hasBassFrequency) editor.putFloat(AudioEffectsService.KEY_BASS_FREQUENCY_HZ, BASS_DEFAULT_FREQUENCY_HZ)
+        if (!hasOverallGain) editor.putFloat(AudioEffectsService.KEY_OVERALL_GAIN_DB, 0f)
         editor.apply()
     }
 
@@ -1168,6 +1204,7 @@ class EqualizerFragment : Fragment() {
         editor.putFloat(AudioEffectsService.KEY_BASS_DB, quantizeBassGainToggle(preset.bassDb))
         editor.putFloat(AudioEffectsService.KEY_BASS_FREQUENCY_HZ, normalizeBassFrequencySlider(preset.bassFrequencyHz))
         editor.putInt(AudioEffectsService.KEY_BASS_TYPE, normalizeBassType(preset.bassType))
+        editor.putFloat(AudioEffectsService.KEY_OVERALL_GAIN_DB, preset.overallGainDb.coerceIn(AudioEffectsService.OVERALL_GAIN_MIN_DB, AudioEffectsService.OVERALL_GAIN_MAX_DB))
         editor.apply()
     }
 
@@ -1190,6 +1227,18 @@ class EqualizerFragment : Fragment() {
                 .putFloat(KEY_USER_PRESET_BASS_DB_PREFIX + profileId, preferences.getFloat(AudioEffectsService.KEY_BASS_DB, 0f))
                 .putFloat(KEY_USER_PRESET_BASS_FREQ_PREFIX + profileId, preferences.getFloat(AudioEffectsService.KEY_BASS_FREQUENCY_HZ, BASS_DEFAULT_FREQUENCY_HZ))
                 .putInt(KEY_USER_PRESET_BASS_TYPE_PREFIX + profileId, preferences.getInt(AudioEffectsService.KEY_BASS_TYPE, BASS_TYPE_DEFAULT))
+                .apply()
+        } else {
+            markPresetAsCustom()
+        }
+    }
+
+    private fun markOrSaveGainToUserPreset() {
+        val currentPreset = preferences.getString(KEY_SELECTED_PRESET, PRESET_DEFAULT)
+        if (isUserPresetId(currentPreset)) {
+            val profileId = profileIdFromUserPresetId(currentPreset) ?: return
+            preferences.edit()
+                .putFloat(KEY_USER_PRESET_GAIN_DB_PREFIX + profileId, preferences.getFloat(AudioEffectsService.KEY_OVERALL_GAIN_DB, 0f))
                 .apply()
         } else {
             markPresetAsCustom()
@@ -1259,6 +1308,15 @@ class EqualizerFragment : Fragment() {
 
     private fun formatDb(value: Float): String = String.format(Locale.US, "%.1f dB", value)
 
+    private fun formatGainDb(value: Float): String {
+        val rounded = Math.round(value * 10f) / 10f
+        return when {
+            kotlin.math.abs(rounded) < 0.05f -> "0.0 dB"
+            rounded > 0f -> String.format(Locale.US, "+%.1f dB", rounded)
+            else -> String.format(Locale.US, "%.1f dB", rounded)
+        }
+    }
+
     private fun formatHz(value: Float): String = String.format(Locale.US, "%d Hz", Math.round(value))
 
     private fun normalizeBassFrequencySlider(rawValue: Float): Float =
@@ -1298,7 +1356,8 @@ class EqualizerFragment : Fragment() {
             R.id.cardPresetSelector,
             R.id.cardGraphicEq,
             R.id.cardBassTuner,
-            R.id.cardBassTypeSelector
+            R.id.cardBassTypeSelector,
+            R.id.cardOverallGain
         )
         for (id in cardIds) {
             val v = rootView.findViewById<View>(id)
@@ -1330,7 +1389,8 @@ class EqualizerFragment : Fragment() {
         val bands: FloatArray,
         val bassDb: Float = 0f,
         val bassFrequencyHz: Float = BASS_DEFAULT_FREQUENCY_HZ,
-        val bassType: Int = BASS_TYPE_DEFAULT
+        val bassType: Int = BASS_TYPE_DEFAULT,
+        val overallGainDb: Float = 0f
     )
 
     private class BassTypeOption(val value: Int, val label: String)
@@ -1347,6 +1407,7 @@ class EqualizerFragment : Fragment() {
         private const val KEY_PROFILE_CUSTOM_PRESET_NAME_PREFIX = "profile_custom_preset_name_"
         private const val KEY_USER_PRESET_BAND_PREFIX = "user_preset_band_"
         private const val KEY_USER_PRESET_BASS_DB_PREFIX = "user_preset_bass_db_"
+        private const val KEY_USER_PRESET_GAIN_DB_PREFIX = "user_preset_gain_db_"
         private const val KEY_USER_PRESET_BASS_FREQ_PREFIX = "user_preset_bass_freq_"
         private const val KEY_USER_PRESET_BASS_TYPE_PREFIX = "user_preset_bass_type_"
         private const val KEY_DEVICE_PROFILE_PREFIX = "device_profile_"

@@ -43,18 +43,6 @@
             android:layout_height="1dp"
             android:layout_weight="1" />
 
-        <ImageView
-            android:id="@+id/btnCamera"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
-            android:background="?attr/selectableItemBackgroundBorderless"
-            android:clickable="true"
-            android:contentDescription="Scanner"
-            android:focusable="true"
-            android:padding="8dp"
-            android:src="@drawable/ic_camera"
-            android:visibility="gone"
-            app:tint="@android:color/white" />
 
         <ImageView
             android:id="@+id/btnHeaderSearch"
@@ -160,32 +148,11 @@
         android:id="@+id/playerContainer"
         android:layout_width="0dp"
         android:layout_height="0dp"
-        android:elevation="40dp"
+        android:elevation="100dp"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toTopOf="parent" />
 
-    <FrameLayout
-        android:id="@+id/scannerLoadingOverlay"
-        android:layout_width="0dp"
-        android:layout_height="0dp"
-        android:background="@android:color/black"
-        android:elevation="25dp"
-        android:visibility="gone"
-        android:clickable="true"
-        android:focusable="true"
-        app:layout_constraintBottom_toBottomOf="parent"
-        app:layout_constraintEnd_toEndOf="parent"
-        app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintTop_toTopOf="parent">
-
-        <ProgressBar
-            android:layout_width="62dp"
-            android:layout_height="62dp"
-            android:layout_gravity="center"
-            android:indeterminate="true"
-            android:indeterminateTint="@android:color/white" />
-    </FrameLayout>
 
 </androidx.constraintlayout.widget.ConstraintLayout>

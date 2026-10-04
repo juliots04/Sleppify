@@ -616,7 +616,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             val mainActivity = activity as? MainActivity ?: return@setOnClickListener
             btnFragSignIn?.isEnabled = false
             btnFragSignIn?.alpha = 0.56f
-            mainActivity.requireAuth(
+            mainActivity.startGoogleSignInThenWebSession(
                 {
                     btnFragSignIn?.isEnabled = true
                     btnFragSignIn?.alpha = 1f

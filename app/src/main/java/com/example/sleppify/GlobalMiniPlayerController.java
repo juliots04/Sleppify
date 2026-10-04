@@ -116,7 +116,7 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
         if (fullPlayerVisible) {
             hide();
         } else {
-            updateUi();
+            animateIn();
         }
     }
 
@@ -141,6 +141,52 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
             return;
         }
 
+        boolean hasContent = updateContent();
+        if (!hasContent) {
+            llMiniPlayer.setVisibility(View.GONE);
+            return;
+        }
+
+        // Show with slide-up animation if currently hidden
+        if (llMiniPlayer.getVisibility() != View.VISIBLE) {
+            animateIn();
+        }
+    }
+
+    public void animateIn() {
+        if (activity.isFinishing() || activity.isDestroyed()) return;
+        if (llMiniPlayer == null) return;
+        if (activity.isSongPlayerVisible()) return;
+        if (!activity.isMiniPlayerAllowedForCurrentScreen()) {
+            llMiniPlayer.setVisibility(View.GONE);
+            return;
+        }
+
+        animatingOut = false;
+        llMiniPlayer.animate().cancel();
+        ensureNavAboveMiniPlayer();
+        if (!updateContent()) {
+            llMiniPlayer.setVisibility(View.GONE);
+            return;
+        }
+
+        float distance = llMiniPlayer.getHeight() > 0 ? llMiniPlayer.getHeight() : 300f;
+        llMiniPlayer.setTranslationY(distance);
+        llMiniPlayer.setVisibility(View.VISIBLE);
+        llMiniPlayer.setAlpha(1f);
+
+        llMiniPlayer.animate()
+                .translationY(0f)
+                .setDuration(250)
+                .setInterpolator(MATERIAL_EASE)
+                .withEndAction(() -> {
+                    llMiniPlayer.setTranslationY(0f);
+                    resetNavTranslationZ();
+                })
+                .start();
+    }
+
+    private boolean updateContent() {
         SongPlayerFragment songPlayer = activity.findSongPlayerFragment();
         boolean playerAttached = songPlayer != null && songPlayer.isAdded();
         PlaybackHistoryStore.Snapshot snapshot = PlaybackHistoryStore.load(activity);
@@ -153,12 +199,20 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
         int currentSeconds = 0;
 
         if (playerAttached) {
-            coldStart = false;
-            totalSeconds = Math.max(1, songPlayer.externalGetTotalSeconds());
-            currentSeconds = Math.max(0, songPlayer.externalGetCurrentSeconds());
             title = songPlayer.externalGetCurrentTitle();
             subtitle = songPlayer.externalGetCurrentArtist();
             imageUrl = songPlayer.externalGetCurrentImageUrl();
+            if (TextUtils.isEmpty(title) && (snapshotTrack == null || TextUtils.isEmpty(snapshotTrack.title))) {
+                if (llMiniPlayer.getVisibility() != View.GONE) {
+                    llMiniPlayer.setVisibility(View.GONE);
+                }
+                miniPlaying = false;
+                playbackLoading = false;
+                return false;
+            }
+            coldStart = false;
+            totalSeconds = Math.max(1, songPlayer.externalGetTotalSeconds());
+            currentSeconds = Math.max(0, songPlayer.externalGetCurrentSeconds());
             playbackLoading = songPlayer.externalIsLoading();
             // Durante la ventana de carga en frío (la URL aún resolviéndose) el estado REAL es "no
             // reproduciendo", y este updateUi() del ticker de 500ms revertía el icono a "play" pese a
@@ -170,8 +224,12 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
             // On cold start, don't show mini-player from snapshot alone;
             // wait until the player is actually attached and ready.
             if (coldStart) {
-                llMiniPlayer.setVisibility(View.GONE);
-                return;
+                if (llMiniPlayer.getVisibility() != View.GONE) {
+                    llMiniPlayer.setVisibility(View.GONE);
+                }
+                miniPlaying = false;
+                playbackLoading = false;
+                return false;
             }
             title = TextUtils.isEmpty(snapshotTrack.title) ? "Última reproducción" : snapshotTrack.title;
             subtitle = snapshotTrack.artist;
@@ -188,22 +246,7 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
             }
             miniPlaying = false;
             playbackLoading = false;
-            return;
-        }
-
-        // Show with slide-up animation if currently hidden
-        if (llMiniPlayer.getVisibility() != View.VISIBLE) {
-            float distance = llMiniPlayer.getHeight() > 0 ? llMiniPlayer.getHeight() : 300f;
-            llMiniPlayer.setTranslationY(distance);
-            llMiniPlayer.setVisibility(View.VISIBLE);
-            llMiniPlayer.animate().cancel();
-            ensureNavAboveMiniPlayer();
-            llMiniPlayer.animate()
-                    .translationY(0f)
-                    .setDuration(250)
-                    .setInterpolator(MATERIAL_EASE)
-                    .withEndAction(null)
-                    .start();
+            return false;
         }
 
         // Title / Subtitle. The miniplayer shows ONLY the artist name — snapshots persisted by
@@ -248,6 +291,7 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
         }
 
         updateMiniLoadingVisibility();
+        return true;
     }
 
     // ── Actions ───────────────────────────────────────────────────
@@ -301,19 +345,30 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
      */
     public void animateOut() {
         if (llMiniPlayer == null) return;
+        if (llMiniPlayer.getVisibility() != View.VISIBLE) return;
+        if (animatingOut) return;
         animatingOut = true;
         llMiniPlayer.animate().cancel();
         ensureNavAboveMiniPlayer();
         float distance = llMiniPlayer.getHeight() > 0 ? llMiniPlayer.getHeight() : 300f;
         llMiniPlayer.animate()
                 .translationY(distance)
-                .setDuration(250)
+                .setDuration(260)
                 .setInterpolator(MATERIAL_EASE)
                 .withEndAction(() -> {
                     llMiniPlayer.setVisibility(View.GONE);
+                    llMiniPlayer.setTranslationY(0f);
                     animatingOut = false;
+                    resetNavTranslationZ();
                 })
                 .start();
+    }
+
+    private void resetNavTranslationZ() {
+        View nav = activity.findViewById(R.id.bottomNavigation);
+        if (nav != null) {
+            nav.setTranslationZ(0f);
+        }
     }
 
     public boolean isAnimatingOut() {
@@ -460,6 +515,7 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
                 snapshotIndex, startPlaying
         );
 
+        playerFragment.externalPrepareEnterSlide();
         injectOriginalQueueFromSnapshot(playerFragment, snapshot);
 
         activity.getSupportFragmentManager()

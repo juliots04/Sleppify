@@ -191,15 +191,30 @@
                     android:gravity="center"
                     android:orientation="horizontal">
 
-                    <ImageButton
-                        android:id="@+id/btnDownload"
+                    <FrameLayout
+                        android:id="@+id/flHeaderDownloadContainer"
                         android:layout_width="48dp"
                         android:layout_height="48dp"
-                        android:background="@drawable/bg_playlist_action_dark"
-                        android:padding="14dp"
-                        android:scaleType="center"
-                        android:src="@drawable/ic_download_bold"
-                        app:tint="#FFFFFF" />
+                        android:clipChildren="false"
+                        android:clipToPadding="false">
+
+                        <ImageButton
+                            android:id="@+id/btnDownload"
+                            android:layout_width="48dp"
+                            android:layout_height="48dp"
+                            android:background="@drawable/bg_playlist_action_dark"
+                            android:padding="14dp"
+                            android:scaleType="center"
+                            android:src="@drawable/ic_download_bold"
+                            app:tint="#FFFFFF" />
+
+                        <com.example.sleppify.CircularProgressView
+                            android:id="@+id/cpvHeaderDownload"
+                            android:layout_width="44dp"
+                            android:layout_height="44dp"
+                            android:layout_gravity="center"
+                            android:visibility="gone" />
+                    </FrameLayout>
 
                     <ImageButton
                         android:id="@+id/btnEditPlaylist"

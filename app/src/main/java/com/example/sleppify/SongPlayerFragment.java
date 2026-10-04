@@ -114,7 +114,7 @@ public class SongPlayerFragment extends Fragment {
     private static final String PREF_LAST_PLAYLIST_SUBTITLE = "stream_last_playlist_subtitle";
     private static final String PREF_LAST_PLAYLIST_THUMBNAIL = "stream_last_playlist_thumbnail";
     private static final String PREF_LAST_YOUTUBE_ACCESS_TOKEN = "stream_last_youtube_access_token";
-    private static final String MEDIA_NOTIFICATION_CHANNEL_ID = "sleppify_media_playback";
+    private static final String MEDIA_NOTIFICATION_CHANNEL_ID = PlaybackKeepAliveService.CHANNEL_ID;
     private static final int MEDIA_NOTIFICATION_ID = AppConstants.MEDIA_NOTIFICATION_ID;
     private static final String TAG_PLAYLIST_DETAIL = "playlist_detail";
     private static final String TAG_MODULE_MUSIC = "module_music";
@@ -330,6 +330,8 @@ public class SongPlayerFragment extends Fragment {
     @Nullable
     private ActivityResultLauncher<String> notificationPermissionLauncher;
     private boolean shuffleEnabled = false;
+    @Nullable
+    private Boolean pendingShuffleEnabled = null;
     private int repeatMode = REPEAT_MODE_ALL;
     private boolean collapsingToMiniMode;
     private long lastHandledEndedAtMs = 0L;
@@ -378,6 +380,30 @@ public class SongPlayerFragment extends Fragment {
     public void externalSetPlaylistContext(@NonNull String playlistId, @NonNull String playlistName) {
         currentPlaylistContextId = playlistId;
         currentPlaylistContextName = playlistName;
+        if (isAdded()) {
+            requireContext().getSharedPreferences(PREFS_PLAYER_STATE, Activity.MODE_PRIVATE)
+                    .edit()
+                    .putString(PREF_LAST_PLAYLIST_ID, playlistId)
+                    .putString(PREF_LAST_PLAYLIST_TITLE, playlistName)
+                    .apply();
+        }
+    }
+
+    @NonNull
+    public String externalGetPlaylistContextId() {
+        return currentPlaylistContextId != null ? currentPlaylistContextId : "";
+    }
+
+    public void externalClearPlaylistContext() {
+        currentPlaylistContextId = "";
+        currentPlaylistContextName = "";
+        if (isAdded()) {
+            requireContext().getSharedPreferences(PREFS_PLAYER_STATE, Activity.MODE_PRIVATE)
+                    .edit()
+                    .remove(PREF_LAST_PLAYLIST_ID)
+                    .remove(PREF_LAST_PLAYLIST_TITLE)
+                    .apply();
+        }
     }
     @NonNull
     private String returnTargetTag = TAG_PLAYLIST_DETAIL;
@@ -537,7 +563,8 @@ public class SongPlayerFragment extends Fragment {
                     | PlaybackStateCompat.ACTION_PLAY_PAUSE
                     | PlaybackStateCompat.ACTION_SKIP_TO_NEXT
                     | PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS
-                    | PlaybackStateCompat.ACTION_SEEK_TO);
+                    | PlaybackStateCompat.ACTION_SEEK_TO
+                    | PlaybackStateCompat.ACTION_STOP);
 
     // Last values actually rendered into the time labels / seekbar, so the 2Hz ticker skips the
     // String.format + setText + layout when the displayed value hasn't changed (the current-time
@@ -763,7 +790,11 @@ public class SongPlayerFragment extends Fragment {
     public void onViewCreated(@NonNull View view, @Nullable Bundle savedInstanceState) {
         super.onViewCreated(view, savedInstanceState);
 
-        view.setTranslationY(0f);
+        if (playerEnterAnimationRunning) {
+            view.setTranslationY(view.getResources().getDisplayMetrics().heightPixels);
+        } else {
+            view.setTranslationY(0f);
+        }
         view.setAlpha(1f);
 
         persistentAppContext = requireContext().getApplicationContext();
@@ -962,6 +993,10 @@ public class SongPlayerFragment extends Fragment {
 
             playerStatePrefs = requireContext().getSharedPreferences(PREFS_PLAYER_STATE, Activity.MODE_PRIVATE);
             settingsPrefs = requireContext().getSharedPreferences(CloudSyncManager.PREFS_SETTINGS, Activity.MODE_PRIVATE);
+            if (TextUtils.isEmpty(currentPlaylistContextId) && playerStatePrefs != null) {
+                currentPlaylistContextId = safeValue(playerStatePrefs.getString(PREF_LAST_PLAYLIST_ID, ""));
+                currentPlaylistContextName = safeValue(playerStatePrefs.getString(PREF_LAST_PLAYLIST_TITLE, ""));
+            }
             loadPlaybackModesFromSettings();
             hydrateTracksFromArgs();
             currentIndex = Math.max(0, Math.min(currentIndex, tracks.size() - 1));
@@ -1641,6 +1676,7 @@ public class SongPlayerFragment extends Fragment {
 
             updatePlayPauseIcon();
             updateMediaSessionState();
+            updateMediaNotification();
             syncMiniStateWithPlaylist();
             persistPlaybackSnapshot(false);
             return;
@@ -1689,6 +1725,7 @@ public class SongPlayerFragment extends Fragment {
             stopLocalProgressTicker();
             updatePlayPauseIcon();
             updateMediaSessionState();
+            updateMediaNotification();
             syncMiniStateWithPlaylist();
             persistPlaybackSnapshot(false);
             return;
@@ -1818,6 +1855,7 @@ public class SongPlayerFragment extends Fragment {
         updatePlaybackModeButtons();
         updateMediaNotification();
         syncMiniStateWithPlaylist();
+        PlaybackEventBus.notifyShuffleModeChanged(enabled);
     }
 
     private int normalizeRepeatMode(int mode) {
@@ -1834,13 +1872,20 @@ public class SongPlayerFragment extends Fragment {
             boolean hasShuffle = settingsPrefs.contains(CloudSyncManager.KEY_PLAYER_SHUFFLE_ENABLED);
             boolean hasRepeat = settingsPrefs.contains(CloudSyncManager.KEY_PLAYER_REPEAT_MODE);
 
-            shuffleEnabled = settingsPrefs.getBoolean(CloudSyncManager.KEY_PLAYER_SHUFFLE_ENABLED, false);
+            if (pendingShuffleEnabled != null) {
+                shuffleEnabled = pendingShuffleEnabled;
+                pendingShuffleEnabled = null;
+                persistNormalized = true;
+            } else {
+                shuffleEnabled = settingsPrefs.getBoolean(CloudSyncManager.KEY_PLAYER_SHUFFLE_ENABLED, false);
+            }
             int storedRepeatMode = settingsPrefs.getInt(CloudSyncManager.KEY_PLAYER_REPEAT_MODE, REPEAT_MODE_ALL);
             repeatMode = normalizeRepeatMode(storedRepeatMode);
 
-            persistNormalized = !hasShuffle || !hasRepeat || storedRepeatMode != repeatMode;
+            persistNormalized = persistNormalized || !hasShuffle || !hasRepeat || storedRepeatMode != repeatMode;
         } else {
-            shuffleEnabled = false;
+            shuffleEnabled = pendingShuffleEnabled != null ? pendingShuffleEnabled : false;
+            pendingShuffleEnabled = null;
             repeatMode = REPEAT_MODE_ALL;
         }
 
@@ -2127,6 +2172,7 @@ public class SongPlayerFragment extends Fragment {
         startLocalProgressTicker();
         updateMediaSessionMetadata();
         updateMediaSessionState();
+        updateMediaNotification();
         syncMiniStateWithPlaylist();
         persistPlaybackSnapshot(false);
         prefetchNextTrackStream();
@@ -5444,6 +5490,21 @@ public class SongPlayerFragment extends Fragment {
         persistPlaybackSnapshot(true);
     }
 
+    public void externalPrepareEnterSlide() {
+        playerEnterAnimationRunning = true;
+        collapsingToMiniMode = false;
+        View root = getView();
+        if (root != null) {
+            root.animate().cancel();
+            int distance = root.getHeight() > 0 ? root.getHeight() : root.getResources().getDisplayMetrics().heightPixels;
+            root.setTranslationY(distance);
+        }
+    }
+
+    public boolean externalIsCollapsing() {
+        return collapsingToMiniMode || swipeDismissAnimationRunning;
+    }
+
     public void externalAnimateEnterSlide() {
         View root = getView();
         if (root == null) {
@@ -5545,6 +5606,11 @@ public class SongPlayerFragment extends Fragment {
     }
 
     public void externalSetShuffleEnabled(boolean enabled) {
+        if (!isAdded() || tracks.isEmpty()) {
+            pendingShuffleEnabled = enabled;
+            shuffleEnabled = enabled;
+            return;
+        }
         setShuffleEnabled(enabled);
     }
 
@@ -6642,13 +6708,52 @@ public class SongPlayerFragment extends Fragment {
         syncMiniStateWithPlaylist();
         Fragment target = resolveReturnTarget(fm);
 
+        MainActivity ma = (getActivity() instanceof MainActivity) ? (MainActivity) getActivity() : null;
+        if (ma != null) {
+            GlobalMiniPlayerController mini = ma.getGlobalMiniPlayer();
+            if (mini != null) {
+                mini.animateIn();
+            }
+            ma.ensureHeaderVisibleForMusic();
+        }
+
+        View root = getView();
+        if (animate && root != null && root.isAttachedToWindow() && !isDetached()) {
+            if (target != null && target != this && target.isAdded() && target.isHidden()) {
+                fm.beginTransaction().setReorderingAllowed(true).show(target).commitAllowingStateLoss();
+            }
+            root.animate().cancel();
+            int distance = root.getHeight() > 0 ? root.getHeight() : root.getResources().getDisplayMetrics().heightPixels;
+            root.animate()
+                    .translationY(distance)
+                    .setDuration(250)
+                    .setInterpolator(new android.view.animation.PathInterpolator(0.2f, 0f, 0f, 1f))
+                    .withEndAction(() -> {
+                        commitCollapseTransaction(fm, target);
+                        root.setTranslationY(0f);
+                        collapsingToMiniMode = false;
+                        PlaybackEventBus.notifyPlaybackSnapshotUpdated();
+                    })
+                    .start();
+            return true;
+        } else {
+            commitCollapseTransaction(fm, target);
+            if (root != null) {
+                root.setTranslationY(0f);
+            }
+            collapsingToMiniMode = false;
+            PlaybackEventBus.notifyPlaybackSnapshotUpdated();
+            return true;
+        }
+    }
+
+    private void commitCollapseTransaction(@NonNull FragmentManager fm, @Nullable Fragment target) {
+        if (fm.isStateSaved()) return;
         androidx.fragment.app.FragmentTransaction transaction = fm.beginTransaction()
                 .setReorderingAllowed(true);
 
         Fragment equalizer = findAddedByTag(fm, "module_equalizer");
         Fragment settings = findAddedByTag(fm, "module_settings");
-        Fragment scanner = findAddedByTag(fm, "module_scanner");
-
         if (equalizer != null) {
             transaction.hide(equalizer);
             if (equalizer.getLifecycle().getCurrentState().isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) {
@@ -6661,39 +6766,18 @@ public class SongPlayerFragment extends Fragment {
                 transaction.setMaxLifecycle(settings, androidx.lifecycle.Lifecycle.State.STARTED);
             }
         }
-        if (scanner != null) {
-            transaction.hide(scanner);
-            if (scanner.getLifecycle().getCurrentState().isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) {
-                transaction.setMaxLifecycle(scanner, androidx.lifecycle.Lifecycle.State.STARTED);
-            }
-        }
 
         if (target != null && target != this && target.isAdded()) {
-            transaction
-                    .setCustomAnimations(
-                            R.anim.hold,
-                            R.anim.player_screen_exit
-                    )
-                    .hide(this)
-                    .show(target);
-            transaction.commit();
+            transaction.hide(this).show(target);
+            transaction.commitAllowingStateLoss();
         } else {
-            transaction
-                    .setCustomAnimations(
-                            R.anim.hold,
-                            R.anim.player_screen_exit
-                    )
-                    .remove(this);
-            transaction.commit();
+            transaction.remove(this);
+            transaction.commitAllowingStateLoss();
         }
 
-        // Restore bottomNav visibility when returning to the main module
         if (getActivity() instanceof MainActivity) {
             ((MainActivity) getActivity()).ensureHeaderVisibleForMusic();
         }
-
-        collapsingToMiniMode = false;
-        return true;
     }
 
     @Nullable
@@ -6949,7 +7033,7 @@ public class SongPlayerFragment extends Fragment {
             return;
         }
 
-        boolean effectivelyPlaying = isEffectivePlaying();
+        boolean effectivelyPlaying = isPlaying;
         int state = effectivelyPlaying ? PlaybackStateCompat.STATE_PLAYING : PlaybackStateCompat.STATE_PAUSED;
         float speed = effectivelyPlaying ? 1f : 0f;
 
@@ -7001,27 +7085,42 @@ public class SongPlayerFragment extends Fragment {
         PendingIntent nextPendingIntent = PendingIntent.getBroadcast(
                 persistentAppContext, 8704, nextIntent, mediaPendingFlags);
 
-        boolean effectivelyPlaying = isEffectivePlaying();
+        boolean effectivelyPlaying = isPlaying;
+        ensureMediaNotificationChannel();
         NotificationCompat.Builder builder = new NotificationCompat.Builder(persistentAppContext, MEDIA_NOTIFICATION_CHANNEL_ID)
                 .setSmallIcon(R.drawable.ic_notification_cat)
                 .setContentTitle(track.title)
                 .setContentText(track.artist)
                 .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
                 .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
                 .setContentIntent(contentIntent)
                 .setSilent(true)
                 .setOnlyAlertOnce(true)
-                .setOngoing(effectivelyPlaying)
-                .addAction(android.R.drawable.ic_media_previous, "Anterior", prevPendingIntent)
-                .addAction(
-                        effectivelyPlaying ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play,
-                        effectivelyPlaying ? "Pausar" : "Reproducir",
-                        playPausePendingIntent
-                )
-                .addAction(android.R.drawable.ic_media_next, "Siguiente", nextPendingIntent)
-                .setStyle(new androidx.media.app.NotificationCompat.MediaStyle()
-                        .setMediaSession(mediaSession.getSessionToken())
-                        .setShowActionsInCompactView(0, 1, 2));
+                .setOngoing(effectivelyPlaying);
+
+        androidx.media.app.NotificationCompat.MediaStyle mediaStyle =
+                new androidx.media.app.NotificationCompat.MediaStyle()
+                        .setMediaSession(mediaSession.getSessionToken());
+
+        // En Android 13+ (API 33+), el sistema operativo genera automáticamente los controles de
+        // reproducción oficiales del sistema (Media Controls nativos en panel de notificaciones / Control Center)
+        // a partir de las acciones y estado del MediaSession/PlaybackState, con su propio diseño, barra interactiva
+        // y botones del sistema. No se añaden acciones manuales para evitar iconos personalizados.
+        // En Android 12 o inferior (donde el sistema no genera controles de sesión automáticos sin acciones de estilo),
+        // se añaden las acciones de fallback usando los vectores limpios del reproductor.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            builder.addAction(R.drawable.ic_player_skip_previous, "Anterior", prevPendingIntent)
+                   .addAction(
+                           effectivelyPlaying ? R.drawable.ic_player_pause : R.drawable.ic_player_play,
+                           effectivelyPlaying ? "Pausar" : "Reproducir",
+                           playPausePendingIntent
+                   )
+                   .addAction(R.drawable.ic_player_skip_next, "Siguiente", nextPendingIntent);
+            mediaStyle.setShowActionsInCompactView(0, 1, 2);
+        }
+
+        builder.setStyle(mediaStyle);
 
         if (mediaSessionArtwork != null && !mediaSessionArtwork.isRecycled()) {
             builder.setLargeIcon(mediaSessionArtwork);
@@ -7051,7 +7150,16 @@ public class SongPlayerFragment extends Fragment {
             return;
         }
         NotificationManager manager = persistentAppContext.getSystemService(NotificationManager.class);
-        if (manager == null || manager.getNotificationChannel(MEDIA_NOTIFICATION_CHANNEL_ID) != null) {
+        if (manager == null) {
+            return;
+        }
+        try {
+            manager.deleteNotificationChannel("sleppify_media_playback");
+            manager.deleteNotificationChannel("sleppify_media_playback_v2");
+            manager.deleteNotificationChannel("sleppify_media_playback_v3");
+        } catch (Exception ignored) {}
+
+        if (manager.getNotificationChannel(MEDIA_NOTIFICATION_CHANNEL_ID) != null) {
             return;
         }
         NotificationChannel channel = new NotificationChannel(
@@ -7059,7 +7167,11 @@ public class SongPlayerFragment extends Fragment {
                 "Reproducción",
                 NotificationManager.IMPORTANCE_LOW
         );
+        channel.setDescription("Control de reproducción de música");
         channel.setShowBadge(false);
+        channel.setLockscreenVisibility(android.app.Notification.VISIBILITY_PUBLIC);
+        channel.setSound(null, null);
+        channel.enableVibration(false);
         manager.createNotificationChannel(channel);
     }
 
@@ -8419,6 +8531,11 @@ public class SongPlayerFragment extends Fragment {
                     if (shouldDismiss) {
                         swipeDismissAnimationRunning = true;
                         root.animate().cancel();
+                        if (getActivity() instanceof MainActivity) {
+                            MainActivity ma = (MainActivity) getActivity();
+                            GlobalMiniPlayerController mini = ma.getGlobalMiniPlayer();
+                            if (mini != null) mini.animateIn();
+                        }
                         root.animate()
                                 .translationY(root.getHeight())
                                 .setDuration(250)

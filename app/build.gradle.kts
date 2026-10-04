@@ -54,7 +54,6 @@ android {
 }
 
 dependencies {
-    val cameraXVersion = "1.4.2"
 
     implementation(libs.appcompat)
     implementation(libs.material)
@@ -87,11 +86,6 @@ dependencies {
         exclude(group = "com.google.protobuf", module = "protobuf-javalite")
     }
     implementation("com.github.spotbugs:spotbugs-annotations:4.8.3")
-    implementation("androidx.camera:camera-core:$cameraXVersion")
-    implementation("androidx.camera:camera-camera2:$cameraXVersion")
-    implementation("androidx.camera:camera-lifecycle:$cameraXVersion")
-    implementation("androidx.camera:camera-view:$cameraXVersion")
-    implementation("com.google.mlkit:barcode-scanning:17.3.0")
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs_nio:2.0.3")
     testImplementation(libs.junit)
     androidTestImplementation(libs.ext.junit)

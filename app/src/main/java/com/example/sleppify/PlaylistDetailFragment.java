@@ -61,6 +61,7 @@ import com.bumptech.glide.RequestManager;
 import com.bumptech.glide.load.engine.DiskCacheStrategy;
 import com.bumptech.glide.load.DecodeFormat;
 import com.bumptech.glide.load.resource.drawable.DrawableTransitionOptions;
+import com.bumptech.glide.request.transition.DrawableCrossFadeFactory;
 import com.google.android.material.button.MaterialButton;
 import com.google.android.material.dialog.MaterialAlertDialogBuilder;
 import com.google.android.material.imageview.ShapeableImageView;
@@ -146,10 +147,14 @@ public class PlaylistDetailFragment extends Fragment
 
     /** Shared singleton — avoids allocation per bind and ensures consistent Glide cache keys. */
     private static final YouTubeCropTransformation SHARED_YT_CROP = new YouTubeCropTransformation();
-    /** Shared crossfade — built once, reused on every bind so no transition object is allocated
-     *  per row. Glide skips the animation on memory-cache hits, so it only fades on first load. */
+    /** Shared crossfade factory — enables smooth crossfade from placeholder to decoded art. */
+    private static final DrawableCrossFadeFactory CROSS_FADE_FACTORY =
+            new DrawableCrossFadeFactory.Builder(180)
+                    .setCrossFadeEnabled(true)
+                    .build();
+    /** Shared crossfade transition reused on every bind to avoid allocations. */
     private static final DrawableTransitionOptions SHARED_CROSSFADE =
-            DrawableTransitionOptions.withCrossFade(100);
+            DrawableTransitionOptions.with(CROSS_FADE_FACTORY);
     /** Payload marker for state-only adapter updates (skip image reload). */
     private static final String PAYLOAD_STATE_ONLY = "state_only";
     /** Material standard easing — pre-built once, never re-allocated per animation. */
@@ -298,12 +303,7 @@ public class PlaylistDetailFragment extends Fragment
     private boolean restoringHiddenPlayerFromSnapshot;
     private boolean awaitingInitialPlaylistRender = true;
     private boolean isScrolling = false;
-    /** True only during a momentum fling (SCROLL_STATE_SETTLING). During a fling we defer
-     *  the disk-based offline state lookups (MediaMetadataRetriever reads) to avoid flooding
-     *  the executor; the SCROLL_STATE_IDLE handler covers the visible range once it settles.
-     *  Image loads are NOT deferred — Glide decodes off the main thread and memory-cache
-     *  hits bind instantly, so rows fill in while flinging instead of staying grey. */
-    private boolean isFlinging = false;
+
     /** Cached artwork decode size in px (50dp). Resolved once to avoid a DisplayMetrics
      *  lookup on every list bind. */
     private int cachedTrackArtPx = 0;
@@ -550,7 +550,6 @@ public class PlaylistDetailFragment extends Fragment
             public void onScrollStateChanged(@NonNull RecyclerView recyclerView, int newState) {
                 if (!isAdded()) return;
                 isScrolling = newState != RecyclerView.SCROLL_STATE_IDLE;
-                isFlinging = newState == RecyclerView.SCROLL_STATE_SETTLING;
 
                 if (newState == RecyclerView.SCROLL_STATE_IDLE) {
                     if (trackAdapter != null) {
@@ -589,7 +588,7 @@ public class PlaylistDetailFragment extends Fragment
                 // Warm artwork for the rows about to enter the viewport. Keyed on the
                 // (anchor row, direction) pair so it fires once per new edge row, not on
                 // every scroll frame.
-                if (trackAdapter != null && dy != 0 && !isFlinging) {
+                if (trackAdapter != null && dy != 0) {
                     int anchor = (dy > 0 ? layoutManager.findLastVisibleItemPosition()
                                          : layoutManager.findFirstVisibleItemPosition()) - 1;
                     int prefetchKey = anchor * 2 + (dy > 0 ? 1 : 0);
@@ -628,11 +627,7 @@ public class PlaylistDetailFragment extends Fragment
             if (!isAdded() || getView() == null) {
                 return;
             }
-            // Deferred: these were blocking fragment entry with snapshot loads,
-            // fragment transactions, and Glide calls before the overlay was visible
             restoreOfflineDownloadObservation();
-            maybeRestoreHiddenPlayerFromSnapshot();
-            syncTrackStateFromPlayer();
             refreshPlaylistMeta(requestPlaylistId, requestToken);
             bindTrackList(requestPlaylistId, requestToken);
         });
@@ -663,7 +658,17 @@ public class PlaylistDetailFragment extends Fragment
     @Override
     public void onPlaybackSnapshotUpdated() {
         if (isAdded() && !isHidden() && getActivity() != null) {
-            getActivity().runOnUiThread(this::syncTrackStateFromPlayer);
+            getActivity().runOnUiThread(() -> {
+                syncTrackStateFromPlayer();
+                syncShuffleModeFromPlayer();
+            });
+        }
+    }
+
+    @Override
+    public void onShuffleModeChanged(boolean enabled) {
+        if (isAdded() && getActivity() != null) {
+            getActivity().runOnUiThread(this::syncShuffleModeFromPlayer);
         }
     }
 
@@ -1136,6 +1141,7 @@ public class PlaylistDetailFragment extends Fragment
         if (trackAdapter != null) {
             trackAdapter.setOfflineDownloadState(offlineDownloadRunning, offlineDownloadingTrackIds, offlineTrackProgressFractions);
         }
+        notifyHeaderStateChanged();
     }
 
     private boolean isOfflineStatusPinned() {
@@ -1221,6 +1227,7 @@ public class PlaylistDetailFragment extends Fragment
             setCurrentPlaylistOfflineAutoEnabled(true);
             notifyHeaderChanged();
             startOfflinePlaylistDownload(true);
+            AppSnackbar.show(getActivity(), "Descarga iniciada");
             return;
         }
 
@@ -1244,6 +1251,7 @@ public class PlaylistDetailFragment extends Fragment
         setOfflineDownloadVisualState(false, "");
         offlineDownloadQueued = false;
         notifyHeaderChanged();
+        AppSnackbar.show(getActivity(), "Descargas canceladas");
 
         ArrayList<String> idsToDelete = buildCurrentVideoIds();
         if (idsToDelete.isEmpty()) {
@@ -1483,34 +1491,7 @@ public class PlaylistDetailFragment extends Fragment
         request.into(target);
     }
 
-    /**
-     * Mid-fling artwork bind. Paints the row only if the thumbnail is already resolvable from
-     * cache — a memory hit shows instantly and synchronously (no decode, no executor work, no
-     * crossfade), so it never costs a frame. On a miss it leaves the grey placeholder (the flying
-     * row stays grey) and never touches the network. The signature is set to the URL so that once
-     * the list settles, {@link PlaylistTrackAdapter#reloadImagesForRange} skips the rows that
-     * already resolved and issues the full load only for the ones still on the placeholder.
-     */
-    private void loadTrackArtCacheOnly(@NonNull ImageView target, @Nullable String imageUrl) {
-        if (TextUtils.isEmpty(imageUrl)) {
-            target.setTag(R.id.tag_artwork_signature, null);
-            glideManager().clear(target);
-            target.setImageDrawable(null);
-            return;
-        }
-        String url = sizedTrackArtUrl(target.getContext(), imageUrl.trim());
-        if (url != null && url.equals(target.getTag(R.id.tag_artwork_signature))) {
-            return;
-        }
-        target.setTag(R.id.tag_artwork_signature, url);
-        // No .transition() is applied (the base request bakes none) so a cache hit paints with no
-        // crossfade — instant and frame-free, which is exactly what we want mid-fling.
-        artRequestBase(target.getContext()).clone()
-                .load(url)
-                .onlyRetrieveFromCache(true)
-                .priority(com.bumptech.glide.Priority.LOW)
-                .into(target);
-    }
+
 
     /**
      * Warms Glide's memory/disk caches for rows just beyond the viewport in the scroll
@@ -2029,24 +2010,9 @@ public class PlaylistDetailFragment extends Fragment
             if (!forceRefresh && !loadMore) {
                 playlistTracksLoadMoreInFlight = false;
                 playlistTracksCanLoadMore = !hasCompleteCache;
-                boolean freshOnly = canRequestRemote
-                        && enterRevalidateDue(playlistId)
-                        && hasValidatedInternet(requireContext());
-                if (freshOnly) {
-                    // Refresh INVISIBLE: la revalidación va a disparar, así que NO se pinta la
-                    // caché (el usuario vería cómo las canciones se reemplazan al llegar la
-                    // versión fresca — los mixes de YT cambian enteros entre visitas). El
-                    // skeleton sigue en pantalla y se pinta directamente la lista final; la
-                    // caché queda de respaldo por si la red falla o tarda demasiado.
-                    pendingEnterCachedFallback = new ArrayList<>(cachedTracks);
-                    pendingEnterFallbackPlaylistId = playlistId;
-                    mainHandler.removeCallbacks(enterFreshFallbackRunnable);
-                    mainHandler.postDelayed(enterFreshFallbackRunnable, ENTER_FRESH_WAIT_MAX_MS);
-                } else {
-                    renderTracks(cachedTracks, playlistId, true);
-                }
-                // Silently re-fetch from YouTube so changes made in YT Music (added/removed/
-                // reordered songs) appear without a manual pull-to-refresh.
+                // Render cached tracks immediately for instant, lag-free UI
+                renderTracks(cachedTracks, playlistId, true);
+                // Silently re-fetch from YouTube in the background so updates appear without delay
                 maybeRevalidateOnEnter(playlistId, effectiveAccessToken);
                 return;
             }
@@ -2394,7 +2360,8 @@ public class PlaylistDetailFragment extends Fragment
         final long generation = offlineReadyStateGeneration.incrementAndGet();
 
         offlineReadyStateExecutor.execute(() -> {
-            boolean complete = computeOfflineReadyState(appContext, tracksSnapshot);
+            List<String> offlineTrackIds = new ArrayList<>();
+            boolean complete = computeOfflineReadyState(appContext, tracksSnapshot, offlineTrackIds);
             mainHandler.post(() -> {
                 if (!isAdded()
                         || generation != offlineReadyStateGeneration.get()
@@ -2404,6 +2371,9 @@ public class PlaylistDetailFragment extends Fragment
 
                 persistOfflineCompleteStateForCurrentPlaylist(complete);
                 notifyHeaderStateChanged();
+                if (trackAdapter != null && !offlineTrackIds.isEmpty()) {
+                    trackAdapter.markTracksOffline(offlineTrackIds);
+                }
             });
         });
     }
@@ -2411,6 +2381,14 @@ public class PlaylistDetailFragment extends Fragment
     private boolean computeOfflineReadyState(
             @NonNull Context appContext,
             @NonNull List<PlaylistTrack> tracksSnapshot
+    ) {
+        return computeOfflineReadyState(appContext, tracksSnapshot, null);
+    }
+
+    private boolean computeOfflineReadyState(
+            @NonNull Context appContext,
+            @NonNull List<PlaylistTrack> tracksSnapshot,
+            @Nullable List<String> outOfflineTrackIds
     ) {
         if (tracksSnapshot.isEmpty()) {
             // Track list not loaded yet — do NOT claim complete.
@@ -2440,6 +2418,9 @@ public class PlaylistDetailFragment extends Fragment
             if (OfflineAudioStore.hasValidatedOfflineAudio(appContext, track.videoId, track.duration)
                     || OfflineAudioStore.hasOfflineAudio(appContext, track.videoId)) {
                 offlineCount++;
+                if (outOfflineTrackIds != null) {
+                    outOfflineTrackIds.add(track.videoId);
+                }
             }
         }
 
@@ -2524,6 +2505,7 @@ public class PlaylistDetailFragment extends Fragment
             ArrayList<String> titles = new ArrayList<>();
             ArrayList<String> artists = new ArrayList<>();
             ArrayList<String> durations = new ArrayList<>();
+            ArrayList<String> alreadyOfflineTrackIds = new ArrayList<>();
             int skippedAlreadyOffline = 0;
             int totalWithVideoId = 0;
             for (PlaylistTrack track : tracksSnapshot) {
@@ -2532,6 +2514,7 @@ public class PlaylistDetailFragment extends Fragment
                     boolean alreadyOffline = OfflineAudioStore.hasValidatedOfflineAudio(appContext, track.videoId, track.duration);
                     if (alreadyOffline) {
                         skippedAlreadyOffline++;
+                        alreadyOfflineTrackIds.add(track.videoId);
                         continue;
                     }
                     ids.add(track.videoId);
@@ -2540,10 +2523,18 @@ public class PlaylistDetailFragment extends Fragment
                     durations.add(track.duration);
                 }
             }
+            if (!alreadyOfflineTrackIds.isEmpty()) {
+                mainHandler.post(() -> {
+                    if (trackAdapter != null) {
+                        trackAdapter.markTracksOffline(alreadyOfflineTrackIds);
+                    }
+                });
+            }
             if (ids.isEmpty()) {
                 mainHandler.post(() -> {
                     offlineDownloadQueued = false;
                     notifyHeaderChanged();
+                    AppSnackbar.show(getActivity(), "Todas las canciones ya están descargadas");
                 });
                 return;
             }
@@ -3131,7 +3122,17 @@ public class PlaylistDetailFragment extends Fragment
 
         SharedPreferences prefs = requireContext().getSharedPreferences(PREFS_PLAYER_STATE, Activity.MODE_PRIVATE);
         String persisted = prefs.getString(PREF_LAST_YOUTUBE_ACCESS_TOKEN, "");
-        return persisted == null ? "" : persisted.trim();
+        if (persisted != null && !persisted.trim().isEmpty()) {
+            return persisted.trim();
+        }
+        String webCookie = prefs.getString(AppConstants.PREF_LAST_YOUTUBE_WEB_COOKIE, "");
+        if (webCookie != null && !webCookie.trim().isEmpty()) {
+            return "web_session";
+        }
+        if (!TextUtils.isEmpty(StreamResolver.getAuthCookieHeader())) {
+            return "web_session";
+        }
+        return "";
     }
 
     private void scheduleTracksTokenRetry(@NonNull String playlistId) {
@@ -3714,102 +3715,25 @@ public class PlaylistDetailFragment extends Fragment
     }
 
     private void preloadImagesAndReveal() {
-        if (!isAdded() || !awaitingInitialPlaylistRender) {
-            revealPlaylistContentIfNeeded(true);
-            return;
-        }
-
-        // Collect URLs to preload: grid URLs + first 12 track thumbnails
-        List<String> gridUrls = new ArrayList<>();
-        for (String gridUrl : headerGridUrls) {
-            if (!TextUtils.isEmpty(gridUrl)) gridUrls.add(gridUrl.trim());
-        }
-        List<String> trackUrls = new ArrayList<>();
-        int trackLimit = Math.min(currentTracks.size(), 8);
-        for (int i = 0; i < trackLimit; i++) {
-            PlaylistTrack t = currentTracks.get(i);
-            if (t != null && !TextUtils.isEmpty(t.imageUrl)) {
-                String url = t.imageUrl.trim();
-                if (!url.isEmpty()) trackUrls.add(url);
-            }
-        }
-
-        int totalPreloads = gridUrls.size() + trackUrls.size();
-        if (totalPreloads == 0) {
-            revealPlaylistContentIfNeeded(true);
-            return;
-        }
-
-        // Safety timeout: reveal after 1.5s even if preloads haven't all completed
-        Handler uiHandler = new Handler(Looper.getMainLooper());
-        uiHandler.postDelayed(() -> {
-            if (isAdded() && awaitingInitialPlaylistRender) {
-                revealPlaylistContentIfNeeded(true);
-            }
-        }, 1500L);
-
-        Context ctx = requireContext();
-        final java.util.concurrent.atomic.AtomicInteger remaining =
-                new java.util.concurrent.atomic.AtomicInteger(totalPreloads);
-        com.bumptech.glide.request.RequestListener<android.graphics.drawable.Drawable> revealListener =
-                new com.bumptech.glide.request.RequestListener<android.graphics.drawable.Drawable>() {
-            @Override
-            public boolean onLoadFailed(@Nullable com.bumptech.glide.load.engine.GlideException e,
-                    Object model, com.bumptech.glide.request.target.Target<android.graphics.drawable.Drawable> target,
-                    boolean isFirstResource) {
-                if (remaining.decrementAndGet() <= 0) {
-                    uiHandler.post(() -> {
-                        if (isAdded() && awaitingInitialPlaylistRender)
-                            revealPlaylistContentIfNeeded(true);
-                    });
-                }
-                return false;
-            }
-            @Override
-            public boolean onResourceReady(android.graphics.drawable.Drawable resource,
-                    Object model, com.bumptech.glide.request.target.Target<android.graphics.drawable.Drawable> target,
-                    com.bumptech.glide.load.DataSource dataSource, boolean isFirstResource) {
-                if (remaining.decrementAndGet() <= 0) {
-                    uiHandler.post(() -> {
-                        if (isAdded() && awaitingInitialPlaylistRender)
-                            revealPlaylistContentIfNeeded(true);
-                    });
-                }
-                return false;
-            }
-        };
-
-        // Preload grid URLs at 320px (for header)
-        for (String url : gridUrls) {
-            Glide.with(ctx)
-                    .load(url)
-                    .diskCacheStrategy(DiskCacheStrategy.ALL)
-                    .override(320, 320)
-                    .listener(revealListener)
-                    .preload();
-        }
-
-        // Preload track thumbnails with SHARED_YT_CROP + the SAME sized URL + size as
-        // loadTrackArt so the Glide cache key matches and the row bind is a pure cache hit
-        // (an unsized preload would warm entries the sized binds can never hit = double fetch).
-        int trackPx = trackArtSizePx(ctx);
-        for (String url : trackUrls) {
-            Glide.with(ctx)
-                    .load(sizedTrackArtUrl(ctx, url))
-                    .transform(SHARED_YT_CROP)
-                    .format(DecodeFormat.PREFER_RGB_565)
-                    .diskCacheStrategy(DiskCacheStrategy.ALL)
-                    .priority(com.bumptech.glide.Priority.HIGH)
-                    .override(trackPx, trackPx)
-                    .listener(revealListener)
-                    .preload();
-        }
+        revealPlaylistContentIfNeeded(true);
     }
 
     /** True si el player actual está reproduciendo una canción DE ESTA playlist. */
     private boolean isPlayingFromThisPlaylist() {
         SongPlayerFragment player = findSongPlayerFragment();
         if (player == null || !player.isAdded()) return false;
+
+        String playerPlaylistId = player.externalGetPlaylistContextId();
+        if (!TextUtils.isEmpty(playerPlaylistId)) {
+            return TextUtils.equals(currentPlaylistId, playerPlaylistId);
+        }
+
+        SharedPreferences prefs = getPlayerStatePrefs();
+        String lastPlaylistId = prefs.getString(PREF_LAST_PLAYLIST_ID, "");
+        if (!TextUtils.isEmpty(lastPlaylistId)) {
+            return TextUtils.equals(currentPlaylistId, lastPlaylistId);
+        }
+
         String vid = player.externalGetCurrentVideoId();
         if (TextUtils.isEmpty(vid)) return false;
         for (PlaylistTrack t : currentTracks) {
@@ -3844,19 +3768,12 @@ public class PlaylistDetailFragment extends Fragment
 
     private void syncShuffleModeFromPlayer() {
         SongPlayerFragment player = findSongPlayerFragment();
-        if (player == null || !player.isAdded()) {
-            return;
-        }
-
-        boolean playerShuffleEnabled = player.externalIsShuffleEnabled();
-        boolean changed = shuffleModeEnabled != playerShuffleEnabled;
-        shuffleModeEnabled = playerShuffleEnabled;
-        if (changed) {
-            syncPlaybackQueueOrderFromPlayer(player);
+        if (player != null && player.isAdded()) {
+            shuffleModeEnabled = player.externalIsShuffleEnabled();
+        } else {
+            shuffleModeEnabled = loadPersistedShuffleMode();
         }
         persistShuffleModePreference();
-        // Refleja el estado en el botón aleatorio del header (activo solo si además está sonando
-        // algo de ESTA playlist).
         applyShuffleButtonStyle(headerShuffleButton);
     }
 
@@ -3963,9 +3880,6 @@ public class PlaylistDetailFragment extends Fragment
 
     private void rebuildPlaybackQueue() {
         List<PlaylistTrack> base = new ArrayList<>(originalTracks.isEmpty() ? currentTracks : originalTracks);
-        if (shuffleModeEnabled && base.size() > 1) {
-            Collections.shuffle(base, random);
-        }
         playbackQueueTracks.clear();
         playbackQueueTracks.addAll(base);
         lastPlaybackQueueSize = currentTracks.size();
@@ -3973,22 +3887,7 @@ public class PlaylistDetailFragment extends Fragment
     }
 
     private void ensurePlaybackQueue() {
-        boolean needsRebuild = false;
-        
-        // Rebuild if queue is empty
-        if (playbackQueueTracks.isEmpty()) {
-            needsRebuild = true;
-        }
-        // Rebuild only if the actual size of tracks changed (not on every call)
-        else if (lastPlaybackQueueSize != currentTracks.size()) {
-            needsRebuild = true;
-        }
-        // Rebuild if shuffle mode was toggled
-        else if (lastPlaybackQueueShuffleState != shuffleModeEnabled) {
-            needsRebuild = true;
-        }
-        
-        if (needsRebuild) {
+        if (playbackQueueTracks.isEmpty() || lastPlaybackQueueSize != currentTracks.size()) {
             rebuildPlaybackQueue();
         }
     }
@@ -4364,11 +4263,13 @@ public class PlaylistDetailFragment extends Fragment
         int safeIndex = -1;
         SongPlayerFragment songPlayer = findSongPlayerFragment();
         if (!currentTracks.isEmpty() && songPlayer != null && songPlayer.isAdded()) {
-            String playerVideoId = songPlayer.externalGetCurrentVideoId();
-            safeIndex = findTrackIndexByVideoId(currentTracks, playerVideoId);
-        }
-        if (safeIndex < 0 && trackIndex >= 0 && trackIndex < currentTracks.size()) {
-            safeIndex = trackIndex;
+            if (isPlayingFromThisPlaylist()) {
+                String playerVideoId = songPlayer.externalGetCurrentVideoId();
+                safeIndex = findTrackIndexByVideoId(currentTracks, playerVideoId);
+                if (safeIndex < 0 && trackIndex >= 0 && trackIndex < currentTracks.size()) {
+                    safeIndex = trackIndex;
+                }
+            }
         }
 
         currentTrackIndex = safeIndex;
@@ -4376,6 +4277,8 @@ public class PlaylistDetailFragment extends Fragment
         if (trackAdapter != null) {
             trackAdapter.setActiveIndex(safeIndex);
         }
+
+        syncShuffleModeFromPlayer();
 
         if (getView() == null) {
             return;
@@ -4394,16 +4297,13 @@ public class PlaylistDetailFragment extends Fragment
         }
 
         String selectedVideoId = currentTracks.get(position).videoId;
-        int queueIndex = findTrackIndexByVideoId(playbackQueueTracks, selectedVideoId);
-        if (queueIndex < 0) {
-            queueIndex = 0;
-        }
+        int queueIndex = position;
 
-        ArrayList<String> ids = new ArrayList<>();
-        ArrayList<String> titles = new ArrayList<>();
-        ArrayList<String> artists = new ArrayList<>();
-        ArrayList<String> durations = new ArrayList<>();
-        ArrayList<String> images = new ArrayList<>();
+        ArrayList<String> ids = new ArrayList<>(playbackQueueTracks.size());
+        ArrayList<String> titles = new ArrayList<>(playbackQueueTracks.size());
+        ArrayList<String> artists = new ArrayList<>(playbackQueueTracks.size());
+        ArrayList<String> durations = new ArrayList<>(playbackQueueTracks.size());
+        ArrayList<String> images = new ArrayList<>(playbackQueueTracks.size());
         for (PlaylistTrack item : playbackQueueTracks) {
             ids.add(item.videoId);
             titles.add(item.title);
@@ -4420,11 +4320,11 @@ public class PlaylistDetailFragment extends Fragment
             // Play in the mini-player — do NOT auto-open the full-screen player. If the tapped
             // track is already the loaded one, leave it playing; otherwise switch to it in place.
             if (!TextUtils.equals(selectedVideoId, existingPlayer.getLoadedVideoId())) {
-                if (existingPlayer.externalMatchesQueue(ids)) {
+                if (existingPlayer.externalMatchesQueue(ids) && !existingPlayer.externalIsShuffleEnabled()) {
                     existingPlayer.externalPlayTrackFromStart(queueIndex);
                 } else {
                     existingPlayer.externalReplaceQueueFromStart(ids, titles, artists, durations, images, queueIndex, true);
-                    injectOriginalQueueOrderIfShuffled(existingPlayer);
+                    injectOriginalQueueOrder(existingPlayer);
                 }
             }
 
@@ -4436,10 +4336,12 @@ public class PlaylistDetailFragment extends Fragment
                 trackAdapter.setActiveIndex(position);
             }
             syncTrackStateFromPlayer();
+            applyShuffleButtonStyle(headerShuffleButton);
             return;
         }
 
         startHiddenIntegratedPlayerAt(position, true);
+        applyShuffleButtonStyle(headerShuffleButton);
     }
 
     private void onTrackMorePressed(int position, @NonNull View anchor) {
@@ -5414,6 +5316,7 @@ public class PlaylistDetailFragment extends Fragment
         offlineDownloadQueued = true;
         notifyHeaderChanged();
         observeOfflineDownload(uniqueName);
+        AppSnackbar.show(getActivity(), "Descargando canción...");
 
         // Notify MusicPlayerFragment to update its offline state for this playlist
         notifyMusicPlayerOfflineChanged();
@@ -5439,6 +5342,7 @@ public class PlaylistDetailFragment extends Fragment
             trackAdapter.invalidateTrackStateCache(videoId);
             trackAdapter.notifyItemChanged(position);
         }
+        AppSnackbar.show(getActivity(), "Descarga eliminada");
 
         trackStateLookupExecutor.execute(() -> {
             OfflineAudioStore.deleteOfflineAudio(appContext, idsToDelete);
@@ -5825,8 +5729,7 @@ public class PlaylistDetailFragment extends Fragment
         }
     }
 
-    private void injectOriginalQueueOrderIfShuffled(@NonNull SongPlayerFragment player) {
-        if (!shuffleModeEnabled) return;
+    private void injectOriginalQueueOrder(@NonNull SongPlayerFragment player) {
         List<PlaylistTrack> base = originalTracks.isEmpty() ? currentTracks : originalTracks;
         if (base.isEmpty()) return;
         java.util.List<SongPlayerFragment.PlayerTrack> original = new java.util.ArrayList<>(base.size());
@@ -5836,6 +5739,10 @@ public class PlaylistDetailFragment extends Fragment
             ));
         }
         player.externalSetOriginalQueueOrder(original);
+    }
+
+    private void injectOriginalQueueOrderIfShuffled(@NonNull SongPlayerFragment player) {
+        injectOriginalQueueOrder(player);
     }
 
     private void injectOriginalQueueFromSnapshot(
@@ -5900,6 +5807,8 @@ public class PlaylistDetailFragment extends Fragment
             return false;
         }
 
+        persistShuffleModePreference();
+
         SongPlayerFragment playerFragment = SongPlayerFragment.newInstance(
                 ids,
                 titles,
@@ -5910,7 +5819,9 @@ public class PlaylistDetailFragment extends Fragment
                 true
         );
         playerFragment.externalSetReturnTargetTag(TAG_PLAYLIST_DETAIL);
-        injectOriginalQueueOrderIfShuffled(playerFragment);
+        playerFragment.externalSetPlaylistContext(currentPlaylistId, currentPlaylistTitle);
+        playerFragment.externalSetShuffleEnabled(shuffleModeEnabled);
+        injectOriginalQueueOrder(playerFragment);
 
         getParentFragmentManager()
                 .beginTransaction()
@@ -5926,6 +5837,7 @@ public class PlaylistDetailFragment extends Fragment
             trackAdapter.setActiveIndex(position);
         }
         syncTrackStateFromPlayer();
+        applyShuffleButtonStyle(headerShuffleButton);
         return true;
     }
 
@@ -6645,16 +6557,23 @@ public class PlaylistDetailFragment extends Fragment
             }
             boolean offlineAutoEnabled = isCurrentPlaylistOfflineAutoEnabled();
             boolean completeOffline = isPersistedOfflineCompleteStateForCurrentPlaylist();
+            boolean isDownloading = offlineDownloadRunning || offlineDownloadQueued;
             holder.btnEditPlaylist.setVisibility(View.VISIBLE);
 
             if (offlineAutoEnabled) {
-                holder.btnDownload.setImageResource(R.drawable.ic_check_small);
-                holder.btnDownload.setBackgroundResource(completeOffline
-                        ? R.drawable.bg_offline_state_filled_primary
-                        : R.drawable.bg_playlist_action_dark);
-                holder.btnDownload.setColorFilter(completeOffline
-                        ? ContextCompat.getColor(requireContext(), R.color.surface_dark)
-                        : 0xFFFFFFFF);
+                if (completeOffline) {
+                    holder.btnDownload.setImageResource(R.drawable.ic_check_small);
+                    holder.btnDownload.setBackgroundResource(R.drawable.bg_offline_state_filled_primary);
+                    holder.btnDownload.setColorFilter(ContextCompat.getColor(requireContext(), R.color.surface_dark));
+                } else {
+                    holder.btnDownload.setImageResource(R.drawable.ic_sync_offline);
+                    holder.btnDownload.setBackgroundResource(R.drawable.bg_playlist_action_dark);
+                    holder.btnDownload.setColorFilter(ContextCompat.getColor(requireContext(), R.color.stitch_blue));
+                }
+            } else if (isDownloading) {
+                holder.btnDownload.setImageResource(R.drawable.ic_sync_offline);
+                holder.btnDownload.setBackgroundResource(R.drawable.bg_playlist_action_dark);
+                holder.btnDownload.setColorFilter(ContextCompat.getColor(requireContext(), R.color.stitch_blue));
             } else {
                 holder.btnDownload.setImageResource(R.drawable.ic_download_bold);
                 holder.btnDownload.setBackgroundResource(R.drawable.bg_playlist_action_dark);
@@ -6718,40 +6637,61 @@ public class PlaylistDetailFragment extends Fragment
                 btnSharePlaylist.setOnClickListener(v -> shareCurrentPlaylist());
                 btnShufflePlay.setOnClickListener(v -> {
                     if (currentTracks.isEmpty()) return;
-                    if (isPlayingFromThisPlaylist()) {
+                    v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
+
+                    SongPlayerFragment player = findSongPlayerFragment();
+                    boolean isPlayingThis = isPlayingFromThisPlaylist();
+
+                    if (isPlayingThis && player != null && player.isAdded()) {
                         // YA estamos reproduciendo esta playlist: el botón es un ESPEJO del
-                        // aleatorio del player — alterna el modo sin cambiar la canción.
-                        SongPlayerFragment player = findSongPlayerFragment();
-                        boolean enable = !(player != null && player.isAdded()
-                                && player.externalIsShuffleEnabled());
-                        if (player != null && player.isAdded()) {
-                            if (!enable) injectOriginalQueueOrderIfShuffled(player);
-                            player.externalSetShuffleEnabled(enable);
-                        }
-                        shuffleModeEnabled = enable;
+                        // aleatorio del player — alterna el modo sin cambiar ni reiniciar la canción.
+                        boolean newShuffle = !player.externalIsShuffleEnabled();
+                        player.externalSetShuffleEnabled(newShuffle);
+                        shuffleModeEnabled = newShuffle;
                         persistShuffleModePreference();
                         applyShuffleButtonStyle(btnShufflePlay);
                     } else {
-                        // Nada de esta playlist sonando: reproducir una canción al azar con
-                        // aleatorio encendido, reflejándolo también en el player (si ya estaba
-                        // en aleatorio, externalSetShuffleEnabled(true) es no-op y se mantiene).
+                        // Nada de esta playlist sonando: iniciar la playlist en aleatorio con
+                        // una canción al azar y dejar el aleatorio encendido en el player.
                         shuffleModeEnabled = true;
-                        int randomIndex = new Random().nextInt(currentTracks.size());
-                        onTrackSelected(randomIndex);
-                        SongPlayerFragment started = findSongPlayerFragment();
-                        if (started != null && started.isAdded()) {
-                            started.externalSetShuffleEnabled(true);
-                        }
-                        applyShuffleButtonStyle(btnShufflePlay);
-                        // El player puede crearse async tras onTrackSelected: reintento corto
-                        // para que su icono de aleatorio quede encendido también.
-                        mainHandler.postDelayed(() -> {
-                            SongPlayerFragment late = findSongPlayerFragment();
-                            if (late != null && late.isAdded()) {
-                                late.externalSetShuffleEnabled(true);
+                        persistShuffleModePreference();
+
+                        int randomIndex = currentTracks.size() > 1 ? random.nextInt(currentTracks.size()) : 0;
+
+                        if (player != null && player.isAdded()) {
+                            player.externalSetReturnTargetTag(TAG_PLAYLIST_DETAIL);
+                            player.externalSetPlaylistContext(currentPlaylistId, currentPlaylistTitle);
+                            player.externalSetShuffleEnabled(true);
+
+                            ensurePlaybackQueue();
+                            ArrayList<String> ids = new ArrayList<>(playbackQueueTracks.size());
+                            ArrayList<String> titles = new ArrayList<>(playbackQueueTracks.size());
+                            ArrayList<String> artists = new ArrayList<>(playbackQueueTracks.size());
+                            ArrayList<String> durations = new ArrayList<>(playbackQueueTracks.size());
+                            ArrayList<String> images = new ArrayList<>(playbackQueueTracks.size());
+                            for (PlaylistTrack item : playbackQueueTracks) {
+                                ids.add(item.videoId);
+                                titles.add(item.title);
+                                artists.add(item.artist);
+                                durations.add(item.duration);
+                                images.add(item.imageUrl);
                             }
-                            applyShuffleButtonStyle(headerShuffleButton);
-                        }, 450L);
+
+                            player.externalReplaceQueueFromStart(ids, titles, artists, durations, images, randomIndex, true);
+                            injectOriginalQueueOrder(player);
+
+                            ensureMiniPlayerShown();
+                            currentTrackIndex = randomIndex;
+                            miniPlaying = true;
+                            if (trackAdapter != null) {
+                                trackAdapter.setActiveIndex(randomIndex);
+                            }
+                            syncTrackStateFromPlayer();
+                            applyShuffleButtonStyle(btnShufflePlay);
+                        } else {
+                            onTrackSelected(randomIndex);
+                            applyShuffleButtonStyle(btnShufflePlay);
+                        }
                     }
                 });
             }
@@ -6980,6 +6920,16 @@ public class PlaylistDetailFragment extends Fragment
             final List<PlaylistTrack> previous = new ArrayList<>(items);
             final List<PlaylistTrack> incoming = new ArrayList<>(newItems);
             final int generation = ++submitGeneration;
+
+            if (previous.isEmpty()) {
+                items.clear();
+                items.addAll(incoming);
+                if (activeIndex >= items.size()) {
+                    activeIndex = -1;
+                }
+                notifyDataSetChanged();
+                return;
+            }
 
             // Offload DiffUtil to background thread to avoid UI stutter on large lists during playback
             trackStateLookupExecutor.execute(() -> {
@@ -7239,6 +7189,20 @@ public class PlaylistDetailFragment extends Fragment
             }
         }
 
+        void markTracksOffline(@NonNull java.util.Collection<String> trackIds) {
+            for (String id : trackIds) {
+                if (TextUtils.isEmpty(id)) continue;
+                String normalized = id.trim();
+                if (!Boolean.TRUE.equals(offlineAvailabilityCache.get(normalized))) {
+                    offlineAvailabilityCache.put(normalized, Boolean.TRUE);
+                    int idx = indexOfTrackById(normalized);
+                    if (idx >= 0 && idx < getItemCount()) {
+                        immediateNotifyStateChanged(idx);
+                    }
+                }
+            }
+        }
+
         private boolean isOfflineAvailable(
                 @NonNull Context context,
                 @Nullable String trackId,
@@ -7248,11 +7212,11 @@ public class PlaylistDetailFragment extends Fragment
             if (TextUtils.isEmpty(trackId)) {
                 return false;
             }
+            if (isPersistedOfflineCompleteStateForCurrentPlaylist()) {
+                return true;
+            }
             String normalized = trackId.trim();
             Boolean cached = offlineAvailabilityCache.get(normalized);
-            // Only the download OBSERVER seeds this cache now (a track that just finished). Scrolling
-            // never triggers a disk lookup — the "escaneo de descargas" that made the first scroll
-            // lag was removed; the "Descargas" library view owns downloaded-state discovery.
             return cached != null ? cached : false;
         }
 
@@ -7365,6 +7329,15 @@ public class PlaylistDetailFragment extends Fragment
             if (holder.flOfflineProgress != null) {
                 holder.flOfflineProgress.setVisibility(View.GONE);
             }
+            if (holder.flTrackDownloadIndicator != null) {
+                holder.flTrackDownloadIndicator.setVisibility(View.GONE);
+            }
+            if (holder.pbTrackDownloading != null) {
+                holder.pbTrackDownloading.setVisibility(View.GONE);
+            }
+            if (holder.ivTrackDownloaded != null) {
+                holder.ivTrackDownloaded.setVisibility(View.GONE);
+            }
             // The views above were force-reset, so the memoized state no longer matches them.
             // Without this, a rebind that computes the SAME state as before recycling hits the
             // appliedOfflineState no-op guard and leaves the check INVISIBLE on a downloaded row.
@@ -7399,10 +7372,22 @@ public class PlaylistDetailFragment extends Fragment
             if (prevOfflineState != offlineState) {
                 holder.appliedOfflineState = offlineState;
 
-                // No persistent per-row "downloaded" indicator anymore (no check circle). While a
-                // track is actively downloading we show ONLY the thin progress bar; once it finishes
-                // the bar sweeps to 100% and disappears, leaving the row clean. This keeps scrolling
-                // free of any per-row download-state work — "solo la barra de progreso, después nada".
+                // ── Track download indicator (spinner / check badge) ────────────────
+                if (holder.flTrackDownloadIndicator != null) {
+                    if (offlineState == OFFLINE_STATE_DOWNLOADING) {
+                        holder.flTrackDownloadIndicator.setVisibility(View.VISIBLE);
+                        if (holder.pbTrackDownloading != null) holder.pbTrackDownloading.setVisibility(View.VISIBLE);
+                        if (holder.ivTrackDownloaded != null) holder.ivTrackDownloaded.setVisibility(View.GONE);
+                    } else if (offlineState == OFFLINE_STATE_AVAILABLE) {
+                        holder.flTrackDownloadIndicator.setVisibility(View.VISIBLE);
+                        if (holder.pbTrackDownloading != null) holder.pbTrackDownloading.setVisibility(View.GONE);
+                        if (holder.ivTrackDownloaded != null) holder.ivTrackDownloaded.setVisibility(View.VISIBLE);
+                    } else {
+                        holder.flTrackDownloadIndicator.setVisibility(View.GONE);
+                        if (holder.pbTrackDownloading != null) holder.pbTrackDownloading.setVisibility(View.GONE);
+                        if (holder.ivTrackDownloaded != null) holder.ivTrackDownloaded.setVisibility(View.GONE);
+                    }
+                }
 
                 // ── Progress bar show/hide ──────────────────────────────────────────
                 if (offlineState == OFFLINE_STATE_DOWNLOADING) {
@@ -7517,18 +7502,7 @@ public class PlaylistDetailFragment extends Fragment
                 LocalArtworkResolver.detach(holder.ivTrackArt);
                 holder.ivTrackArt.setScaleType(ImageView.ScaleType.FIT_CENTER);
                 holder.ivTrackArt.setBackgroundColor(android.graphics.Color.TRANSPARENT);
-                if (isFlinging) {
-                    // Mid fast-fling, dozens of rows bind per second. Firing a full HIGH-priority
-                    // Glide request for each (request-graph build + executor submit + crossfade
-                    // wiring) is the churn that makes fast scroll stutter. Instead paint only rows
-                    // already in the memory cache (synchronous, no decode); rows not yet cached keep
-                    // the grey placeholder and fly past. reloadImagesForRange() issues their real
-                    // loads once the list settles (IDLE), so images stream in exactly as scrolling
-                    // stops — the YT-Music feel: rows fly smoothly, artwork fills in on settle.
-                    loadTrackArtCacheOnly(holder.ivTrackArt, track.imageUrl);
-                } else {
-                    loadTrackArt(holder.ivTrackArt, track.imageUrl, com.bumptech.glide.Priority.HIGH);
-                }
+                loadTrackArt(holder.ivTrackArt, track.imageUrl, com.bumptech.glide.Priority.NORMAL);
             }
 
             // NO per-row offline-state disk lookup on bind anymore. Checking each row's downloaded
@@ -7549,6 +7523,9 @@ public class PlaylistDetailFragment extends Fragment
             final ImageView ivMore;
             final FrameLayout flOfflineProgress;
             final View vOfflineProgressFill;
+            final FrameLayout flTrackDownloadIndicator;
+            final ProgressBar pbTrackDownloading;
+            final ImageView ivTrackDownloaded;
             /** Background drawable currently applied to the row; starts as the XML default. */
             int appliedRowBackgroundRes = R.drawable.bg_playlist_track_default;
             /** Offline indicator visual state currently applied to this holder (-1 = unset).
@@ -7566,6 +7543,9 @@ public class PlaylistDetailFragment extends Fragment
                 ivMore = itemView.findViewById(R.id.ivMore);
                 flOfflineProgress = itemView.findViewById(R.id.flOfflineProgress);
                 vOfflineProgressFill = itemView.findViewById(R.id.vOfflineProgressFill);
+                flTrackDownloadIndicator = itemView.findViewById(R.id.flTrackDownloadIndicator);
+                pbTrackDownloading = itemView.findViewById(R.id.pbTrackDownloading);
+                ivTrackDownloaded = itemView.findViewById(R.id.ivTrackDownloaded);
 
                 itemView.setOnClickListener(v -> {
                     int pos = getAdapterPosition();

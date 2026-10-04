@@ -662,7 +662,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 new com.google.android.material.bottomsheet.BottomSheetDialog(requireContext());
         View view = LayoutInflater.from(requireContext()).inflate(R.layout.bottom_sheet_library_switcher, null);
         // Fondo casi rectangular: solo 8dp en las esquinas superiores (vs los 24dp del
-        // bg_bottom_sheet estándar), aplicado en código como en ScannerFragment.
+        // bg_bottom_sheet estándar).
         android.graphics.drawable.GradientDrawable sheetBg = new android.graphics.drawable.GradientDrawable();
         sheetBg.setColor(ContextCompat.getColor(requireContext(), R.color.surface_dark));
         float r = dpToPx(8);
@@ -1200,8 +1200,6 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     private String youtubeAccessToken = "";
     private boolean youtubeAuthRefreshInProgress;
     private boolean streamingOauthCompleted;
-    private long lastAutoWebSessionLaunchAtMs;
-    private boolean webSessionAlreadyAttempted;
     private boolean restoringHiddenMiniPlayerFromSnapshot;
     @Nullable
     private PopupWindow playlistActionPopupWindow;
@@ -1239,7 +1237,6 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     private static final long SNAPSHOT_UI_DEBOUNCE_MS = 500L;
     private ActivityResultLauncher<Intent> signInLauncher;
     private ActivityResultLauncher<Intent> recoverAuthLauncher;
-    private ActivityResultLauncher<Intent> webSessionLauncher;
     private enum ScreenMode {
         LIBRARY
     }
@@ -1310,19 +1307,6 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                         }
                     }
                     setLibraryLoading(false, "Permiso de YouTube no concedido.");
-                }
-        );
-        webSessionLauncher = registerForActivityResult(
-                new ActivityResultContracts.StartActivityForResult(),
-                result -> {
-                    if (!isAdded()) {
-                        return;
-                    }
-                    if (result.getResultCode() != Activity.RESULT_OK || result.getData() == null) {
-                        setLibraryLoading(false, "Sesion web cancelada.");
-                        return;
-                    }
-                    handleWebSessionAuthSuccess(result.getData());
                 }
         );
     }
@@ -1439,22 +1423,17 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             persistStreamingScreen(STREAM_SCREEN_LIBRARY);
         }
 
-        // Attach the WorkManager progress observers immediately (idempotent, lifecycle-scoped)
-        // so a download already RUNNING on cold start is reflected in the tiles right away
-        // instead of after the 800ms defer.
-        startObservingOfflineQueue();
+        // Defer WorkManager progress observers so Room SQLite DB is not queried on the main thread during layout
+        view.postDelayed(() -> {
+            if (!isAdded() || isRemoving() || isDetached()) return;
+            startObservingOfflineQueue();
+        }, 400L);
 
         // Defer mini-player restore so it doesn't block first frame (SongPlayerFragment inflate is heavy)
         view.postDelayed(() -> {
             if (!isAdded() || isRemoving() || isDetached()) return;
             maybeRestoreHiddenMiniPlayerFromPausedSnapshot();
         }, 200L);
-
-        // Defer non-critical work
-        view.postDelayed(() -> {
-            if (!isAdded() || isRemoving() || isDetached()) return;
-            maybeAutoLaunchWebSessionIfNeeded();
-        }, 800L);
 
         // Always start from the top — post so it runs AFTER RecyclerView restores saved scroll state
         if (rvMusicResults != null) {
@@ -1549,6 +1528,8 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 && (entrySkeletonPendingWhenShown || loadingLibrary || libraryFetchInFlight || !libraryStoresWarmed)) {
             entrySkeletonPendingWhenShown = false;
             showLibraryEntrySkeleton();
+        } else if (activeScreen == ScreenMode.LIBRARY && libraryStoresWarmed && (adapter == null || adapter.dataSize() == 0)) {
+            renderLibraryResults();
         }
         // Re-entering Biblioteca from another module always resets to no chip selected (the full
         // library), per request. Only re-render if we actually cleared an active filter.
@@ -1680,7 +1661,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 if (getActivity() instanceof MainActivity) {
                     btnFragSignIn.setEnabled(false);
                     btnFragSignIn.setAlpha(0.56f);
-                    ((MainActivity) getActivity()).requireAuth(
+                    ((MainActivity) getActivity()).startGoogleSignInThenWebSession(
                         () -> {
                             if (btnFragSignIn != null) { btnFragSignIn.setEnabled(true); btnFragSignIn.setAlpha(1f); }
                             refreshFragHeaderProfilePhoto();
@@ -1766,27 +1747,6 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         }
     }
 
-    private void maybeAutoLaunchWebSessionIfNeeded() {
-        if (!isAdded()) {
-            return;
-        }
-        if (streamingOauthCompleted || loadingLibrary || webSessionLauncher == null) {
-            return;
-        }
-        if (webSessionAlreadyAttempted) {
-            return;
-        }
-        if (!isNetworkAvailable()) {
-            return;
-        }
-        long now = System.currentTimeMillis();
-        if ((now - lastAutoWebSessionLaunchAtMs) < 3000L) {
-            return;
-        }
-        lastAutoWebSessionLaunchAtMs = now;
-        webSessionAlreadyAttempted = true;
-        onYoutubeLoginClicked();
-    }
     private boolean isPlaylistDetailStatePending() {
         if (!isAdded()) {
             return false;
@@ -1924,15 +1884,19 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         if (!isAdded() || loadingLibrary || libraryFetchInFlight || !streamingOauthCompleted) {
             return;
         }
+        if (!libraryStoresWarmed) {
+            return;
+        }
         if (!isNetworkAvailable()) {
             return;
         }
         long now = System.currentTimeMillis();
-        boolean hasLocalData = !libraryTracks.isEmpty();
+        String accountKey = resolveAccountKey();
+        boolean hasLocalData = !libraryTracks.isEmpty()
+                || (!TextUtils.isEmpty(accountKey) && getPersistedLibraryUpdatedAt(accountKey) > 0L);
         if (hasLocalData && (now - lastLibrarySyncAtMs) < LIBRARY_REFRESH_MIN_INTERVAL_MS) {
             return;
         }
-        String accountKey = resolveAccountKey();
         boolean backgroundRefresh = hasLocalData;
         if (hasValidCachedToken(accountKey)) {
             youtubeAccessToken = cachedYoutubeAccessToken;
@@ -1940,6 +1904,10 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             return;
         }
         if (!TextUtils.isEmpty(youtubeAccessToken)) {
+            fetchLibraryPlaylists(false, backgroundRefresh, false);
+            return;
+        }
+        if (!TextUtils.isEmpty(StreamResolver.getAuthCookieHeader())) {
             fetchLibraryPlaylists(false, backgroundRefresh, false);
         }
     }
@@ -2028,29 +1996,22 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         }
         return appEmail.equalsIgnoreCase(accountEmail.trim());
     }
-    private void onYoutubeLoginClicked() {
+    public void onYoutubeLoginClicked() {
         if (!isAdded()) {
             return;
         }
-        Log.i(TAG_STREAMING, "login:web_session_launch requested");
-        streamingOauthCompleted = false;
-        youtubeAccessToken = "";
-        clearCachedToken();
-        requireContext()
-            .getSharedPreferences(PREFS_PLAYER_STATE, Activity.MODE_PRIVATE)
-            .edit()
-            .remove(PREF_LAST_YOUTUBE_WEB_COOKIE)
-            .apply();
-        updateYoutubeButtonLabel();
-        setLibraryLoading(true, "Abriendo sesion web de YouTube Music...");
-        if (webSessionLauncher == null) {
-            setLibraryLoading(false, "No se pudo abrir el mininavegador de sesion.");
-            return;
+        if (getActivity() instanceof MainActivity) {
+            setLibraryLoading(true, "Abriendo sesion web de YouTube Music...");
+            ((MainActivity) getActivity()).startGoogleSignInThenWebSession(
+                null,
+                () -> setLibraryLoading(false, "Inicio de sesion cancelado.")
+            );
         }
-        Intent intent = new Intent(requireContext(), YouTubeMusicWebSessionActivity.class);
-        webSessionLauncher.launch(intent);
     }
-    private void handleWebSessionAuthSuccess(@NonNull Intent data) {
+    public void onWebSessionCanceled() {
+        setLibraryLoading(false, "Sesion web cancelada.");
+    }
+    public void handleWebSessionAuthSuccess(@NonNull Intent data) {
         String cookieHeader = data.getStringExtra(YouTubeMusicWebSessionActivity.EXTRA_SESSION_COOKIE_HEADER);
         String userAgent = data.getStringExtra(YouTubeMusicWebSessionActivity.EXTRA_SESSION_USER_AGENT);
         if (TextUtils.isEmpty(cookieHeader)) {
@@ -2076,7 +2037,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             // Pre-initialize shared ExoPlayer on main thread immediately so it's
             // ready when SongPlayerFragment.playCurrentTrack runs (~500ms later).
             // This avoids the ExoPlayer init blocking the first playback frame.
-            requireView().post(() -> {
+            mainHandler.post(() -> {
                 if (isAdded()) ExoPlayerManager.INSTANCE.initialize(requireContext());
             });
         }
@@ -2105,6 +2066,8 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         }
         streamingOauthCompleted = true;
         updateYoutubeButtonLabel();
+        // Immediately fetch user's library playlists with the freshly authenticated web session
+        fetchLibraryPlaylists(true, false, true);
         // Keep user-agent available for future web-session API extensions.
         if (TextUtils.isEmpty(userAgent)) {
             userAgent = "";
@@ -2387,8 +2350,9 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             return;
         }
         libraryFetchInFlight = true;
-        if (TextUtils.isEmpty(youtubeAccessToken)) {
-            Log.w(TAG_STREAMING, "playlist_fetch skipped: empty_token");
+        boolean hasWebSession = !TextUtils.isEmpty(StreamResolver.getAuthCookieHeader());
+        if (TextUtils.isEmpty(youtubeAccessToken) && !hasWebSession) {
+            Log.w(TAG_STREAMING, "playlist_fetch skipped: empty_token_and_no_web_session");
             libraryFetchInFlight = false;
             boolean hasLocalContent = LocalFilesStore.isEnabled(requireContext()) ||
                     !CustomPlaylistsStore.INSTANCE.getAllPlaylistNames(requireContext()).isEmpty() ||
@@ -2439,7 +2403,8 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             }
         }
         Log.i(TAG_STREAMING, "playlist_fetch start limit=" + LIBRARY_PLAYLIST_FETCH_LIMIT);
-        youTubeMusicService.fetchMyPlaylists(youtubeAccessToken, LIBRARY_PLAYLIST_FETCH_LIMIT, new YouTubeMusicService.PlaylistsCallback() {
+        String effectiveToken = TextUtils.isEmpty(youtubeAccessToken) ? "web_session" : youtubeAccessToken;
+        youTubeMusicService.fetchMyPlaylists(effectiveToken, LIBRARY_PLAYLIST_FETCH_LIMIT, new YouTubeMusicService.PlaylistsCallback() {
             @Override
             public void onSuccess(@NonNull List<YouTubeMusicService.PlaylistResult> playlists) {
                 libraryFetchInFlight = false;
@@ -2462,13 +2427,16 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 libraryTracks.addAll(preservedCloudRows);
                 displayLibraryDirty = true;
                 cacheLibraryForCurrentAccount(libraryTracks);
-                // Prefetch tracks on initial load. On pull-to-refresh, only prefetch
-                // if some playlists are still missing grid images (first-install catch-up).
-                if (!forceRefresh) {
-                    prefetchLibraryTracksForOffline(libraryTracks, youtubeAccessToken);
-                } else if (hasPlaylistsWithoutGrid(libraryTracks)) {
-                    prefetchLibraryTracksForOffline(libraryTracks, youtubeAccessToken);
-                }
+                // Prefetch tracks deferred after UI renders to prevent frame drops.
+                final String prefetchToken = TextUtils.isEmpty(youtubeAccessToken) ? "web_session" : youtubeAccessToken;
+                mainHandler.postDelayed(() -> {
+                    if (!isAdded()) return;
+                    if (!forceRefresh) {
+                        prefetchLibraryTracksForOffline(libraryTracks, prefetchToken);
+                    } else if (hasPlaylistsWithoutGrid(libraryTracks)) {
+                        prefetchLibraryTracksForOffline(libraryTracks, prefetchToken);
+                    }
+                }, 800L);
                 lastLibrarySyncAtMs = System.currentTimeMillis();
                 youtubeAuthRefreshInProgress = false;
                 if (!backgroundRefresh) {
@@ -2627,9 +2595,14 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         // seconds. Show the skeleton and warm everything off-main; the warmup post-back re-enters
         // this method with every read memory-cached.
         if (!libraryStoresWarmed) {
-            showLibraryEntrySkeleton();
-            warmLibraryStoresOffMain();
-            return;
+            if (!libraryTracks.isEmpty()) {
+                libraryStoresWarmed = true;
+                warmLibraryStoresOffMain();
+            } else {
+                showLibraryEntrySkeleton();
+                warmLibraryStoresOffMain();
+                return;
+            }
         }
         featuredTrack = null;
         llFeaturedResult.setVisibility(View.GONE);
@@ -2715,25 +2688,33 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         final boolean needLibraryRestore = libraryTracks.isEmpty();
         final boolean needArtistsRestore = libraryArtists.isEmpty();
         authExecutor.execute(() -> {
+            Thread storeWarmupThread = new Thread(() -> {
+                try {
+                    FavoritesPlaylistStore.loadFavorites(appCtx);
+                    for (String name : CustomPlaylistsStore.INSTANCE.getAllPlaylistNames(appCtx)) {
+                        CustomPlaylistsStore.INSTANCE.getTracksFromPlaylist(appCtx, name);
+                    }
+                    RadioHistoryStore.INSTANCE.getPinnedPlaylistIds(appCtx);
+                    RadioHistoryStore.INSTANCE.getRadios(appCtx);
+                    if (LocalFilesStore.isEnabled(appCtx)) {
+                        LocalFilesStore.getCachedFiles(appCtx);
+                    }
+                } catch (Exception e) {
+                    Log.w(TAG, "library store warmup failed", e);
+                }
+            }, "lib-stores-warm");
+            storeWarmupThread.start();
+
             final List<YouTubeMusicService.TrackResult> restoredLibrary =
                     needLibraryRestore ? loadPersistedLibrary(accountKey)
                             : java.util.Collections.<YouTubeMusicService.TrackResult>emptyList();
             final List<YouTubeMusicService.ArtistResult> restoredArtists =
                     needArtistsRestore ? loadPersistedArtists(accountKey)
                             : java.util.Collections.<YouTubeMusicService.ArtistResult>emptyList();
+
             try {
-                FavoritesPlaylistStore.loadFavorites(appCtx);
-                for (String name : CustomPlaylistsStore.INSTANCE.getAllPlaylistNames(appCtx)) {
-                    CustomPlaylistsStore.INSTANCE.getTracksFromPlaylist(appCtx, name);
-                }
-                RadioHistoryStore.INSTANCE.getPinnedPlaylistIds(appCtx);
-                RadioHistoryStore.INSTANCE.getRadios(appCtx);
-                if (LocalFilesStore.isEnabled(appCtx)) {
-                    LocalFilesStore.getCachedFiles(appCtx);
-                }
-            } catch (Exception e) {
-                Log.w(TAG, "library store warmup failed", e);
-            }
+                storeWarmupThread.join();
+            } catch (InterruptedException ignored) {}
             mainHandler.post(() -> {
                 libraryWarmupInFlight = false;
                 libraryStoresWarmed = true;
@@ -3061,7 +3042,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             llMusicState.setVisibility(visible ? View.VISIBLE : View.GONE);
         }
     }
-    private void setLibraryLoading(boolean loading, @NonNull String stateMessage) {
+    void setLibraryLoading(boolean loading, @NonNull String stateMessage) {
         loadingLibrary = loading;
         if (btnYoutubeLogin != null) {
             btnYoutubeLogin.setEnabled(!loading);
@@ -3106,13 +3087,16 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     }
     private void showLibraryGridOverlay(int pendingCount) {
         if (pendingCount <= 0 || flLibraryLoadingOverlay == null || suppressGridOverlay) return;
+        // Don't show the blocking loading overlay if content is already visible in the adapter!
+        // Grid art should update smoothly in-place in the background.
+        if (adapter != null && adapter.dataSize() > 0) return;
         libraryGridPendingCount = pendingCount;
         libraryGridOverlayActive = true;
         flLibraryLoadingOverlay.setAlpha(1f);
         flLibraryLoadingOverlay.setVisibility(View.VISIBLE);
-        // Safety timeout: dismiss after 5 seconds even if prefetches haven't finished
+        // Safety timeout: dismiss after 2.5 seconds max
         mainHandler.removeCallbacks(libraryOverlayTimeout);
-        mainHandler.postDelayed(libraryOverlayTimeout, 5000L);
+        mainHandler.postDelayed(libraryOverlayTimeout, 2500L);
     }
 
     /**
@@ -3124,6 +3108,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
      */
     private void showLibraryEntrySkeleton() {
         if (flLibraryLoadingOverlay == null || libraryGridOverlayActive) return;
+        if (adapter != null && adapter.dataSize() > 0) return;
         if (isHidden()) {
             // No consumir el skeleton invisible (fragment pre-creado oculto al arrancar):
             // recordarlo y mostrarlo en la primera entrada real al módulo.
@@ -3136,7 +3121,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         flLibraryLoadingOverlay.setAlpha(1f);
         flLibraryLoadingOverlay.setVisibility(View.VISIBLE);
         mainHandler.removeCallbacks(libraryOverlayTimeout);
-        mainHandler.postDelayed(libraryOverlayTimeout, 6000L);
+        mainHandler.postDelayed(libraryOverlayTimeout, 3000L);
     }
     private void onLibraryGridPrefetchComplete() {
         if (!libraryGridOverlayActive) return;
@@ -3664,8 +3649,8 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             if (playlistIdsToFetch.size() >= OFFLINE_TRACKS_PREFETCH_LIMIT) break;
         }
 
-        // Show loading overlay if there are playlists to fetch (first install scenario)
-        if (!playlistIdsToFetch.isEmpty()) {
+        // Show loading overlay only if library has 0 rows rendered (first install scenario)
+        if (!playlistIdsToFetch.isEmpty() && (adapter == null || adapter.dataSize() == 0)) {
             mainHandler.post(() -> showLibraryGridOverlay(playlistIdsToFetch.size()));
         }
 
@@ -4509,13 +4494,32 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             RadioArt.bindThumb(ivArt, playlistId, track.thumbnailUrl,
                     Math.round(48 * getResources().getDisplayMetrics().density), tvBsRadioBadge);
         } else {
-            List<String> gridUrls = playlistId.isEmpty() ? java.util.Collections.emptyList() : resolvePlaylistGridUrls(playlistId);
-            if (gridUrls.size() >= 4) {
-                float density = getResources().getDisplayMetrics().density;
-                int sizePx = Math.round(50 * density);
-                PlaylistGridArtLoader.load(ivArt, gridUrls, sizePx);
+            ImageView anchorThumb = anchor.findViewById(R.id.ivTrackThumb);
+            if (anchorThumb == null && anchor.getParent() instanceof View) {
+                anchorThumb = ((View) anchor.getParent()).findViewById(R.id.ivTrackThumb);
+            }
+            android.graphics.drawable.Drawable d = anchorThumb != null ? anchorThumb.getDrawable() : null;
+            if (d instanceof android.graphics.drawable.BitmapDrawable && ((android.graphics.drawable.BitmapDrawable) d).getBitmap() != null) {
+                ivArt.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                ivArt.setImageBitmap(((android.graphics.drawable.BitmapDrawable) d).getBitmap());
+            } else if (d != null && !(d instanceof android.graphics.drawable.ColorDrawable)) {
+                ivArt.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                android.graphics.drawable.Drawable.ConstantState cs = d.getConstantState();
+                ivArt.setImageDrawable(cs != null ? cs.newDrawable(getResources()).mutate() : d);
             } else {
-                loadArtworkInto(ivArt, track.thumbnailUrl);
+                String officialUrl = playlistId.isEmpty() ? null
+                        : OfficialCoverStore.get(requireContext(), playlistId);
+                List<String> gridUrls = (playlistId.isEmpty() || !TextUtils.isEmpty(officialUrl))
+                        ? java.util.Collections.emptyList() : resolvePlaylistGridUrls(playlistId);
+                if (gridUrls.size() >= 4) {
+                    float density = getResources().getDisplayMetrics().density;
+                    int sizePx = Math.round(50 * density);
+                    PlaylistGridArtLoader.load(ivArt, gridUrls, sizePx);
+                } else if (!TextUtils.isEmpty(officialUrl)) {
+                    loadArtworkInto(ivArt, officialUrl);
+                } else {
+                    loadArtworkInto(ivArt, track.thumbnailUrl);
+                }
             }
         }
         // Top 3 buttons: Play, Share, Download/Delete Downloads
@@ -6507,6 +6511,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 return;
             }
             existingPlayer.externalSetReturnTargetTag(TAG_MODULE_MUSIC);
+            existingPlayer.externalClearPlaylistContext();
             existingPlayer.externalReplaceQueueFromStart(ids, titles, artists, durations, images, selectedIndex, true);
             if (!startInMiniMode) {
                 getParentFragmentManager()
@@ -6623,14 +6628,18 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         }
         SharedPreferences prefs = requireContext().getSharedPreferences(PREFS_PLAYER_STATE, Activity.MODE_PRIVATE);
         String persisted = prefs.getString(PREF_LAST_YOUTUBE_ACCESS_TOKEN, "");
-        if (persisted == null) {
-            return "";
+        if (persisted != null && !persisted.trim().isEmpty()) {
+            youtubeAccessToken = persisted.trim();
+            return youtubeAccessToken;
         }
-        String trimmed = persisted.trim();
-        if (!trimmed.isEmpty()) {
-            youtubeAccessToken = trimmed;
+        String webCookie = prefs.getString(PREF_LAST_YOUTUBE_WEB_COOKIE, "");
+        if (webCookie != null && !webCookie.trim().isEmpty()) {
+            return "web_session";
         }
-        return trimmed;
+        if (!TextUtils.isEmpty(StreamResolver.getAuthCookieHeader())) {
+            return "web_session";
+        }
+        return "";
     }
     private boolean isPlaylistDetailOnTop() {
         try {

@@ -11,18 +11,14 @@ import android.webkit.CookieManager
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import android.widget.Button
-import android.widget.ImageView
-import android.widget.TextView
+import android.widget.ProgressBar
 import androidx.appcompat.app.AppCompatActivity
-import android.view.animation.AnimationUtils
 
 class YouTubeMusicWebSessionActivity : AppCompatActivity() {
 
     private var webView: WebView? = null
     private var webSessionContainer: android.widget.FrameLayout? = null
-    private var loginOverlay: View? = null
-    private var btnOverlayLogin: Button? = null
+    private var progressBar: ProgressBar? = null
     private var lastCookieHeader: String = ""
     private var lastAutoLoginClickAtMs: Long = 0L
     private var autoConnectTriggered: Boolean = false
@@ -32,25 +28,9 @@ class YouTubeMusicWebSessionActivity : AppCompatActivity() {
         setContentView(R.layout.activity_youtube_web_session)
 
         webSessionContainer = findViewById(R.id.webSessionContainer)
-        loginOverlay = findViewById(R.id.loginOverlay)
-        btnOverlayLogin = findViewById(R.id.btnOverlayLogin)
+        progressBar = findViewById(R.id.progressBarWebLoading)
 
-        val imgAmbient = findViewById<ImageView>(R.id.imgAmbient)
-        imgAmbient?.postDelayed({
-            if (isFinishing || isDestroyed) return@postDelayed
-            try {
-                val breatheAnim = AnimationUtils.loadAnimation(this, R.anim.bg_breathe)
-                imgAmbient.startAnimation(breatheAnim)
-            } catch (e: Exception) {
-                Log.e("YouTubeMusicWebSession", "Error loading breathe animation", e)
-            }
-        }, 400L)
-
-        btnOverlayLogin?.setOnClickListener {
-            // Start loading WebView only when user taps — avoids lag on the onboarding overlay
-            initWebViewAndLoad()
-            loginOverlay?.visibility = View.GONE
-        }
+        initWebViewAndLoad()
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -108,12 +88,19 @@ class YouTubeMusicWebSessionActivity : AppCompatActivity() {
 
             override fun onPageFinished(view: WebView, url: String?) {
                 super.onPageFinished(view, url)
+                progressBar?.visibility = View.GONE
                 attemptAutoLoginClick()
                 refreshSessionState()
             }
         }
 
-        wv.loadUrl("https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fmusic.youtube.com%2F")
+        val email = intent.getStringExtra(EXTRA_ACCOUNT_EMAIL)
+        val loginUrl = if (!email.isNullOrBlank()) {
+            "https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fmusic.youtube.com%2F&Email=${Uri.encode(email)}&login_hint=${Uri.encode(email)}"
+        } else {
+            "https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fmusic.youtube.com%2F"
+        }
+        wv.loadUrl(loginUrl)
     }
 
     private fun refreshSessionState() {
@@ -234,6 +221,7 @@ class YouTubeMusicWebSessionActivity : AppCompatActivity() {
     companion object {
         const val EXTRA_SESSION_COOKIE_HEADER = "extra_session_cookie_header"
         const val EXTRA_SESSION_USER_AGENT = "extra_session_user_agent"
+        const val EXTRA_ACCOUNT_EMAIL = "extra_account_email"
         private const val TAG_STREAMING_WEB = "SleppifyStreamingWeb"
     }
 }

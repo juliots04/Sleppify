@@ -100,6 +100,35 @@
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintBottom_toBottomOf="parent">
 
+        <!-- Per-track download indicator: spinner while downloading, badge when downloaded -->
+        <FrameLayout
+            android:id="@+id/flTrackDownloadIndicator"
+            android:layout_width="28dp"
+            android:layout_height="28dp"
+            android:layout_marginEnd="2dp"
+            android:visibility="gone">
+
+            <ProgressBar
+                android:id="@+id/pbTrackDownloading"
+                android:layout_width="16dp"
+                android:layout_height="16dp"
+                android:layout_gravity="center"
+                android:indeterminate="true"
+                android:indeterminateTint="@color/stitch_blue"
+                android:visibility="gone" />
+
+            <ImageView
+                android:id="@+id/ivTrackDownloaded"
+                android:layout_width="16dp"
+                android:layout_height="16dp"
+                android:layout_gravity="center"
+                android:background="@drawable/bg_offline_state_filled_primary"
+                android:padding="2dp"
+                android:src="@drawable/ic_check_small"
+                app:tint="@color/surface_dark"
+                android:visibility="gone" />
+        </FrameLayout>
+
         <ImageView
             android:id="@+id/ivMore"
             android:layout_width="36dp"
@@ -112,11 +141,11 @@
             app:tint="@color/text_secondary" />
     </LinearLayout>
 
-    <!-- Offline download progress bar - OPTIMIZADO: constraint layout más eficiente -->
+    <!-- Offline download progress bar -->
     <FrameLayout
         android:id="@+id/flOfflineProgress"
         android:layout_width="0dp"
-        android:layout_height="2dp"
+        android:layout_height="3dp"
         android:layout_marginEnd="8dp"
         android:background="@color/surface_high"
         android:visibility="gone"

@@ -1205,6 +1205,7 @@ class CloudSyncManager private constructor(context: Context) {
 
     private fun isLikelyFloatKey(key: String): Boolean {
         if (AudioEffectsService.KEY_BASS_DB == key ||
+            AudioEffectsService.KEY_OVERALL_GAIN_DB == key ||
             AudioEffectsService.KEY_BASS_FREQUENCY_HZ == key ||
             key.startsWith(LEGACY_BAND_PREFIX) ||
             key.startsWith(LEGACY_USER_PRESET_BAND_PREFIX)
@@ -1215,6 +1216,7 @@ class CloudSyncManager private constructor(context: Context) {
         if (!key.startsWith(LEGACY_DEVICE_PROFILE_PREFIX)) return false
 
         return key.endsWith("_" + AudioEffectsService.KEY_BASS_DB) ||
+                key.endsWith("_" + AudioEffectsService.KEY_OVERALL_GAIN_DB) ||
                 key.endsWith("_" + AudioEffectsService.KEY_BASS_FREQUENCY_HZ) ||
                 key.contains("_$LEGACY_BAND_PREFIX")
     }

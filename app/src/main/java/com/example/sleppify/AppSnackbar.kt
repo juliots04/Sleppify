@@ -22,7 +22,7 @@ import androidx.core.content.res.ResourcesCompat
  * tappable. One look, one spring animation, one dedupe tag.
  *
  * Replaces every ad-hoc mechanism that existed before (android.widget.Toast, the five
- * hand-rolled `saved_bar` LinearLayout builders in Search/PlaylistDetail/Scanner/SongPlayer).
+ * hand-rolled `saved_bar` LinearLayout builders in Search/PlaylistDetail/SongPlayer).
  *
  * Hosting:
  *  - [show]/[showAction] attach to the Activity content root, floating above the bottom

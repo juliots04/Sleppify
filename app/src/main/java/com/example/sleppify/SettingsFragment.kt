@@ -77,8 +77,6 @@ class SettingsFragment : Fragment() {
 
     // --- Views ---
     private lateinit var tvToolbarTitle: TextView
-    // El botón de cámara (scanner) solo tiene sentido en la raíz de Configuración.
-    private var btnSettingsCamera: View? = null
     private lateinit var sectionRoot: View
     private lateinit var sectionPlayback: View
     private lateinit var sectionDownloads: View
@@ -208,10 +206,6 @@ class SettingsFragment : Fragment() {
         val llSettingsToolbar = view.findViewById<View>(R.id.llSettingsToolbar)
         tvToolbarTitle = view.findViewById(R.id.tvSettingsToolbarTitle)
         view.findViewById<View>(R.id.btnSettingsBack)?.setOnClickListener { onBackPressed() }
-        btnSettingsCamera = view.findViewById(R.id.btnSettingsCamera)
-        btnSettingsCamera?.setOnClickListener {
-            (activity as? MainActivity)?.openScannerFromSettings()
-        }
         ViewCompat.setOnApplyWindowInsetsListener(view) { _, insets ->
             val top = insets.getInsets(WindowInsetsCompat.Type.statusBars()).top
             llSettingsToolbar?.setPadding(llSettingsToolbar.paddingLeft, top, llSettingsToolbar.paddingRight, llSettingsToolbar.paddingBottom)
@@ -356,9 +350,6 @@ class SettingsFragment : Fragment() {
             SECTION_ACCOUNT -> "Cuenta"
             else -> "Configuración"
         }
-
-        // La cámara (scanner) solo en la raíz; en las subsecciones el header va limpio.
-        btnSettingsCamera?.visibility = if (section == SECTION_ROOT) View.VISIBLE else View.GONE
 
         // Scroll to top
         when (section) {

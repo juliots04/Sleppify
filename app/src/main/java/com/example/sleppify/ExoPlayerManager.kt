@@ -1,6 +1,8 @@
 package com.example.sleppify
 
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import androidx.annotation.NonNull
 import androidx.annotation.Nullable
@@ -31,6 +33,7 @@ object ExoPlayerManager {
     private var appContextRef: Context? = null
 
     private val initLock = Any()
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     /**
      * Inicializa la instancia compartida de ExoPlayer.
@@ -49,7 +52,7 @@ object ExoPlayerManager {
                             .build()
 
                         // Aggressive LoadControl: start playback after only 500ms of
-                        // buffered audio instead of the default 2500ms.  Keep a
+                        // buffered audio instead of the default 2500ms. Keep a
                         // reasonable back-buffer so seeks within recently-played
                         // sections are instant.
                         val loadControl = DefaultLoadControl.Builder()
@@ -69,20 +72,31 @@ object ExoPlayerManager {
                         val renderersFactory = DefaultRenderersFactory(appContext)
                             .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_OFF)
 
-                        sharedExoPlayer = ExoPlayer.Builder(appContext, renderersFactory)
+                        val player = ExoPlayer.Builder(appContext, renderersFactory)
                             .setLoadControl(loadControl)
-                            .setLooper(android.os.Looper.getMainLooper())
+                            .setLooper(Looper.getMainLooper())
                             .setAudioAttributes(audioAttributes, true)
                             .setHandleAudioBecomingNoisy(true)
                             .build()
-                            .also { player ->
-                                // CLOSEST_SYNC: sources con pista de video (stream muxed itag-18,
-                                // .mp4 offline) retoman en el keyframe más cercano en vez de
-                                // decodificar desde el keyframe previo hasta el frame exacto —
-                                // eso era gran parte de la latencia del seek. El audio puro no
-                                // tiene keyframes distantes, así que no lo afecta.
-                                player.setSeekParameters(SeekParameters.CLOSEST_SYNC)
+
+                        // CLOSEST_SYNC: sources con pista de video (stream muxed itag-18,
+                        // .mp4 offline) retoman en el keyframe más cercano en vez de
+                        // decodificar desde el keyframe previo hasta el frame exacto.
+                        // Debe ejecutarse en el Looper de la aplicación (Main Looper) para evitar
+                        // IllegalStateException: Player is accessed on the wrong thread.
+                        if (Looper.myLooper() == Looper.getMainLooper()) {
+                            player.setSeekParameters(SeekParameters.CLOSEST_SYNC)
+                        } else {
+                            mainHandler.post {
+                                try {
+                                    player.setSeekParameters(SeekParameters.CLOSEST_SYNC)
+                                } catch (e: Exception) {
+                                    Log.w(TAG, "Error al configurar seekParameters en main looper", e)
+                                }
                             }
+                        }
+
+                        sharedExoPlayer = player
                         initialized = true
                     } catch (e: Exception) {
                         Log.e(TAG, "Falló la inicialización del ExoPlayer compartido", e)
@@ -121,22 +135,26 @@ object ExoPlayerManager {
      * Útil cuando hay problemas con handlers de threads muertos.
      */
     fun reinitialize(@NonNull context: Context) {
-        synchronized(initLock) {
-            try {
-                sharedExoPlayer?.let { player ->
-                    // Stop + clear before release to ensure AudioTrack resources are freed
-                    // immediately. On low-memory devices, release() alone may leave AudioFlinger
-                    // resources in a stale state causing -12 (ENOMEM) on the next AudioTrack init.
-                    player.stop()
-                    player.clearMediaItems()
-                    player.release()
+        val doReinit = Runnable {
+            synchronized(initLock) {
+                try {
+                    sharedExoPlayer?.let { player ->
+                        player.stop()
+                        player.clearMediaItems()
+                        player.release()
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error liberando ExoPlayer durante reinitialización", e)
                 }
-            } catch (e: Exception) {
-                Log.w(TAG, "Error liberando ExoPlayer durante reinitialización", e)
+                sharedExoPlayer = null
+                initialized = false
+                initialize(context)
             }
-            sharedExoPlayer = null
-            initialized = false
-            initialize(context)
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            doReinit.run()
+        } else {
+            mainHandler.post(doReinit)
         }
     }
 
@@ -151,11 +169,22 @@ object ExoPlayerManager {
      * Libera la instancia compartida de ExoPlayer. Llamar esto cuando la app se está cerrando.
      */
     fun release() {
-        synchronized(initLock) {
-            sharedExoPlayer?.release()
-            sharedExoPlayer = null
-            appContextRef = null
-            initialized = false
+        val doRelease = Runnable {
+            synchronized(initLock) {
+                try {
+                    sharedExoPlayer?.release()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error liberando ExoPlayer", e)
+                }
+                sharedExoPlayer = null
+                appContextRef = null
+                initialized = false
+            }
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            doRelease.run()
+        } else {
+            mainHandler.post(doRelease)
         }
     }
 }

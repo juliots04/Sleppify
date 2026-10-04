@@ -287,9 +287,12 @@ class AudioEffectsService : Service() {
             }
         }
 
-        // Set input gain to 0 dB (no pre-attenuation)
+        // Set input gain according to configured overall gain
         try {
-            dp.setInputGainAllChannelsTo(0f)
+            val initialGain = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .getFloat(KEY_OVERALL_GAIN_DB, OVERALL_GAIN_DEFAULT_DB)
+                .coerceIn(OVERALL_GAIN_MIN_DB, OVERALL_GAIN_MAX_DB)
+            dp.setInputGainAllChannelsTo(initialGain)
         } catch (e: Exception) {
             Log.w(TAG, "Failed to set input gain", e)
         }
@@ -366,9 +369,11 @@ class AudioEffectsService : Service() {
             }
         }
 
-        // Ensure NO input gain reduction — keep at 0 dB
+        // Apply overall input gain (-5 dB to +5 dB)
+        val overallGainDb = prefs.getFloat(KEY_OVERALL_GAIN_DB, OVERALL_GAIN_DEFAULT_DB)
+            .coerceIn(OVERALL_GAIN_MIN_DB, OVERALL_GAIN_MAX_DB)
         try {
-            dp.setInputGainAllChannelsTo(0f)
+            dp.setInputGainAllChannelsTo(overallGainDb)
         } catch (e: Exception) {
             Log.w(TAG, "Failed to set input gain after apply", e)
         }
@@ -442,6 +447,10 @@ class AudioEffectsService : Service() {
         // Última sesión de audio real reportada por el player (ExoMediaPlayer.onAudioSessionIdChanged).
         const val KEY_PLAYER_SESSION_ID = "player_session_id"
         const val KEY_BASS_DB = "bass_db"
+        const val KEY_OVERALL_GAIN_DB = "overall_gain_db"
+        const val OVERALL_GAIN_DEFAULT_DB = 0f
+        const val OVERALL_GAIN_MIN_DB = -5f
+        const val OVERALL_GAIN_MAX_DB = 5f
         const val KEY_BASS_FREQUENCY_HZ = "bass_frequency_hz"
         const val KEY_BASS_TYPE = "bass_type"
         const val KEY_SPATIAL_ENABLED = "spatial_enabled"
@@ -474,7 +483,7 @@ class AudioEffectsService : Service() {
             return cutoffHz.coerceIn(BASS_FREQUENCY_MIN_HZ, BASS_FREQUENCY_MAX_HZ)
         }
 
-        private const val NOTIFICATION_CHANNEL_ID = "sleppify_media_playback"
+        private const val NOTIFICATION_CHANNEL_ID = "sleppify_audio_effects"
         private const val FOREGROUND_NOTIFICATION_ID = 11032
 
         /**

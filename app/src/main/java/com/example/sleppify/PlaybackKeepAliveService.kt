@@ -2,6 +2,7 @@ package com.example.sleppify
 
 import android.app.Notification
 import android.app.Service
+import androidx.core.app.NotificationCompat
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -25,11 +26,11 @@ class PlaybackKeepAliveService : Service() {
         // Immediately satisfy the foreground contract to prevent
         // ForegroundServiceDidNotStartInTimeException on slow devices or process restarts.
         try {
-            val fallback = buildFallbackNotification()
+            val initialNotif = latestNotification ?: buildFallbackNotification()
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                startForeground(NOTIFICATION_ID, fallback, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+                startForeground(NOTIFICATION_ID, initialNotif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
             } else {
-                startForeground(NOTIFICATION_ID, fallback)
+                startForeground(NOTIFICATION_ID, initialNotif)
             }
         } catch (e: Exception) {
             Log.e("PlaybackKeepAlive", "onCreate: failed to start foreground", e)
@@ -39,6 +40,7 @@ class PlaybackKeepAliveService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action
         if (action == ACTION_STOP) {
+            latestNotification = null
             safeStopForeground()
             stopSelf()
             return START_NOT_STICKY
@@ -66,7 +68,7 @@ class PlaybackKeepAliveService : Service() {
             // No notification provided — must still call startForeground() to satisfy the
             // contract before stopping, otherwise Android kills the process.
             try {
-                val fallback = buildFallbackNotification()
+                val fallback = latestNotification ?: buildFallbackNotification()
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     startForeground(NOTIFICATION_ID, fallback, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
                 } else {
@@ -79,6 +81,7 @@ class PlaybackKeepAliveService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
+        latestNotification = notification
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 startForeground(
@@ -111,24 +114,37 @@ class PlaybackKeepAliveService : Service() {
         // in-place startForeground swap on id 11031 is seamless and never flashes a distinct-looking
         // "Sleppify" entry. This exists only to satisfy the foreground contract in the brief window
         // before onStartCommand replaces it with the real MediaStyle notification.
-        val channelId = "sleppify_media_playback"
+        val channelId = CHANNEL_ID
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val nm = getSystemService(android.app.NotificationManager::class.java)
             if (nm != null) {
+                try {
+                    nm.deleteNotificationChannel("sleppify_media_playback")
+                    nm.deleteNotificationChannel("sleppify_media_playback_v2")
+                    nm.deleteNotificationChannel("sleppify_media_playback_v3")
+                } catch (e: Exception) {
+                    // Ignored
+                }
                 if (nm.getNotificationChannel(channelId) == null) {
                     val channel = android.app.NotificationChannel(
                         channelId, "Reproducción", android.app.NotificationManager.IMPORTANCE_LOW
-                    )
-                    channel.setShowBadge(false)
+                    ).apply {
+                        description = "Control de reproducción de música"
+                        setShowBadge(false)
+                        lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+                        setSound(null, null)
+                        enableVibration(false)
+                    }
                     nm.createNotificationChannel(channel)
                 }
             } else {
                 Log.w("PlaybackKeepAlive", "NotificationManager is null, notification may fail to display")
             }
         }
-        return Notification.Builder(this, channelId)
+        return NotificationCompat.Builder(this, channelId)
             .setSmallIcon(R.drawable.ic_notification_cat)
             .setContentTitle("Sleppify")
+            .setPriority(NotificationCompat.PRIORITY_LOW)
             .setOngoing(true)
             .build()
     }
@@ -151,9 +167,14 @@ class PlaybackKeepAliveService : Service() {
         const val ACTION_STOP_FOREGROUND = "com.example.sleppify.action.STOP_FOREGROUND_KEEP_NOTIF"
         const val EXTRA_NOTIFICATION = "extra_notification"
         const val NOTIFICATION_ID = 11031 // Same as SongPlayerFragment MEDIA_NOTIFICATION_ID
+        const val CHANNEL_ID = "sleppify_media_playback_v4"
+
+        @Volatile
+        private var latestNotification: Notification? = null
 
         @JvmStatic
         fun start(context: Context, notification: Notification) {
+            latestNotification = notification
             val intent = Intent(context, PlaybackKeepAliveService::class.java).apply {
                 action = ACTION_START
                 putExtra(EXTRA_NOTIFICATION, notification)
@@ -187,6 +208,7 @@ class PlaybackKeepAliveService : Service() {
 
         @JvmStatic
         fun stop(context: Context) {
+            latestNotification = null
             val intent = Intent(context, PlaybackKeepAliveService::class.java).apply {
                 action = ACTION_STOP
             }

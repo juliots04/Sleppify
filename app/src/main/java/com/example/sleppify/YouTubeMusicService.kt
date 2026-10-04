@@ -826,10 +826,57 @@ class YouTubeMusicService @JvmOverloads constructor(
                     if (browseParams.isNotEmpty()) put("params", browseParams)
                 }.toString().toByteArray(StandardCharsets.UTF_8)
                 val responseBody = postInnerTubeBrowse(endpoint, body, cookieHeader.trim())
-                val rows = parseAlbumTracks(JSONObject(responseBody))
+                val firstRoot = JSONObject(responseBody)
+                val shelf = findPlaylistShelf(firstRoot)
+                val initialContents = shelf?.optJSONArray("contents")
+                val rows = ArrayList<TrackResult>()
+                initialContents?.let { rows.addAll(parseAlbumTrackRows(it)) }
+                if (rows.isEmpty()) {
+                    rows.addAll(parseAlbumTracks(firstRoot))
+                }
+                var continuation = extractPlaylistShelfContinuation(shelf, initialContents, firstRoot)
+                var guard = 0
+                while (continuation != null && guard < 500) {
+                    guard++
+                    val responseBody = try {
+                        val encodedToken = java.net.URLEncoder.encode(continuation, "UTF-8")
+                        val contEndpoint = "https://music.youtube.com/youtubei/v1/browse?continuation=$encodedToken&prettyPrint=false"
+                        postInnerTubeBrowse(contEndpoint, buildLibraryBrowseBody(null, continuation), cookieHeader.trim())
+                    } catch (e: Exception) {
+                        try {
+                            postInnerTubeBrowse(endpoint, buildLibraryBrowseBody(null, continuation), cookieHeader.trim())
+                        } catch (e2: Exception) {
+                            null
+                        }
+                    }
+                    if (responseBody == null) break
+
+                    val contRoot = try {
+                        JSONObject(responseBody)
+                    } catch (_: Exception) {
+                        break
+                    }
+
+                    val contShelf = contRoot.optJSONObject("continuationContents")
+                        ?.optJSONObject("musicPlaylistShelfContinuation")
+                        ?: contRoot.optJSONObject("continuationContents")?.optJSONObject("musicShelfContinuation")
+                        ?: contRoot.optJSONObject("continuationContents")?.optJSONObject("sectionListContinuation")
+
+                    val contItems: JSONArray? = contShelf?.optJSONArray("contents")
+                        ?: extractModernContinuationItems(contRoot)
+
+                    val nextRows = contItems?.let { parseAlbumTrackRows(it) } ?: emptyList()
+                    if (nextRows.isNotEmpty()) {
+                        rows.addAll(nextRows)
+                    }
+                    val nextCont = extractPlaylistShelfContinuation(contShelf, contItems, contRoot)
+                    if (nextCont == null || nextCont == continuation) break
+                    continuation = nextCont
+                }
                 val result = ArrayList<PlaylistTrackResult>()
+                val seen = HashSet<String>()
                 for (t in rows) {
-                    if (t.videoId.isEmpty()) continue
+                    if (t.videoId.isEmpty() || !seen.add(t.videoId)) continue
                     val duration = if (TextUtils.isEmpty(t.duration)) "--:--" else t.duration
                     result.add(PlaylistTrackResult(t.videoId, t.title, t.subtitle, duration, t.thumbnailUrl))
                 }
@@ -1585,11 +1632,17 @@ class YouTubeMusicService @JvmOverloads constructor(
     private fun extractContinuationTokenFromItem(item: JSONObject): String? {
         val continuationItem = item.optJSONObject("continuationItemRenderer") ?: return null
 
-        val directToken = continuationItem.optJSONObject("continuationEndpoint")
+        val cmdObj = continuationItem.optJSONObject("continuationEndpoint")
             ?.optJSONObject("continuationCommand")
-            ?.optString("token", "")
-            ?.takeIf { it.isNotEmpty() }
+        val directToken = cmdObj?.optString("token", "")?.takeIf { it.isNotEmpty() }
+            ?: cmdObj?.optString("continuation", "")?.takeIf { it.isNotEmpty() }
         if (directToken != null) return directToken
+
+        val nextContinuation = continuationItem.optJSONObject("continuationEndpoint")
+            ?.optJSONObject("nextContinuationData")
+            ?.optString("continuation", "")
+            ?.takeIf { it.isNotEmpty() }
+        if (nextContinuation != null) return nextContinuation
 
         val commands = continuationItem.optJSONObject("commandExecutorCommand")
             ?.optJSONArray("commands")
@@ -1598,9 +1651,10 @@ class YouTubeMusicService @JvmOverloads constructor(
                 val command = commands.optJSONObject(i) ?: continue
                 val continuationCommand = command.optJSONObject("continuationCommand") ?: continue
                 val request = continuationCommand.optString("request", "")
-                if (request == "CONTINUATION_REQUEST_TYPE_BROWSE") {
-                    val token = continuationCommand.optString("token", "")
-                    if (token.isNotEmpty()) return token
+                if (request == "CONTINUATION_REQUEST_TYPE_BROWSE" || request.isEmpty()) {
+                    val token = continuationCommand.optString("token", "").takeIf { it.isNotEmpty() }
+                        ?: continuationCommand.optString("continuation", "").takeIf { it.isNotEmpty() }
+                    if (!token.isNullOrEmpty()) return token
                 }
             }
         }
@@ -2285,6 +2339,32 @@ class YouTubeMusicService @JvmOverloads constructor(
                     ?.optJSONObject("watchEndpoint")
                     ?.optString("videoId", "")?.trim() ?: ""
             }
+            if (videoId.isEmpty()) {
+                videoId = r.optJSONObject("navigationEndpoint")
+                    ?.optJSONObject("watchEndpoint")
+                    ?.optString("videoId", "")?.trim() ?: ""
+            }
+            if (videoId.isEmpty()) {
+                videoId = r.optJSONObject("doubleTapCommand")
+                    ?.optJSONObject("watchEndpoint")
+                    ?.optString("videoId", "")?.trim() ?: ""
+            }
+            if (videoId.isEmpty()) {
+                val flex = r.optJSONArray("flexColumns")
+                val runs = flex?.optJSONObject(0)
+                    ?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")
+                    ?.optJSONObject("text")?.optJSONArray("runs")
+                if (runs != null) {
+                    for (k in 0 until runs.length()) {
+                        val v = runs.optJSONObject(k)?.optJSONObject("navigationEndpoint")
+                            ?.optJSONObject("watchEndpoint")?.optString("videoId", "")?.trim() ?: ""
+                        if (v.isNotEmpty()) {
+                            videoId = v
+                            break
+                        }
+                    }
+                }
+            }
             if (videoId.isEmpty()) return@forEachObject
             val flex = r.optJSONArray("flexColumns")
             val title = artistRunsToText(
@@ -2296,12 +2376,26 @@ class YouTubeMusicService @JvmOverloads constructor(
                 flex?.optJSONObject(1)
                     ?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")?.optJSONObject("text")
             )
-            // Album pages put the track duration in a fixedColumn ("2:12"), not in the subtitle.
-            val duration = artistRunsToText(
+            // Album/playlist pages put the track duration in a fixedColumn ("2:12") or the subtitle.
+            var duration = artistRunsToText(
                 r.optJSONArray("fixedColumns")?.optJSONObject(0)
                     ?.optJSONObject("musicResponsiveListItemFixedColumnRenderer")?.optJSONObject("text")
             )
-            val thumb = artistThumbUrl(r.optJSONObject("thumbnail")?.optJSONObject("musicThumbnailRenderer"))
+            if (duration.isEmpty()) {
+                val subRuns = flex?.optJSONObject(1)
+                    ?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")?.optJSONObject("text")
+                    ?.optJSONArray("runs")
+                if (subRuns != null && subRuns.length() > 0) {
+                    val lastRunText = subRuns.optJSONObject(subRuns.length() - 1)?.optString("text", "")?.trim() ?: ""
+                    if (Regex("^\\d{1,2}:\\d{2}(?::\\d{2})?$").matches(lastRunText)) {
+                        duration = lastRunText
+                    }
+                }
+            }
+            val thumb = artistThumbUrl(
+                r.optJSONObject("thumbnail")?.optJSONObject("musicThumbnailRenderer")
+                    ?: r.optJSONObject("thumbnailRenderer")?.optJSONObject("musicThumbnailRenderer")
+            )
             out.add(TrackResult("video", videoId, title, artist, thumb, duration))
         }
         return out
@@ -2472,20 +2566,49 @@ class YouTubeMusicService @JvmOverloads constructor(
 
         val firstRoot = JSONObject(postInnerTubeBrowse(endpoint, buildLibraryBrowseBody(browseId, null), cookieHeader))
         val shelf = findPlaylistShelf(firstRoot)
-        shelf?.optJSONArray("contents")?.let { addRows(parseAlbumTrackRows(it)) }
-        var continuation = extractPlaylistShelfContinuation(shelf)
+        val initialContents = shelf?.optJSONArray("contents")
+        initialContents?.let { addRows(parseAlbumTrackRows(it)) }
+        var continuation = extractPlaylistShelfContinuation(shelf, initialContents, firstRoot)
 
         var guard = 0
-        while (out.size < target && continuation != null && guard < 12) {
+        while (out.size < target && continuation != null && guard < 500) {
             guard++
-            val contRoot = JSONObject(postInnerTubeBrowse(endpoint, buildLibraryBrowseBody(null, continuation), cookieHeader))
+            val responseBody = try {
+                val encodedToken = java.net.URLEncoder.encode(continuation, "UTF-8")
+                val contEndpoint = "https://music.youtube.com/youtubei/v1/browse?continuation=$encodedToken&prettyPrint=false"
+                postInnerTubeBrowse(contEndpoint, buildLibraryBrowseBody(null, continuation), cookieHeader)
+            } catch (e: Exception) {
+                Log.w(TAG, "Browse continuation query param failed, trying body only: ${e.message}")
+                try {
+                    postInnerTubeBrowse(endpoint, buildLibraryBrowseBody(null, continuation), cookieHeader)
+                } catch (e2: Exception) {
+                    Log.w(TAG, "Browse continuation failed completely: ${e2.message}")
+                    null
+                }
+            }
+            if (responseBody == null) break
+
+            val contRoot = try {
+                JSONObject(responseBody)
+            } catch (_: Exception) {
+                break
+            }
+
             val contShelf = contRoot.optJSONObject("continuationContents")
                 ?.optJSONObject("musicPlaylistShelfContinuation")
                 ?: contRoot.optJSONObject("continuationContents")?.optJSONObject("musicShelfContinuation")
-            val rows = contShelf?.optJSONArray("contents")?.let { parseAlbumTrackRows(it) } ?: emptyList()
-            if (rows.isEmpty()) break
-            addRows(rows)
-            continuation = extractPlaylistShelfContinuation(contShelf)
+                ?: contRoot.optJSONObject("continuationContents")?.optJSONObject("sectionListContinuation")
+
+            val contItems: JSONArray? = contShelf?.optJSONArray("contents")
+                ?: extractModernContinuationItems(contRoot)
+
+            val rows = contItems?.let { parseAlbumTrackRows(it) } ?: emptyList()
+            if (rows.isNotEmpty()) {
+                addRows(rows)
+            }
+            val nextCont = extractPlaylistShelfContinuation(contShelf, contItems, contRoot)
+            if (nextCont == null || nextCont == continuation) break
+            continuation = nextCont
         }
 
         return out
@@ -2505,9 +2628,9 @@ class YouTubeMusicService @JvmOverloads constructor(
                     ?.optJSONObject("sectionListRenderer")?.optJSONArray("contents")
                     ?.let { sectionLists.add(it) }
                 two.optJSONArray("tabs")?.optJSONObject(0)
-                    ?.optJSONObject("tabRenderer")?.optJSONObject("content")
-                    ?.optJSONObject("sectionListRenderer")?.optJSONArray("contents")
-                    ?.let { sectionLists.add(it) }
+                ?.optJSONObject("tabRenderer")?.optJSONObject("content")
+                ?.optJSONObject("sectionListRenderer")?.optJSONArray("contents")
+                ?.let { sectionLists.add(it) }
             }
         }
         for (sections in sectionLists) {
@@ -2521,12 +2644,105 @@ class YouTubeMusicService @JvmOverloads constructor(
         return null
     }
 
-    private fun extractPlaylistShelfContinuation(node: JSONObject?): String? {
-        val conts = node?.optJSONArray("continuations") ?: return null
-        for (i in 0 until conts.length()) {
-            val token = conts.optJSONObject(i)?.optJSONObject("nextContinuationData")
-                ?.optString("continuation", "")
+    private fun extractModernContinuationItems(root: JSONObject): JSONArray? {
+        val actions = root.optJSONArray("onResponseReceivedActions") ?: return null
+        for (i in 0 until actions.length()) {
+            val action = actions.optJSONObject(i) ?: continue
+            val appendAction = action.optJSONObject("appendContinuationItemsAction")
+                ?: action.optJSONObject("reloadContinuationItemsCommand")
+            val items = appendAction?.optJSONArray("continuationItems")
+            if (items != null) return items
+        }
+        return null
+    }
+
+    private fun extractPlaylistShelfContinuation(
+        node: JSONObject?,
+        items: JSONArray? = null,
+        root: JSONObject? = null
+    ): String? {
+        val conts = node?.optJSONArray("continuations")
+        if (conts != null) {
+            for (i in 0 until conts.length()) {
+                val cObj = conts.optJSONObject(i) ?: continue
+                val token = cObj.optJSONObject("nextContinuationData")?.optString("continuation", "")?.takeIf { it.isNotEmpty() }
+                    ?: cObj.optJSONObject("reloadContinuationData")?.optString("continuation", "")?.takeIf { it.isNotEmpty() }
+                    ?: cObj.optJSONObject("continuationEndpoint")?.optJSONObject("continuationCommand")?.optString("token", "")?.takeIf { it.isNotEmpty() }
+                    ?: cObj.optJSONObject("continuationEndpoint")?.optJSONObject("continuationCommand")?.optString("continuation", "")?.takeIf { it.isNotEmpty() }
+                    ?: cObj.optString("continuation", "").takeIf { it.isNotEmpty() }
+                    ?: cObj.optString("token", "").takeIf { it.isNotEmpty() }
+                if (!token.isNullOrEmpty()) return token
+            }
+        }
+        if (items != null && items.length() > 0) {
+            val token = extractContinuationTokenFromItems(items)
             if (!token.isNullOrEmpty()) return token
+        }
+        if (root != null) {
+            val cc = root.optJSONObject("continuationContents")
+            val psc = cc?.optJSONObject("musicPlaylistShelfContinuation")
+                ?: cc?.optJSONObject("musicShelfContinuation")
+                ?: cc?.optJSONObject("sectionListContinuation")
+            if (psc != null) {
+                val fromPsc = extractPlaylistShelfContinuation(psc, psc.optJSONArray("contents"), null)
+                if (!fromPsc.isNullOrEmpty()) return fromPsc
+            }
+            val modernItems = extractModernContinuationItems(root)
+            if (modernItems != null && modernItems.length() > 0) {
+                val token = extractContinuationTokenFromItems(modernItems)
+                if (!token.isNullOrEmpty()) return token
+            }
+            // Check sectionListRenderer in root
+            val sectionLists = mutableListOf<JSONArray>()
+            root.optJSONObject("contents")?.let { contents ->
+                contents.optJSONObject("singleColumnBrowseResultsRenderer")
+                    ?.optJSONArray("tabs")?.optJSONObject(0)
+                    ?.optJSONObject("tabRenderer")?.optJSONObject("content")
+                    ?.optJSONObject("sectionListRenderer")?.optJSONArray("contents")
+                    ?.let { sectionLists.add(it) }
+                contents.optJSONObject("twoColumnBrowseResultsRenderer")?.let { two ->
+                    two.optJSONObject("secondaryContents")
+                        ?.optJSONObject("sectionListRenderer")?.optJSONArray("contents")
+                        ?.let { sectionLists.add(it) }
+                    two.optJSONArray("tabs")?.optJSONObject(0)
+                        ?.optJSONObject("tabRenderer")?.optJSONObject("content")
+                        ?.optJSONObject("sectionListRenderer")?.optJSONArray("contents")
+                        ?.let { sectionLists.add(it) }
+                }
+            }
+            for (secs in sectionLists) {
+                val token = extractContinuationTokenFromItems(secs)
+                if (!token.isNullOrEmpty()) return token
+            }
+            // Deep search fallback
+            val deepToken = findContinuationTokenDeep(root)
+            if (!deepToken.isNullOrEmpty()) return deepToken
+        }
+        return null
+    }
+
+    private fun findContinuationTokenDeep(json: Any?, depth: Int = 0): String? {
+        if (depth > 8 || json == null) return null
+        if (json is JSONObject) {
+            val nextCont = json.optJSONObject("nextContinuationData")
+                ?.optString("continuation", "")?.takeIf { it.isNotEmpty() }
+            if (nextCont != null) return nextCont
+            val cmd = json.optJSONObject("continuationCommand")
+            val cmdToken = cmd?.optString("token", "")?.takeIf { it.isNotEmpty() }
+                ?: cmd?.optString("continuation", "")?.takeIf { it.isNotEmpty() }
+            if (cmdToken != null) return cmdToken
+            val keys = json.keys()
+            while (keys.hasNext()) {
+                val key = keys.next()
+                if (key == "client" || key == "responseContext" || key == "trackingParams") continue
+                val res = findContinuationTokenDeep(json.opt(key), depth + 1)
+                if (res != null) return res
+            }
+        } else if (json is JSONArray) {
+            for (i in json.length() - 1 downTo 0) {
+                val res = findContinuationTokenDeep(json.opt(i), depth + 1)
+                if (res != null) return res
+            }
         }
         return null
     }
