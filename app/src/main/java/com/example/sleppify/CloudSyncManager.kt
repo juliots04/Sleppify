@@ -121,6 +121,7 @@ class CloudSyncManager private constructor(context: Context) {
     private fun ensureEqDefaults() {
         eqPrefs.putDefaults {
             bool(AudioEffectsService.KEY_ENABLED, false)
+            bool(AudioEffectsService.KEY_APPLY_GLOBAL, true)
             bool(AudioEffectsService.KEY_SPATIAL_ENABLED, false)
             int(AudioEffectsService.KEY_SPATIAL_STRENGTH, AudioEffectsService.SPATIAL_STRENGTH_DEFAULT)
             int(AudioEffectsService.KEY_REVERB_LEVEL, AudioEffectsService.REVERB_LEVEL_OFF)
@@ -148,6 +149,7 @@ class CloudSyncManager private constructor(context: Context) {
             bool(KEY_WIFI_ONLY_PLAYBACK, false)
             bool(KEY_NO_MUSIC_VIDEOS, true)
             bool(KEY_NO_PODCAST_VIDEOS, false)
+            bool(KEY_AUTO_DOWNLOAD_PLAYED_SONGS, true)
         }
     }
 
@@ -1695,6 +1697,7 @@ class CloudSyncManager private constructor(context: Context) {
 
         @JvmField val KEY_DOWNLOAD_CANVAS_ENABLED = "download_canvas_enabled"
         @JvmField val KEY_GAPLESS_PLAYBACK = "gapless_playback_enabled"
+        @JvmField val KEY_AUTO_DOWNLOAD_PLAYED_SONGS = "auto_download_played_songs"
 
         private const val USERS_COLLECTION = "users"
         private const val APP_SCOPE_COLLECTION = "sleppify"

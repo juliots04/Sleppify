@@ -40,10 +40,10 @@ object StreamResolver {
     // Preferred audio itags: 141=AAC256k, 140=AAC128k, 251=Opus160k, 250=Opus70k, 249=Opus50k
     private val PREFERRED_ITAGS = intArrayOf(141, 140, 251, 250, 249)
 
-    private val ITAGS_LOW = intArrayOf(249, 250)           // Opus 50k, 70k
-    private val ITAGS_MEDIUM = intArrayOf(250, 140, 249)   // Opus 70k, AAC 128k, Opus 50k
-    private val ITAGS_HIGH = intArrayOf(251, 140, 250)     // Opus 160k, AAC 128k, Opus 70k
-    private val ITAGS_VERY_HIGH = intArrayOf(141, 251, 140) // AAC 256k, Opus 160k, AAC 128k
+    internal val ITAGS_LOW = intArrayOf(249, 250)           // Opus 50k, 70k
+    internal val ITAGS_MEDIUM = intArrayOf(250, 140, 249)   // Opus 70k, AAC 128k, Opus 50k
+    internal val ITAGS_HIGH = intArrayOf(251, 140, 250)     // Opus 160k, AAC 128k, Opus 70k
+    internal val ITAGS_VERY_HIGH = intArrayOf(141, 251, 140) // AAC 256k, Opus 160k, AAC 128k
 
     @Volatile private var authCookieHeader: String = ""
     private val newPipeInitialized = AtomicBoolean(false)
@@ -463,7 +463,8 @@ object StreamResolver {
      * Returns the preferred itag order based on the user's quality preference
      * for the current network type (WiFi vs mobile data).
      */
-    private fun getPreferredItags(context: Context): IntArray {
+    @JvmStatic
+    fun getPreferredItags(context: Context): IntArray {
         val prefs = context.getSharedPreferences(AppConstants.PREFS_SETTINGS, Context.MODE_PRIVATE)
         val onWifi = isOnWifi(context)
         val qualityKey = if (onWifi) CloudSyncManager.KEY_STREAMING_QUALITY_WIFI
@@ -485,6 +486,7 @@ object StreamResolver {
             ?: return false
         val caps = cm.getNetworkCapabilities(cm.activeNetwork) ?: return false
         return caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)
+            || caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_ETHERNET)
     }
 
     /**

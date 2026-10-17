@@ -3,6 +3,8 @@ package com.example.sleppify
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import android.content.res.ColorStateList
+import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.os.Build
 import android.os.Bundle
@@ -49,7 +51,6 @@ class SettingsFragment : Fragment() {
         private const val SECTION_DOWNLOADS = 2
         private const val SECTION_HISTORY = 3
         private const val SECTION_ACCOUNT = 4
-        private const val SECTION_DATA_SAVER = 5
         private const val HISTORY_PAGE_SIZE = 20
         private const val HISTORY_DAY_VISIBLE_LIMIT = 20
         // Única fuente de verdad de la clave: OfflineAudioStore (quien la consume al descargar).
@@ -82,7 +83,6 @@ class SettingsFragment : Fragment() {
     private lateinit var sectionDownloads: View
     private lateinit var sectionHistory: View
     private lateinit var sectionAccount: View
-    private lateinit var sectionDataSaver: View
 
     // Playback sub-section
     private lateinit var sbPlaybackCrossfade: SeekBar
@@ -90,15 +90,27 @@ class SettingsFragment : Fragment() {
     private lateinit var swPlaybackGapless: MaterialSwitch
     private lateinit var swPlaybackOffline: MaterialSwitch
     private lateinit var swPlaybackEqGlobal: MaterialSwitch
+    private lateinit var tvQualityMobileValue: TextView
+    private lateinit var tvQualityWifiValue: TextView
+    private lateinit var tvVideoQualityMobileValue: TextView
+    private lateinit var tvVideoQualityWifiValue: TextView
+    private lateinit var swLimitMobileData: MaterialSwitch
+    private lateinit var swWifiOnlyPlayback: MaterialSwitch
+    private lateinit var swNoMusicVideos: MaterialSwitch
 
     // Downloads sub-section
     private lateinit var tvDownloadsStorageFree: TextView
     private lateinit var tvDownloadsStorageUsed: TextView
     private lateinit var pbStorageInternal: ProgressBar
+    private lateinit var sectionSdStorage: View
     private lateinit var tvDownloadsSdFree: TextView
     private lateinit var tvDownloadsSdUsed: TextView
     private lateinit var pbStorageSd: ProgressBar
+    private lateinit var rowUseSdCard: View
+    private lateinit var tvUseSdCardSubtitle: TextView
     private lateinit var swUseSdCard: MaterialSwitch
+    private lateinit var rowAutoDownloadOnPlay: View
+    private lateinit var swAutoDownloadOnPlay: MaterialSwitch
     private lateinit var swShowDeviceFiles: MaterialSwitch
     private lateinit var swDownloadWifiOnly: MaterialSwitch
     private lateinit var tvDownloadsDeleteTitle: TextView
@@ -108,15 +120,6 @@ class SettingsFragment : Fragment() {
     private lateinit var tvHistoryEmpty: TextView
     private var historyAdapter: HistoryAdapter? = null
     private var historyLoaded = 0
-
-    // Data saver sub-section
-    private lateinit var tvQualityMobileValue: TextView
-    private lateinit var tvQualityWifiValue: TextView
-    private lateinit var tvVideoQualityMobileValue: TextView
-    private lateinit var tvVideoQualityWifiValue: TextView
-    private lateinit var swLimitMobileData: MaterialSwitch
-    private lateinit var swWifiOnlyPlayback: MaterialSwitch
-    private lateinit var swNoMusicVideos: MaterialSwitch
 
     // Account sub-section
     private lateinit var ivAccountPhoto: ShapeableImageView
@@ -215,14 +218,12 @@ class SettingsFragment : Fragment() {
         sectionRoot = view.findViewById(R.id.settingsRoot)
         sectionPlayback = view.findViewById(R.id.settingsPlayback)
         sectionDownloads = view.findViewById(R.id.settingsDownloads)
-        sectionDataSaver = view.findViewById(R.id.settingsDataSaver)
         sectionHistory = view.findViewById(R.id.settingsHistory)
         sectionAccount = view.findViewById(R.id.settingsAccount)
 
         setupRootSection(view)
         setupPlaybackSection(view)
         setupDownloadsSection(view)
-        setupDataSaverSection(view)
         setupHistorySection(view)
         setupAccountSection(view)
 
@@ -280,6 +281,7 @@ class SettingsFragment : Fragment() {
             }
         }
         if (currentSection == SECTION_PLAYBACK) renderPlaybackSection()
+        if (currentSection == SECTION_DOWNLOADS) renderDownloadsSection()
         if (currentSection == SECTION_ACCOUNT) renderAccountSection()
     }
 
@@ -338,14 +340,12 @@ class SettingsFragment : Fragment() {
         sectionRoot.visibility = if (section == SECTION_ROOT) View.VISIBLE else View.GONE
         sectionPlayback.visibility = if (section == SECTION_PLAYBACK) View.VISIBLE else View.GONE
         sectionDownloads.visibility = if (section == SECTION_DOWNLOADS) View.VISIBLE else View.GONE
-        sectionDataSaver.visibility = if (section == SECTION_DATA_SAVER) View.VISIBLE else View.GONE
         sectionHistory.visibility = if (section == SECTION_HISTORY) View.VISIBLE else View.GONE
         sectionAccount.visibility = if (section == SECTION_ACCOUNT) View.VISIBLE else View.GONE
 
         tvToolbarTitle.text = when (section) {
             SECTION_PLAYBACK -> "Reproducción"
             SECTION_DOWNLOADS -> "Descargas y almacenamiento"
-            SECTION_DATA_SAVER -> "Ahorro de datos"
             SECTION_HISTORY -> "Historial"
             SECTION_ACCOUNT -> "Cuenta"
             else -> "Configuración"
@@ -355,7 +355,6 @@ class SettingsFragment : Fragment() {
         when (section) {
             SECTION_PLAYBACK -> sectionPlayback.findViewById<ScrollView>(R.id.svSettingsPlayback)?.scrollTo(0, 0)
             SECTION_DOWNLOADS -> sectionDownloads.findViewById<ScrollView>(R.id.svSettingsDownloads)?.scrollTo(0, 0)
-            SECTION_DATA_SAVER -> sectionDataSaver.findViewById<ScrollView>(R.id.svSettingsDataSaver)?.scrollTo(0, 0)
             SECTION_HISTORY -> rvHistory.scrollToPosition(0)
             SECTION_ACCOUNT -> sectionAccount.findViewById<ScrollView>(R.id.svSettingsAccount)?.scrollTo(0, 0)
         }
@@ -364,7 +363,6 @@ class SettingsFragment : Fragment() {
         when (section) {
             SECTION_PLAYBACK -> renderPlaybackSection()
             SECTION_DOWNLOADS -> renderDownloadsSection()
-            SECTION_DATA_SAVER -> renderDataSaverSection()
             SECTION_HISTORY -> loadHistory(reset = true)
             SECTION_ACCOUNT -> renderAccountSection()
         }
@@ -385,7 +383,6 @@ class SettingsFragment : Fragment() {
     private fun setupRootSection(view: View) {
         view.findViewById<View>(R.id.rowSettingsPlayback)?.setOnClickListener { showSection(SECTION_PLAYBACK) }
         view.findViewById<View>(R.id.rowSettingsDownloads)?.setOnClickListener { showSection(SECTION_DOWNLOADS) }
-        view.findViewById<View>(R.id.rowSettingsDataSaver)?.setOnClickListener { showSection(SECTION_DATA_SAVER) }
         view.findViewById<View>(R.id.rowSettingsHistory)?.setOnClickListener { showSection(SECTION_HISTORY) }
         view.findViewById<View>(R.id.rowSettingsAccount)?.setOnClickListener { showSection(SECTION_ACCOUNT) }
     }
@@ -402,6 +399,29 @@ class SettingsFragment : Fragment() {
         view.findViewById<View>(R.id.rowPlaybackEqualizer)?.setOnClickListener {
             (activity as? MainActivity)?.openEqualizerFromSettings()
         }
+
+        // Calidad de audio
+        tvQualityMobileValue = view.findViewById(R.id.tvQualityMobileValue)
+        tvQualityWifiValue = view.findViewById(R.id.tvQualityWifiValue)
+        view.findViewById<View>(R.id.rowQualityMobile)?.setOnClickListener {
+            showQualityDialog(CloudSyncManager.KEY_STREAMING_QUALITY_MOBILE, "Calidad del audio en redes móviles", tvQualityMobileValue, audioQualityOptions, audioQualityLabels)
+        }
+        view.findViewById<View>(R.id.rowQualityWifi)?.setOnClickListener {
+            showQualityDialog(CloudSyncManager.KEY_STREAMING_QUALITY_WIFI, "Calidad del audio con Wi-Fi", tvQualityWifiValue, audioQualityOptions, audioQualityLabels)
+        }
+
+        // Video y datos
+        tvVideoQualityMobileValue = view.findViewById(R.id.tvVideoQualityMobileValue)
+        tvVideoQualityWifiValue = view.findViewById(R.id.tvVideoQualityWifiValue)
+        view.findViewById<View>(R.id.rowVideoQualityMobile)?.setOnClickListener {
+            showQualityDialog(CloudSyncManager.KEY_VIDEO_QUALITY_MOBILE, "Calidad de video en redes móviles", tvVideoQualityMobileValue, videoQualityOptions, videoQualityLabels)
+        }
+        view.findViewById<View>(R.id.rowVideoQualityWifi)?.setOnClickListener {
+            showQualityDialog(CloudSyncManager.KEY_VIDEO_QUALITY_WIFI, "Calidad de video con Wi-Fi", tvVideoQualityWifiValue, videoQualityOptions, videoQualityLabels)
+        }
+        swNoMusicVideos = view.findViewById(R.id.swNoMusicVideos)
+        swLimitMobileData = view.findViewById(R.id.swLimitMobileData)
+        swWifiOnlyPlayback = view.findViewById(R.id.swWifiOnlyPlayback)
     }
 
     private fun renderPlaybackSection() {
@@ -411,6 +431,9 @@ class SettingsFragment : Fragment() {
         val offlineMode = settingsPrefs.getBoolean(CloudSyncManager.KEY_OFFLINE_MODE_ENABLED, false)
 
         sbPlaybackCrossfade.apply {
+            progressTintList = ColorStateList.valueOf(Color.WHITE)
+            thumbTintList = ColorStateList.valueOf(Color.WHITE)
+            progressBackgroundTintList = ColorStateList.valueOf(Color.parseColor("#40FFFFFF"))
             setOnSeekBarChangeListener(null)
             max = 12; progress = crossfade
             tvPlaybackCrossfadeValue.text = if (crossfade == 0) "off" else "${crossfade}s"
@@ -447,6 +470,51 @@ class SettingsFragment : Fragment() {
                 AudioEffectsService.sendApply(requireContext().applicationContext)
             }
         }
+
+        // Calidad de audio
+        tvQualityMobileValue.text = qualityDisplayName(
+            settingsPrefs.getString(CloudSyncManager.KEY_STREAMING_QUALITY_MOBILE, CloudSyncManager.STREAMING_QUALITY_MEDIUM) ?: CloudSyncManager.STREAMING_QUALITY_MEDIUM
+        )
+        tvQualityWifiValue.text = qualityDisplayName(
+            settingsPrefs.getString(CloudSyncManager.KEY_STREAMING_QUALITY_WIFI, CloudSyncManager.STREAMING_QUALITY_MEDIUM) ?: CloudSyncManager.STREAMING_QUALITY_MEDIUM
+        )
+
+        // Calidad de video
+        tvVideoQualityMobileValue.text = videoQualityDisplayName(
+            settingsPrefs.getString(CloudSyncManager.KEY_VIDEO_QUALITY_MOBILE, CloudSyncManager.STREAMING_QUALITY_MEDIUM) ?: CloudSyncManager.STREAMING_QUALITY_MEDIUM
+        )
+        tvVideoQualityWifiValue.text = videoQualityDisplayName(
+            settingsPrefs.getString(CloudSyncManager.KEY_VIDEO_QUALITY_WIFI, CloudSyncManager.STREAMING_QUALITY_MEDIUM) ?: CloudSyncManager.STREAMING_QUALITY_MEDIUM
+        )
+
+        swNoMusicVideos.apply {
+            setOnCheckedChangeListener(null)
+            isChecked = settingsPrefs.getBoolean(CloudSyncManager.KEY_NO_MUSIC_VIDEOS, true)
+            setOnCheckedChangeListener { _, c ->
+                settingsPrefs.edit().putBoolean(CloudSyncManager.KEY_NO_MUSIC_VIDEOS, c).apply()
+                val player = parentFragmentManager
+                    .findFragmentByTag(AppConstants.TAG_SONG_PLAYER) as? SongPlayerFragment
+                if (player != null && player.isAdded) {
+                    player.applyNoMusicVideosSetting()
+                }
+            }
+        }
+
+        swLimitMobileData.apply {
+            setOnCheckedChangeListener(null)
+            isChecked = settingsPrefs.getBoolean(CloudSyncManager.KEY_LIMIT_MOBILE_DATA, false)
+            setOnCheckedChangeListener { _, c ->
+                settingsPrefs.edit().putBoolean(CloudSyncManager.KEY_LIMIT_MOBILE_DATA, c).apply()
+            }
+        }
+
+        swWifiOnlyPlayback.apply {
+            setOnCheckedChangeListener(null)
+            isChecked = settingsPrefs.getBoolean(CloudSyncManager.KEY_WIFI_ONLY_PLAYBACK, false)
+            setOnCheckedChangeListener { _, c ->
+                settingsPrefs.edit().putBoolean(CloudSyncManager.KEY_WIFI_ONLY_PLAYBACK, c).apply()
+            }
+        }
     }
 
     // --- Downloads section ---
@@ -455,10 +523,16 @@ class SettingsFragment : Fragment() {
         tvDownloadsStorageFree = view.findViewById(R.id.tvDownloadsStorageFree)
         tvDownloadsStorageUsed = view.findViewById(R.id.tvDownloadsStorageUsed)
         pbStorageInternal = view.findViewById(R.id.pbStorageInternal)
+        sectionSdStorage = view.findViewById(R.id.sectionSdStorage)
         tvDownloadsSdFree = view.findViewById(R.id.tvDownloadsSdFree)
         tvDownloadsSdUsed = view.findViewById(R.id.tvDownloadsSdUsed)
         pbStorageSd = view.findViewById(R.id.pbStorageSd)
+        rowUseSdCard = view.findViewById(R.id.rowUseSdCard)
+        tvUseSdCardSubtitle = view.findViewById(R.id.tvUseSdCardSubtitle)
         swUseSdCard = view.findViewById(R.id.swUseSdCard)
+        rowAutoDownloadOnPlay = view.findViewById(R.id.rowAutoDownloadOnPlay)
+        swAutoDownloadOnPlay = view.findViewById(R.id.swAutoDownloadOnPlay)
+        rowAutoDownloadOnPlay.setOnClickListener { swAutoDownloadOnPlay.toggle() }
         swShowDeviceFiles = view.findViewById(R.id.swShowDeviceFiles)
         swDownloadWifiOnly = view.findViewById(R.id.swDownloadWifiOnly)
         tvDownloadsDeleteTitle = view.findViewById(R.id.tvDownloadsDeleteTitle)
@@ -466,11 +540,63 @@ class SettingsFragment : Fragment() {
         view.findViewById<View>(R.id.rowDownloadsDelete)?.setOnClickListener { showDeleteAllDownloadsConfirmation() }
     }
 
+    private fun applySdDisabledState() {
+        sectionSdStorage.visibility = View.GONE
+        tvUseSdCardSubtitle.text = "Descargar contenido en la tarjeta SD"
+        rowUseSdCard.alpha = 1.0f
+        rowUseSdCard.setOnClickListener(null)
+        rowUseSdCard.isClickable = false
+        swUseSdCard.apply {
+            setOnCheckedChangeListener(null)
+            isChecked = false
+            isEnabled = false
+        }
+    }
+
+    private fun applySdEnabledState() {
+        tvUseSdCardSubtitle.text = "Descargar contenido en la tarjeta SD"
+        rowUseSdCard.alpha = 1.0f
+        rowUseSdCard.isClickable = true
+        rowUseSdCard.isEnabled = true
+        val useSd = settingsPrefs.getBoolean(KEY_USE_SD_CARD, false)
+        swUseSdCard.apply {
+            isEnabled = true
+            setOnCheckedChangeListener(null)
+            isChecked = useSd
+            setOnCheckedChangeListener { _, c ->
+                if (c && !OfflineAudioStore.hasSdCard(requireContext())) {
+                    setOnCheckedChangeListener(null)
+                    isChecked = false
+                    settingsPrefs.edit().putBoolean(KEY_USE_SD_CARD, false).apply()
+                    applySdDisabledState()
+                    return@setOnCheckedChangeListener
+                }
+                settingsPrefs.edit().putBoolean(KEY_USE_SD_CARD, c).apply()
+                OfflineAudioStore.clearOfflineAudioStateCache()
+            }
+        }
+        rowUseSdCard.setOnClickListener {
+            if (swUseSdCard.isEnabled) {
+                swUseSdCard.toggle()
+            }
+        }
+    }
+
     private fun renderDownloadsSection() {
         if (!isAdded) return
+        val appCtx = requireContext().applicationContext
+
+        // Verificación inicial inmediata para evitar saltos o parpadeos en la UI
+        val hasSdInitial = OfflineAudioStore.hasSdCard(appCtx)
+        if (!hasSdInitial) {
+            settingsPrefs.edit().putBoolean(KEY_USE_SD_CARD, false).apply()
+            applySdDisabledState()
+        } else {
+            applySdEnabledState()
+        }
+
         // Storage info. "En uso" = lo que OCUPA LA APP en ese volumen (descargas + caches),
         // no el uso total del dispositivo; la barra muestra ese uso relativo al volumen.
-        val appCtx = requireContext().applicationContext
         viewLifecycleOwner.lifecycleScope.launch(Dispatchers.IO) {
             // Internal volume totals
             val stat = try { StatFs(Environment.getDataDirectory().absolutePath) } catch (_: Exception) { null }
@@ -490,16 +616,20 @@ class SettingsFragment : Fragment() {
                     ?.firstOrNull { Environment.getExternalStorageState(it) == Environment.MEDIA_MOUNTED }
             } catch (_: Exception) { null }
             val sdStat = sdFilesDir?.let { try { StatFs(it.absolutePath) } catch (_: Exception) { null } }
+            val hasValidSd = sdFilesDir != null && sdStat != null && sdStat.totalBytes > 0L
+
             val totalSd = sdStat?.totalBytes ?: 1L
             val freeSd = sdStat?.availableBytes ?: 0L
 
             // App usage on the SD volume: downloads there + any external cache on that card.
-            val sdDownloads = sdFilesDir?.let { calculateSize(File(it, "offline_audio")) } ?: 0L
-            val sdCaches = try {
-                appCtx.externalCacheDirs?.drop(1)?.filterNotNull()?.sumOf { calculateSize(it) } ?: 0L
-            } catch (_: Exception) { 0L }
+            val sdDownloads = if (hasValidSd) calculateSize(File(sdFilesDir, "offline_audio")) else 0L
+            val sdCaches = if (hasValidSd) {
+                try {
+                    appCtx.externalCacheDirs?.drop(1)?.filterNotNull()?.sumOf { calculateSize(it) } ?: 0L
+                } catch (_: Exception) { 0L }
+            } else 0L
             val appUsedSd = sdDownloads + sdCaches
-            val sdPercent = if (sdStat != null) appUsagePercent(appUsedSd, totalSd) else 0
+            val sdPercent = if (hasValidSd) appUsagePercent(appUsedSd, totalSd) else 0
 
             withContext(Dispatchers.Main) {
                 if (!isAdded) return@withContext
@@ -507,38 +637,29 @@ class SettingsFragment : Fragment() {
                 tvDownloadsStorageUsed.text = "${formatSize(appUsedInternal)} en uso"
                 pbStorageInternal.progress = internalPercent
 
-                if (sdStat != null) {
+                if (hasValidSd) {
+                    sectionSdStorage.visibility = View.VISIBLE
                     tvDownloadsSdFree.text = "${formatSize(freeSd)} libres"
                     tvDownloadsSdUsed.text = "${formatSize(appUsedSd)} en uso"
                     pbStorageSd.progress = sdPercent
+                    applySdEnabledState()
                 } else {
-                    tvDownloadsSdFree.text = "No disponible"
-                    tvDownloadsSdUsed.text = ""
-                    pbStorageSd.progress = 0
+                    settingsPrefs.edit().putBoolean(KEY_USE_SD_CARD, false).apply()
+                    applySdDisabledState()
                 }
-            }
-        }
-
-        // SD card switch — OfflineAudioStore lee esta pref para decidir el volumen de escritura.
-        val useSd = settingsPrefs.getBoolean(KEY_USE_SD_CARD, false)
-        swUseSdCard.apply {
-            setOnCheckedChangeListener(null); isChecked = useSd
-            setOnCheckedChangeListener { _, c ->
-                if (c && !OfflineAudioStore.hasSdCard(requireContext())) {
-                    // Sin SD montada no hay nada que activar — el switch vuelve solo.
-                    setOnCheckedChangeListener(null); isChecked = false
-                    renderDownloadsSection()
-                    AppSnackbar.show(activity, "No se detectó una tarjeta SD")
-                    return@setOnCheckedChangeListener
-                }
-                settingsPrefs.edit().putBoolean(KEY_USE_SD_CARD, c).apply()
-                // Los estados cacheados siguen siendo válidos (los lookups recorren ambos
-                // volúmenes), pero limpiar es barato y evita cualquier residuo de rutas.
-                OfflineAudioStore.clearOfflineAudioStateCache()
             }
         }
 
         // Switches
+        val autoDownload = settingsPrefs.getBoolean(CloudSyncManager.KEY_AUTO_DOWNLOAD_PLAYED_SONGS, true)
+        swAutoDownloadOnPlay.apply {
+            setOnCheckedChangeListener(null)
+            isChecked = autoDownload
+            setOnCheckedChangeListener { _, c ->
+                settingsPrefs.edit().putBoolean(CloudSyncManager.KEY_AUTO_DOWNLOAD_PLAYED_SONGS, c).apply()
+            }
+        }
+
         renderShowDeviceFiles()
 
         val wifiOnly = !settingsPrefs.getBoolean(CloudSyncManager.KEY_OFFLINE_DOWNLOAD_ALLOW_MOBILE_DATA, false)
@@ -582,76 +703,7 @@ class SettingsFragment : Fragment() {
         }
     }
 
-    // --- Data saver section ---
 
-    private fun setupDataSaverSection(view: View) {
-        tvQualityMobileValue = view.findViewById(R.id.tvQualityMobileValue)
-        tvQualityWifiValue = view.findViewById(R.id.tvQualityWifiValue)
-        tvVideoQualityMobileValue = view.findViewById(R.id.tvVideoQualityMobileValue)
-        tvVideoQualityWifiValue = view.findViewById(R.id.tvVideoQualityWifiValue)
-        swLimitMobileData = view.findViewById(R.id.swLimitMobileData)
-        swWifiOnlyPlayback = view.findViewById(R.id.swWifiOnlyPlayback)
-        swNoMusicVideos = view.findViewById(R.id.swNoMusicVideos)
-
-        view.findViewById<View>(R.id.rowQualityMobile)?.setOnClickListener {
-            showQualityDialog(CloudSyncManager.KEY_STREAMING_QUALITY_MOBILE, "Calidad del audio en redes móviles", tvQualityMobileValue, audioQualityOptions, audioQualityLabels)
-        }
-        view.findViewById<View>(R.id.rowQualityWifi)?.setOnClickListener {
-            showQualityDialog(CloudSyncManager.KEY_STREAMING_QUALITY_WIFI, "Calidad del audio con Wi-Fi", tvQualityWifiValue, audioQualityOptions, audioQualityLabels)
-        }
-        view.findViewById<View>(R.id.rowVideoQualityMobile)?.setOnClickListener {
-            showQualityDialog(CloudSyncManager.KEY_VIDEO_QUALITY_MOBILE, "Calidad de video en redes móviles", tvVideoQualityMobileValue, videoQualityOptions, videoQualityLabels)
-        }
-        view.findViewById<View>(R.id.rowVideoQualityWifi)?.setOnClickListener {
-            showQualityDialog(CloudSyncManager.KEY_VIDEO_QUALITY_WIFI, "Calidad de video con Wi-Fi", tvVideoQualityWifiValue, videoQualityOptions, videoQualityLabels)
-        }
-    }
-
-    private fun renderDataSaverSection() {
-        if (!isAdded) return
-        tvQualityMobileValue.text = qualityDisplayName(
-            settingsPrefs.getString(CloudSyncManager.KEY_STREAMING_QUALITY_MOBILE, CloudSyncManager.STREAMING_QUALITY_MEDIUM) ?: CloudSyncManager.STREAMING_QUALITY_MEDIUM
-        )
-        tvQualityWifiValue.text = qualityDisplayName(
-            settingsPrefs.getString(CloudSyncManager.KEY_STREAMING_QUALITY_WIFI, CloudSyncManager.STREAMING_QUALITY_MEDIUM) ?: CloudSyncManager.STREAMING_QUALITY_MEDIUM
-        )
-        tvVideoQualityMobileValue.text = videoQualityDisplayName(
-            settingsPrefs.getString(CloudSyncManager.KEY_VIDEO_QUALITY_MOBILE, CloudSyncManager.STREAMING_QUALITY_MEDIUM) ?: CloudSyncManager.STREAMING_QUALITY_MEDIUM
-        )
-        tvVideoQualityWifiValue.text = videoQualityDisplayName(
-            settingsPrefs.getString(CloudSyncManager.KEY_VIDEO_QUALITY_WIFI, CloudSyncManager.STREAMING_QUALITY_MEDIUM) ?: CloudSyncManager.STREAMING_QUALITY_MEDIUM
-        )
-
-        swLimitMobileData.apply {
-            setOnCheckedChangeListener(null)
-            isChecked = settingsPrefs.getBoolean(CloudSyncManager.KEY_LIMIT_MOBILE_DATA, false)
-            setOnCheckedChangeListener { _, c ->
-                settingsPrefs.edit().putBoolean(CloudSyncManager.KEY_LIMIT_MOBILE_DATA, c).apply()
-            }
-        }
-        swWifiOnlyPlayback.apply {
-            setOnCheckedChangeListener(null)
-            isChecked = settingsPrefs.getBoolean(CloudSyncManager.KEY_WIFI_ONLY_PLAYBACK, false)
-            setOnCheckedChangeListener { _, c ->
-                settingsPrefs.edit().putBoolean(CloudSyncManager.KEY_WIFI_ONLY_PLAYBACK, c).apply()
-            }
-        }
-        swNoMusicVideos.apply {
-            setOnCheckedChangeListener(null)
-            isChecked = settingsPrefs.getBoolean(CloudSyncManager.KEY_NO_MUSIC_VIDEOS, true)
-            setOnCheckedChangeListener { _, c ->
-                settingsPrefs.edit().putBoolean(CloudSyncManager.KEY_NO_MUSIC_VIDEOS, c).apply()
-                // Candado en vivo: si el player está montado, aplica ya (oculta/muestra la
-                // pastilla Canción|Video y, si un video está sonando, vuelve a canción en
-                // caliente). Si no está montado, onViewCreated del player lo aplica al montar.
-                val player = parentFragmentManager
-                    .findFragmentByTag(AppConstants.TAG_SONG_PLAYER) as? SongPlayerFragment
-                if (player != null && player.isAdded) {
-                    player.applyNoMusicVideosSetting()
-                }
-            }
-        }
-    }
 
     private fun qualityDisplayName(key: String): String = when (key) {
         CloudSyncManager.STREAMING_QUALITY_LOW -> "Baja"
@@ -1218,12 +1270,25 @@ class SettingsFragment : Fragment() {
 
     private fun showDeleteAllDownloadsConfirmation() {
         if (!isAdded || downloadCleanupInFlight) return
-        MaterialAlertDialogBuilder(requireContext())
-            .setTitle("Borrar descargas")
-            .setMessage("Se eliminarán todos los archivos de audio descargados.\n\nEsta acción no se puede deshacer.")
-            .setNegativeButton("Cancelar", null)
-            .setPositiveButton("Eliminar todo") { _, _ -> performDeleteAllDownloads() }
-            .show()
+        val appContext = requireContext().applicationContext
+        viewLifecycleOwner.lifecycleScope.launch {
+            val totalBytes = withContext(Dispatchers.IO) {
+                OfflineAudioStore.getDownloadsTotalBytes(appContext)
+            }
+            if (!isAdded) return@launch
+            val formattedSize = formatSize(totalBytes)
+            val message = if (totalBytes > 0L) {
+                "Se eliminarán todos los archivos de audio descargados.\nSe liberarán $formattedSize de espacio.\n\nEsta acción no se puede deshacer."
+            } else {
+                "Se eliminarán todos los archivos de audio descargados.\n\nEsta acción no se puede deshacer."
+            }
+            MaterialAlertDialogBuilder(requireContext())
+                .setTitle("Borrar descargas")
+                .setMessage(message)
+                .setNegativeButton("Cancelar", null)
+                .setPositiveButton("Eliminar todo") { _, _ -> performDeleteAllDownloads() }
+                .show()
+        }
     }
 
     private fun performDeleteAllDownloads() {
@@ -1254,7 +1319,13 @@ class SettingsFragment : Fragment() {
 
     private fun formatSize(b: Long): String {
         val mb = b / (1024.0 * 1024.0)
-        return if (mb < 1024.0) "%.0f MB".format(mb) else "%.2f GB".format(mb / 1024.0)
+        return when {
+            b <= 0L -> "0 MB"
+            mb < 0.1 -> "< 1 MB"
+            mb < 10.0 -> "%.1f MB".format(mb)
+            mb < 1024.0 -> "%.0f MB".format(mb)
+            else -> "%.2f GB".format(mb / 1024.0)
+        }
     }
 
     /** % de la barra: uso de la app relativo al volumen; nunca 0 si hay algo ocupado. */

@@ -2346,11 +2346,18 @@ public class SongPlayerFragment extends Fragment {
         final Context appContext = requireContext().getApplicationContext();
         if (OfflineAudioStore.hasOfflineAudio(appContext, normalized)) return;
 
+        // Respect the user's auto-download setting: only save streamed tracks automatically
+        // when the setting is enabled (default true). If disabled, prebuffer still works
+        // but no track is saved offline unless manually requested.
+        android.content.SharedPreferences settingsPrefsForSave =
+                appContext.getSharedPreferences(CloudSyncManager.PREFS_SETTINGS, Context.MODE_PRIVATE);
+        boolean autoDownload =
+                settingsPrefsForSave.getBoolean(CloudSyncManager.KEY_AUTO_DOWNLOAD_PLAYED_SONGS, true);
+        if (!autoDownload) return;
+
         // Respect the user's download-over-mobile-data setting, like every WorkManager download
         // path does (UNMETERED constraint). This passive save pulls the audio from the CDN —
         // without this gate, every track played on mobile data would silently burn data.
-        android.content.SharedPreferences settingsPrefsForSave =
-                appContext.getSharedPreferences(CloudSyncManager.PREFS_SETTINGS, Context.MODE_PRIVATE);
         boolean allowMobileForSave =
                 settingsPrefsForSave.getBoolean(CloudSyncManager.KEY_OFFLINE_DOWNLOAD_ALLOW_MOBILE_DATA, false);
         if (!allowMobileForSave) {

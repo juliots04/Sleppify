@@ -296,7 +296,13 @@ class MainActivity : AppCompatActivity() {
         setupListeners()
         configureHeaderActionForMainModules()
         configureAudioAuthorizationFlow()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.BLUETOOTH_CONNECT), 101)
+            }
+        }
         restoreMainModuleReferences()
+
         if (savedInstanceState != null) {
             inSettings = settingsFragment != null
             inEqualizerFromSettings = equalizerFragment != null
@@ -820,7 +826,7 @@ class MainActivity : AppCompatActivity() {
         val audioPrefs = getSharedPreferences(AudioEffectsService.PREFS_NAME, MODE_PRIVATE)
         val selected = AudioDeviceProfileStore.selectPreferredOutput(manager)
 
-        val profileSwitched = AudioDeviceProfileStore.syncActiveProfileForOutput(audioPrefs, selected)
+        val profileSwitched = AudioDeviceProfileStore.syncActiveProfileForOutput(audioPrefs, selected, this)
 
         if (profileSwitched && applyIfChanged) {
             syncAudioEffectsServiceFromPreferences(forceSync = true)
@@ -828,6 +834,7 @@ class MainActivity : AppCompatActivity() {
             (getMainModuleFragment(R.id.nav_equalizer) as? EqualizerFragment)?.onOutputProfileSwitchedLocally()
         }
     }
+
 
     private fun syncAudioEffectsServiceFromPreferences(forceSync: Boolean, allowAuthorizationPrompt: Boolean = false) {
         val audioPrefs = getSharedPreferences(AudioEffectsService.PREFS_NAME, MODE_PRIVATE)
@@ -870,7 +877,9 @@ class MainActivity : AppCompatActivity() {
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQUEST_CODE_RECORD_AUDIO) {
+        if (requestCode == 101 && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            syncAudioProfile(true)
+        } else if (requestCode == REQUEST_CODE_RECORD_AUDIO) {
             val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
             if (granted) {
                 if (pendingAudioProcessingAuthorization && ensureAudioProcessingAuthorization(true)) {

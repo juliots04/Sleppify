@@ -404,9 +404,11 @@ class EqualizerFragment : Fragment() {
             }
         }
 
-        val restoredFromProfile = AudioDeviceProfileStore.restoreActiveValuesForOutput(preferences, selected)
-        val profileSwitched = AudioDeviceProfileStore.syncActiveProfileForOutput(preferences, selected)
-        val currentProfile = AudioDeviceProfileStore.getActiveProfileId(preferences, selected)
+        val ctx = context ?: activity?.applicationContext
+        val restoredFromProfile = AudioDeviceProfileStore.restoreActiveValuesForOutput(preferences, selected, ctx)
+        val profileSwitched = AudioDeviceProfileStore.syncActiveProfileForOutput(preferences, selected, ctx)
+        val currentProfile = AudioDeviceProfileStore.getActiveProfileId(preferences, selected, ctx)
+
         val previousBoundProfile = boundProfileId
         val shouldReloadUi = restoredFromProfile || profileSwitched || !hasLoadedUi ||
                 !TextUtils.equals(previousBoundProfile, currentProfile)

@@ -21,6 +21,7 @@ class SleppifyApp : Application() {
 
         // Store app context so ExoPlayerManager can lazy-init on first use
         ExoPlayerManager.setAppContext(this)
+        AudioDeviceProfileStore.init(this)
 
         // Disponibilidad de video musical por canción (pastilla Canción|Video): carga el caché
         // persistido y habilita la persistencia de lo que cosechen los /next.

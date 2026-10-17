@@ -214,14 +214,8 @@ public class PlaylistDetailFragment extends Fragment
     private PlaylistTrackAdapter trackAdapter;
     private int currentTrackIndex = -1;
     private boolean miniPlaying;
-    private boolean shuffleModeEnabled;
-    // Botón aleatorio del header actualmente en pantalla (para repintar su estado activo/neutro
-    // cuando el modo aleatorio o la canción en reproducción cambian fuera del bind).
-    @Nullable
-    private ImageButton headerShuffleButton;
     private final Random random = new Random();
     private int lastPlaybackQueueSize = -1;
-    private boolean lastPlaybackQueueShuffleState = false;
     private PlaylistMeta currentMeta = new PlaylistMeta("", 0, "", "", "");
     @NonNull
     private String currentPlaylistId = "";
@@ -618,8 +612,6 @@ public class PlaylistDetailFragment extends Fragment
         playlistTracksLoadMoreInFlight = false;
         playlistTracksCanLoadMore = false;
 
-        shuffleModeEnabled = loadPersistedShuffleMode();
-        syncShuffleModeFromPlayer();
 
         final String requestPlaylistId = playlistId;
         final String requestToken = youtubeAccessToken;
@@ -658,17 +650,7 @@ public class PlaylistDetailFragment extends Fragment
     @Override
     public void onPlaybackSnapshotUpdated() {
         if (isAdded() && !isHidden() && getActivity() != null) {
-            getActivity().runOnUiThread(() -> {
-                syncTrackStateFromPlayer();
-                syncShuffleModeFromPlayer();
-            });
-        }
-    }
-
-    @Override
-    public void onShuffleModeChanged(boolean enabled) {
-        if (isAdded() && getActivity() != null) {
-            getActivity().runOnUiThread(this::syncShuffleModeFromPlayer);
+            getActivity().runOnUiThread(this::syncTrackStateFromPlayer);
         }
     }
 
@@ -713,7 +695,6 @@ public class PlaylistDetailFragment extends Fragment
                     if (!isAdded() || isHidden()) return;
                     restoreOfflineDownloadObservation();
                     maybeRestoreHiddenPlayerFromSnapshot();
-                    syncShuffleModeFromPlayer();
                     if (rvPlaylistContent != null) {
                         rvPlaylistContent.post(() -> {
                             if (!isAdded()) return;
@@ -725,12 +706,10 @@ public class PlaylistDetailFragment extends Fragment
             } else {
                 restoreOfflineDownloadObservation();
                 maybeRestoreHiddenPlayerFromSnapshot();
-                syncShuffleModeFromPlayer();
             }
         } else {
             restoreOfflineDownloadObservation();
             maybeRestoreHiddenPlayerFromSnapshot();
-            syncShuffleModeFromPlayer();
             if (rvPlaylistContent != null) {
                 rvPlaylistContent.post(() -> {
                     if (!isAdded()) return;
@@ -3742,66 +3721,6 @@ public class PlaylistDetailFragment extends Fragment
         return false;
     }
 
-    /** Estado "activo" del botón aleatorio del header: ESPEJO del aleatorio del player (fuente
-     *  de verdad cuando existe) Y sonando algo de esta playlist. Con otra playlist sonando, el
-     *  botón vuelve a su estado neutro. */
-    private boolean isShuffleActiveForThisPlaylist() {
-        SongPlayerFragment player = findSongPlayerFragment();
-        boolean shuffleOn = (player != null && player.isAdded())
-                ? player.externalIsShuffleEnabled()
-                : shuffleModeEnabled;
-        return shuffleOn && isPlayingFromThisPlaylist();
-    }
-
-    /** Pinta el botón aleatorio del header según su estado: activo = fondo blanco y glifo negro;
-     *  neutro = fondo semitransparente y glifo blanco. */
-    private void applyShuffleButtonStyle(@Nullable ImageButton btn) {
-        if (btn == null) return;
-        if (isShuffleActiveForThisPlaylist()) {
-            btn.setBackgroundResource(R.drawable.bg_playlist_action_light);
-            btn.setImageTintList(android.content.res.ColorStateList.valueOf(0xFF000000));
-        } else {
-            btn.setBackgroundResource(R.drawable.bg_playlist_action_dark);
-            btn.setImageTintList(android.content.res.ColorStateList.valueOf(0xFFFFFFFF));
-        }
-    }
-
-    private void syncShuffleModeFromPlayer() {
-        SongPlayerFragment player = findSongPlayerFragment();
-        if (player != null && player.isAdded()) {
-            shuffleModeEnabled = player.externalIsShuffleEnabled();
-        } else {
-            shuffleModeEnabled = loadPersistedShuffleMode();
-        }
-        persistShuffleModePreference();
-        applyShuffleButtonStyle(headerShuffleButton);
-    }
-
-    private boolean loadPersistedShuffleMode() {
-        if (!isAdded()) {
-            return false;
-        }
-        SharedPreferences settings = requireContext()
-                .getSharedPreferences(CloudSyncManager.PREFS_SETTINGS, Activity.MODE_PRIVATE);
-        return settings.getBoolean(CloudSyncManager.KEY_PLAYER_SHUFFLE_ENABLED, false);
-    }
-
-    private void persistShuffleModePreference() {
-        if (!isAdded()) {
-            return;
-        }
-
-        SharedPreferences settings = requireContext()
-                .getSharedPreferences(CloudSyncManager.PREFS_SETTINGS, Activity.MODE_PRIVATE);
-        boolean currentValue = settings.getBoolean(CloudSyncManager.KEY_PLAYER_SHUFFLE_ENABLED, false);
-        if (currentValue == shuffleModeEnabled) {
-            return;
-        }
-
-        settings.edit()
-                .putBoolean(CloudSyncManager.KEY_PLAYER_SHUFFLE_ENABLED, shuffleModeEnabled)
-                .apply();
-    }
 
     private void syncPlaybackQueueOrderFromPlayer(@NonNull SongPlayerFragment player) {
         List<String> queueVideoIds = player.externalGetQueueVideoIds();
@@ -3874,7 +3793,7 @@ public class PlaylistDetailFragment extends Fragment
         }
 
         player.externalReplaceQueue(ids, titles, artists, durations, images, startIndex, keepPlaying);
-        injectOriginalQueueOrderIfShuffled(player);
+        injectOriginalQueueOrder(player);
         miniPlaying = keepPlaying;
     }
 
@@ -3883,7 +3802,6 @@ public class PlaylistDetailFragment extends Fragment
         playbackQueueTracks.clear();
         playbackQueueTracks.addAll(base);
         lastPlaybackQueueSize = currentTracks.size();
-        lastPlaybackQueueShuffleState = shuffleModeEnabled;
     }
 
     private void ensurePlaybackQueue() {
@@ -4278,8 +4196,6 @@ public class PlaylistDetailFragment extends Fragment
             trackAdapter.setActiveIndex(safeIndex);
         }
 
-        syncShuffleModeFromPlayer();
-
         if (getView() == null) {
             return;
         }
@@ -4336,12 +4252,10 @@ public class PlaylistDetailFragment extends Fragment
                 trackAdapter.setActiveIndex(position);
             }
             syncTrackStateFromPlayer();
-            applyShuffleButtonStyle(headerShuffleButton);
             return;
         }
 
         startHiddenIntegratedPlayerAt(position, true);
-        applyShuffleButtonStyle(headerShuffleButton);
     }
 
     private void onTrackMorePressed(int position, @NonNull View anchor) {
@@ -5527,108 +5441,6 @@ public class PlaylistDetailFragment extends Fragment
         }
     }
 
-    private void playAllInOrder() {
-        if (currentTracks.isEmpty()) {
-            
-            return;
-        }
-
-        if (shuffleModeEnabled) {
-            ensurePlaybackQueue();
-            if (!playbackQueueTracks.isEmpty()) {
-                String firstQueueVideoId = playbackQueueTracks.get(0).videoId;
-                int displayIndex = findTrackIndexByVideoId(currentTracks, firstQueueVideoId);
-                openIntegratedPlayerAt(displayIndex >= 0 ? displayIndex : 0, true);
-                return;
-            }
-        }
-
-        openIntegratedPlayerAt(0, true);
-    }
-
-    private void openIntegratedPlayerAt(int position, boolean startFromBeginning) {
-        if (position < 0 || position >= currentTracks.size()) {
-            return;
-        }
-
-        // Playback now starts in the mini-player (never auto-opens the full player), so we no
-        // longer animate the mini-player out here — it stays/appears instead.
-
-        ensurePlaybackQueue();
-        if (playbackQueueTracks.isEmpty()) {
-            return;
-        }
-
-        String selectedVideoId = currentTracks.get(position).videoId;
-        int queueIndex = findTrackIndexByVideoId(playbackQueueTracks, selectedVideoId);
-        if (queueIndex < 0) {
-            queueIndex = 0;
-        }
-        final int effectiveQueueIndex = queueIndex;
-
-        ArrayList<String> ids = new ArrayList<>();
-        ArrayList<String> titles = new ArrayList<>();
-        ArrayList<String> artists = new ArrayList<>();
-        ArrayList<String> durations = new ArrayList<>();
-        ArrayList<String> images = new ArrayList<>();
-        for (PlaylistTrack item : playbackQueueTracks) {
-            ids.add(item.videoId);
-            titles.add(item.title);
-            artists.add(item.artist);
-            durations.add(item.duration);
-            images.add(item.imageUrl);
-        }
-
-        SongPlayerFragment existingPlayer = findSongPlayerFragment();
-        if (existingPlayer != null) {
-            if (existingPlayer.isAdded()) {
-                existingPlayer.externalSetReturnTargetTag(TAG_PLAYLIST_DETAIL);
-                existingPlayer.externalSetPlaylistContext(currentPlaylistId, currentPlaylistTitle);
-                if (existingPlayer.externalMatchesQueue(ids)) {
-                    if (startFromBeginning) {
-                        existingPlayer.externalPlayTrackFromStart(queueIndex);
-                    } else {
-                        existingPlayer.externalPlayTrack(queueIndex);
-                    }
-                } else {
-                    if (startFromBeginning) {
-                        existingPlayer.externalReplaceQueueFromStart(ids, titles, artists, durations, images, queueIndex, true);
-                    } else {
-                        existingPlayer.externalReplaceQueue(ids, titles, artists, durations, images, queueIndex, true);
-                    }
-                    injectOriginalQueueOrderIfShuffled(existingPlayer);
-                }
-
-                ensureMiniPlayerShown();
-
-                currentTrackIndex = position;
-                miniPlaying = true;
-                if (trackAdapter != null) {
-                    trackAdapter.setActiveIndex(position);
-                }
-            }
-            return;
-        }
-
-        currentTrackIndex = position;
-        miniPlaying = true;
-        trackAdapter.setActiveIndex(position);
-
-        SongPlayerFragment playerFragment = SongPlayerFragment.newInstance(
-                ids,
-                titles,
-                artists,
-                durations,
-                images,
-                queueIndex,
-                true
-        );
-        playerFragment.externalSetReturnTargetTag(TAG_PLAYLIST_DETAIL);
-        playerFragment.externalSetPlaylistContext(currentPlaylistId, currentPlaylistTitle);
-        injectOriginalQueueOrderIfShuffled(playerFragment);
-        // Start hidden → plays in the mini-player instead of opening the full-screen player.
-        addSongPlayerHidden(playerFragment);
-    }
 
     private void maybeRestoreHiddenPlayerFromSnapshot() {
         if (!isAdded() || isHidden() || restoringHiddenPlayerFromSnapshot) {
@@ -5741,35 +5553,11 @@ public class PlaylistDetailFragment extends Fragment
         player.externalSetOriginalQueueOrder(original);
     }
 
-    private void injectOriginalQueueOrderIfShuffled(@NonNull SongPlayerFragment player) {
-        injectOriginalQueueOrder(player);
-    }
-
-    private void injectOriginalQueueFromSnapshot(
-            @NonNull SongPlayerFragment player,
-            @NonNull PlaybackHistoryStore.Snapshot snapshot
-    ) {
-        if (snapshot.originalQueue == null || snapshot.originalQueue.isEmpty()) return;
-        if (snapshot.originalQueue.size() == snapshot.queue.size()) {
-            boolean same = true;
-            for (int i = 0; i < snapshot.queue.size(); i++) {
-                if (!android.text.TextUtils.equals(snapshot.queue.get(i).videoId, snapshot.originalQueue.get(i).videoId)) {
-                    same = false;
-                    break;
-                }
-            }
-            if (same) return;
-        }
-        java.util.List<SongPlayerFragment.PlayerTrack> original = new java.util.ArrayList<>(snapshot.originalQueue.size());
-        for (PlaybackHistoryStore.QueueTrack item : snapshot.originalQueue) {
-            original.add(new SongPlayerFragment.PlayerTrack(
-                    item.videoId, item.title, item.artist, item.duration, item.imageUrl
-            ));
-        }
-        player.externalSetOriginalQueueOrder(original);
-    }
-
     private boolean startHiddenIntegratedPlayerAt(int position, boolean startFromBeginning) {
+        return startHiddenIntegratedPlayerAt(position, startFromBeginning, false);
+    }
+
+    private boolean startHiddenIntegratedPlayerAt(int position, boolean startFromBeginning, boolean forceShuffle) {
         if (!isAdded() || position < 0 || position >= currentTracks.size()) {
             return false;
         }
@@ -5807,8 +5595,6 @@ public class PlaylistDetailFragment extends Fragment
             return false;
         }
 
-        persistShuffleModePreference();
-
         SongPlayerFragment playerFragment = SongPlayerFragment.newInstance(
                 ids,
                 titles,
@@ -5820,7 +5606,9 @@ public class PlaylistDetailFragment extends Fragment
         );
         playerFragment.externalSetReturnTargetTag(TAG_PLAYLIST_DETAIL);
         playerFragment.externalSetPlaylistContext(currentPlaylistId, currentPlaylistTitle);
-        playerFragment.externalSetShuffleEnabled(shuffleModeEnabled);
+        if (forceShuffle) {
+            playerFragment.externalSetShuffleEnabled(true);
+        }
         injectOriginalQueueOrder(playerFragment);
 
         getParentFragmentManager()
@@ -5837,7 +5625,6 @@ public class PlaylistDetailFragment extends Fragment
             trackAdapter.setActiveIndex(position);
         }
         syncTrackStateFromPlayer();
-        applyShuffleButtonStyle(headerShuffleButton);
         return true;
     }
 
@@ -6358,8 +6145,6 @@ public class PlaylistDetailFragment extends Fragment
 
         @Override
         public void onBindViewHolder(@NonNull HeaderViewHolder holder, int position) {
-            headerShuffleButton = holder.btnShufflePlay;
-            applyShuffleButtonStyle(holder.btnShufflePlay);
             holder.tvPlaylistName.setText(headerPlaylistTitle);
             holder.tvGoogleProfileName.setText(headerProfileName);
             holder.tvPlaylistInfo.setText(headerPlaylistInfo);
@@ -6639,59 +6424,42 @@ public class PlaylistDetailFragment extends Fragment
                     if (currentTracks.isEmpty()) return;
                     v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
 
+                    int randomIndex = currentTracks.size() > 1 ? random.nextInt(currentTracks.size()) : 0;
+
                     SongPlayerFragment player = findSongPlayerFragment();
-                    boolean isPlayingThis = isPlayingFromThisPlaylist();
-
-                    if (isPlayingThis && player != null && player.isAdded()) {
-                        // YA estamos reproduciendo esta playlist: el botón es un ESPEJO del
-                        // aleatorio del player — alterna el modo sin cambiar ni reiniciar la canción.
-                        boolean newShuffle = !player.externalIsShuffleEnabled();
-                        player.externalSetShuffleEnabled(newShuffle);
-                        shuffleModeEnabled = newShuffle;
-                        persistShuffleModePreference();
-                        applyShuffleButtonStyle(btnShufflePlay);
-                    } else {
-                        // Nada de esta playlist sonando: iniciar la playlist en aleatorio con
-                        // una canción al azar y dejar el aleatorio encendido en el player.
-                        shuffleModeEnabled = true;
-                        persistShuffleModePreference();
-
-                        int randomIndex = currentTracks.size() > 1 ? random.nextInt(currentTracks.size()) : 0;
-
-                        if (player != null && player.isAdded()) {
-                            player.externalSetReturnTargetTag(TAG_PLAYLIST_DETAIL);
-                            player.externalSetPlaylistContext(currentPlaylistId, currentPlaylistTitle);
+                    if (player != null && player.isAdded()) {
+                        player.externalSetReturnTargetTag(TAG_PLAYLIST_DETAIL);
+                        player.externalSetPlaylistContext(currentPlaylistId, currentPlaylistTitle);
+                        if (!player.externalIsShuffleEnabled()) {
                             player.externalSetShuffleEnabled(true);
-
-                            ensurePlaybackQueue();
-                            ArrayList<String> ids = new ArrayList<>(playbackQueueTracks.size());
-                            ArrayList<String> titles = new ArrayList<>(playbackQueueTracks.size());
-                            ArrayList<String> artists = new ArrayList<>(playbackQueueTracks.size());
-                            ArrayList<String> durations = new ArrayList<>(playbackQueueTracks.size());
-                            ArrayList<String> images = new ArrayList<>(playbackQueueTracks.size());
-                            for (PlaylistTrack item : playbackQueueTracks) {
-                                ids.add(item.videoId);
-                                titles.add(item.title);
-                                artists.add(item.artist);
-                                durations.add(item.duration);
-                                images.add(item.imageUrl);
-                            }
-
-                            player.externalReplaceQueueFromStart(ids, titles, artists, durations, images, randomIndex, true);
-                            injectOriginalQueueOrder(player);
-
-                            ensureMiniPlayerShown();
-                            currentTrackIndex = randomIndex;
-                            miniPlaying = true;
-                            if (trackAdapter != null) {
-                                trackAdapter.setActiveIndex(randomIndex);
-                            }
-                            syncTrackStateFromPlayer();
-                            applyShuffleButtonStyle(btnShufflePlay);
-                        } else {
-                            onTrackSelected(randomIndex);
-                            applyShuffleButtonStyle(btnShufflePlay);
                         }
+
+                        ensurePlaybackQueue();
+                        ArrayList<String> ids = new ArrayList<>(playbackQueueTracks.size());
+                        ArrayList<String> titles = new ArrayList<>(playbackQueueTracks.size());
+                        ArrayList<String> artists = new ArrayList<>(playbackQueueTracks.size());
+                        ArrayList<String> durations = new ArrayList<>(playbackQueueTracks.size());
+                        ArrayList<String> images = new ArrayList<>(playbackQueueTracks.size());
+                        for (PlaylistTrack item : playbackQueueTracks) {
+                            ids.add(item.videoId);
+                            titles.add(item.title);
+                            artists.add(item.artist);
+                            durations.add(item.duration);
+                            images.add(item.imageUrl);
+                        }
+
+                        player.externalReplaceQueueFromStart(ids, titles, artists, durations, images, randomIndex, true);
+                        injectOriginalQueueOrder(player);
+
+                        ensureMiniPlayerShown();
+                        currentTrackIndex = randomIndex;
+                        miniPlaying = true;
+                        if (trackAdapter != null) {
+                            trackAdapter.setActiveIndex(randomIndex);
+                        }
+                        syncTrackStateFromPlayer();
+                    } else {
+                        startHiddenIntegratedPlayerAt(randomIndex, true, true);
                     }
                 });
             }

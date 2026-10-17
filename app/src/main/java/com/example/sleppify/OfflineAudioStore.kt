@@ -3,6 +3,7 @@ package com.example.sleppify
 import android.content.Context
 import android.media.MediaMetadataRetriever
 import android.os.Environment
+import android.os.StatFs
 import java.io.File
 import java.util.LinkedHashMap
 
@@ -86,7 +87,16 @@ object OfflineAudioStore {
     }
 
     @JvmStatic
-    fun hasSdCard(context: Context): Boolean = getSdOfflineAudioDir(context) != null
+    fun hasSdCard(context: Context): Boolean {
+        refreshSdCardState()
+        val dir = getSdOfflineAudioDir(context) ?: return false
+        return try {
+            val parent = dir.parentFile ?: dir
+            (parent.exists() || parent.mkdirs()) && StatFs(parent.absolutePath).totalBytes > 0L
+        } catch (_: Exception) {
+            false
+        }
+    }
 
     private fun useSdCard(context: Context): Boolean {
         return context.getSharedPreferences(AppConstants.PREFS_SETTINGS, Context.MODE_PRIVATE)
@@ -324,6 +334,21 @@ object OfflineAudioStore {
         clearOfflineAudioStateCache()
         return removedCount
     }
+
+    @JvmStatic
+    fun getDownloadsTotalBytes(context: Context): Long {
+        var total = 0L
+        for (dir in allOfflineAudioDirs(context)) {
+            val files = dir.listFiles() ?: continue
+            for (file in files) {
+                if (file.isFile) {
+                    total += file.length().coerceAtLeast(0L)
+                }
+            }
+        }
+        return total
+    }
+
 
     /**
      * Every downloaded track id currently on disk (normalized filename stem, extension stripped),

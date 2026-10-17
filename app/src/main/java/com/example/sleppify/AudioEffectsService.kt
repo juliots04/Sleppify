@@ -5,12 +5,15 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
+import android.media.audiofx.AudioEffect
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -46,17 +49,54 @@ class AudioEffectsService : Service() {
         }
     }
 
+    private var lastExternalSessionId: Int = 0
+
+    private val sessionReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val action = intent?.action ?: return
+            if (action == AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION) {
+                val sessionId = intent.getIntExtra(AudioEffect.EXTRA_AUDIO_SESSION, 0)
+                if (sessionId > 0) {
+                    lastExternalSessionId = sessionId
+                    val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    if (prefs.getBoolean(KEY_APPLY_GLOBAL, true) && prefs.getBoolean(KEY_ENABLED, false)) {
+                        applyEffects()
+                    }
+                }
+            } else if (action == AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION) {
+                val sessionId = intent.getIntExtra(AudioEffect.EXTRA_AUDIO_SESSION, 0)
+                if (sessionId == lastExternalSessionId) {
+                    lastExternalSessionId = 0
+                    val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    if (prefs.getBoolean(KEY_APPLY_GLOBAL, true) && prefs.getBoolean(KEY_ENABLED, false)) {
+                        applyEffects()
+                    }
+                }
+            }
+        }
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
-        // Intentionally NOT a foreground service and it owns NO notification channel. The DSP
-        // engine attaches to the global audio session; the process is already held foreground by
-        // PlaybackKeepAliveService (media notification id 11031) during playback. Posting its own
-        // (blank) notification id 11032 on the shared media channel was the spurious "extra media
-        // notification" that appeared whenever the EQ was enabled.
+        ensureNotificationChannel()
         audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
         audioManager?.registerAudioDeviceCallback(deviceCallback, mainHandler)
+
+        try {
+            val filter = IntentFilter().apply {
+                addAction(AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION)
+                addAction(AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(sessionReceiver, filter, Context.RECEIVER_EXPORTED)
+            } else {
+                registerReceiver(sessionReceiver, filter)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to register audio effect session receiver", e)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -64,6 +104,7 @@ class AudioEffectsService : Service() {
 
         when (action) {
             ACTION_APPLY -> {
+                enterForeground()
                 applyEffects()
             }
             ACTION_STOP -> {
@@ -72,6 +113,7 @@ class AudioEffectsService : Service() {
                 stopSelf()
             }
             else -> {
+                enterForeground()
                 applyEffects()
             }
         }
@@ -80,6 +122,9 @@ class AudioEffectsService : Service() {
     }
 
     override fun onDestroy() {
+        try {
+            unregisterReceiver(sessionReceiver)
+        } catch (_: Exception) {}
         audioManager?.unregisterAudioDeviceCallback(deviceCallback)
         releaseEngine()
         exitForeground()
@@ -92,7 +137,7 @@ class AudioEffectsService : Service() {
 
     private fun enterForeground() {
         if (isForegroundStarted) return
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        ensureNotificationChannel()
 
         try {
             val notification = buildForegroundNotification()
@@ -125,7 +170,6 @@ class AudioEffectsService : Service() {
     }
 
     private fun buildForegroundNotification(): Notification {
-        // Invisible notification - required for foreground service but hidden from user
         val intent = Intent(this, MainActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
         val pendingFlags = PendingIntent.FLAG_UPDATE_CURRENT or
@@ -133,15 +177,14 @@ class AudioEffectsService : Service() {
         val contentIntent = PendingIntent.getActivity(this, 0, intent, pendingFlags)
 
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
-            .setSmallIcon(android.R.color.transparent)  // Invisible icon
-            .setContentTitle("")  // No visible title
-            .setContentText("")   // No visible text
+            .setSmallIcon(R.drawable.ic_equalizer)
+            .setContentTitle("Sleppify Equalizer")
+            .setContentText("Motor DSP activo")
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setPriority(NotificationCompat.PRIORITY_MIN)
-            .setSilent(true)      // No sound
+            .setSilent(true)
             .setShowWhen(false)
             .setOngoing(true)
-            .setVisibility(NotificationCompat.VISIBILITY_SECRET)  // Hidden on lock screen
             .setContentIntent(contentIntent)
             .build()
     }
@@ -153,14 +196,14 @@ class AudioEffectsService : Service() {
 
         val channel = NotificationChannel(
             NOTIFICATION_CHANNEL_ID,
-            "Sleppify Audio",
-            NotificationManager.IMPORTANCE_MIN  // Lowest importance - invisible
+            "Sleppify Equalizer",
+            NotificationManager.IMPORTANCE_MIN
         ).apply {
-            description = "Audio processing"
+            description = "Mantiene activo el ecualizador DSP en segundo plano"
             setShowBadge(false)
             enableLights(false)
             enableVibration(false)
-            setSound(null, null)  // No sound
+            setSound(null, null)
         }
         manager.createNotificationChannel(channel)
     }
@@ -182,16 +225,20 @@ class AudioEffectsService : Service() {
         val manager = audioManager
         if (manager != null) {
             val selected = AudioDeviceProfileStore.selectPreferredOutput(manager)
-            AudioDeviceProfileStore.syncActiveProfileForOutput(prefs, selected)
+            AudioDeviceProfileStore.syncActiveProfileForOutput(prefs, selected, this)
         }
+
 
         val enabled = prefs.getBoolean(KEY_ENABLED, false)
 
         if (!enabled) {
             releaseEngine()
+            exitForeground()
             stopSelf()
             return
         }
+
+        enterForeground()
 
         // Scope: global (session 0, all system audio — needs the heavier system routing) or
         // app-only (the player's live audio session — cheaper, only touches Sleppify's output).
@@ -382,9 +429,13 @@ class AudioEffectsService : Service() {
     }
 
     private fun resolveTargetSession(prefs: SharedPreferences): Int {
-        if (prefs.getBoolean(KEY_APPLY_GLOBAL, true)) return GLOBAL_SESSION_ID
-        // App-only scope: attach to the player's last known audio session. Until playback has
-        // produced a real session id, fall back to global so the EQ never silently disappears.
+        val isGlobal = prefs.getBoolean(KEY_APPLY_GLOBAL, true)
+        if (isGlobal) {
+            // Modo global: sesión 0 ecualiza todo el flujo de salida del sistema operativo (Spotify, YouTube, Sleppify, etc.)
+            // y no muere cuando Sleppify pausa o se cierra.
+            return GLOBAL_SESSION_ID
+        }
+        // Modo app-only (solo Sleppify): se enlaza a la sesión del player local para no afectar a otras aplicaciones.
         val playerSession = prefs.getInt(KEY_PLAYER_SESSION_ID, GLOBAL_SESSION_ID)
         return if (playerSession > 0) playerSession else GLOBAL_SESSION_ID
     }
@@ -394,8 +445,9 @@ class AudioEffectsService : Service() {
         val manager = audioManager ?: return
         val selected = AudioDeviceProfileStore.selectPreferredOutput(manager)
 
-        val changed = AudioDeviceProfileStore.syncActiveProfileForOutput(prefs, selected)
+        val changed = AudioDeviceProfileStore.syncActiveProfileForOutput(prefs, selected, this)
         if (changed) {
+
             if (prefs.getBoolean(KEY_ENABLED, false)) {
                 applyEffects()
             }
@@ -504,11 +556,17 @@ class AudioEffectsService : Service() {
                 action = ACTION_APPLY
             }
             try {
-                // Use regular startService to avoid ForegroundServiceDidNotStartInTimeException
-                // The service will run without a notification since player notification handles it
-                context.startService(intent)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
             } catch (e: Exception) {
-                Log.w(TAG, "sendApply:failed", e)
+                try {
+                    context.startService(intent)
+                } catch (e2: Exception) {
+                    Log.w(TAG, "sendApply:failed", e2)
+                }
             }
         }
 

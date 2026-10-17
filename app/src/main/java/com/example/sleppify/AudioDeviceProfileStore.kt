@@ -1,14 +1,18 @@
 package com.example.sleppify
 
+import android.content.Context
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
 import android.media.AudioDeviceInfo
 import android.os.Build
 import android.text.TextUtils
 import android.util.Log
+import androidx.core.content.ContextCompat
 
 /**
  * Native Kotlin implementation of AudioDeviceProfileStore.
- * Manages EQ and Bass profiles for different audio outputs.
+ * Manages EQ and Bass profiles for different audio outputs with persistent,
+ * hardware-based identification for Bluetooth and wired devices.
  */
 object AudioDeviceProfileStore {
     private const val TAG = "AudioProfileStore"
@@ -23,6 +27,11 @@ object AudioDeviceProfileStore {
     private const val KEY_USER_PRESET_BAND_PREFIX = "user_preset_band_"
     private const val KEY_PROFILE_CUSTOM_PRESET_NAME_PREFIX = "profile_custom_preset_name_"
 
+    // Registry prefix for device mapping (hardware MAC, fingerprint, aliases)
+    private const val KEY_REG_MAC_PREFIX = "bt_reg_mac_"
+    private const val KEY_REG_FP_PREFIX = "bt_reg_fp_"
+    private const val KEY_REG_NAME_PREFIX = "bt_reg_name_"
+
     private const val PRESET_DEFAULT = "default"
     private const val PRESET_CUSTOM = "custom"
     private const val USER_PRESET_ID_PREFIX = "user_profile_"
@@ -36,21 +45,75 @@ object AudioDeviceProfileStore {
     private const val PROFILE_DEFAULT_BASS_FREQUENCY_HZ = 62f
     private const val PROFILE_DEFAULT_ENABLED = false
 
+    @Volatile
+    private var appContext: Context? = null
+    @Volatile
+    private var a2dpProxy: android.bluetooth.BluetoothProfile? = null
+    @Volatile
+    private var headsetProxy: android.bluetooth.BluetoothProfile? = null
+
+    @JvmStatic
+    fun init(context: Context) {
+        if (appContext == null) {
+            val app = context.applicationContext
+            appContext = app
+            try {
+                val adapter = android.bluetooth.BluetoothAdapter.getDefaultAdapter()
+                adapter?.getProfileProxy(app, object : android.bluetooth.BluetoothProfile.ServiceListener {
+                    override fun onServiceConnected(profile: Int, proxy: android.bluetooth.BluetoothProfile) {
+                        if (profile == android.bluetooth.BluetoothProfile.A2DP) a2dpProxy = proxy
+                        if (profile == android.bluetooth.BluetoothProfile.HEADSET) headsetProxy = proxy
+                    }
+                    override fun onServiceDisconnected(profile: Int) {
+                        if (profile == android.bluetooth.BluetoothProfile.A2DP) a2dpProxy = null
+                        if (profile == android.bluetooth.BluetoothProfile.HEADSET) headsetProxy = null
+                    }
+                }, android.bluetooth.BluetoothProfile.A2DP)
+                adapter?.getProfileProxy(app, object : android.bluetooth.BluetoothProfile.ServiceListener {
+                    override fun onServiceConnected(profile: Int, proxy: android.bluetooth.BluetoothProfile) {
+                        if (profile == android.bluetooth.BluetoothProfile.HEADSET) headsetProxy = proxy
+                    }
+                    override fun onServiceDisconnected(profile: Int) {
+                        if (profile == android.bluetooth.BluetoothProfile.HEADSET) headsetProxy = null
+                    }
+                }, android.bluetooth.BluetoothProfile.HEADSET)
+            } catch (_: Throwable) {}
+        }
+    }
+
+
     /**
      * Syncs the active profile values based on the currently connected audio output.
      */
     @JvmStatic
-    fun syncActiveProfileForOutput(prefs: SharedPreferences, selectedOutput: AudioDeviceInfo?): Boolean {
-        val targetProfileId = buildProfileId(selectedOutput)
+    @JvmOverloads
+    fun syncActiveProfileForOutput(
+        prefs: SharedPreferences,
+        selectedOutput: AudioDeviceInfo?,
+        context: Context? = null
+    ): Boolean {
+        val targetProfileId = buildProfileId(selectedOutput, context)
         val currentProfileId = prefs.getString(KEY_ACTIVE_PROFILE_ID, null)
+
         if (currentProfileId == targetProfileId) {
             if (!hasProfileData(prefs, targetProfileId)) {
+                val alias = findExistingAliasProfileId(prefs, targetProfileId, selectedOutput, context)
+                val currentEnabled = prefs.getBoolean(AudioEffectsService.KEY_ENABLED, false)
                 prefs.edit().apply {
-                    writeDefaultValuesToProfile(this, targetProfileId)
-                    writeDefaultValuesToActive(this)
+                    if (alias != null) {
+                        copyProfileValuesToProfile(this, prefs, alias, targetProfileId)
+                        copyProfileValuesToActive(this, prefs, targetProfileId)
+                    } else {
+                        writeDefaultValuesToProfile(this, targetProfileId, currentEnabled)
+                        writeDefaultValuesToActive(this, currentEnabled)
+                    }
+                    recordDeviceRegistration(this, targetProfileId, selectedOutput, context)
                 }.apply()
                 return true
             }
+            prefs.edit().apply {
+                recordDeviceRegistration(this, targetProfileId, selectedOutput, context)
+            }.apply()
             return false
         }
 
@@ -62,11 +125,19 @@ object AudioDeviceProfileStore {
             if (hasProfileData(prefs, targetProfileId)) {
                 copyProfileValuesToActive(this, prefs, targetProfileId)
             } else {
-                writeDefaultValuesToProfile(this, targetProfileId)
-                writeDefaultValuesToActive(this)
+                val currentEnabled = prefs.getBoolean(AudioEffectsService.KEY_ENABLED, false)
+                val alias = findExistingAliasProfileId(prefs, targetProfileId, selectedOutput, context)
+                if (alias != null) {
+                    copyProfileValuesToProfile(this, prefs, alias, targetProfileId)
+                    copyProfileValuesToActive(this, prefs, targetProfileId)
+                } else {
+                    writeDefaultValuesToProfile(this, targetProfileId, currentEnabled)
+                    writeDefaultValuesToActive(this, currentEnabled)
+                }
             }
 
             putString(KEY_ACTIVE_PROFILE_ID, targetProfileId)
+            recordDeviceRegistration(this, targetProfileId, selectedOutput, context)
         }.apply()
 
         return true
@@ -82,40 +153,76 @@ object AudioDeviceProfileStore {
     }
 
     @JvmStatic
-    fun restoreActiveValuesForOutput(prefs: SharedPreferences, selectedOutput: AudioDeviceInfo?): Boolean {
-        val targetProfileId = buildProfileId(selectedOutput)
+    @JvmOverloads
+    fun restoreActiveValuesForOutput(
+        prefs: SharedPreferences,
+        selectedOutput: AudioDeviceInfo?,
+        context: Context? = null
+    ): Boolean {
+        val targetProfileId = buildProfileId(selectedOutput, context)
 
-        if (!hasProfileData(prefs, targetProfileId)) {
-            return false
+        val profileToRestore = if (hasProfileData(prefs, targetProfileId)) {
+            targetProfileId
+        } else {
+            val alias = findExistingAliasProfileId(prefs, targetProfileId, selectedOutput, context)
+            if (alias != null) {
+                prefs.edit().apply {
+                    copyProfileValuesToProfile(this, prefs, alias, targetProfileId)
+                    recordDeviceRegistration(this, targetProfileId, selectedOutput, context)
+                }.apply()
+                targetProfileId
+            } else {
+                return false
+            }
         }
 
         val currentId = prefs.getString(KEY_ACTIVE_PROFILE_ID, null)
-        if (currentId == targetProfileId) {
+        if (currentId == profileToRestore && areActiveValuesAlignedWithProfile(prefs, profileToRestore)) {
             return false
         }
 
         prefs.edit().apply {
-            copyProfileValuesToActive(this, prefs, targetProfileId)
-            putString(KEY_ACTIVE_PROFILE_ID, targetProfileId)
+            copyProfileValuesToActive(this, prefs, profileToRestore)
+            putString(KEY_ACTIVE_PROFILE_ID, profileToRestore)
+            recordDeviceRegistration(this, profileToRestore, selectedOutput, context)
         }.apply()
         return true
     }
 
     @JvmStatic
-    fun getActiveProfileId(prefs: SharedPreferences, selectedOutput: AudioDeviceInfo?): String {
-        return prefs.getString(KEY_ACTIVE_PROFILE_ID, null) ?: buildProfileId(selectedOutput)
+    @JvmOverloads
+    fun getActiveProfileId(
+        prefs: SharedPreferences,
+        selectedOutput: AudioDeviceInfo?,
+        context: Context? = null
+    ): String {
+        return prefs.getString(KEY_ACTIVE_PROFILE_ID, null) ?: buildProfileId(selectedOutput, context)
     }
 
     @JvmStatic
-    fun buildProfileId(selectedOutput: AudioDeviceInfo?): String {
+    @JvmOverloads
+    fun buildProfileId(selectedOutput: AudioDeviceInfo?, context: Context? = null): String {
         if (selectedOutput == null || !selectedOutput.isSink) return GLOBAL_PROFILE_ID
 
         val type = selectedOutput.type
         return when {
             isBluetoothType(type) -> {
-                val unique = sanitize(uniqueOutputName(selectedOutput))
-                if (unique.isNotEmpty()) "bluetooth_$unique" 
-                else sanitizeProductName(selectedOutput).let { if (it.isNotEmpty()) "bluetooth_$it" else "bluetooth" }
+                // Tier 1: Hardware MAC address (stable, completely independent of device name)
+                val mac = resolveBluetoothMac(selectedOutput, context)
+                if (mac.isNotEmpty()) {
+                    "bluetooth_mac_$mac"
+                } else {
+                    // Tier 2: Audio Hardware Fingerprint (codecs, channels, sample rates)
+                    val fp = buildAudioHardwareFingerprint(selectedOutput)
+                    if (fp.isNotEmpty()) {
+                        "bluetooth_hw_$fp"
+                    } else {
+                        // Tier 3: Clean unique name or fallback
+                        val unique = sanitize(uniqueOutputName(selectedOutput))
+                        if (unique.isNotEmpty()) "bluetooth_$unique"
+                        else sanitizeProductName(selectedOutput).let { if (it.isNotEmpty()) "bluetooth_$it" else "bluetooth" }
+                    }
+                }
             }
             isWiredType(type) -> {
                 val unique = sanitize(uniqueOutputName(selectedOutput))
@@ -128,7 +235,192 @@ object AudioDeviceProfileStore {
         }
     }
 
+    /**
+     * Resolves the hardware MAC address of a connected Bluetooth audio device without dashes or colons.
+     * Checks AudioDeviceInfo.address first, then queries BluetoothManager active A2DP/Headset profiles.
+     */
+    @JvmStatic
+    @JvmOverloads
+    fun resolveBluetoothMac(info: AudioDeviceInfo?, context: Context? = null): String {
+        if (info == null) return ""
+
+        // 1. AudioDeviceInfo.address (Android 9+ / API 28+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            try {
+                val rawAddr = info.address?.trim()
+                if (!rawAddr.isNullOrEmpty() && isValidMacAddress(rawAddr)) {
+                    return cleanMac(rawAddr)
+                }
+            } catch (_: Throwable) {}
+        }
+
+        val ctx = context ?: appContext
+
+        // 2. Query A2DP & Headset profile proxies (Official Android BluetoothProfile API)
+        try {
+            val a2dpDevices = a2dpProxy?.connectedDevices
+            if (!a2dpDevices.isNullOrEmpty()) {
+                val prodName = info.productName?.toString()?.trim() ?: ""
+                val matched = a2dpDevices.firstOrNull { dev ->
+                    val devName = dev.name?.trim() ?: ""
+                    val devAlias = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        try { dev.alias?.trim() ?: "" } catch (_: SecurityException) { "" }
+                    } else ""
+                    prodName.isNotEmpty() && (prodName.equals(devName, ignoreCase = true) || prodName.equals(devAlias, ignoreCase = true))
+                }
+                if (matched != null && isValidMacAddress(matched.address)) {
+                    return cleanMac(matched.address)
+                }
+                val firstDev = a2dpDevices[0]
+                if (isValidMacAddress(firstDev.address)) {
+                    return cleanMac(firstDev.address)
+                }
+            }
+        } catch (_: Throwable) {}
+
+        try {
+            val hsDevices = headsetProxy?.connectedDevices
+            if (!hsDevices.isNullOrEmpty()) {
+                val firstDev = hsDevices[0]
+                if (isValidMacAddress(firstDev.address)) {
+                    return cleanMac(firstDev.address)
+                }
+            }
+        } catch (_: Throwable) {}
+
+        // 3. Query BluetoothAdapter bonded devices
+        if (ctx != null) {
+            try {
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
+                    ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+                ) {
+                    val bm = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? android.bluetooth.BluetoothManager
+                    val adapter = bm?.adapter ?: android.bluetooth.BluetoothAdapter.getDefaultAdapter()
+                    if (adapter != null && adapter.isEnabled) {
+                        val bonded = adapter.bondedDevices
+                        if (!bonded.isNullOrEmpty()) {
+                            val prodName = info.productName?.toString()?.trim() ?: ""
+
+                            // 3a. Check which bonded devices are actively connected via reflection
+                            val connectedBonded = bonded.filter { dev ->
+                                try {
+                                    val isConnectedMethod = dev.javaClass.getMethod("isConnected")
+                                    isConnectedMethod.invoke(dev) as? Boolean ?: false
+                                } catch (_: Throwable) {
+                                    false
+                                }
+                            }
+                            if (connectedBonded.isNotEmpty()) {
+                                val matchedConnected = connectedBonded.firstOrNull { dev ->
+                                    val devName = dev.name?.trim() ?: ""
+                                    val devAlias = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                        try { dev.alias?.trim() ?: "" } catch (_: SecurityException) { "" }
+                                    } else ""
+                                    prodName.isNotEmpty() && (prodName.equals(devName, ignoreCase = true) || prodName.equals(devAlias, ignoreCase = true))
+                                }
+                                if (matchedConnected != null && isValidMacAddress(matchedConnected.address)) {
+                                    return cleanMac(matchedConnected.address)
+                                }
+                                if (connectedBonded.size == 1 && isValidMacAddress(connectedBonded[0].address)) {
+                                    return cleanMac(connectedBonded[0].address)
+                                }
+                            }
+
+                            // 3b. Check bonded devices matching current product name or alias
+                            val matched = bonded.firstOrNull { dev ->
+                                val devName = dev.name?.trim() ?: ""
+                                val devAlias = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                    try { dev.alias?.trim() ?: "" } catch (_: SecurityException) { "" }
+                                } else ""
+                                (prodName.isNotEmpty() && (prodName.equals(devName, ignoreCase = true) || prodName.equals(devAlias, ignoreCase = true)))
+                            }
+                            if (matched != null && !matched.address.isNullOrEmpty() && isValidMacAddress(matched.address)) {
+                                return cleanMac(matched.address)
+                            }
+
+                            // 3c. If only 1 bonded device exists on system
+                            if (bonded.size == 1) {
+                                val single = bonded.first()
+                                if (!single.address.isNullOrEmpty() && isValidMacAddress(single.address)) {
+                                    return cleanMac(single.address)
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: SecurityException) {
+            } catch (_: Throwable) {}
+        }
+
+        // 4. Check if info.address has a non-MAC hardware identifier
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            try {
+                val addr = info.address?.trim() ?: ""
+                if (addr.isNotEmpty() && addr != "00:00:00:00:00:00" && addr != "02:00:00:00:00:00") {
+                    val sanitized = sanitize(addr)
+                    if (sanitized.length >= 4) return sanitized
+                }
+            } catch (_: Throwable) {}
+        }
+
+        return ""
+    }
+
+
+    private fun isValidMacAddress(mac: String): Boolean {
+        val clean = mac.replace(":", "").replace("-", "").trim()
+        if (clean.length != 12) return false
+        if (clean.all { it == '0' } || clean.equals("020000000000", ignoreCase = true)) return false
+        return clean.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }
+    }
+
+    private fun cleanMac(mac: String): String {
+        return mac.lowercase().replace(":", "").replace("-", "").trim()
+    }
+
+    /**
+     * Builds a hardware audio fingerprint that remains constant even if the device is renamed.
+     */
+    @JvmStatic
+    fun buildAudioHardwareFingerprint(info: AudioDeviceInfo?): String {
+        if (info == null) return ""
+        val sb = StringBuilder()
+        sb.append("t").append(info.type)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val enc = info.encodings.sorted().joinToString("")
+            val sr = info.sampleRates.sorted().joinToString("")
+            val ch = info.channelCounts.sorted().joinToString("")
+            val cm = info.channelMasks.sorted().joinToString("")
+            if (enc.isNotEmpty() || sr.isNotEmpty() || ch.isNotEmpty()) {
+                val raw = "${enc}_${sr}_${ch}_${cm}"
+                sb.append("_").append(Integer.toHexString(raw.hashCode()))
+            }
+        }
+        return sb.toString()
+    }
+
     // --- PRIVATE UTILS ---
+
+    private fun recordDeviceRegistration(
+        editor: SharedPreferences.Editor,
+        profileId: String,
+        info: AudioDeviceInfo?,
+        context: Context?
+    ) {
+        if (info == null || !isBluetoothType(info.type)) return
+        val mac = resolveBluetoothMac(info, context)
+        if (mac.isNotEmpty()) {
+            editor.putString("$KEY_REG_MAC_PREFIX$mac", profileId)
+        }
+        val fp = buildAudioHardwareFingerprint(info)
+        if (fp.isNotEmpty()) {
+            editor.putString("$KEY_REG_FP_PREFIX$fp", profileId)
+        }
+        val prod = sanitizeProductName(info)
+        if (prod.isNotEmpty()) {
+            editor.putString("$KEY_REG_NAME_PREFIX$prod", profileId)
+        }
+    }
 
     private fun hasProfileData(prefs: SharedPreferences, id: String): Boolean {
         return prefs.contains(profileKey(id, AudioEffectsService.KEY_ENABLED)) ||
@@ -212,10 +504,25 @@ object AudioDeviceProfileStore {
         for (i in 0 until BAND_COUNT) {
             editor.putFloat(profileBandKey(dst, i), resolveProfileBandValue(prefs, src, i, presetId))
         }
+
+        // Copy custom user preset name if present
+        val customNameKey = profileCustomPresetNameKey(src)
+        if (prefs.contains(customNameKey)) {
+            val customName = prefs.getString(customNameKey, null)
+            if (!customName.isNullOrEmpty()) {
+                editor.putString(profileCustomPresetNameKey(dst), customName)
+            }
+        }
+        for (i in 0 until BAND_COUNT) {
+            val userBandKey = userPresetBandKey(src, i)
+            if (prefs.contains(userBandKey)) {
+                editor.putFloat(userPresetBandKey(dst, i), prefs.getFloat(userBandKey, 0f))
+            }
+        }
     }
 
-    private fun writeDefaultValuesToProfile(editor: SharedPreferences.Editor, id: String) {
-        editor.putBoolean(profileKey(id, AudioEffectsService.KEY_ENABLED), PROFILE_DEFAULT_ENABLED)
+    private fun writeDefaultValuesToProfile(editor: SharedPreferences.Editor, id: String, initialEnabled: Boolean = PROFILE_DEFAULT_ENABLED) {
+        editor.putBoolean(profileKey(id, AudioEffectsService.KEY_ENABLED), initialEnabled)
         editor.putFloat(profileKey(id, AudioEffectsService.KEY_BASS_DB), PROFILE_DEFAULT_BASS_DB)
         editor.putFloat(profileKey(id, AudioEffectsService.KEY_OVERALL_GAIN_DB), PROFILE_DEFAULT_OVERALL_GAIN_DB)
         editor.putInt(profileKey(id, AudioEffectsService.KEY_BASS_TYPE), PROFILE_DEFAULT_BASS_TYPE)
@@ -224,8 +531,8 @@ object AudioDeviceProfileStore {
         for (i in 0 until BAND_COUNT) editor.putFloat(profileBandKey(id, i), 0f)
     }
 
-    private fun writeDefaultValuesToActive(editor: SharedPreferences.Editor) {
-        editor.putBoolean(AudioEffectsService.KEY_ENABLED, PROFILE_DEFAULT_ENABLED)
+    private fun writeDefaultValuesToActive(editor: SharedPreferences.Editor, initialEnabled: Boolean = PROFILE_DEFAULT_ENABLED) {
+        editor.putBoolean(AudioEffectsService.KEY_ENABLED, initialEnabled)
         editor.putFloat(AudioEffectsService.KEY_BASS_DB, PROFILE_DEFAULT_BASS_DB)
         editor.putFloat(AudioEffectsService.KEY_OVERALL_GAIN_DB, PROFILE_DEFAULT_OVERALL_GAIN_DB)
         editor.putInt(AudioEffectsService.KEY_BASS_TYPE, PROFILE_DEFAULT_BASS_TYPE)
@@ -299,25 +606,72 @@ object AudioDeviceProfileStore {
         return false
     }
 
-    private fun findExistingAliasProfileId(prefs: SharedPreferences, targetId: String, info: AudioDeviceInfo?): String? {
+    fun findExistingAliasProfileId(
+        prefs: SharedPreferences,
+        targetId: String,
+        info: AudioDeviceInfo?,
+        context: Context? = null
+    ): String? {
         if (info == null) return null
         val type = info.type
-        val product = sanitizeProductName(info)
 
         if (isBluetoothType(type)) {
-            if (product.isNotEmpty()) {
-                val alias = "bluetooth_$product"
-                if (alias != targetId && hasProfileData(prefs, alias)) return alias
+            // 1. Check registry by MAC address
+            val mac = resolveBluetoothMac(info, context)
+            if (mac.isNotEmpty()) {
+                val mappedId = prefs.getString("$KEY_REG_MAC_PREFIX$mac", null)
+                if (!mappedId.isNullOrEmpty() && mappedId != targetId && hasProfileData(prefs, mappedId)) {
+                    return mappedId
+                }
             }
+
+            // 2. Check registry by Audio Hardware Fingerprint
+            val fp = buildAudioHardwareFingerprint(info)
+            if (fp.isNotEmpty()) {
+                val mappedFpId = prefs.getString("$KEY_REG_FP_PREFIX$fp", null)
+                if (!mappedFpId.isNullOrEmpty() && mappedFpId != targetId && hasProfileData(prefs, mappedFpId)) {
+                    return mappedFpId
+                }
+            }
+
+            // 3. Check registry by product name or previous bluetooth_<name> alias
+            val product = sanitizeProductName(info)
+            if (product.isNotEmpty()) {
+                val mappedNameId = prefs.getString("$KEY_REG_NAME_PREFIX$product", null)
+                if (!mappedNameId.isNullOrEmpty() && mappedNameId != targetId && hasProfileData(prefs, mappedNameId)) {
+                    return mappedNameId
+                }
+                val oldAlias = "bluetooth_$product"
+                if (oldAlias != targetId && hasProfileData(prefs, oldAlias)) return oldAlias
+            }
+
+            // 4. Check generic "bluetooth" profile
             if ("bluetooth" != targetId && hasProfileData(prefs, "bluetooth")) return "bluetooth"
+
+            // 5. If there is only ONE other bluetooth profile saved in prefs, migrate from it
+            val allKeys = prefs.all.keys
+            val existingBtProfiles = allKeys
+                .filter { it.startsWith(KEY_PROFILE_PREFIX + "bluetooth_") }
+                .map { key ->
+                    key.removePrefix(KEY_PROFILE_PREFIX).substringBefore("_" + AudioEffectsService.KEY_ENABLED)
+                }
+                .distinct()
+                .filter { it != targetId && hasProfileData(prefs, it) }
+
+            if (existingBtProfiles.size == 1) {
+                return existingBtProfiles[0]
+            }
         }
+
         if (isWiredType(type)) {
+            val product = sanitizeProductName(info)
             if (product.isNotEmpty()) {
                 val alias = "wired_$product"
                 if (alias != targetId && hasProfileData(prefs, alias)) return alias
             }
             if ("wired" != targetId && hasProfileData(prefs, "wired")) return "wired"
         }
+
         val typeOnly = "type_$type"
         if (typeOnly != targetId && hasProfileData(prefs, typeOnly)) return typeOnly
         if (GLOBAL_PROFILE_ID != targetId && hasProfileData(prefs, GLOBAL_PROFILE_ID)) return GLOBAL_PROFILE_ID
@@ -329,7 +683,7 @@ object AudioDeviceProfileStore {
 
     private fun uniqueOutputName(info: AudioDeviceInfo): String {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            info.address?.trim()?.let { if (it.isNotEmpty() && it != "00:00:00:00:00:00") return it }
+            info.address?.trim()?.let { if (it.isNotEmpty() && isValidMacAddress(it)) return cleanMac(it) }
         }
         return info.productName?.toString()?.trim() ?: ""
     }

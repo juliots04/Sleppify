@@ -43,7 +43,8 @@ class CommentsBottomSheet(
         val creatorHeartAvatarUrl: String = "",
         val heartTooltip: String = "",
         val memberBadgeUrl: String = "",
-        val memberBadgeLabel: String = ""
+        val memberBadgeLabel: String = "",
+        var isExpanded: Boolean = false
     )
 
     data class CommentItem(
@@ -66,7 +67,8 @@ class CommentsBottomSheet(
         val creatorHeartAvatarUrl: String = "",
         val heartTooltip: String = "",
         val memberBadgeUrl: String = "",
-        val memberBadgeLabel: String = ""
+        val memberBadgeLabel: String = "",
+        var isExpanded: Boolean = false
     )
 
     private val executor = Executors.newSingleThreadExecutor()
@@ -81,8 +83,8 @@ class CommentsBottomSheet(
     private val pbLoading: ProgressBar = bsv.findViewById(R.id.pbCommentsLoading)
     private val tvEmpty: TextView = bsv.findViewById(R.id.tvCommentsEmpty)
     private val tvCount: TextView = bsv.findViewById(R.id.tvCommentsCount)
-    private val flPagingLoader: FrameLayout = bsv.findViewById(R.id.flCommentsPagingLoader)
     private val adapter = CommentsAdapter(comments)
+
 
     companion object {
         private const val INNERTUBE_NEXT = "https://www.youtube.com/youtubei/v1/next?prettyPrint=false"
@@ -237,6 +239,73 @@ class CommentsBottomSheet(
                 ?.substringAfter("=")
                 ?.trim()
         }
+
+        fun normalizeImageUrl(url: String): String {
+            val trimmed = url.trim()
+            if (trimmed.isEmpty()) return ""
+            return when {
+                trimmed.startsWith("//") -> "https:$trimmed"
+                trimmed.startsWith("http://") -> trimmed.replaceFirst("http://", "https://")
+                else -> trimmed
+            }
+        }
+
+        fun extractAvatarUrl(entityPayload: JSONObject?, authorObj: JSONObject?): String {
+            if (authorObj != null) {
+                authorObj.optString("avatarThumbnailUrl", "").takeIf { it.isNotBlank() }?.let { return normalizeImageUrl(it) }
+                val authorAvatar = authorObj.optJSONObject("avatar")
+                if (authorAvatar != null) {
+                    authorAvatar.optJSONObject("image")?.optJSONArray("sources")?.optJSONObject(0)?.optString("url", "")
+                        ?.takeIf { it.isNotBlank() }?.let { return normalizeImageUrl(it) }
+                    authorAvatar.optJSONArray("thumbnails")?.optJSONObject(0)?.optString("url", "")
+                        ?.takeIf { it.isNotBlank() }?.let { return normalizeImageUrl(it) }
+                    authorAvatar.optString("thumbnailUrl", "").takeIf { it.isNotBlank() }?.let { return normalizeImageUrl(it) }
+                }
+                authorObj.optJSONArray("thumbnails")?.optJSONObject(0)?.optString("url", "")
+                    ?.takeIf { it.isNotBlank() }?.let { return normalizeImageUrl(it) }
+                authorObj.optJSONObject("thumbnail")?.optJSONArray("thumbnails")?.optJSONObject(0)?.optString("url", "")
+                    ?.takeIf { it.isNotBlank() }?.let { return normalizeImageUrl(it) }
+            }
+            if (entityPayload != null) {
+                val authorInPayload = entityPayload.optJSONObject("author")
+                if (authorInPayload != null && authorInPayload != authorObj) {
+                    authorInPayload.optString("avatarThumbnailUrl", "").takeIf { it.isNotBlank() }?.let { return normalizeImageUrl(it) }
+                }
+                val avatarObj = entityPayload.optJSONObject("avatar")
+                if (avatarObj != null) {
+                    avatarObj.optJSONObject("image")?.optJSONArray("sources")?.optJSONObject(0)?.optString("url", "")
+                        ?.takeIf { it.isNotBlank() }?.let { return normalizeImageUrl(it) }
+                    avatarObj.optJSONArray("thumbnails")?.optJSONObject(0)?.optString("url", "")
+                        ?.takeIf { it.isNotBlank() }?.let { return normalizeImageUrl(it) }
+                    avatarObj.optString("thumbnailUrl", "").takeIf { it.isNotBlank() }?.let { return normalizeImageUrl(it) }
+                }
+                val authorThumb = entityPayload.optJSONObject("authorThumbnail")
+                if (authorThumb != null) {
+                    authorThumb.optJSONArray("thumbnails")?.optJSONObject(0)?.optString("url", "")
+                        ?.takeIf { it.isNotBlank() }?.let { return normalizeImageUrl(it) }
+                    authorThumb.optString("url", "").takeIf { it.isNotBlank() }?.let { return normalizeImageUrl(it) }
+                }
+            }
+            return ""
+        }
+
+
+        fun extractLegacyAvatarUrl(commentRenderer: JSONObject): String {
+            val thumbObj = commentRenderer.optJSONObject("authorThumbnail")
+            if (thumbObj != null) {
+                thumbObj.optJSONArray("thumbnails")?.optJSONObject(0)?.optString("url", "")
+                    ?.takeIf { it.isNotBlank() }?.let { return normalizeImageUrl(it) }
+                thumbObj.optJSONArray("sources")?.optJSONObject(0)?.optString("url", "")
+                    ?.takeIf { it.isNotBlank() }?.let { return normalizeImageUrl(it) }
+                thumbObj.optString("url", "").takeIf { it.isNotBlank() }?.let { return normalizeImageUrl(it) }
+            }
+            val thumbArr = commentRenderer.optJSONArray("authorThumbnail")
+            if (thumbArr != null) {
+                thumbArr.optJSONObject(0)?.optString("url", "")
+                    ?.takeIf { it.isNotBlank() }?.let { return normalizeImageUrl(it) }
+            }
+            return ""
+        }
     }
 
     init {
@@ -313,7 +382,7 @@ class CommentsBottomSheet(
     private fun loadComments(pageToken: String?) {
         if (isLoading) return
         isLoading = true
-        if (pageToken != null) flPagingLoader.visibility = View.VISIBLE
+
 
         executor.execute {
             var cacheLoaded = false
@@ -375,7 +444,7 @@ class CommentsBottomSheet(
             bsv.post {
                 if (!dialog.isShowing) return@post
                 isLoading = false
-                flPagingLoader.visibility = View.GONE
+
 
                 if (result == null) {
                     if (comments.isEmpty()) {
@@ -599,10 +668,17 @@ class CommentsBottomSheet(
                 val key = mutation.optString("entityKey", "")
                 if (key.isEmpty()) continue
                 val payloadObj = mutation.optJSONObject("payload") ?: continue
-                payloadObj.optJSONObject("commentEntityPayload")
-                    ?.let { entityMap[key] = it }
+                val cep = payloadObj.optJSONObject("commentEntityPayload")
+                if (cep != null) {
+                    entityMap[key] = cep
+                    val k = cep.optString("key", "")
+                    if (k.isNotEmpty()) entityMap[k] = cep
+                    val cId = cep.optJSONObject("properties")?.optString("commentId", "") ?: ""
+                    if (cId.isNotEmpty()) entityMap[cId] = cep
+                }
                 payloadObj.optJSONObject("engagementToolbarStateEntityPayload")
                     ?.let { toolbarStateMap[key] = it }
+
             }
         }
 
@@ -648,7 +724,6 @@ class CommentsBottomSheet(
                         val props = entityPayload.optJSONObject("properties")
                         val toolbar = entityPayload.optJSONObject("toolbar")
                         val authorObj = entityPayload.optJSONObject("author")
-                        val avatarObj = entityPayload.optJSONObject("avatar")
 
                         val commentText = props?.optJSONObject("content")?.optString("content", "") ?: ""
                         val author = authorObj?.optString("displayName", "")
@@ -656,21 +731,19 @@ class CommentsBottomSheet(
                         val publishedTime = props?.optString("publishedTime", "") ?: ""
                         val likeCount = toolbar?.optString("likeCountNotliked", "")
                             ?: toolbar?.optString("likeCountLiked", "") ?: ""
-                        val profileUrl = avatarObj?.optJSONObject("image")
-                            ?.optJSONArray("sources")?.optJSONObject(0)?.optString("url", "")
-                            ?: avatarObj?.optString("thumbnailUrl", "") ?: ""
+                        val profileUrl = extractAvatarUrl(entityPayload, authorObj)
 
                         // Badges (new format): flags live on author; the creator heart joins
                         // through properties.toolbarStateKey; pinnedText sits on the viewModel.
                         val isVerified = authorObj?.optBoolean("isVerified", false) ?: false
                         val isArtist = authorObj?.optBoolean("isArtist", false) ?: false
                         val isChannelOwner = authorObj?.optBoolean("isCreator", false) ?: false
-                        val memberBadgeUrl = authorObj?.optString("sponsorBadgeUrl", "") ?: ""
+                        val memberBadgeUrl = normalizeImageUrl(authorObj?.optString("sponsorBadgeUrl", "") ?: "")
                         val memberBadgeLabel = authorObj?.optString("sponsorBadgeA11y", "") ?: ""
                         val toolbarStateKey = props?.optString("toolbarStateKey", "") ?: ""
                         val isHearted = toolbarStateMap[toolbarStateKey]
                             ?.optString("heartState", "") == "TOOLBAR_HEART_STATE_HEARTED"
-                        val creatorHeartAvatarUrl = toolbar?.optString("creatorThumbnailUrl", "") ?: ""
+                        val creatorHeartAvatarUrl = normalizeImageUrl(toolbar?.optString("creatorThumbnailUrl", "") ?: "")
                         val heartTooltip = toolbar?.optString("heartActiveTooltip", "") ?: ""
                         // pinnedText is usually a plain string; key presence alone marks pinned
                         // (object-shaped variants fall back to the default "Fijado" label).
@@ -732,11 +805,7 @@ class CommentsBottomSheet(
 
                 val author = extractText(commentRenderer.optJSONObject("authorText"))
                 val text = extractText(commentRenderer.optJSONObject("contentText"))
-                val profileUrl = commentRenderer.optJSONArray("authorThumbnail")
-                    ?.optJSONObject(0)?.optString("url", "")
-                    ?: commentRenderer.optJSONObject("authorThumbnail")
-                        ?.optJSONArray("thumbnails")?.optJSONObject(0)?.optString("url", "")
-                    ?: ""
+                val profileUrl = extractLegacyAvatarUrl(commentRenderer)
                 val likeCountText = extractText(commentRenderer.optJSONObject("voteCount"))
                 val publishedText = extractText(commentRenderer.optJSONObject("publishedTimeText"))
 
@@ -752,16 +821,20 @@ class CommentsBottomSheet(
                 val legacyArtist = badgeIcon == "OFFICIAL_ARTIST_BADGE" || badgeIcon == "AUDIO_BADGE"
                 val sponsorBadge = commentRenderer.optJSONObject("sponsorCommentBadge")
                     ?.optJSONObject("sponsorCommentBadgeRenderer")
-                val legacyMemberUrl = sponsorBadge?.optJSONObject("customBadge")
-                    ?.optJSONArray("thumbnails")?.optJSONObject(0)?.optString("url", "") ?: ""
+                val legacyMemberUrl = normalizeImageUrl(
+                    sponsorBadge?.optJSONObject("customBadge")
+                        ?.optJSONArray("thumbnails")?.optJSONObject(0)?.optString("url", "") ?: ""
+                )
                 val legacyMemberLabel = sponsorBadge?.optString("tooltip", "") ?: ""
                 val heartRenderer = commentRenderer.optJSONObject("actionButtons")
                     ?.optJSONObject("commentActionButtonsRenderer")
                     ?.optJSONObject("creatorHeart")
                     ?.optJSONObject("creatorHeartRenderer")
                 val legacyHearted = heartRenderer?.optBoolean("isHearted", false) ?: false
-                val legacyHeartAvatar = heartRenderer?.optJSONObject("creatorThumbnail")
-                    ?.optJSONArray("thumbnails")?.optJSONObject(0)?.optString("url", "") ?: ""
+                val legacyHeartAvatar = normalizeImageUrl(
+                    heartRenderer?.optJSONObject("creatorThumbnail")
+                        ?.optJSONArray("thumbnails")?.optJSONObject(0)?.optString("url", "") ?: ""
+                )
                 val legacyHeartTooltip = heartRenderer?.optString("heartedTooltip", "") ?: ""
 
                 // Extract reply continuation token for lazy loading (legacy)
@@ -837,10 +910,17 @@ class CommentsBottomSheet(
                     val key = mutation.optString("entityKey", "")
                     if (key.isEmpty()) continue
                     val payloadObj = mutation.optJSONObject("payload") ?: continue
-                    payloadObj.optJSONObject("commentEntityPayload")
-                        ?.let { replyEntityMap[key] = it }
+                    val cep = payloadObj.optJSONObject("commentEntityPayload")
+                    if (cep != null) {
+                        replyEntityMap[key] = cep
+                        val k = cep.optString("key", "")
+                        if (k.isNotEmpty()) replyEntityMap[k] = cep
+                        val cId = cep.optJSONObject("properties")?.optString("commentId", "") ?: ""
+                        if (cId.isNotEmpty()) replyEntityMap[cId] = cep
+                    }
                     payloadObj.optJSONObject("engagementToolbarStateEntityPayload")
                         ?.let { replyToolbarStateMap[key] = it }
+
                 }
             }
 
@@ -873,12 +953,13 @@ class CommentsBottomSheet(
                             val rTsKey = props?.optString("toolbarStateKey", "") ?: ""
                             val rHearted = replyToolbarStateMap[rTsKey]
                                 ?.optString("heartState", "") == "TOOLBAR_HEART_STATE_HEARTED"
+                            val rProfileUrl = extractAvatarUrl(payload2, authorObj)
+                            val rCreatorHeartAvatarUrl = normalizeImageUrl(rToolbar?.optString("creatorThumbnailUrl", "") ?: "")
+                            val rMemberBadgeUrl = normalizeImageUrl(authorObj?.optString("sponsorBadgeUrl", "") ?: "")
                             result.add(ReplyItem(
                                 authorName = rAuthor,
                                 authorInitial = rAuthor.firstOrNull()?.uppercaseChar()?.toString() ?: "?",
-                                authorProfileUrl = payload2.optJSONObject("avatar")
-                                    ?.optJSONObject("image")?.optJSONArray("sources")
-                                    ?.optJSONObject(0)?.optString("url", "") ?: "",
+                                authorProfileUrl = rProfileUrl,
                                 text = props?.optJSONObject("content")?.optString("content", "") ?: "",
                                 likeCount = rToolbar?.optString("likeCountNotliked", "") ?: "",
                                 publishedAt = props?.optString("publishedTime", "") ?: "",
@@ -886,9 +967,9 @@ class CommentsBottomSheet(
                                 isArtist = authorObj?.optBoolean("isArtist", false) ?: false,
                                 isChannelOwner = authorObj?.optBoolean("isCreator", false) ?: false,
                                 isHearted = rHearted,
-                                creatorHeartAvatarUrl = rToolbar?.optString("creatorThumbnailUrl", "") ?: "",
+                                creatorHeartAvatarUrl = rCreatorHeartAvatarUrl,
                                 heartTooltip = rToolbar?.optString("heartActiveTooltip", "") ?: "",
-                                memberBadgeUrl = authorObj?.optString("sponsorBadgeUrl", "") ?: "",
+                                memberBadgeUrl = rMemberBadgeUrl,
                                 memberBadgeLabel = authorObj?.optString("sponsorBadgeA11y", "") ?: ""
                             ))
                             continue
@@ -905,11 +986,19 @@ class CommentsBottomSheet(
                             ?.optJSONObject("commentActionButtonsRenderer")
                             ?.optJSONObject("creatorHeart")
                             ?.optJSONObject("creatorHeartRenderer")
+                        val rProfileUrl = extractLegacyAvatarUrl(cr)
+                        val rHeartAvatar = normalizeImageUrl(
+                            rHeart?.optJSONObject("creatorThumbnail")
+                                ?.optJSONArray("thumbnails")?.optJSONObject(0)?.optString("url", "") ?: ""
+                        )
+                        val rMemberUrl = normalizeImageUrl(
+                            rSponsor?.optJSONObject("customBadge")
+                                ?.optJSONArray("thumbnails")?.optJSONObject(0)?.optString("url", "") ?: ""
+                        )
                         result.add(ReplyItem(
                             authorName = rAuthor,
                             authorInitial = rAuthor.firstOrNull()?.uppercaseChar()?.toString() ?: "?",
-                            authorProfileUrl = cr.optJSONObject("authorThumbnail")
-                                ?.optJSONArray("thumbnails")?.optJSONObject(0)?.optString("url", "") ?: "",
+                            authorProfileUrl = rProfileUrl,
                             text = extractText(cr.optJSONObject("contentText")),
                             likeCount = extractText(cr.optJSONObject("voteCount")),
                             publishedAt = extractText(cr.optJSONObject("publishedTimeText")),
@@ -917,11 +1006,9 @@ class CommentsBottomSheet(
                             isArtist = rBadgeIcon == "OFFICIAL_ARTIST_BADGE" || rBadgeIcon == "AUDIO_BADGE",
                             isChannelOwner = cr.optBoolean("authorIsChannelOwner", false),
                             isHearted = rHeart?.optBoolean("isHearted", false) ?: false,
-                            creatorHeartAvatarUrl = rHeart?.optJSONObject("creatorThumbnail")
-                                ?.optJSONArray("thumbnails")?.optJSONObject(0)?.optString("url", "") ?: "",
+                            creatorHeartAvatarUrl = rHeartAvatar,
                             heartTooltip = rHeart?.optString("heartedTooltip", "") ?: "",
-                            memberBadgeUrl = rSponsor?.optJSONObject("customBadge")
-                                ?.optJSONArray("thumbnails")?.optJSONObject(0)?.optString("url", "") ?: "",
+                            memberBadgeUrl = rMemberUrl,
                             memberBadgeLabel = rSponsor?.optString("tooltip", "") ?: ""
                         ))
                     }
@@ -973,25 +1060,32 @@ class CommentsBottomSheet(
     }
 
     private fun loadAvatarInto(profileUrl: String, ivAvatar: ImageView) {
-        if (profileUrl.isNotEmpty()) {
+        val cleanUrl = normalizeImageUrl(profileUrl)
+        if (cleanUrl.isNotEmpty()) {
             ivAvatar.visibility = View.VISIBLE
             try {
-                // Avatars render at 36dp: decoding at a bounded size + caching the transformed
-                // result makes scrolling through pages dramatically cheaper.
-                Glide.with(context)
-                    .load(profileUrl)
+                val ctx = ivAvatar.context ?: context
+                Glide.with(ctx)
+                    .load(cleanUrl)
                     .transform(CircleCrop())
                     .override(96, 96)
+                    .placeholder(R.drawable.bg_comment_avatar)
+                    .error(R.drawable.bg_comment_avatar)
                     .diskCacheStrategy(DiskCacheStrategy.ALL)
                     .into(ivAvatar)
             } catch (_: Exception) {
-                ivAvatar.visibility = View.GONE
+                ivAvatar.setImageResource(R.drawable.bg_comment_avatar)
             }
         } else {
-            try { Glide.with(context).clear(ivAvatar) } catch (_: Exception) {}
-            ivAvatar.visibility = View.GONE
+            try {
+                val ctx = ivAvatar.context ?: context
+                Glide.with(ctx).clear(ivAvatar)
+            } catch (_: Exception) {}
+            ivAvatar.setImageResource(R.drawable.bg_comment_avatar)
+            ivAvatar.visibility = View.VISIBLE
         }
     }
+
 
     /**
      * Author-row badges shared by comments and replies. Holders recycle, so every badge
@@ -1012,11 +1106,13 @@ class CommentsBottomSheet(
             ivBadge.visibility = View.GONE
         }
         if (memberBadgeUrl.isNotEmpty()) {
+            val cleanMemberUrl = normalizeImageUrl(memberBadgeUrl)
             ivMemberBadge.contentDescription = memberBadgeLabel.ifEmpty { "Miembro" }
             ivMemberBadge.visibility = View.VISIBLE
             try {
-                Glide.with(context)
-                    .load(memberBadgeUrl)
+                val ctx = ivMemberBadge.context ?: context
+                Glide.with(ctx)
+                    .load(cleanMemberUrl)
                     .override(28, 28)
                     .diskCacheStrategy(DiskCacheStrategy.ALL)
                     .into(ivMemberBadge)
@@ -1024,7 +1120,10 @@ class CommentsBottomSheet(
                 ivMemberBadge.visibility = View.GONE
             }
         } else {
-            try { Glide.with(context).clear(ivMemberBadge) } catch (_: Exception) {}
+            try {
+                val ctx = ivMemberBadge.context ?: context
+                Glide.with(ctx).clear(ivMemberBadge)
+            } catch (_: Exception) {}
             ivMemberBadge.visibility = View.GONE
         }
         if (isChannelOwner) {
@@ -1135,6 +1234,7 @@ class CommentsBottomSheet(
             private val tvAuthor: TextView = view.findViewById(R.id.tvCommentAuthor)
             private val tvTime: TextView = view.findViewById(R.id.tvCommentTime)
             private val tvText: TextView = view.findViewById(R.id.tvCommentText)
+            private val tvExpand: TextView = view.findViewById(R.id.tvCommentExpand)
             private val tvLikes: TextView = view.findViewById(R.id.tvCommentLikes)
             private val llPinned: View = view.findViewById(R.id.llCommentPinned)
             private val tvPinned: TextView = view.findViewById(R.id.tvCommentPinned)
@@ -1149,6 +1249,11 @@ class CommentsBottomSheet(
                 tvLikes.text = item.likeCount
                 tvLikes.visibility = if (item.likeCount.isEmpty()) View.GONE else View.VISIBLE
                 loadAvatarInto(item.authorProfileUrl, ivAvatar)
+                applyExpandState(item)
+                tvExpand.setOnClickListener {
+                    item.isExpanded = !item.isExpanded
+                    applyExpandState(item)
+                }
                 if (item.isPinned) {
                     tvPinned.text = item.pinnedLabel.ifEmpty { "Fijado" }
                     llPinned.visibility = View.VISIBLE
@@ -1164,6 +1269,36 @@ class CommentsBottomSheet(
                     item.creatorHeartAvatarUrl, item.heartTooltip
                 )
             }
+
+            private fun applyExpandState(item: CommentItem) {
+                val rawText = item.text
+                val newlineCount = rawText.count { it == '\n' }
+                val isLongContent = newlineCount >= 3 || rawText.length > 150
+
+                if (item.isExpanded) {
+                    tvText.maxLines = Int.MAX_VALUE
+                    tvText.ellipsize = null
+                    tvExpand.visibility = View.VISIBLE
+                    tvExpand.text = "Ver menos"
+                } else {
+                    tvText.maxLines = 4
+                    tvText.ellipsize = android.text.TextUtils.TruncateAt.END
+                    tvExpand.text = "Ver más"
+                    // Visibilidad inmediata para evitar parpadeos si tiene saltos de línea (letras de canciones)
+                    tvExpand.visibility = if (isLongContent) View.VISIBLE else View.GONE
+                    tvText.post {
+                        if (item.isExpanded) return@post
+                        val layout = tvText.layout
+                        if (layout != null) {
+                            val lastLine = layout.lineCount - 1
+                            val isCutOff = (lastLine >= 0 && layout.getLineEnd(lastLine) < tvText.text.length)
+                                || (lastLine >= 0 && layout.getEllipsisCount(lastLine) > 0)
+                                || isLongContent
+                            tvExpand.visibility = if (isCutOff) View.VISIBLE else View.GONE
+                        }
+                    }
+                }
+            }
         }
 
         inner class ReplyVH(view: View) : RecyclerView.ViewHolder(view) {
@@ -1171,6 +1306,7 @@ class CommentsBottomSheet(
             private val tvAuthor: TextView = view.findViewById(R.id.tvReplyAuthor)
             private val tvTime: TextView = view.findViewById(R.id.tvReplyTime)
             private val tvText: TextView = view.findViewById(R.id.tvReplyText)
+            private val tvExpand: TextView = view.findViewById(R.id.tvReplyExpand)
             private val tvLikes: TextView = view.findViewById(R.id.tvReplyLikes)
             private val ivBadge: ImageView = view.findViewById(R.id.ivReplyBadge)
             private val ivMemberBadge: ImageView = view.findViewById(R.id.ivReplyMemberBadge)
@@ -1183,6 +1319,11 @@ class CommentsBottomSheet(
                 tvLikes.text = item.likeCount
                 tvLikes.visibility = if (item.likeCount.isEmpty()) View.GONE else View.VISIBLE
                 loadAvatarInto(item.authorProfileUrl, ivAvatar)
+                applyExpandState(item)
+                tvExpand.setOnClickListener {
+                    item.isExpanded = !item.isExpanded
+                    applyExpandState(item)
+                }
                 bindAuthorBadges(
                     tvAuthor, ivBadge, ivMemberBadge, item.isVerified, item.isArtist,
                     item.isChannelOwner, item.memberBadgeUrl, item.memberBadgeLabel
@@ -1191,6 +1332,35 @@ class CommentsBottomSheet(
                     flHeart, ivHeartAvatar, item.isHearted,
                     item.creatorHeartAvatarUrl, item.heartTooltip
                 )
+            }
+
+            private fun applyExpandState(item: ReplyItem) {
+                val rawText = item.text
+                val newlineCount = rawText.count { it == '\n' }
+                val isLongContent = newlineCount >= 3 || rawText.length > 150
+
+                if (item.isExpanded) {
+                    tvText.maxLines = Int.MAX_VALUE
+                    tvText.ellipsize = null
+                    tvExpand.visibility = View.VISIBLE
+                    tvExpand.text = "Ver menos"
+                } else {
+                    tvText.maxLines = 4
+                    tvText.ellipsize = android.text.TextUtils.TruncateAt.END
+                    tvExpand.text = "Ver más"
+                    tvExpand.visibility = if (isLongContent) View.VISIBLE else View.GONE
+                    tvText.post {
+                        if (item.isExpanded) return@post
+                        val layout = tvText.layout
+                        if (layout != null) {
+                            val lastLine = layout.lineCount - 1
+                            val isCutOff = (lastLine >= 0 && layout.getLineEnd(lastLine) < tvText.text.length)
+                                || (lastLine >= 0 && layout.getEllipsisCount(lastLine) > 0)
+                                || isLongContent
+                            tvExpand.visibility = if (isCutOff) View.VISIBLE else View.GONE
+                        }
+                    }
+                }
             }
         }
 
