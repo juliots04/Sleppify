@@ -19,6 +19,7 @@ import android.view.View
 import android.view.KeyEvent
 import android.widget.ImageView
 import android.widget.TextView
+import android.widget.FrameLayout
 import android.provider.Settings
 import android.transition.TransitionManager
 import android.util.Log
@@ -61,6 +62,7 @@ class MainActivity : AppCompatActivity() {
         private const val TAG_PLAYLIST_DETAIL = "playlist_detail"
         private const val TAG_ARTIST_DETAIL = "artist_detail"
         private const val TAG_SONG_PLAYER = AppConstants.TAG_SONG_PLAYER
+        const val TAG_WELCOME_AUTH = "welcome_auth"
 
         private const val PREFS_PLAYER_STATE = AppConstants.PREFS_PLAYER_STATE
         private const val PREFS_BOOTSTRAP = "sleppify_bootstrap"
@@ -189,6 +191,7 @@ class MainActivity : AppCompatActivity() {
     private var lastSmartPrefetchAtMs = 0L
     private var hasAudioServiceStateSnapshot = false
     private var lastEqEnabled = false
+    private var lastNormEnabled = false
     private var lastSpatialEnabled = false
     private var lastReverbLevel = 0
     
@@ -213,10 +216,12 @@ class MainActivity : AppCompatActivity() {
             if (music != null && music.isAdded) {
                 music.handleWebSessionAuthSuccess(intentData)
             }
+            dismissWelcomeAuth()
         } else {
             if (music != null && music.isAdded) {
                 music.onWebSessionCanceled()
             }
+            onWelcomeAuthWebSessionCanceled()
         }
     }
     private var pendingAudioProcessingAuthorization = false
@@ -231,14 +236,21 @@ class MainActivity : AppCompatActivity() {
     private val outputDeviceCallback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<AudioDeviceInfo>?) {
             syncAudioProfile(true)
+            mainHandler.postDelayed({ syncAudioProfile(true) }, 400L)
         }
         override fun onAudioDevicesRemoved(removedDevices: Array<AudioDeviceInfo>?) {
             syncAudioProfile(true)
+            mainHandler.postDelayed({ syncAudioProfile(true) }, 400L)
         }
     }
 
     private val backPressedCallback = object : OnBackPressedCallback(true) {
         override fun handleOnBackPressed() {
+            val welcomeContainer = findViewById<View>(R.id.welcomeAuthContainer)
+            if (welcomeContainer != null && welcomeContainer.visibility == View.VISIBLE) {
+                moveTaskToBack(true)
+                return
+            }
             val eq = supportFragmentManager.findFragmentByTag(TAG_MODULE_EQUALIZER)
             if (eq != null && eq.isAdded && !eq.isHidden) {
                 returnFromEqualizer()
@@ -338,6 +350,10 @@ class MainActivity : AppCompatActivity() {
         }
         showMainShell()
 
+        if (shouldShowWelcomeAuth()) {
+            showWelcomeAuth(animated = false)
+        }
+
         // Pre-create MusicPlayerFragment hidden so its library state is warm and ready
         // when the user navigates to Biblioteca.
         fragmentContainer.postDelayed({
@@ -356,7 +372,7 @@ class MainActivity : AppCompatActivity() {
         // Defer heavy startup work to background thread
         lifecycleScope.launch {
             delay(100) // Allow UI to render first
-            syncAudioProfile(false)
+            syncAudioProfile(true)
             withContext(Dispatchers.IO) {
                 syncAudioEffectsServiceFromPreferences(forceSync = true)
             }
@@ -749,13 +765,19 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
+    private fun isNetworkOnline(caps: android.net.NetworkCapabilities?): Boolean {
+        if (caps == null) return false
+        if (!caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)) return false
+        if (caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR)) return true
+        return caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                || !caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_CAPTIVE_PORTAL)
+    }
+
     private fun registerNetworkCallback() {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager ?: return
         // Seed initial state without showing bar
         val caps = cm.getNetworkCapabilities(cm.activeNetwork)
-        wasNetworkAvailable = caps != null
-                && caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                && caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        wasNetworkAvailable = isNetworkOnline(caps)
 
         val cb = object : android.net.ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: android.net.Network) {
@@ -766,8 +788,7 @@ class MainActivity : AppCompatActivity() {
                 network: android.net.Network,
                 caps: android.net.NetworkCapabilities
             ) {
-                val hasInternet = caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                        && caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                val hasInternet = isNetworkOnline(caps)
                 if (hasInternet && wasNetworkAvailable != true) {
                     wasNetworkAvailable = true
                     mainHandler.post { onNetworkRestored() }
@@ -780,9 +801,7 @@ class MainActivity : AppCompatActivity() {
                     val cmInner = getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
                     val active = cmInner?.activeNetwork
                     val activeCaps = if (active != null) cmInner.getNetworkCapabilities(active) else null
-                    val stillOnline = activeCaps != null
-                            && activeCaps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                            && activeCaps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                    val stillOnline = isNetworkOnline(activeCaps)
                     if (!stillOnline && wasNetworkAvailable != false) {
                         wasNetworkAvailable = false
                         onNetworkLost()
@@ -818,7 +837,13 @@ class MainActivity : AppCompatActivity() {
 
     fun requestAudioEffectsStopFromUi() {
         hasAudioServiceStateSnapshot = false
-        AudioEffectsService.sendStop(applicationContext)
+        val audioPrefs = getSharedPreferences(AudioEffectsService.PREFS_NAME, MODE_PRIVATE)
+        val normEnabled = audioPrefs.getBoolean(AudioEffectsService.KEY_VOLUME_NORMALIZATION, true)
+        if (normEnabled) {
+            AudioEffectsService.sendApply(applicationContext)
+        } else {
+            AudioEffectsService.sendStop(applicationContext)
+        }
     }
 
     private fun syncAudioProfile(applyIfChanged: Boolean) {
@@ -830,9 +855,10 @@ class MainActivity : AppCompatActivity() {
 
         if (profileSwitched && applyIfChanged) {
             syncAudioEffectsServiceFromPreferences(forceSync = true)
-            // Notify EqualizerFragment if it's active
-            (getMainModuleFragment(R.id.nav_equalizer) as? EqualizerFragment)?.onOutputProfileSwitchedLocally()
         }
+        val eq = (equalizerFragment as? EqualizerFragment)
+            ?: (supportFragmentManager.findFragmentByTag(TAG_MODULE_EQUALIZER) as? EqualizerFragment)
+        eq?.onOutputProfileSwitchedLocally()
     }
 
 
@@ -840,19 +866,23 @@ class MainActivity : AppCompatActivity() {
         val audioPrefs = getSharedPreferences(AudioEffectsService.PREFS_NAME, MODE_PRIVATE)
 
         val eqEnabled = audioPrefs.getBoolean(AudioEffectsService.KEY_ENABLED, false)
+        val normEnabled = audioPrefs.getBoolean(AudioEffectsService.KEY_VOLUME_NORMALIZATION, true)
         val spatialEnabled = audioPrefs.getBoolean(AudioEffectsService.KEY_SPATIAL_ENABLED, false)
         val reverbLevel = audioPrefs.getInt(AudioEffectsService.KEY_REVERB_LEVEL, AudioEffectsService.REVERB_LEVEL_OFF)
 
-        if (!forceSync && hasAudioServiceStateSnapshot && eqEnabled == lastEqEnabled && spatialEnabled == lastSpatialEnabled && reverbLevel == lastReverbLevel) {
+        val shouldRun = eqEnabled || normEnabled
+
+        if (!forceSync && hasAudioServiceStateSnapshot && eqEnabled == lastEqEnabled && normEnabled == lastNormEnabled && spatialEnabled == lastSpatialEnabled && reverbLevel == lastReverbLevel) {
             return
         }
 
         hasAudioServiceStateSnapshot = true
         lastEqEnabled = eqEnabled
+        lastNormEnabled = normEnabled
         lastSpatialEnabled = spatialEnabled
         lastReverbLevel = reverbLevel
 
-        if (eqEnabled) AudioEffectsService.sendApply(applicationContext) else AudioEffectsService.sendStop(applicationContext)
+        if (shouldRun) AudioEffectsService.sendApply(applicationContext) else AudioEffectsService.sendStop(applicationContext)
     }
 
     private fun configureAudioAuthorizationFlow() {
@@ -878,6 +908,7 @@ class MainActivity : AppCompatActivity() {
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == 101 && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            AudioDeviceProfileStore.ensureBluetoothProxies(this)
             syncAudioProfile(true)
         } else if (requestCode == REQUEST_CODE_RECORD_AUDIO) {
             val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
@@ -983,9 +1014,86 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
+    fun shouldShowWelcomeAuth(): Boolean {
+        return !authManagerLazy.isSignedIn() || !hasSessionCookie()
+    }
+
+    fun showWelcomeAuth(animated: Boolean = true) {
+        val container = findViewById<FrameLayout>(R.id.welcomeAuthContainer) ?: return
+        container.visibility = View.VISIBLE
+        if (animated) {
+            container.alpha = 0f
+            container.animate().alpha(1f).setDuration(260L).start()
+        } else {
+            container.alpha = 1f
+        }
+        var fragment = supportFragmentManager.findFragmentByTag(TAG_WELCOME_AUTH) as? WelcomeAuthFragment
+        if (fragment == null) {
+            fragment = WelcomeAuthFragment()
+            supportFragmentManager.beginTransaction()
+                .replace(R.id.welcomeAuthContainer, fragment, TAG_WELCOME_AUTH)
+                .commitAllowingStateLoss()
+        }
+        topAppBar.visibility = View.GONE
+        bottomNav.visibility = View.GONE
+    }
+
+    fun dismissWelcomeAuth() {
+        val container = findViewById<FrameLayout>(R.id.welcomeAuthContainer) ?: return
+        if (container.visibility != View.VISIBLE) return
+        container.animate()
+            .alpha(0f)
+            .setDuration(280L)
+            .withEndAction {
+                container.visibility = View.GONE
+                val fragment = supportFragmentManager.findFragmentByTag(TAG_WELCOME_AUTH)
+                if (fragment != null) {
+                    try {
+                        supportFragmentManager.beginTransaction()
+                            .remove(fragment)
+                            .commitNowAllowingStateLoss()
+                    } catch (_: Exception) {
+                        supportFragmentManager.beginTransaction()
+                            .remove(fragment)
+                            .commitAllowingStateLoss()
+                    }
+                }
+                bottomNav.visibility = View.VISIBLE
+                showMainShell()
+                refreshPrincipalContentIfVisible()
+            }
+            .start()
+    }
+
+    fun dismissWelcomeAuthAsGuest() {
+        getSharedPreferences("sleppify_welcome_prefs", Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean("welcome_dismissed_guest", true)
+            .apply()
+        dismissWelcomeAuth()
+    }
+
+    fun startGoogleSignInFromWelcome(onSuccess: Runnable? = null, onError: Runnable? = null) {
+        startGoogleSignInThenWebSession(
+            onSuccess = {
+                onSuccess?.run()
+            },
+            onError = {
+                onError?.run()
+            }
+        )
+    }
+
+    fun onWelcomeAuthWebSessionCanceled() {
+        val fragment = supportFragmentManager.findFragmentByTag(TAG_WELCOME_AUTH) as? WelcomeAuthFragment
+        fragment?.resetGoogleButtonState()
+    }
+
     private fun showMainShell() {
         // Do not force header/bottomNav visible when inside overlay screens
         if (inSettings || inEqualizerFromSettings || isAnyOverlayModuleVisible()) return
+        val welcomeContainer = findViewById<View>(R.id.welcomeAuthContainer)
+        if (welcomeContainer != null && welcomeContainer.visibility == View.VISIBLE) return
         if (!isSearchFragmentVisible() && !isPlaylistDetailVisible()) {
             // Music and Principal fragments own their own header — hide topAppBar for them
             val isFragOwnedHeader = currentMainNavItemId == R.id.nav_music || currentMainNavItemId == R.id.nav_principal
@@ -1695,9 +1803,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun isAnyOverlayModuleVisible(): Boolean {
         fun Fragment?.isActuallyVisible(): Boolean = this != null && isAdded && !isHidden && !isRemoving
+        val welcomeContainer = findViewById<View>(R.id.welcomeAuthContainer)
+        val isWelcomeVisible = welcomeContainer != null && welcomeContainer.visibility == View.VISIBLE
         return settingsFragment.isActuallyVisible() ||
             equalizerFragment.isActuallyVisible() ||
-            searchFragment.isActuallyVisible()
+            searchFragment.isActuallyVisible() ||
+            isWelcomeVisible
     }
 
     private fun hideAllMainScreens(transaction: FragmentTransaction, target: Fragment) {

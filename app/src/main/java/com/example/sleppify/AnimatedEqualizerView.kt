@@ -1,13 +1,19 @@
 package com.example.sleppify
 
-import android.animation.ValueAnimator
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Paint
+import android.os.SystemClock
 import android.util.AttributeSet
 import android.view.View
-import android.view.animation.LinearInterpolator
 
+/**
+ * Custom animated equalizer view drawing three vertical bars.
+ *
+ * Uses Choreographer-aligned [postInvalidateOnAnimation] instead of [android.animation.ValueAnimator]
+ * to guarantee robust playback across RecyclerView scrolling, recycling, view detach/attach,
+ * fragment transitions, and devices where system animator scale is disabled (0x).
+ */
 class AnimatedEqualizerView @JvmOverloads constructor(
     context: Context,
     attrs: AttributeSet? = null,
@@ -16,38 +22,15 @@ class AnimatedEqualizerView @JvmOverloads constructor(
 
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val barHeights = floatArrayOf(0.2f, 0.2f, 0.2f)
-    private val targetHeights = floatArrayOf(0.2f, 0.2f, 0.2f)
+    private val targetHeights = floatArrayOf(0.35f, 0.65f, 0.45f)
 
-    // Deterministic keyframe pattern — same table for all bars, offset by phase
-    private val keyframes = floatArrayOf(0.3f, 0.75f, 0.45f, 0.9f, 0.55f, 0.35f, 0.8f, 0.5f)
-    private val phaseIndex = intArrayOf(0, 3, 5) // staggered start phases per bar
+    // Keyframe pattern for natural equalizer bounce
+    private val keyframes = floatArrayOf(0.24f, 0.52f, 0.32f, 0.62f, 0.40f, 0.22f, 0.56f, 0.34f)
+    private val phaseIndex = intArrayOf(0, 3, 5) // Staggered start phases per bar
 
     private var animating = false
     private var barColor = -0x1
-
-    private var frameCounter = 0
-
-    private val animator = ValueAnimator.ofFloat(0f, 1f).apply {
-        duration = 400L
-        repeatCount = ValueAnimator.INFINITE
-        interpolator = LinearInterpolator()
-        addUpdateListener {
-            frameCounter++
-            if (frameCounter % 4 != 0) return@addUpdateListener
-            for (i in 0..2) {
-                if (Math.abs(barHeights[i] - targetHeights[i]) < 0.02f) {
-                    phaseIndex[i] = (phaseIndex[i] + 1) % keyframes.size
-                    targetHeights[i] = keyframes[phaseIndex[i]]
-                }
-                if (barHeights[i] < targetHeights[i]) {
-                    barHeights[i] += 0.015f
-                } else {
-                    barHeights[i] -= 0.015f
-                }
-            }
-            invalidate()
-        }
-    }
+    private var lastFrameTime = 0L
 
     init {
         attrs?.let {
@@ -57,7 +40,6 @@ class AnimatedEqualizerView @JvmOverloads constructor(
         }
         paint.color = barColor
         paint.style = Paint.Style.FILL
-        setLayerType(LAYER_TYPE_HARDWARE, null)
     }
 
     fun setBarColor(color: Int) {
@@ -67,38 +49,59 @@ class AnimatedEqualizerView @JvmOverloads constructor(
     }
 
     fun setAnimating(animating: Boolean) {
-        if (this.animating == animating) return
         this.animating = animating
         if (animating) {
-            animator.start()
+            lastFrameTime = SystemClock.uptimeMillis()
+            postInvalidateOnAnimation()
         } else {
-            animator.cancel()
-            // Reset to low height
+            // Reset to rest height
             for (i in 0..2) {
                 barHeights[i] = 0.2f
                 targetHeights[i] = 0.2f
-                phaseIndex[i] = i * 3 // reset staggered phases
+                phaseIndex[i] = i * 3
             }
             invalidate()
         }
     }
 
-    override fun onDetachedFromWindow() {
-        super.onDetachedFromWindow()
-        animator.cancel()
-    }
-
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
-        // onDetachedFromWindow cancels the animator but keeps `animating` true, so a
-        // recycled/re-attached row would otherwise stay frozen: setAnimating(true) no-ops.
-        if (animating && !animator.isStarted) {
-            animator.start()
+        if (animating) {
+            lastFrameTime = SystemClock.uptimeMillis()
+            postInvalidateOnAnimation()
+        }
+    }
+
+    override fun onVisibilityChanged(changedView: View, visibility: Int) {
+        super.onVisibilityChanged(changedView, visibility)
+        if (visibility == VISIBLE && animating) {
+            lastFrameTime = SystemClock.uptimeMillis()
+            postInvalidateOnAnimation()
         }
     }
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
+
+        if (animating) {
+            val now = SystemClock.uptimeMillis()
+            val dt = if (lastFrameTime > 0) (now - lastFrameTime).coerceIn(8L, 40L) else 16L
+            lastFrameTime = now
+
+            // Smooth tempo: ~0.0011 per ms produces relaxed, fluid equalizer movement
+            val speed = 0.0011f * dt
+            for (i in 0..2) {
+                if (Math.abs(barHeights[i] - targetHeights[i]) < 0.035f) {
+                    phaseIndex[i] = (phaseIndex[i] + 1) % keyframes.size
+                    targetHeights[i] = keyframes[phaseIndex[i]]
+                }
+                if (barHeights[i] < targetHeights[i]) {
+                    barHeights[i] = Math.min(barHeights[i] + speed, targetHeights[i])
+                } else {
+                    barHeights[i] = Math.max(barHeights[i] - speed, targetHeights[i])
+                }
+            }
+        }
 
         val width = width.toFloat()
         val height = height.toFloat()
@@ -113,6 +116,10 @@ class AnimatedEqualizerView @JvmOverloads constructor(
             val bottom = height
 
             canvas.drawRect(left, top, right, bottom, paint)
+        }
+
+        if (animating) {
+            postInvalidateOnAnimation()
         }
     }
 }

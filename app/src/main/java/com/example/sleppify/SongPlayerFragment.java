@@ -6,8 +6,10 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.res.ColorStateList;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.graphics.Bitmap;
 import android.graphics.Color;
@@ -130,7 +132,7 @@ public class SongPlayerFragment extends Fragment {
     // usuario 30s en silencio ante una URL colgada antes de reaccionar. Al vencer, el reintento
     // fuerza el cliente ANDROID_VR (ver forceAltClientVideoIds), que suele reproducir donde la URL
     // de NewPipe se colgaba.
-    private static final long SOURCE_PREPARE_TIMEOUT_MS = 15000L;
+    private static final long SOURCE_PREPARE_TIMEOUT_MS = 10000L;
     private static final long SOCIAL_STATS_FETCH_DEFER_MS = 1800L;
     private static final long COMMENTS_PREFETCH_DEFER_MS = 2200L;
     private static final long PLAYBACK_BOOTSTRAP_GRACE_MS = 1800L;
@@ -327,6 +329,16 @@ public class SongPlayerFragment extends Fragment {
     private int swipeDismissTouchSlopPx = 12;
     private int swipeDismissMinDistancePx = 120;
     private int consecutiveStreamFailures = 0;
+    private boolean isBecomingNoisyReceiverRegistered = false;
+    private final BroadcastReceiver becomingNoisyReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (intent != null && AudioManager.ACTION_AUDIO_BECOMING_NOISY.equals(intent.getAction())) {
+                Log.d(TAG, "becomingNoisyReceiver: Audio becoming noisy detected (Bluetooth / Headset disconnected)");
+                handleExternalPlaybackPause("audio-becoming-noisy");
+            }
+        }
+    };
     @Nullable
     private ActivityResultLauncher<String> notificationPermissionLauncher;
     private boolean shuffleEnabled = false;
@@ -411,6 +423,7 @@ public class SongPlayerFragment extends Fragment {
     private final Handler localProgressHandler = new Handler(Looper.getMainLooper());
     private final YouTubeMusicService radioMusicService = new YouTubeMusicService();
     private final ExecutorService streamResolverExecutor = Executors.newFixedThreadPool(3);
+    private final ExecutorService immediateResolverExecutor = Executors.newSingleThreadExecutor();
     private final ExecutorService backgroundExecutor = Executors.newSingleThreadExecutor();
     private final ExecutorService backgroundDownloadExecutor = Executors.newSingleThreadExecutor();
     private final android.util.LruCache<String, SocialStats> socialStatsCache = new android.util.LruCache<>(50);
@@ -766,6 +779,8 @@ public class SongPlayerFragment extends Fragment {
     public void onCreate(@Nullable Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         persistentAppContext = requireContext().getApplicationContext();
+        registerBecomingNoisyReceiver();
+        ExoMediaPlayer.setGlobalPlayWhenReadyChangedListener(this::handlePlayerPlayWhenReadyChanged);
         if (savedInstanceState != null) {
             // Prevent auto-playback when restoring from a crash/process death
             isPlaying = false;
@@ -798,6 +813,7 @@ public class SongPlayerFragment extends Fragment {
         view.setAlpha(1f);
 
         persistentAppContext = requireContext().getApplicationContext();
+        registerBecomingNoisyReceiver();
         if (getActivity() instanceof MainActivity) {
             ((MainActivity) getActivity()).setContainerOverlayMode(true);
         }
@@ -1195,7 +1211,10 @@ public class SongPlayerFragment extends Fragment {
     @Override
     public void onDestroyView() {
         if (!isTemporaryPlayer) {
-            persistPlaybackSnapshot(true);
+            // Synchronous: the queue MUST hit disk before the process dies.
+            // The old async path (backgroundExecutor) was silently lost when
+            // the user swiped the app from recents before the executor ran.
+            persistPlaybackSnapshot(true, true);
         }
         cancelAutoplayRecovery();
         cancelPlaybackErrorRetry();
@@ -1316,6 +1335,7 @@ public class SongPlayerFragment extends Fragment {
                 updatePlayPauseIcon();
                 updateMediaSessionState();
                 updateMediaNotification();
+                syncMiniStateWithPlaylist();
                 persistPlaybackSnapshot(false);
             }
 
@@ -1439,6 +1459,8 @@ public class SongPlayerFragment extends Fragment {
                     isPlaying = true;
                     currentSeconds = 0;
                     playCurrentTrack();
+                    lastSnapshotDispatchedAtMs = 0;
+                    persistPlaybackSnapshot(false);
                     syncMiniStateWithPlaylist();
                     return;
                 }
@@ -1800,6 +1822,79 @@ public class SongPlayerFragment extends Fragment {
         updateMediaNotification();
         syncMiniStateWithPlaylist();
         persistPlaybackSnapshot(false);
+    }
+
+    private void registerBecomingNoisyReceiver() {
+        if (isBecomingNoisyReceiverRegistered || persistentAppContext == null) return;
+        try {
+            IntentFilter filter = new IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY);
+            ContextCompat.registerReceiver(persistentAppContext, becomingNoisyReceiver, filter, ContextCompat.RECEIVER_EXPORTED);
+            isBecomingNoisyReceiverRegistered = true;
+            Log.d(TAG, "registerBecomingNoisyReceiver: successfully registered");
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to register becomingNoisyReceiver", e);
+        }
+    }
+
+    private void unregisterBecomingNoisyReceiver() {
+        if (!isBecomingNoisyReceiverRegistered || persistentAppContext == null) return;
+        try {
+            persistentAppContext.unregisterReceiver(becomingNoisyReceiver);
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to unregister becomingNoisyReceiver", e);
+        } finally {
+            isBecomingNoisyReceiverRegistered = false;
+        }
+    }
+
+    private void handleExternalPlaybackPause(@NonNull String reason) {
+        if (!isAdded()) return;
+        Log.d(TAG, "handleExternalPlaybackPause: reason=" + reason + " isPlaying=" + isPlaying);
+        if (!isPlaying) return;
+
+        pauseRequestedByUser = false;
+        isPlaying = false;
+        cancelOfflineCrossfade();
+        if (localExoMediaPlayer != null) {
+            try {
+                localExoMediaPlayer.pause();
+            } catch (Exception e) {
+                Log.w(TAG, "handleExternalPlaybackPause: pause failed", e);
+            }
+        }
+        stopLocalProgressTicker();
+        updatePlayPauseIcon();
+        updateMediaSessionState();
+        updateMediaNotification();
+        syncMiniStateWithPlaylist();
+        persistPlaybackSnapshot(false);
+    }
+
+    private void handlePlayerPlayWhenReadyChanged(@NonNull ExoMediaPlayer player, boolean playWhenReady, int reason) {
+        if (!isAdded()) return;
+        if (player != localExoMediaPlayer) return;
+
+        Log.d(TAG, "handlePlayerPlayWhenReadyChanged: playWhenReady=" + playWhenReady + ", reason=" + reason + ", isPlaying=" + isPlaying);
+
+        if (!playWhenReady && isPlaying) {
+            pauseRequestedByUser = false;
+            isPlaying = false;
+            cancelOfflineCrossfade();
+            stopLocalProgressTicker();
+            updatePlayPauseIcon();
+            updateMediaSessionState();
+            updateMediaNotification();
+            syncMiniStateWithPlaylist();
+            persistPlaybackSnapshot(false);
+        } else if (playWhenReady && !isPlaying) {
+            isPlaying = true;
+            updatePlayPauseIcon();
+            updateMediaSessionState();
+            updateMediaNotification();
+            syncMiniStateWithPlaylist();
+            startLocalProgressTicker();
+            persistPlaybackSnapshot(false);
+        }
     }
 
     private void toggleShuffleMode() {
@@ -2252,7 +2347,7 @@ public class SongPlayerFragment extends Fragment {
         // Capture the app context now: requireContext() inside the executor lambda throws
         // if the fragment detaches mid-flight, silently aborting the resolution.
         final Context resolveCtx = requireContext().getApplicationContext();
-        pendingStreamResolverFuture = streamResolverExecutor.submit(() -> {
+        pendingStreamResolverFuture = immediateResolverExecutor.submit(() -> {
             String resolvedUrl = StreamResolver.resolveStreamUrl(resolveCtx, track.videoId, forceAlternativeClient);
 
             localProgressHandler.post(() -> {
@@ -2854,6 +2949,9 @@ public class SongPlayerFragment extends Fragment {
                     consecutiveStreamFailures = 0; // Reset counter on successful playback
                     audioTrackReinitToken = -1;
                     startLocalProgressTicker();
+                    updatePlayPauseIcon();
+                    syncMiniStateWithPlaylist();
+                    PlaybackEventBus.notifyPlaybackSnapshotUpdated();
 
                     // Defer the two background network jobs so they don't fight the just-started
                     // stream's buffering (which is what janked the UI the instant playback began).
@@ -3013,6 +3111,9 @@ public class SongPlayerFragment extends Fragment {
                 player.setDataSource(source);
             }
             player.prepareAsync();
+            if (isPlaying) {
+                player.setPlayWhenReady(true);
+            }
             scheduleSourcePrepareTimeout(track, requestToken, player, onFailure);
         } catch (IllegalStateException ise) {
             cancelSourcePrepareTimeout();
@@ -3246,7 +3347,7 @@ public class SongPlayerFragment extends Fragment {
         Log.w(TAG, "tryResolveAudiusAndReplay: start videoId=" + track.videoId + " requestToken=" + requestToken);
 
         cancelPendingStreamResolver();
-        pendingStreamResolverFuture = streamResolverExecutor.submit(() -> {
+        pendingStreamResolverFuture = immediateResolverExecutor.submit(() -> {
             String resolved = fetchAudiusStreamUrl(track);
 
             localProgressHandler.post(() -> {
@@ -3858,6 +3959,8 @@ public class SongPlayerFragment extends Fragment {
 
     @Override
     public void onDestroy() {
+        unregisterBecomingNoisyReceiver();
+        ExoMediaPlayer.setGlobalPlayWhenReadyChangedListener(null);
         cancelSourcePrepareTimeout();
         cancelAutoplayRecovery();
         cancelPlaybackErrorRetry();
@@ -3865,6 +3968,7 @@ public class SongPlayerFragment extends Fragment {
         releaseLocalExoMediaPlayer();
         cancelPendingStreamResolver();
         streamResolverExecutor.shutdownNow();
+        immediateResolverExecutor.shutdownNow();
         backgroundExecutor.shutdownNow();
         backgroundDownloadExecutor.shutdownNow();
         super.onDestroy();
@@ -4673,7 +4777,7 @@ public class SongPlayerFragment extends Fragment {
 
         final String videoId = track.videoId;
         final Context appCtx = requireContext().getApplicationContext();
-        streamResolverExecutor.execute(() -> {
+        backgroundExecutor.execute(() -> {
             boolean isDownloaded = OfflineAudioStore.hasValidatedOfflineAudio(appCtx, videoId, null);
             localProgressHandler.post(() -> {
                 if (!isAdded() || actionDownloadTrack == null) return;
@@ -5915,6 +6019,12 @@ public class SongPlayerFragment extends Fragment {
             invalidateNextTrackPreparations();
         }
         
+        // Reset debounce so this queue change is ALWAYS written to disk.
+        // Without this, a save from the progress ticker within the last 300 ms
+        // would cause the debounce guard to skip this save — and if the app is
+        // killed before the next un-debounced tick, the old (shorter) queue
+        // would be restored, losing radio / playlist tracks.
+        lastSnapshotDispatchedAtMs = 0;
         persistPlaybackSnapshot(false);
     }
 
@@ -6868,6 +6978,15 @@ public class SongPlayerFragment extends Fragment {
         String accessToken = safeValue(prefs.getString(PREF_LAST_YOUTUBE_ACCESS_TOKEN, ""));
         String normalizedPlaylistId = normalizeLikedPlaylistId(playlistId, playlistTitle, playlistSubtitle);
 
+        RecentPlaylistsStore.recordPlaylistOpened(
+                requireContext(),
+                normalizedPlaylistId,
+                playlistTitle,
+                playlistSubtitle,
+                playlistThumbnail,
+                false
+        );
+
         PlaylistDetailFragment detailFragment = PlaylistDetailFragment.newInstance(
                 normalizedPlaylistId,
                 TextUtils.isEmpty(playlistTitle) ? "Lista" : playlistTitle,
@@ -7325,6 +7444,7 @@ public class SongPlayerFragment extends Fragment {
             cacheOriginalQueueOrder();
         }
 
+        lastSnapshotDispatchedAtMs = 0;
         persistPlaybackSnapshot(false);
         
         // CRITICAL: Invalidate gapless pre-buffer and prefetch because the "next" song has changed

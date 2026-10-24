@@ -61,8 +61,21 @@ class ExoMediaPlayer {
         fun onRenderedFirstFrame(mp: ExoMediaPlayer)
     }
 
+    /**
+     * Fired when ExoPlayer's playWhenReady changes externally (e.g. audio becoming noisy
+     * on Bluetooth disconnect). This lets the fragment sync its own isPlaying flag and
+     * update the media notification accordingly.
+     */
+    interface OnPlayWhenReadyChangedListener {
+        fun onPlayWhenReadyChanged(mp: ExoMediaPlayer, playWhenReady: Boolean, reason: Int)
+    }
+
     companion object {
         private const val TAG = "ExoMediaPlayer"
+
+        @Volatile
+        @JvmStatic
+        var globalPlayWhenReadyChangedListener: OnPlayWhenReadyChangedListener? = null
 
         @Volatile
         private var sharedCache: SimpleCache? = null
@@ -191,8 +204,8 @@ class ExoMediaPlayer {
             if (handle.isCancelled()) return
             try {
                 val httpFactory = DefaultHttpDataSource.Factory()
-                    .setConnectTimeoutMs(20_000)
-                    .setReadTimeoutMs(20_000)
+                    .setConnectTimeoutMs(10_000)
+                    .setReadTimeoutMs(12_000)
                     .setAllowCrossProtocolRedirects(true)
                 if (!headers.isNullOrEmpty()) {
                     httpFactory.setDefaultRequestProperties(headers)
@@ -265,6 +278,7 @@ class ExoMediaPlayer {
     private var errorListener: OnErrorListener? = null
     private var bufferingListener: OnBufferingListener? = null
     private var renderedFirstFrameListener: OnRenderedFirstFrameListener? = null
+    private var playWhenReadyChangedListener: OnPlayWhenReadyChangedListener? = null
 
     private var pendingUri: Uri? = null
     private var pendingPath: String? = null
@@ -313,7 +327,7 @@ class ExoMediaPlayer {
             }
             else -> {
                 DefaultLoadControl.Builder()
-                    .setBufferDurationsMs(15_000, 50_000, 250, 500)
+                    .setBufferDurationsMs(10_000, 50_000, 250, 500)
                     // Mismo back-buffer que el player compartido (ExoPlayerManager): tras un
                     // hot-swap o crossfade el player activo es uno de estos PROPIOS, y sin
                     // back-buffer cada seek hacia atrás re-descargaba desde el CDN.
@@ -419,6 +433,19 @@ class ExoMediaPlayer {
                 }
             }
         }
+
+        override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+            mainHandler.post {
+                if (!released) {
+                    playWhenReadyChangedListener?.onPlayWhenReadyChanged(
+                        this@ExoMediaPlayer, playWhenReady, reason
+                    )
+                    globalPlayWhenReadyChangedListener?.onPlayWhenReadyChanged(
+                        this@ExoMediaPlayer, playWhenReady, reason
+                    )
+                }
+            }
+        }
     }
 
     fun setAudioAttributes(attrs: AudioAttributes) {
@@ -450,6 +477,10 @@ class ExoMediaPlayer {
 
     fun setOnRenderedFirstFrameListener(l: OnRenderedFirstFrameListener?) {
         this.renderedFirstFrameListener = l
+    }
+
+    fun setOnPlayWhenReadyChangedListener(l: OnPlayWhenReadyChangedListener?) {
+        this.playWhenReadyChangedListener = l
     }
 
     fun setDataSource(context: Context, uri: Uri, headers: Map<String, String>?) {
@@ -489,8 +520,8 @@ class ExoMediaPlayer {
             // por el CDN de YouTube causando 403, mientras que HttpURLConnection
             // tiene un fingerprint consistente con el de una app Android real.
             val httpFactory = DefaultHttpDataSource.Factory()
-                .setConnectTimeoutMs(20_000)
-                .setReadTimeoutMs(20_000)
+                .setConnectTimeoutMs(10_000)
+                .setReadTimeoutMs(12_000)
                 .setAllowCrossProtocolRedirects(true)
 
             pendingHeaders?.let { headers ->
@@ -575,6 +606,11 @@ class ExoMediaPlayer {
     fun getPlayWhenReady(): Boolean {
         if (released) return false
         return exoPlayer?.playWhenReady ?: false
+    }
+
+    fun setPlayWhenReady(playWhenReady: Boolean) {
+        if (released) return
+        exoPlayer?.playWhenReady = playWhenReady
     }
 
     fun seekTo(msec: Int) {
@@ -693,6 +729,7 @@ class ExoMediaPlayer {
         errorListener = null
         bufferingListener = null
         renderedFirstFrameListener = null
+        playWhenReadyChangedListener = null
         // Drop this instance from the active registry so released players don't accumulate as
         // dead WeakReferences (stopOthers only prunes lazily while iterating).
         activeInstances.removeIf { it.get() === this }

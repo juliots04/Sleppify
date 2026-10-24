@@ -51,6 +51,7 @@ class SettingsFragment : Fragment() {
         private const val SECTION_DOWNLOADS = 2
         private const val SECTION_HISTORY = 3
         private const val SECTION_ACCOUNT = 4
+        private const val SECTION_DATA_SAVER = 5
         private const val HISTORY_PAGE_SIZE = 20
         private const val HISTORY_DAY_VISIBLE_LIMIT = 20
         // Única fuente de verdad de la clave: OfflineAudioStore (quien la consume al descargar).
@@ -83,20 +84,15 @@ class SettingsFragment : Fragment() {
     private lateinit var sectionDownloads: View
     private lateinit var sectionHistory: View
     private lateinit var sectionAccount: View
+    private lateinit var sectionDataSaver: View
 
     // Playback sub-section
     private lateinit var sbPlaybackCrossfade: SeekBar
     private lateinit var tvPlaybackCrossfadeValue: TextView
     private lateinit var swPlaybackGapless: MaterialSwitch
     private lateinit var swPlaybackOffline: MaterialSwitch
+    private lateinit var swPlaybackNormalizeVolume: MaterialSwitch
     private lateinit var swPlaybackEqGlobal: MaterialSwitch
-    private lateinit var tvQualityMobileValue: TextView
-    private lateinit var tvQualityWifiValue: TextView
-    private lateinit var tvVideoQualityMobileValue: TextView
-    private lateinit var tvVideoQualityWifiValue: TextView
-    private lateinit var swLimitMobileData: MaterialSwitch
-    private lateinit var swWifiOnlyPlayback: MaterialSwitch
-    private lateinit var swNoMusicVideos: MaterialSwitch
 
     // Downloads sub-section
     private lateinit var tvDownloadsStorageFree: TextView
@@ -109,6 +105,7 @@ class SettingsFragment : Fragment() {
     private lateinit var rowUseSdCard: View
     private lateinit var tvUseSdCardSubtitle: TextView
     private lateinit var swUseSdCard: MaterialSwitch
+    private var dividerAfterSd: View? = null
     private lateinit var rowAutoDownloadOnPlay: View
     private lateinit var swAutoDownloadOnPlay: MaterialSwitch
     private lateinit var swShowDeviceFiles: MaterialSwitch
@@ -120,6 +117,15 @@ class SettingsFragment : Fragment() {
     private lateinit var tvHistoryEmpty: TextView
     private var historyAdapter: HistoryAdapter? = null
     private var historyLoaded = 0
+
+    // Data saver sub-section
+    private lateinit var tvQualityMobileValue: TextView
+    private lateinit var tvQualityWifiValue: TextView
+    private lateinit var tvVideoQualityMobileValue: TextView
+    private lateinit var tvVideoQualityWifiValue: TextView
+    private lateinit var swLimitMobileData: MaterialSwitch
+    private lateinit var swWifiOnlyPlayback: MaterialSwitch
+    private lateinit var swNoMusicVideos: MaterialSwitch
 
     // Account sub-section
     private lateinit var ivAccountPhoto: ShapeableImageView
@@ -218,12 +224,14 @@ class SettingsFragment : Fragment() {
         sectionRoot = view.findViewById(R.id.settingsRoot)
         sectionPlayback = view.findViewById(R.id.settingsPlayback)
         sectionDownloads = view.findViewById(R.id.settingsDownloads)
+        sectionDataSaver = view.findViewById(R.id.settingsDataSaver)
         sectionHistory = view.findViewById(R.id.settingsHistory)
         sectionAccount = view.findViewById(R.id.settingsAccount)
 
         setupRootSection(view)
         setupPlaybackSection(view)
         setupDownloadsSection(view)
+        setupDataSaverSection(view)
         setupHistorySection(view)
         setupAccountSection(view)
 
@@ -282,6 +290,7 @@ class SettingsFragment : Fragment() {
         }
         if (currentSection == SECTION_PLAYBACK) renderPlaybackSection()
         if (currentSection == SECTION_DOWNLOADS) renderDownloadsSection()
+        if (currentSection == SECTION_DATA_SAVER) renderDataSaverSection()
         if (currentSection == SECTION_ACCOUNT) renderAccountSection()
     }
 
@@ -340,12 +349,14 @@ class SettingsFragment : Fragment() {
         sectionRoot.visibility = if (section == SECTION_ROOT) View.VISIBLE else View.GONE
         sectionPlayback.visibility = if (section == SECTION_PLAYBACK) View.VISIBLE else View.GONE
         sectionDownloads.visibility = if (section == SECTION_DOWNLOADS) View.VISIBLE else View.GONE
+        sectionDataSaver.visibility = if (section == SECTION_DATA_SAVER) View.VISIBLE else View.GONE
         sectionHistory.visibility = if (section == SECTION_HISTORY) View.VISIBLE else View.GONE
         sectionAccount.visibility = if (section == SECTION_ACCOUNT) View.VISIBLE else View.GONE
 
         tvToolbarTitle.text = when (section) {
             SECTION_PLAYBACK -> "Reproducción"
             SECTION_DOWNLOADS -> "Descargas y almacenamiento"
+            SECTION_DATA_SAVER -> "Ahorro de datos"
             SECTION_HISTORY -> "Historial"
             SECTION_ACCOUNT -> "Cuenta"
             else -> "Configuración"
@@ -355,6 +366,7 @@ class SettingsFragment : Fragment() {
         when (section) {
             SECTION_PLAYBACK -> sectionPlayback.findViewById<ScrollView>(R.id.svSettingsPlayback)?.scrollTo(0, 0)
             SECTION_DOWNLOADS -> sectionDownloads.findViewById<ScrollView>(R.id.svSettingsDownloads)?.scrollTo(0, 0)
+            SECTION_DATA_SAVER -> sectionDataSaver.findViewById<ScrollView>(R.id.svSettingsDataSaver)?.scrollTo(0, 0)
             SECTION_HISTORY -> rvHistory.scrollToPosition(0)
             SECTION_ACCOUNT -> sectionAccount.findViewById<ScrollView>(R.id.svSettingsAccount)?.scrollTo(0, 0)
         }
@@ -363,6 +375,7 @@ class SettingsFragment : Fragment() {
         when (section) {
             SECTION_PLAYBACK -> renderPlaybackSection()
             SECTION_DOWNLOADS -> renderDownloadsSection()
+            SECTION_DATA_SAVER -> renderDataSaverSection()
             SECTION_HISTORY -> loadHistory(reset = true)
             SECTION_ACCOUNT -> renderAccountSection()
         }
@@ -383,6 +396,7 @@ class SettingsFragment : Fragment() {
     private fun setupRootSection(view: View) {
         view.findViewById<View>(R.id.rowSettingsPlayback)?.setOnClickListener { showSection(SECTION_PLAYBACK) }
         view.findViewById<View>(R.id.rowSettingsDownloads)?.setOnClickListener { showSection(SECTION_DOWNLOADS) }
+        view.findViewById<View>(R.id.rowSettingsDataSaver)?.setOnClickListener { showSection(SECTION_DATA_SAVER) }
         view.findViewById<View>(R.id.rowSettingsHistory)?.setOnClickListener { showSection(SECTION_HISTORY) }
         view.findViewById<View>(R.id.rowSettingsAccount)?.setOnClickListener { showSection(SECTION_ACCOUNT) }
     }
@@ -394,34 +408,12 @@ class SettingsFragment : Fragment() {
         tvPlaybackCrossfadeValue = view.findViewById(R.id.tvPlaybackCrossfadeValue)
         swPlaybackGapless = view.findViewById(R.id.swPlaybackGapless)
         swPlaybackOffline = view.findViewById(R.id.swPlaybackOffline)
+        swPlaybackNormalizeVolume = view.findViewById(R.id.swPlaybackNormalizeVolume)
         swPlaybackEqGlobal = view.findViewById(R.id.swPlaybackEqGlobal)
 
         view.findViewById<View>(R.id.rowPlaybackEqualizer)?.setOnClickListener {
             (activity as? MainActivity)?.openEqualizerFromSettings()
         }
-
-        // Calidad de audio
-        tvQualityMobileValue = view.findViewById(R.id.tvQualityMobileValue)
-        tvQualityWifiValue = view.findViewById(R.id.tvQualityWifiValue)
-        view.findViewById<View>(R.id.rowQualityMobile)?.setOnClickListener {
-            showQualityDialog(CloudSyncManager.KEY_STREAMING_QUALITY_MOBILE, "Calidad del audio en redes móviles", tvQualityMobileValue, audioQualityOptions, audioQualityLabels)
-        }
-        view.findViewById<View>(R.id.rowQualityWifi)?.setOnClickListener {
-            showQualityDialog(CloudSyncManager.KEY_STREAMING_QUALITY_WIFI, "Calidad del audio con Wi-Fi", tvQualityWifiValue, audioQualityOptions, audioQualityLabels)
-        }
-
-        // Video y datos
-        tvVideoQualityMobileValue = view.findViewById(R.id.tvVideoQualityMobileValue)
-        tvVideoQualityWifiValue = view.findViewById(R.id.tvVideoQualityWifiValue)
-        view.findViewById<View>(R.id.rowVideoQualityMobile)?.setOnClickListener {
-            showQualityDialog(CloudSyncManager.KEY_VIDEO_QUALITY_MOBILE, "Calidad de video en redes móviles", tvVideoQualityMobileValue, videoQualityOptions, videoQualityLabels)
-        }
-        view.findViewById<View>(R.id.rowVideoQualityWifi)?.setOnClickListener {
-            showQualityDialog(CloudSyncManager.KEY_VIDEO_QUALITY_WIFI, "Calidad de video con Wi-Fi", tvVideoQualityWifiValue, videoQualityOptions, videoQualityLabels)
-        }
-        swNoMusicVideos = view.findViewById(R.id.swNoMusicVideos)
-        swLimitMobileData = view.findViewById(R.id.swLimitMobileData)
-        swWifiOnlyPlayback = view.findViewById(R.id.swWifiOnlyPlayback)
     }
 
     private fun renderPlaybackSection() {
@@ -457,9 +449,20 @@ class SettingsFragment : Fragment() {
             }
         }
 
+        // Configuración de audio y efectos DSP (en global_eq_prefs)
+        val eqPrefs = requireContext().getSharedPreferences(AudioEffectsService.PREFS_NAME, Context.MODE_PRIVATE)
+
+        swPlaybackNormalizeVolume.apply {
+            setOnCheckedChangeListener(null)
+            isChecked = eqPrefs.getBoolean(AudioEffectsService.KEY_VOLUME_NORMALIZATION, true)
+            setOnCheckedChangeListener { _, c ->
+                eqPrefs.edit().putBoolean(AudioEffectsService.KEY_VOLUME_NORMALIZATION, c).apply()
+                AudioEffectsService.sendApply(requireContext().applicationContext)
+            }
+        }
+
         // EQ scope: global (session 0, todo el sistema) vs solo Sleppify (sesión del player).
         // Vive en global_eq_prefs porque es AudioEffectsService quien la resuelve en cada apply.
-        val eqPrefs = requireContext().getSharedPreferences(AudioEffectsService.PREFS_NAME, Context.MODE_PRIVATE)
         swPlaybackEqGlobal.apply {
             setOnCheckedChangeListener(null)
             isChecked = eqPrefs.getBoolean(AudioEffectsService.KEY_APPLY_GLOBAL, true)
@@ -468,51 +471,6 @@ class SettingsFragment : Fragment() {
                 // Re-apply inmediato: el service rehace el engine sobre la sesión que corresponda
                 // (si el EQ está apagado, sendApply degrada a stop y no pasa nada).
                 AudioEffectsService.sendApply(requireContext().applicationContext)
-            }
-        }
-
-        // Calidad de audio
-        tvQualityMobileValue.text = qualityDisplayName(
-            settingsPrefs.getString(CloudSyncManager.KEY_STREAMING_QUALITY_MOBILE, CloudSyncManager.STREAMING_QUALITY_MEDIUM) ?: CloudSyncManager.STREAMING_QUALITY_MEDIUM
-        )
-        tvQualityWifiValue.text = qualityDisplayName(
-            settingsPrefs.getString(CloudSyncManager.KEY_STREAMING_QUALITY_WIFI, CloudSyncManager.STREAMING_QUALITY_MEDIUM) ?: CloudSyncManager.STREAMING_QUALITY_MEDIUM
-        )
-
-        // Calidad de video
-        tvVideoQualityMobileValue.text = videoQualityDisplayName(
-            settingsPrefs.getString(CloudSyncManager.KEY_VIDEO_QUALITY_MOBILE, CloudSyncManager.STREAMING_QUALITY_MEDIUM) ?: CloudSyncManager.STREAMING_QUALITY_MEDIUM
-        )
-        tvVideoQualityWifiValue.text = videoQualityDisplayName(
-            settingsPrefs.getString(CloudSyncManager.KEY_VIDEO_QUALITY_WIFI, CloudSyncManager.STREAMING_QUALITY_MEDIUM) ?: CloudSyncManager.STREAMING_QUALITY_MEDIUM
-        )
-
-        swNoMusicVideos.apply {
-            setOnCheckedChangeListener(null)
-            isChecked = settingsPrefs.getBoolean(CloudSyncManager.KEY_NO_MUSIC_VIDEOS, true)
-            setOnCheckedChangeListener { _, c ->
-                settingsPrefs.edit().putBoolean(CloudSyncManager.KEY_NO_MUSIC_VIDEOS, c).apply()
-                val player = parentFragmentManager
-                    .findFragmentByTag(AppConstants.TAG_SONG_PLAYER) as? SongPlayerFragment
-                if (player != null && player.isAdded) {
-                    player.applyNoMusicVideosSetting()
-                }
-            }
-        }
-
-        swLimitMobileData.apply {
-            setOnCheckedChangeListener(null)
-            isChecked = settingsPrefs.getBoolean(CloudSyncManager.KEY_LIMIT_MOBILE_DATA, false)
-            setOnCheckedChangeListener { _, c ->
-                settingsPrefs.edit().putBoolean(CloudSyncManager.KEY_LIMIT_MOBILE_DATA, c).apply()
-            }
-        }
-
-        swWifiOnlyPlayback.apply {
-            setOnCheckedChangeListener(null)
-            isChecked = settingsPrefs.getBoolean(CloudSyncManager.KEY_WIFI_ONLY_PLAYBACK, false)
-            setOnCheckedChangeListener { _, c ->
-                settingsPrefs.edit().putBoolean(CloudSyncManager.KEY_WIFI_ONLY_PLAYBACK, c).apply()
             }
         }
     }
@@ -530,6 +488,7 @@ class SettingsFragment : Fragment() {
         rowUseSdCard = view.findViewById(R.id.rowUseSdCard)
         tvUseSdCardSubtitle = view.findViewById(R.id.tvUseSdCardSubtitle)
         swUseSdCard = view.findViewById(R.id.swUseSdCard)
+        dividerAfterSd = view.findViewById(R.id.dividerAfterSd)
         rowAutoDownloadOnPlay = view.findViewById(R.id.rowAutoDownloadOnPlay)
         swAutoDownloadOnPlay = view.findViewById(R.id.swAutoDownloadOnPlay)
         rowAutoDownloadOnPlay.setOnClickListener { swAutoDownloadOnPlay.toggle() }
@@ -542,6 +501,8 @@ class SettingsFragment : Fragment() {
 
     private fun applySdDisabledState() {
         sectionSdStorage.visibility = View.GONE
+        rowUseSdCard.visibility = View.GONE
+        dividerAfterSd?.visibility = View.GONE
         tvUseSdCardSubtitle.text = "Descargar contenido en la tarjeta SD"
         rowUseSdCard.alpha = 1.0f
         rowUseSdCard.setOnClickListener(null)
@@ -554,6 +515,8 @@ class SettingsFragment : Fragment() {
     }
 
     private fun applySdEnabledState() {
+        rowUseSdCard.visibility = View.VISIBLE
+        dividerAfterSd?.visibility = View.VISIBLE
         tvUseSdCardSubtitle.text = "Descargar contenido en la tarjeta SD"
         rowUseSdCard.alpha = 1.0f
         rowUseSdCard.isClickable = true
@@ -666,7 +629,20 @@ class SettingsFragment : Fragment() {
         swDownloadWifiOnly.apply {
             setOnCheckedChangeListener(null); isChecked = wifiOnly
             setOnCheckedChangeListener { _, c ->
-                settingsPrefs.edit().putBoolean(CloudSyncManager.KEY_OFFLINE_DOWNLOAD_ALLOW_MOBILE_DATA, !c).apply()
+                val allowMobile = !c
+                settingsPrefs.edit().putBoolean(CloudSyncManager.KEY_OFFLINE_DOWNLOAD_ALLOW_MOBILE_DATA, allowMobile).apply()
+                // Desbloquea las colas de WorkManager: si había descargas previas retenidas
+                // con UNMETERED (solo Wi-Fi), WorkManager las mantiene en cola indefinidamente
+                // y bloquea por head-of-line blocking (APPEND_OR_REPLACE) cualquier nueva descarga.
+                try {
+                    val appCtx = context?.applicationContext ?: return@setOnCheckedChangeListener
+                    val wm = androidx.work.WorkManager.getInstance(appCtx)
+                    wm.cancelUniqueWork(AppConstants.OFFLINE_MANUAL_TRACK_QUEUE)
+                    wm.cancelUniqueWork(MusicPlayerFragment.OFFLINE_DOWNLOAD_QUEUE_UNIQUE_NAME)
+                    wm.pruneWork()
+                } catch (e: Exception) {
+                    android.util.Log.w("SettingsFragment", "Failed to prune queues on download policy change", e)
+                }
             }
         }
 
@@ -700,6 +676,77 @@ class SettingsFragment : Fragment() {
             val tracks = LocalFilesStore.scanLocalFiles(requireContext())
             LocalFilesStore.cacheFiles(requireContext(), tracks)
             withContext(Dispatchers.Main) { (activity as? MainActivity)?.refreshMusicLibrary() }
+        }
+    }
+
+    // --- Data saver section ---
+
+    private fun setupDataSaverSection(view: View) {
+        tvQualityMobileValue = view.findViewById(R.id.tvQualityMobileValue)
+        tvQualityWifiValue = view.findViewById(R.id.tvQualityWifiValue)
+        tvVideoQualityMobileValue = view.findViewById(R.id.tvVideoQualityMobileValue)
+        tvVideoQualityWifiValue = view.findViewById(R.id.tvVideoQualityWifiValue)
+        swLimitMobileData = view.findViewById(R.id.swLimitMobileData)
+        swWifiOnlyPlayback = view.findViewById(R.id.swWifiOnlyPlayback)
+        swNoMusicVideos = view.findViewById(R.id.swNoMusicVideos)
+
+        view.findViewById<View>(R.id.rowQualityMobile)?.setOnClickListener {
+            showQualityDialog(CloudSyncManager.KEY_STREAMING_QUALITY_MOBILE, "Calidad del audio en redes móviles", tvQualityMobileValue, audioQualityOptions, audioQualityLabels)
+        }
+        view.findViewById<View>(R.id.rowQualityWifi)?.setOnClickListener {
+            showQualityDialog(CloudSyncManager.KEY_STREAMING_QUALITY_WIFI, "Calidad del audio con Wi-Fi", tvQualityWifiValue, audioQualityOptions, audioQualityLabels)
+        }
+        view.findViewById<View>(R.id.rowVideoQualityMobile)?.setOnClickListener {
+            showQualityDialog(CloudSyncManager.KEY_VIDEO_QUALITY_MOBILE, "Calidad de video en redes móviles", tvVideoQualityMobileValue, videoQualityOptions, videoQualityLabels)
+        }
+        view.findViewById<View>(R.id.rowVideoQualityWifi)?.setOnClickListener {
+            showQualityDialog(CloudSyncManager.KEY_VIDEO_QUALITY_WIFI, "Calidad de video con Wi-Fi", tvVideoQualityWifiValue, videoQualityOptions, videoQualityLabels)
+        }
+    }
+
+    private fun renderDataSaverSection() {
+        if (!isAdded) return
+        tvQualityMobileValue.text = qualityDisplayName(
+            settingsPrefs.getString(CloudSyncManager.KEY_STREAMING_QUALITY_MOBILE, CloudSyncManager.STREAMING_QUALITY_MEDIUM) ?: CloudSyncManager.STREAMING_QUALITY_MEDIUM
+        )
+        tvQualityWifiValue.text = qualityDisplayName(
+            settingsPrefs.getString(CloudSyncManager.KEY_STREAMING_QUALITY_WIFI, CloudSyncManager.STREAMING_QUALITY_MEDIUM) ?: CloudSyncManager.STREAMING_QUALITY_MEDIUM
+        )
+        tvVideoQualityMobileValue.text = videoQualityDisplayName(
+            settingsPrefs.getString(CloudSyncManager.KEY_VIDEO_QUALITY_MOBILE, CloudSyncManager.STREAMING_QUALITY_MEDIUM) ?: CloudSyncManager.STREAMING_QUALITY_MEDIUM
+        )
+        tvVideoQualityWifiValue.text = videoQualityDisplayName(
+            settingsPrefs.getString(CloudSyncManager.KEY_VIDEO_QUALITY_WIFI, CloudSyncManager.STREAMING_QUALITY_MEDIUM) ?: CloudSyncManager.STREAMING_QUALITY_MEDIUM
+        )
+
+        swLimitMobileData.apply {
+            setOnCheckedChangeListener(null)
+            isChecked = settingsPrefs.getBoolean(CloudSyncManager.KEY_LIMIT_MOBILE_DATA, false)
+            setOnCheckedChangeListener { _, c ->
+                settingsPrefs.edit().putBoolean(CloudSyncManager.KEY_LIMIT_MOBILE_DATA, c).apply()
+            }
+        }
+        swWifiOnlyPlayback.apply {
+            setOnCheckedChangeListener(null)
+            isChecked = settingsPrefs.getBoolean(CloudSyncManager.KEY_WIFI_ONLY_PLAYBACK, false)
+            setOnCheckedChangeListener { _, c ->
+                settingsPrefs.edit().putBoolean(CloudSyncManager.KEY_WIFI_ONLY_PLAYBACK, c).apply()
+            }
+        }
+        swNoMusicVideos.apply {
+            setOnCheckedChangeListener(null)
+            isChecked = settingsPrefs.getBoolean(CloudSyncManager.KEY_NO_MUSIC_VIDEOS, true)
+            setOnCheckedChangeListener { _, c ->
+                settingsPrefs.edit().putBoolean(CloudSyncManager.KEY_NO_MUSIC_VIDEOS, c).apply()
+                // Candado en vivo: si el player está montado, aplica ya (oculta/muestra la
+                // pastilla Canción|Video y, si un video está sonando, vuelve a canción en
+                // caliente). Si no está montado, onViewCreated del player lo aplica al montar.
+                val player = parentFragmentManager
+                    .findFragmentByTag(AppConstants.TAG_SONG_PLAYER) as? SongPlayerFragment
+                if (player != null && player.isAdded) {
+                    player.applyNoMusicVideosSetting()
+                }
+            }
         }
     }
 
@@ -1154,6 +1201,12 @@ class SettingsFragment : Fragment() {
             // los servicios en foreground se cortan en el teardown, y el relanzamiento en frío
             // suelta el estático StreamResolver.authCookieHeader que sobreviviría en el proceso.
             CloudSyncManager.getInstance(requireContext()).onUserSignedOut()
+            try {
+                requireContext().getSharedPreferences("sleppify_welcome_prefs", Context.MODE_PRIVATE)
+                    .edit()
+                    .clear()
+                    .apply()
+            } catch (_: Throwable) {}
             activity?.runOnUiThread { terminateAndRelaunch() }
         }
     }

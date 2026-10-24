@@ -337,7 +337,7 @@
         android:layout_height="0dp"
         android:background="@android:color/black"
         android:alpha="0"
-        android:translationZ="50dp"
+        android:translationZ="52dp"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toTopOf="parent" />

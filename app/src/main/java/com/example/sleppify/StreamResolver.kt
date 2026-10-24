@@ -2,6 +2,14 @@ package com.example.sleppify
 
 import android.content.Context
 import android.util.Log
+import okhttp3.Cache
+import okhttp3.ConnectionPool
+import okhttp3.Dns
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Protocol
+import okhttp3.Request as OkRequest
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.schabi.newpipe.extractor.NewPipe
 import org.schabi.newpipe.extractor.ServiceList
 import org.schabi.newpipe.extractor.downloader.Downloader
@@ -10,10 +18,13 @@ import org.schabi.newpipe.extractor.downloader.Response
 import org.schabi.newpipe.extractor.stream.AudioStream
 import org.schabi.newpipe.extractor.stream.DeliveryMethod
 import org.schabi.newpipe.extractor.stream.StreamExtractor
+import java.io.File
 import java.io.IOException
 import java.net.HttpURLConnection
+import java.net.InetAddress
 import java.net.URL
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -75,6 +86,145 @@ object StreamResolver {
     // Dedup: in-flight resolutions so parallel callers wait on the same result
     private val inFlightResolutions = ConcurrentHashMap<String, java.util.concurrent.CompletableFuture<String?>>()
 
+    // Shared OkHttpClient with connection pooling and response cache
+    @Volatile
+    private var sharedOkHttpClient: OkHttpClient? = null
+    private val clientLock = Any()
+
+    // DNS cache: pre-resolved YouTube/googlevideo IPs so the first playback avoids a cold DNS lookup
+    private val dnsCache = ConcurrentHashMap<String, List<InetAddress>>()
+    private val warmDns = object : Dns {
+        override fun lookup(hostname: String): List<InetAddress> {
+            return dnsCache[hostname] ?: Dns.SYSTEM.lookup(hostname).also { dnsCache[hostname] = it }
+        }
+    }
+
+    /** Pre-resolves DNS for the critical YouTube domains so the first HTTP request is faster. */
+    @JvmStatic
+    fun warmDnsForYoutube() {
+        val domains = listOf(
+            "youtubei.googleapis.com",
+            "music.youtube.com",
+            "www.youtube.com",
+            "redirector.googlevideo.com"
+        )
+        for (domain in domains) {
+            if (dnsCache.containsKey(domain)) continue
+            try {
+                val addrs = InetAddress.getAllByName(domain).toList()
+                if (addrs.isNotEmpty()) dnsCache[domain] = addrs
+            } catch (e: Exception) {
+                Log.w(TAG, "warmDns failed for $domain: ${e.message}")
+            }
+        }
+    }
+
+    @JvmStatic
+    fun getSharedOkHttpClient(context: Context? = null): OkHttpClient {
+        return sharedOkHttpClient ?: synchronized(clientLock) {
+            sharedOkHttpClient ?: run {
+                val builder = OkHttpClient.Builder()
+                    .connectTimeout(5, TimeUnit.SECONDS)
+                    .readTimeout(8, TimeUnit.SECONDS)
+                    .connectionPool(ConnectionPool(8, 5, TimeUnit.MINUTES))
+                    .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
+                    .dns(warmDns)
+                    .followRedirects(true)
+                    .followSslRedirects(true)
+                if (context != null) {
+                    try {
+                        val cacheDir = File(context.applicationContext.cacheDir, "stream_resolver_http_cache")
+                        builder.cache(Cache(cacheDir, 25L * 1024L * 1024L))
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to setup OkHttp cache", e)
+                    }
+                }
+                builder.build().also { sharedOkHttpClient = it }
+            }
+        }
+    }
+
+    // Cached visitorData for YouTube InnerTube client (VISIONOS)
+    @Volatile private var cachedVisitorData: String = ""
+    private const val PREFS_VISITOR_DATA = "yt_visitor_data_prefs"
+    private const val KEY_VISITOR_DATA = "visitor_data"
+    private const val KEY_VISITOR_DATA_TIME = "visitor_data_time"
+    private const val VISITOR_DATA_TTL_MS = 24 * 60 * 60 * 1000L // 24h
+
+    @JvmStatic
+    fun getVisitorData(context: Context?): String {
+        if (cachedVisitorData.isNotBlank()) return cachedVisitorData
+        if (context != null) {
+            try {
+                val prefs = context.getSharedPreferences(PREFS_VISITOR_DATA, Context.MODE_PRIVATE)
+                val saved = prefs.getString(KEY_VISITOR_DATA, "") ?: ""
+                val ts = prefs.getLong(KEY_VISITOR_DATA_TIME, 0L)
+                if (saved.isNotBlank() && (System.currentTimeMillis() - ts < VISITOR_DATA_TTL_MS)) {
+                    cachedVisitorData = saved
+                    return saved
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Error reading visitorData prefs", e)
+            }
+        }
+        val fresh = fetchFreshVisitorData(context)
+        if (fresh.isNotBlank()) {
+            cachedVisitorData = fresh
+            if (context != null) {
+                try {
+                    context.getSharedPreferences(PREFS_VISITOR_DATA, Context.MODE_PRIVATE)
+                        .edit()
+                        .putString(KEY_VISITOR_DATA, fresh)
+                        .putLong(KEY_VISITOR_DATA_TIME, System.currentTimeMillis())
+                        .apply()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error saving visitorData prefs", e)
+                }
+            }
+            return fresh
+        }
+        return ""
+    }
+
+    private fun fetchFreshVisitorData(context: Context?): String {
+        return try {
+            val client = getSharedOkHttpClient(context)
+            val vBody = org.json.JSONObject().apply {
+                put("context", org.json.JSONObject().put("client", org.json.JSONObject().apply {
+                    put("clientName", "VISIONOS")
+                    put("clientVersion", "1.02")
+                    put("clientScreen", "WATCH")
+                    put("platform", "MOBILE")
+                    put("deviceMake", "Apple")
+                    put("deviceModel", "RealityDevice14,1")
+                    put("osName", "visionOS")
+                    put("osVersion", "25.6.0.23O471")
+                    put("hl", "es")
+                    put("gl", "US")
+                }))
+            }.toString()
+
+            val req = OkRequest.Builder()
+                .url("https://youtubei.googleapis.com/youtubei/v1/visitor_id?prettyPrint=false")
+                .post(vBody.toRequestBody("application/json".toMediaType()))
+                .header("User-Agent", "Mozilla/5.0")
+                .build()
+
+            client.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    val str = resp.body?.string() ?: ""
+                    val json = org.json.JSONObject(str)
+                    json.optJSONObject("responseContext")?.optString("visitorData", "") ?: ""
+                } else {
+                    ""
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "fetchFreshVisitorData failed: ${e.message}")
+            ""
+        }
+    }
+
     // ─── Warm-up (call from MainActivity.onCreate on a background thread) ──────
 
     /**
@@ -85,8 +235,14 @@ object StreamResolver {
     fun warmUp(context: Context) {
         val appCtx = context.applicationContext
         Thread({
-            // 0. Load auth cookies from prefs (was previously on main thread)
+            // 0. Pre-resolve DNS for YouTube domains in parallel with other init
+            warmDnsForYoutube()
+            // 0b. Initialize OkHttpClient early for connection pooling
+            getSharedOkHttpClient(appCtx)
+            // 0c. Load auth cookies from prefs
             loadAuthCookiesFromPrefs(appCtx)
+            // 0d. Warm visitorData in background so the very first playback starts instantly
+            getVisitorData(appCtx)
             // 1. Restore disk-cached URL into memory (instant, no network)
             restoreDiskCache(appCtx)
             // 2. Initialize NewPipe so the first resolveStreamUrl skips init overhead
@@ -138,7 +294,9 @@ object StreamResolver {
             // Resolve now so playCurrentTrack finds it ready. Con los itags de la calidad
             // elegida: este warm-up seedea urlCache y resolveStreamUrl lo devuelve tal cual,
             // así que resolver aquí en máxima calidad saltaba el ajuste del usuario.
-            val url = resolveViaNewPipe(videoId, getPreferredItags(context), context)
+            val itags = getPreferredItags(context)
+            val url = resolveViaInnerTubeFallback(videoId, itags, context)?.url
+                ?: resolveViaNewPipe(videoId, itags, context)
             if (!url.isNullOrBlank()) {
                 urlCache[videoId] = CachedStream(url, SourceType.DIRECT, System.currentTimeMillis())
                 persistDiskCache(context, videoId, url)
@@ -176,7 +334,9 @@ object StreamResolver {
                 if (inFlightResolutions.putIfAbsent(videoId, future) != null) return@execute
                 try {
                     // Con los itags de la calidad elegida (ver preResolveCurrentTrack).
-                    val url = resolveViaNewPipe(videoId, getPreferredItags(appCtx), appCtx)
+                    val itags = getPreferredItags(appCtx)
+                    val url = resolveViaInnerTubeFallback(videoId, itags, appCtx)?.url
+                        ?: resolveViaNewPipe(videoId, itags, appCtx)
                     if (!url.isNullOrBlank()) {
                         urlCache[videoId] = CachedStream(url, SourceType.DIRECT, System.currentTimeMillis())
                         Log.d(TAG, "preResolveQueue ok videoId=$videoId")
@@ -333,19 +493,18 @@ object StreamResolver {
             audioPrefetchCache.remove(videoId)
             val itags = getPreferredItags(context)
             val fb = try {
-                resolveViaInnerTubeFallback(videoId, itags)?.url
+                resolveViaInnerTubeFallback(videoId, itags, context)?.url
             } catch (e: Exception) {
-                Log.w(TAG, "forced ANDROID_VR[$videoId] failed: ${e.message}")
+                Log.w(TAG, "forced alt client[$videoId] failed: ${e.message}")
                 null
             }
             if (!fb.isNullOrBlank()) {
                 val now = System.currentTimeMillis()
                 urlCache[videoId] = CachedStream(fb, SourceType.DIRECT, now)
                 persistDiskCache(context, videoId, fb)
-                Log.d(TAG, "resolve[$videoId] via ANDROID_VR (forced alt client)")
+                Log.d(TAG, "resolve[$videoId] via forced alt client")
                 return fb
             }
-            // Si ANDROID_VR también falla, caer al camino normal (NewPipe) como último recurso.
             Log.w(TAG, "resolve[$videoId] forced alt client empty — falling back to NewPipe path")
         }
 
@@ -399,11 +558,11 @@ object StreamResolver {
         try {
             val tStart = System.currentTimeMillis()
             var directUrl: String? = null
-            var via = "android_vr"
+            var via = "innertube"
             try {
-                directUrl = resolveViaInnerTubeFallback(videoId, itags)?.url
+                directUrl = resolveViaInnerTubeFallback(videoId, itags, context)?.url
             } catch (e: Exception) {
-                Log.w(TAG, "android_vr[$videoId] failed: ${e.javaClass.simpleName} — ${e.message}")
+                Log.w(TAG, "innertube[$videoId] failed: ${e.javaClass.simpleName} — ${e.message}")
             }
             if (directUrl.isNullOrBlank()) {
                 via = "newpipe"
@@ -542,17 +701,51 @@ object StreamResolver {
      * maximum Android compatibility (see [PREFERRED_ITAGS]). Must run on a background thread.
      */
     @JvmStatic
-    fun resolveAudioDownloadSource(videoId: String?): AudioDownloadSource? {
+    @JvmOverloads
+    fun resolveAudioDownloadSource(videoId: String?, context: Context? = null): AudioDownloadSource? {
         if (videoId.isNullOrBlank() || videoId.startsWith("local_")) return null
         return try {
+            // 0. Cache hit check: si la pista ya está en memoria o en side-cache,
+            // reutilizarla inmediatamente sin pagar round-trip de red.
+            val cached = urlCache[videoId]
+            if (cached != null && cached.type == SourceType.DIRECT
+                && System.currentTimeMillis() - cached.timestamp < DIRECT_CACHE_TTL_MS
+            ) {
+                val itag = try {
+                    android.net.Uri.parse(cached.url).getQueryParameter("itag")?.toIntOrNull() ?: 140
+                } catch (_: Exception) { 140 }
+                val isWebm = itag in OPUS_ITAGS
+                Log.d(TAG, "download[$videoId] using cached DIRECT stream itag=$itag")
+                return AudioDownloadSource(cached.url, isWebm, itag)
+            }
+            audioPrefetchCache[videoId]?.let { pf ->
+                if (System.currentTimeMillis() - pf.timestamp < DIRECT_CACHE_TTL_MS) {
+                    val itag = try {
+                        android.net.Uri.parse(pf.url).getQueryParameter("itag")?.toIntOrNull() ?: 140
+                    } catch (_: Exception) { 140 }
+                    val isWebm = itag in OPUS_ITAGS
+                    Log.d(TAG, "download[$videoId] using audioPrefetchCache stream itag=$itag")
+                    return AudioDownloadSource(pf.url, isWebm, itag)
+                }
+            }
+
+            // 1. PRIMARIO: InnerTube VISIONOS (/player) — devuelve URLs YA descifradas en UN solo POST
+            // (~0.2s), SIN descargar ni ejecutar el base.js (~2.5MB) de YouTube. Esencial en redes móviles.
+            val fbSource = downloadSourceViaFallback(videoId, context)
+            if (fbSource != null && fbSource.url.isNotBlank()) {
+                Log.d(TAG, "download[$videoId] resolved via InnerTube VISIONOS itag=${fbSource.itag}")
+                return fbSource
+            }
+
+            // 2. FALLBACK: NewPipe extractor si InnerTube no devuelve streams (kids, etc.)
             ensureNewPipeInitialized()
             val extractor = ServiceList.YouTube.getStreamExtractor("https://www.youtube.com/watch?v=$videoId")
             extractor.fetchPage()
 
             val audioStreams: List<AudioStream> = extractor.audioStreams ?: emptyList()
             if (audioStreams.isEmpty()) {
-                Log.w(TAG, "download[$videoId] no audio streams")
-                return downloadSourceViaFallback(videoId)
+                Log.w(TAG, "download[$videoId] no audio streams via newpipe")
+                return null
             }
 
             // Only streams that expose a real, directly-fetchable URL. Prefer progressive
@@ -571,17 +764,17 @@ object StreamResolver {
                 suffix != null -> suffix.equals("webm", true) || suffix.equals("opus", true)
                 else -> chosen.itag in OPUS_ITAGS
             }
-            Log.d(TAG, "download[$videoId] itag=${chosen.itag} webm=$isWebm")
+            Log.d(TAG, "download[$videoId] itag=${chosen.itag} webm=$isWebm via NewPipe fallback")
             AudioDownloadSource(chosen.content, isWebm, chosen.itag)
         } catch (e: Exception) {
             Log.w(TAG, "download[$videoId] resolve failed: ${e.javaClass.simpleName} — ${e.message}")
-            downloadSourceViaFallback(videoId)
+            downloadSourceViaFallback(videoId, context)
         }
     }
 
-    /** Fallback de descarga vía InnerTube ANDROID_VR (mismo criterio de contenedor que NewPipe). */
-    private fun downloadSourceViaFallback(videoId: String): AudioDownloadSource? {
-        val fb = resolveViaInnerTubeFallback(videoId, PREFERRED_ITAGS) ?: return null
+    /** Fallback de descarga vía InnerTube VISIONOS (mismo criterio de contenedor que NewPipe). */
+    private fun downloadSourceViaFallback(videoId: String, context: Context? = null): AudioDownloadSource? {
+        val fb = resolveViaInnerTubeFallback(videoId, PREFERRED_ITAGS, context) ?: return null
         return AudioDownloadSource(fb.url, fb.itag in OPUS_ITAGS, fb.itag)
     }
 
@@ -752,94 +945,265 @@ object StreamResolver {
         return url
     }
 
-    // ─── Fallback InnerTube (cliente ANDROID_VR) ─────────────────────────
+    // ─── InnerTube Player Direct Resolver (cliente VISIONOS + visitorData) ─────────
 
-    // Cuando NewPipe falla (un cambio de YouTube rompió el extractor, bot-check, parsing), se pide
-    // el /player de InnerTube DIRECTAMENTE con el cliente ANDROID_VR: según la guía PO-Token de
-    // yt-dlp (2026) es el único cliente que NO exige PO token, y al ser cliente Android entrega
-    // URLs de googlevideo ya descifradas (sin signatureCipher, sin JS). Verificado en vivo:
-    // /player OK + GET 206 con bytes de audio reales, servidos con cualquier User-Agent (la URL
-    // se ata a la IP). Única limitación conocida: videos "made for kids" no disponibles.
-    // Es un FALLBACK, nunca el camino principal — NewPipe sigue siendo la resolución primaria.
-    private const val VR_CLIENT_VERSION = "1.62.27"
-    private const val VR_USER_AGENT =
-        "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+    // VISIONOS es un cliente móvil de YouTube para Apple Vision Pro. A diferencia de ANDROID_VR
+    // (que YouTube empezó a bloquear con "LOGIN_REQUIRED: Inicia sesión para confirmar que no eres un bot"
+    // en pistas musicales y VEVO), VISIONOS con visitorData autenticado entrega streams de googlevideo
+    // directos y descifrados (sin signatureCipher, sin JS, sin throttling) en ~0.2 segundos.
+    // Usamos el OkHttpClient compartido para reutilizar la conexión TLS (HTTP/2 multiplexing).
+    private const val VISIONOS_CLIENT_VERSION = "1.02"
+    private const val VISIONOS_OS_VERSION = "25.6.0.23O471"
 
     /** URL de audio directa + itag elegidos del fallback (el itag decide el contenedor al descargar). */
     private data class FallbackAudio(val url: String, val itag: Int)
 
-    private fun resolveViaInnerTubeFallback(videoId: String, preferredItags: IntArray): FallbackAudio? {
+    private fun extractAudioFromStreamingData(
+        streamingData: org.json.JSONObject,
+        preferredItags: IntArray
+    ): FallbackAudio? {
+        val formats = streamingData.optJSONArray("adaptiveFormats")
+            ?: streamingData.optJSONArray("formats") ?: return null
+
+        val byItag = HashMap<Int, FallbackAudio>()
+        var anyAudio: FallbackAudio? = null
+        for (i in 0 until formats.length()) {
+            val f = formats.optJSONObject(i) ?: continue
+            val mime = f.optString("mimeType", "")
+            if (!mime.startsWith("audio/")) continue
+            val u = f.optString("url", "")
+            if (u.isBlank()) continue
+            val candidate = FallbackAudio(u, f.optInt("itag", -1))
+            byItag[candidate.itag] = candidate
+            if (anyAudio == null) anyAudio = candidate
+        }
+
+        for (itag in preferredItags) {
+            val candidate = byItag[itag]
+            if (candidate != null) return candidate
+        }
+        return anyAudio
+    }
+
+    private fun postInnerTubePlayer(
+        client: OkHttpClient,
+        clientObj: org.json.JSONObject,
+        videoId: String,
+        jsonMediaType: okhttp3.MediaType,
+        context: Context? = null,
+        thirdPartyEmbed: Boolean = false
+    ): org.json.JSONObject? {
         return try {
-            val body = org.json.JSONObject().apply {
-                put("context", org.json.JSONObject().put("client", org.json.JSONObject().apply {
-                    put("clientName", "ANDROID_VR")
-                    put("clientVersion", VR_CLIENT_VERSION)
-                    put("deviceMake", "Oculus")
-                    put("deviceModel", "Quest 3")
-                    put("osName", "Android")
-                    put("osVersion", "12L")
-                    put("androidSdkVersion", 32)
-                    put("hl", "es")
-                }))
+            val bodyObj = org.json.JSONObject().apply {
+                val ctxObj = org.json.JSONObject().put("client", clientObj)
+                if (thirdPartyEmbed) {
+                    ctxObj.put("thirdParty", org.json.JSONObject().put("embedUrl", "https://www.youtube.com/watch?v=$videoId"))
+                }
+                put("context", ctxObj)
                 put("videoId", videoId)
                 put("contentCheckOk", true)
                 put("racyCheckOk", true)
-            }.toString().toByteArray(Charsets.UTF_8)
-
-            val connection = (URL("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
-                .openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                connectTimeout = 8000
-                readTimeout = 10000
-                doOutput = true
-                setRequestProperty("Content-Type", "application/json")
-                setRequestProperty("User-Agent", VR_USER_AGENT)
-            }
-            val responseText = try {
-                connection.outputStream.use { it.write(body) }
-                if (connection.responseCode != HttpURLConnection.HTTP_OK) {
-                    Log.w(TAG, "fallback[$videoId] player HTTP ${connection.responseCode}")
-                    return null
-                }
-                connection.inputStream.bufferedReader().use { it.readText() }
-            } finally {
-                connection.disconnect()
+                put("playbackContext", org.json.JSONObject().apply {
+                    put("contentPlaybackContext", org.json.JSONObject().apply {
+                        put("html5Preference", "HTML5_PREF_WANTS")
+                        put("signatureTimestamp", 19800)
+                    })
+                })
             }
 
-            val root = org.json.JSONObject(responseText)
-            val status = root.optJSONObject("playabilityStatus")?.optString("status", "") ?: ""
-            if (status != "OK") {
-                Log.w(TAG, "fallback[$videoId] playability=$status")
-                return null
-            }
-            val formats = root.optJSONObject("streamingData")
-                ?.optJSONArray("adaptiveFormats") ?: return null
-            val byItag = HashMap<Int, FallbackAudio>()
-            var anyAudio: FallbackAudio? = null
-            for (i in 0 until formats.length()) {
-                val f = formats.optJSONObject(i) ?: continue
-                if (!f.optString("mimeType", "").startsWith("audio/")) continue
-                val u = f.optString("url", "")
-                if (u.isEmpty()) continue // cifrada — no debería ocurrir con ANDROID_VR
-                val candidate = FallbackAudio(u, f.optInt("itag", -1))
-                byItag[candidate.itag] = candidate
-                if (anyAudio == null) anyAudio = candidate
-            }
-            var chosen: FallbackAudio? = null
-            for (itag in preferredItags) {
-                val candidate = byItag[itag]
-                if (candidate != null) {
-                    chosen = candidate
-                    break
+            val cookie = if (authCookieHeader.isNotBlank()) authCookieHeader
+                else if (context != null) {
+                    loadAuthCookiesFromPrefs(context)
+                    authCookieHeader
+                } else ""
+
+            val reqBuilder = OkRequest.Builder()
+                .url("https://youtubei.googleapis.com/youtubei/v1/player?prettyPrint=false")
+                .post(bodyObj.toString().toRequestBody(jsonMediaType))
+                .header("User-Agent", "Mozilla/5.0")
+
+            if (cookie.isNotBlank()) {
+                reqBuilder.header("Cookie", cookie)
+                val auth = buildSapisidHashForCookie(cookie)
+                if (auth.isNotBlank()) {
+                    reqBuilder.header("Authorization", auth)
                 }
             }
-            if (chosen == null) chosen = anyAudio
-            if (chosen != null) Log.d(TAG, "fallback[$videoId] ok (ANDROID_VR itag=${chosen.itag})")
-            chosen
-        } catch (e: Exception) {
-            Log.w(TAG, "fallback[$videoId] failed: ${e.javaClass.simpleName} — ${e.message}")
+
+            val responseText = client.newCall(reqBuilder.build()).execute().use { resp ->
+                if (!resp.isSuccessful) return null
+                resp.body?.string()
+            } ?: return null
+
+            org.json.JSONObject(responseText)
+        } catch (_: Exception) {
             null
         }
+    }
+
+    private fun resolveViaInnerTubeFallback(
+        videoId: String,
+        preferredItags: IntArray,
+        context: Context? = null
+    ): FallbackAudio? {
+        val client = getSharedOkHttpClient(context)
+        val jsonMediaType = "application/json".toMediaType()
+
+        // ── Cliente 1: VISIONOS (con visitorData) ──
+        var visitorData = cachedVisitorData.ifBlank {
+            if (context != null) {
+                try {
+                    val prefs = context.getSharedPreferences(PREFS_VISITOR_DATA, Context.MODE_PRIVATE)
+                    val saved = prefs.getString(KEY_VISITOR_DATA, "") ?: ""
+                    val ts = prefs.getLong(KEY_VISITOR_DATA_TIME, 0L)
+                    if (saved.isNotBlank() && (System.currentTimeMillis() - ts < VISITOR_DATA_TTL_MS)) {
+                        cachedVisitorData = saved
+                        saved
+                    } else ""
+                } catch (_: Exception) { "" }
+            } else ""
+        }
+
+        for (attempt in 0..1) {
+            try {
+                val clientObj = org.json.JSONObject().apply {
+                    put("clientName", "VISIONOS")
+                    put("clientVersion", VISIONOS_CLIENT_VERSION)
+                    put("clientScreen", "WATCH")
+                    put("platform", "MOBILE")
+                    if (visitorData.isNotBlank()) {
+                        put("visitorData", visitorData)
+                    }
+                    put("deviceMake", "Apple")
+                    put("deviceModel", "RealityDevice14,1")
+                    put("osName", "visionOS")
+                    put("osVersion", VISIONOS_OS_VERSION)
+                    put("hl", "es")
+                    put("gl", "US")
+                }
+
+                val root = postInnerTubePlayer(client, clientObj, videoId, jsonMediaType, context)
+                if (root != null) {
+                    val status = root.optJSONObject("playabilityStatus")?.optString("status", "") ?: ""
+                    if (status == "OK") {
+                        val streamingData = root.optJSONObject("streamingData")
+                        if (streamingData != null) {
+                            val audio = extractAudioFromStreamingData(streamingData, preferredItags)
+                            if (audio != null) {
+                                Log.d(TAG, "innertube_player[$videoId] ok (VISIONOS itag=${audio.itag})")
+                                return audio
+                            }
+                        }
+                    } else if (status == "LOGIN_REQUIRED" && attempt == 0) {
+                        cachedVisitorData = ""
+                        visitorData = fetchFreshVisitorData(context)
+                        if (visitorData.isNotBlank() && context != null) {
+                            try {
+                                context.getSharedPreferences(PREFS_VISITOR_DATA, Context.MODE_PRIVATE)
+                                    .edit().putString(KEY_VISITOR_DATA, visitorData)
+                                    .putLong(KEY_VISITOR_DATA_TIME, System.currentTimeMillis()).apply()
+                            } catch (_: Exception) {}
+                        }
+                        continue
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "innertube_player[$videoId] VISIONOS failed: ${e.message}")
+            }
+            break
+        }
+
+        // ── Cliente 2: ANDROID_VR (Meta Quest client, URLs directas sin firma ni throttling) ──
+        try {
+            val vrClient = org.json.JSONObject().apply {
+                put("clientName", "ANDROID_VR")
+                put("clientVersion", "1.60.19")
+                put("deviceMake", "oculus")
+                put("deviceModel", "Quest 3")
+                put("osName", "Android")
+                put("osVersion", "12")
+                put("hl", "es")
+                put("gl", "US")
+            }
+
+            val vrRoot = postInnerTubePlayer(client, vrClient, videoId, jsonMediaType, context)
+            if (vrRoot != null) {
+                val status = vrRoot.optJSONObject("playabilityStatus")?.optString("status", "") ?: ""
+                if (status == "OK") {
+                    val streamingData = vrRoot.optJSONObject("streamingData")
+                    if (streamingData != null) {
+                        val audio = extractAudioFromStreamingData(streamingData, preferredItags)
+                        if (audio != null) {
+                            Log.d(TAG, "innertube_player[$videoId] ok (ANDROID_VR itag=${audio.itag})")
+                            return audio
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "innertube_player[$videoId] ANDROID_VR failed: ${e.message}")
+        }
+
+        // ── Cliente 3: ANDROID_TESTSUITE (ligero, URLs directas) ──
+        try {
+            val testClient = org.json.JSONObject().apply {
+                put("clientName", "ANDROID_TESTSUITE")
+                put("clientVersion", "1.9")
+                put("osName", "Android")
+                put("osVersion", "12")
+                put("hl", "es")
+                put("gl", "US")
+            }
+
+            val testRoot = postInnerTubePlayer(client, testClient, videoId, jsonMediaType, context)
+            if (testRoot != null) {
+                val status = testRoot.optJSONObject("playabilityStatus")?.optString("status", "") ?: ""
+                if (status == "OK") {
+                    val streamingData = testRoot.optJSONObject("streamingData")
+                    if (streamingData != null) {
+                        val audio = extractAudioFromStreamingData(streamingData, preferredItags)
+                        if (audio != null) {
+                            Log.d(TAG, "innertube_player[$videoId] ok (ANDROID_TESTSUITE itag=${audio.itag})")
+                            return audio
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "innertube_player[$videoId] ANDROID_TESTSUITE failed: ${e.message}")
+        }
+
+        // ── Cliente 4: TVHTML5_SIMPLY_EMBEDDED_PLAYER (bypass para videos con restricción de edad / LOGIN_REQUIRED) ──
+        try {
+            val tvClient = org.json.JSONObject().apply {
+                put("clientName", "TVHTML5_SIMPLY_EMBEDDED_PLAYER")
+                put("clientVersion", "2.0")
+                put("clientScreen", "WATCH")
+                put("hl", "es")
+                put("gl", "US")
+            }
+
+            val tvRoot = postInnerTubePlayer(client, tvClient, videoId, jsonMediaType, context, thirdPartyEmbed = true)
+            if (tvRoot != null) {
+                val status = tvRoot.optJSONObject("playabilityStatus")?.optString("status", "") ?: ""
+                if (status == "OK") {
+                    val streamingData = tvRoot.optJSONObject("streamingData")
+                    if (streamingData != null) {
+                        val audio = extractAudioFromStreamingData(streamingData, preferredItags)
+                        if (audio != null) {
+                            Log.d(TAG, "innertube_player[$videoId] ok (TVHTML5_SIMPLY_EMBEDDED itag=${audio.itag})")
+                            return audio
+                        }
+                    }
+                } else {
+                    Log.w(TAG, "innertube_player[$videoId] TVHTML5_SIMPLY_EMBEDDED status=$status")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "innertube_player[$videoId] TVHTML5_SIMPLY_EMBEDDED failed: ${e.message}")
+        }
+
+        return null
     }
 
     private fun resolveViaNewPipe(
@@ -912,35 +1276,37 @@ object StreamResolver {
             ?.trim()
     }
 
-    // ─── NewPipe HTTP Downloader (embedded) ──────────────────────────────
+    // ─── NewPipe HTTP Downloader (embedded OkHttp with connection pool & cache) ──────────
 
     private object NewPipeDownloader : Downloader() {
         override fun execute(request: Request): Response {
-            val connection = (URL(request.url()).openConnection() as HttpURLConnection).apply {
-                requestMethod = request.httpMethod()
-                connectTimeout = 12000
-                readTimeout = 15000
-                setRequestProperty("User-Agent", "Mozilla/5.0")
-                for ((key, values) in request.headers()) {
-                    for (value in values) addRequestProperty(key, value)
-                }
-                request.dataToSend()?.let { data ->
-                    doOutput = true
-                    outputStream.use { it.write(data) }
+            val client = getSharedOkHttpClient()
+            val reqBuilder = OkRequest.Builder()
+                .url(request.url())
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
+
+            for ((key, values) in request.headers()) {
+                for (value in values) {
+                    reqBuilder.addHeader(key, value)
                 }
             }
 
-            val responseCode = connection.responseCode
-            val responseMessage = connection.responseMessage ?: ""
-            val responseHeaders = connection.headerFields
-                ?.filterKeys { it != null }
-                ?.mapValues { (_, v) -> v ?: emptyList() }
-                ?: emptyMap()
-            val body = try {
-                connection.inputStream.bufferedReader().use { it.readText() }
-            } catch (_: IOException) {
-                connection.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
+            val dataToSend = request.dataToSend()
+            val httpMethod = request.httpMethod()
+            if (dataToSend != null) {
+                val mediaType = "application/json; charset=utf-8".toMediaType()
+                reqBuilder.method(httpMethod, dataToSend.toRequestBody(mediaType))
+            } else if (httpMethod.equals("POST", ignoreCase = true)) {
+                reqBuilder.post("".toRequestBody(null))
+            } else {
+                reqBuilder.method(httpMethod, null)
             }
+
+            val okResponse = client.newCall(reqBuilder.build()).execute()
+            val responseCode = okResponse.code
+            val responseMessage = okResponse.message
+            val responseHeaders = okResponse.headers.toMultimap()
+            val body = okResponse.body?.string() ?: ""
             return Response(responseCode, responseMessage, responseHeaders, body, request.url())
         }
     }

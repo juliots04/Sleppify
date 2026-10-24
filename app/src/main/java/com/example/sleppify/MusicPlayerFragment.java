@@ -117,9 +117,9 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     private static final String PREF_PLAYLIST_GRID_URLS_PREFIX = "playlist_grid_urls_";
     private static final String PREF_LAST_STREAMING_ACCOUNT_KEY = "stream_last_library_account_key";
     private static final String OFFLINE_DOWNLOAD_UNIQUE_PREFIX = "offline_playlist_";
-    private static final String OFFLINE_DOWNLOAD_QUEUE_UNIQUE_NAME = "offline_playlist_queue";
+    public static final String OFFLINE_DOWNLOAD_QUEUE_UNIQUE_NAME = "offline_playlist_queue";
     private static final String OFFLINE_DOWNLOAD_MANUAL_TRACK_QUEUE_UNIQUE_NAME = "offline_manual_track_queue";
-    private static final int OFFLINE_AUTO_BATCH_TARGET_TRACKS = 3;
+    private static final int OFFLINE_AUTO_BATCH_TARGET_TRACKS = 25;
     private static final Set<String> offlineSyncRecentlyProcessedPlaylistIds = Collections.synchronizedSet(new HashSet<>());
     private static boolean isOfflineSyncInFlight = false;
     private static final long OFFLINE_TRACKS_PREFETCH_STALE_MS = 7L * 24 * 60 * 60 * 1000L;
@@ -1134,6 +1134,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     @Nullable private View llLibrarySkeletonContent;
     @Nullable private ImageView ivLibraryBackdrop;
     @Nullable private View vStatusBarOverlay;
+    private int statusBarHeightPx = 0;
     private boolean libraryGridOverlayActive;
     private boolean suppressGridOverlay;
     private int libraryGridPendingCount;
@@ -1347,7 +1348,8 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         vStatusBarOverlay = view.findViewById(R.id.vStatusBarOverlay);
         if (vStatusBarOverlay != null) {
             androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(vStatusBarOverlay, (v, insets) -> {
-                int sbHeight = insets.getInsets(androidx.core.view.WindowInsetsCompat.Type.statusBars()).top;
+                int sbHeight = insets.getInsets(androidx.core.view.WindowInsetsCompat.Type.systemBars()).top;
+                statusBarHeightPx = sbHeight;
                 v.getLayoutParams().height = sbHeight;
                 v.setLayoutParams(v.getLayoutParams());
                 return insets;
@@ -1359,13 +1361,6 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         if (nsvLib != null) {
             nsvLib.setOnScrollChangeListener((androidx.core.widget.NestedScrollView.OnScrollChangeListener)
                 (v, scrollX, scrollY, oldScrollX, oldScrollY) -> {
-                    if (vStatusBarOverlay != null && rvMusicResults != null) {
-                        float density = getResources().getDisplayMetrics().density;
-                        float startY = rvMusicResults.getTop();
-                        float endY = startY + (120 * density);
-                        float fraction = endY <= startY ? 1f : Math.min(1f, Math.max(0f, (scrollY - startY) / (endY - startY)));
-                        vStatusBarOverlay.setAlpha(fraction);
-                    }
                     updateHeaderOnScroll(scrollY, scrollY - oldScrollY);
                 });
             // Seed the header/background state once laid out (covers a restored scroll position).
@@ -1523,13 +1518,17 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         // mientras el fragment estaba pre-creado oculto (auto-launch del login). Si la biblioteca
         // sigue vacía con una carga pendiente, mostrarlo ahora — este es el fix de "no aparece
         // el skeleton la primera vez que entro al módulo".
-        if (activeScreen == ScreenMode.LIBRARY
-                && (adapter == null || adapter.dataSize() == 0)
-                && (entrySkeletonPendingWhenShown || loadingLibrary || libraryFetchInFlight || !libraryStoresWarmed)) {
-            entrySkeletonPendingWhenShown = false;
-            showLibraryEntrySkeleton();
-        } else if (activeScreen == ScreenMode.LIBRARY && libraryStoresWarmed && (adapter == null || adapter.dataSize() == 0)) {
-            renderLibraryResults();
+        if (activeScreen == ScreenMode.LIBRARY && (adapter == null || adapter.dataSize() == 0)) {
+            if (libraryTracks.isEmpty()) {
+                restoreLibraryFromPersistentCache();
+            }
+            if (!libraryTracks.isEmpty()) {
+                entrySkeletonPendingWhenShown = false;
+                renderLibraryResults();
+            } else if (entrySkeletonPendingWhenShown || loadingLibrary || libraryFetchInFlight || !libraryStoresWarmed) {
+                entrySkeletonPendingWhenShown = false;
+                showLibraryEntrySkeleton();
+            }
         }
         // Re-entering Biblioteca from another module always resets to no chip selected (the full
         // library), per request. Only re-render if we actually cleared an active filter.
@@ -1584,16 +1583,17 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         if (llFragBrandHeader != null) {
             androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(llFragBrandHeader, (v, insets) -> {
                 int statusBarHeight = insets.getInsets(androidx.core.view.WindowInsetsCompat.Type.systemBars()).top;
+                statusBarHeightPx = statusBarHeight;
                 v.setPadding(v.getPaddingLeft(), statusBarHeight, v.getPaddingRight(), v.getPaddingBottom());
                 return insets;
             });
             llFragBrandHeader.requestApplyInsets();
         }
         if (llLibraryHeaderContainer != null) {
-            // Background starts fully transparent (header rests over the backdrop) and turns solid
+            // Background starts fully transparent (header rests over the backdrop) and turns solid black
             // via updateHeaderOnScroll() as content scrolls underneath.
             headerBgDrawable = new android.graphics.drawable.ColorDrawable(
-                    ContextCompat.getColor(requireContext(), R.color.surface_dark));
+                    ContextCompat.getColor(requireContext(), android.R.color.black));
             headerBgDrawable.setAlpha(0);
             llLibraryHeaderContainer.setBackground(headerBgDrawable);
 
@@ -1700,19 +1700,29 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         int h = header.getHeight();
         if (h <= 0) return;
         float hf = h;
+        float density = getResources().getDisplayMetrics().density;
+        float fadeDistance = Math.max(24f * density, statusBarHeightPx > 0 ? (float) statusBarHeightPx : (36f * density));
 
-        float offset = header.getTranslationY() - dy;
-        offset = Math.max(-hf, Math.min(0f, offset));
-        offset = Math.max(offset, -scrollY);
-        header.setTranslationY(offset);
-
-        // Transparent at rest (over the backdrop), solid while detached/floating. The ramp spans
-        // the first header-height of scroll — while the header is still "attached" — so by the
-        // time it can float over content it is already opaque.
+        // 1. Desvanecido suave coordinado del status bar negro y del fondo del header:
+        // Transparente en reposo sobre el backdrop, negro sólido al desplazarse.
+        float fraction = Math.min(1f, Math.max(0f, scrollY / fadeDistance));
+        if (vStatusBarOverlay != null) {
+            vStatusBarOverlay.setAlpha(fraction);
+        }
         if (headerBgDrawable != null) {
-            float fraction = Math.min(1f, Math.max(0f, scrollY / hf));
             headerBgDrawable.setAlpha((int) (fraction * 255f));
         }
+
+        // 2. Quick-return del header:
+        // Cerca del tope (scrollY <= fadeDistance), el header reposa en translationY = 0
+        // mientras la barra se desvanece a negro (evita que los iconos se trasladen dentro de un status bar transparente).
+        // Una vez superado fadeDistance (status bar 100% negro sólido), el header se traslada hacia arriba
+        // pasando por DETRÁS del status bar negro (vStatusBarOverlay tiene translationZ mayor que el header).
+        float scrollPastFade = Math.max(0f, scrollY - fadeDistance);
+        float offset = header.getTranslationY() - dy;
+        offset = Math.max(-hf, Math.min(0f, offset));
+        offset = Math.max(offset, -scrollPastFade);
+        header.setTranslationY(offset);
     }
 
     void refreshFragHeaderProfilePhoto() {
@@ -2598,6 +2608,9 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             if (!libraryTracks.isEmpty()) {
                 libraryStoresWarmed = true;
                 warmLibraryStoresOffMain();
+            } else if (restoreLibraryFromPersistentCache()) {
+                libraryStoresWarmed = true;
+                warmLibraryStoresOffMain();
             } else {
                 showLibraryEntrySkeleton();
                 warmLibraryStoresOffMain();
@@ -3271,11 +3284,10 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             libraryTracks.clear();
             libraryTracks.addAll(new ArrayList<>(LIBRARY_CACHE));
             displayLibraryDirty = true;
+        } else if (libraryTracks.isEmpty()) {
+            restoreLibraryFromPersistentCache();
         }
-        // Cold process: the persisted library/artists JSON parse is DEFERRED to the off-main
-        // library warmup (warmLibraryStoresOffMain). Parsing it here — synchronously inside
-        // onViewCreated — blocked the module's first frame for the entire cache size; the entry
-        // skeleton now covers that gap instead.
+        restoreCachedArtists(accountKey);
     }
     private void restoreCachedArtists(@NonNull String accountKey) {
         if (!libraryArtists.isEmpty()) return;
@@ -3306,6 +3318,10 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     }
     @NonNull
     private String resolveAccountKey() {
+        String oauthEmail = normalizeAccountEmail(streamingOauthAccountEmail);
+        if (!TextUtils.isEmpty(oauthEmail)) {
+            return oauthEmail;
+        }
         String appEmail = getPrimaryAppGoogleEmail();
         if (!TextUtils.isEmpty(appEmail)) {
             return appEmail.toLowerCase(Locale.US).trim();
@@ -3318,7 +3334,13 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             return account.getEmail().toLowerCase(Locale.US).trim();
         }
         String persistedKey = resolvePersistedLibraryAccountKey();
-        return persistedKey == null ? "" : persistedKey;
+        if (!TextUtils.isEmpty(persistedKey)) {
+            return persistedKey;
+        }
+        if (!TextUtils.isEmpty(StreamResolver.getAuthCookieHeader())) {
+            return "web_session";
+        }
+        return "default_account";
     }
     @Nullable
     private StreamingAccountCandidate resolveStreamingOAuthAccountCandidate() {
@@ -3454,10 +3476,6 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     }
     @NonNull
     private String resolveActiveStreamingAccountKey() {
-        String oauthEmail = normalizeAccountEmail(streamingOauthAccountEmail);
-        if (!TextUtils.isEmpty(oauthEmail)) {
-            return oauthEmail;
-        }
         return resolveAccountKey();
     }
     private void rememberStreamingOauthAccountEmail(@Nullable String email) {
@@ -5400,6 +5418,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         // if hidden, defer until the fragment becomes visible again.
         for (String pid : previouslyDownloadingAuto) {
             if (!downloading.contains(pid)) {
+                offlineSyncRecentlyProcessedPlaylistIds.remove(pid);
                 if (!isHidden() && adapter != null) {
                     adapter.invalidatePlaylistOfflineState(pid, true);
                 } else {
@@ -5650,6 +5669,9 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 offlineSyncRecentlyProcessedPlaylistIds.add(primaryId);
                 mainHandler.postDelayed(() -> {
                     offlineSyncRecentlyProcessedPlaylistIds.remove(primaryId);
+                    if (isAdded() && !isHidden()) {
+                        maybeEnqueueNextOfflineAutoPlaylist();
+                    }
                 }, 60000);
                 boolean enqueued = enqueueOfflineAutoBatchDownloadInternal(candidate);
                 if (enqueued && adapter != null) {
@@ -6558,6 +6580,8 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
         if (getParentFragmentManager().isStateSaved()) {
             return;
         }
+        String officialCover = OfficialCoverStore.get(requireContext(), track.contentId);
+        String effectiveThumb = !TextUtils.isEmpty(officialCover) ? officialCover : track.thumbnailUrl;
         // Desde la pastilla Descargas el detalle se abre en modo "solo descargadas": lista
         // filtrada a lo que está en disco y header con "· N descargadas". El subtítulo de la
         // row ("N descargadas") NO viaja — parseMeta lo tomaría como ownerLabel del header.
@@ -6567,7 +6591,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                     getParentFragmentManager(),
                     track.contentId,
                     track.title,
-                    track.thumbnailUrl
+                    effectiveThumb
             );
             return;
         }
@@ -6579,7 +6603,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                 track.contentId,
                 track.title,
                 track.subtitle,
-                track.thumbnailUrl
+                effectiveThumb
         );
     }
 
@@ -7674,7 +7698,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
                     }
                     if (holder.animatedEq != null) {
                         SongPlayerFragment songPlayer = findSongPlayerFragment();
-                        boolean isActuallyPlaying = songPlayer != null && songPlayer.isPlaying();
+                        boolean isActuallyPlaying = songPlayer == null || songPlayer.isPlaying();
                         holder.animatedEq.setAnimating(isActuallyPlaying);
                     }
                 }
@@ -7738,7 +7762,7 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
             SongPlayerFragment songPlayer = findSongPlayerFragment();
             String currentVideoId = songPlayer != null ? songPlayer.getLoadedVideoId() : "";
             boolean isNowPlaying = !currentVideoId.isEmpty() && TextUtils.equals(currentVideoId, item.contentId);
-            boolean isActuallyPlaying = isNowPlaying && songPlayer != null && songPlayer.isPlaying();
+            boolean isActuallyPlaying = isNowPlaying && (songPlayer == null || songPlayer.isPlaying());
             if (holder.llNowPlayingOverlay != null) {
                 holder.llNowPlayingOverlay.setVisibility(isNowPlaying ? View.VISIBLE : View.GONE);
                 if (holder.animatedEq != null) {

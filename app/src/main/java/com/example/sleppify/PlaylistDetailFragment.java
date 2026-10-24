@@ -157,6 +157,8 @@ public class PlaylistDetailFragment extends Fragment
             DrawableTransitionOptions.with(CROSS_FADE_FACTORY);
     /** Payload marker for state-only adapter updates (skip image reload). */
     private static final String PAYLOAD_STATE_ONLY = "state_only";
+    /** Payload marker for text/meta-only updates (skip BOTH image and offline state reload). */
+    private static final String PAYLOAD_TEXT_ONLY = "text_only";
     /** Material standard easing — pre-built once, never re-allocated per animation. */
     private static final android.view.animation.Interpolator MATERIAL_EASE =
             new android.view.animation.PathInterpolator(0.4f, 0f, 0.2f, 1f);
@@ -484,6 +486,10 @@ public class PlaylistDetailFragment extends Fragment
         String playlistTitle = safeArg(ARG_PLAYLIST_TITLE);
         String playlistSubtitle = safeArg(ARG_PLAYLIST_SUBTITLE);
         String playlistThumbnail = safeArg(ARG_PLAYLIST_THUMBNAIL);
+        String officialCover = OfficialCoverStore.get(requireContext(), playlistId);
+        if (!TextUtils.isEmpty(officialCover)) {
+            playlistThumbnail = officialCover.trim();
+        }
         String youtubeAccessToken = resolveYoutubeAccessToken(safeArg(ARG_YOUTUBE_ACCESS_TOKEN));
         playlistId = normalizeLikedPlaylistId(playlistId, playlistTitle, playlistSubtitle);
         if (isFavoritesPlaylistContext(playlistId)) {
@@ -1051,6 +1057,15 @@ public class PlaylistDetailFragment extends Fragment
         }
     }
 
+    /** Lightweight header update that only refreshes text labels (title, info, profile)
+     *  without re-loading artwork or re-computing offline state. Prevents the cover-art
+     *  flicker that occurred when metadata updates triggered a full artwork Glide reload. */
+    private void notifyHeaderTextChanged() {
+        if (headerAdapter != null) {
+            headerAdapter.notifyItemChanged(0, PAYLOAD_TEXT_ONLY);
+        }
+    }
+
     private void refreshActiveEqualizerState() {
         if (trackAdapter == null || rvPlaylistContent == null || currentTrackIndex < 0) {
             return;
@@ -1066,7 +1081,7 @@ public class PlaylistDetailFragment extends Fragment
             return;
         }
         SongPlayerFragment songPlayer = findSongPlayerFragment();
-        boolean isActuallyPlaying = songPlayer != null && songPlayer.isPlaying();
+        boolean isActuallyPlaying = (songPlayer != null && songPlayer.isPlaying()) || miniPlaying;
         eq.setAnimating(isActuallyPlaying);
     }
 
@@ -1204,7 +1219,7 @@ public class PlaylistDetailFragment extends Fragment
 
         if (!isCurrentPlaylistOfflineAutoEnabled()) {
             setCurrentPlaylistOfflineAutoEnabled(true);
-            notifyHeaderChanged();
+            notifyHeaderStateChanged();
             startOfflinePlaylistDownload(true);
             AppSnackbar.show(getActivity(), "Descarga iniciada");
             return;
@@ -1229,12 +1244,12 @@ public class PlaylistDetailFragment extends Fragment
 
         setOfflineDownloadVisualState(false, "");
         offlineDownloadQueued = false;
-        notifyHeaderChanged();
+        notifyHeaderStateChanged();
         AppSnackbar.show(getActivity(), "Descargas canceladas");
 
         ArrayList<String> idsToDelete = buildCurrentVideoIds();
         if (idsToDelete.isEmpty()) {
-            notifyHeaderChanged();
+            notifyHeaderStateChanged();
             
             return;
         }
@@ -1251,7 +1266,7 @@ public class PlaylistDetailFragment extends Fragment
                 if (!isAdded()) {
                     return;
                 }
-                notifyHeaderChanged();
+                notifyHeaderStateChanged();
                 if (trackAdapter != null) {
                     trackAdapter.invalidateTrackStateCache();
                     trackAdapter.submitTracks(currentTracks);
@@ -1289,7 +1304,12 @@ public class PlaylistDetailFragment extends Fragment
         headerPlaylistTitle = (override != null && !override.isEmpty()) ? override : playlistTitle;
         if (override != null && !override.isEmpty()) currentPlaylistTitle = override;
         headerPlaylistInfo = buildPlaylistInfoLine(meta, currentTracks.isEmpty() ? 0 : currentTracks.size());
-        headerPlaylistThumbnail = playlistThumbnail;
+        String officialCover = isAdded() ? OfficialCoverStore.get(requireContext(), currentPlaylistId) : null;
+        if (!TextUtils.isEmpty(officialCover)) {
+            headerPlaylistThumbnail = officialCover.trim();
+        } else if (!TextUtils.isEmpty(playlistThumbnail)) {
+            headerPlaylistThumbnail = playlistThumbnail;
+        }
         headerGridUrls = new ArrayList<>();
         // Kill the single-thumbnail → 2x2 "flash": if this playlist already has a persisted grid
         // from a previous visit, adopt it BEFORE this first header bind so the cover chain lands on
@@ -1303,9 +1323,12 @@ public class PlaylistDetailFragment extends Fragment
                 && !isLocalFilesContext(currentPlaylistId)
                 && !isRadioContext
                 && !forceSingleCoverArt
-                // Auto-generated playlists (RDCLAK…) keep their single static cover, never a grid —
+                && TextUtils.isEmpty(officialCover)
+                // Auto-generated playlists (RDCLAK, RDTMAK, RD, albums, recaps) keep their single static cover, never a grid —
                 // so a stale persisted grid must not hijack the single-image header either.
-                && !isAutoGeneratedPlaylistId(currentPlaylistId)) {
+                && !isAutoGeneratedPlaylistId(currentPlaylistId)
+                && !isRecapTitle(headerPlaylistTitle)
+                && !isRecapTitle(currentPlaylistTitle)) {
             List<String> persistedGrid = loadPersistedGridUrls(currentPlaylistId);
             if (persistedGrid != null && persistedGrid.size() >= 4) {
                 headerGridUrls = persistedGrid;
@@ -1344,7 +1367,7 @@ public class PlaylistDetailFragment extends Fragment
 
         headerProfileName = extractFirstName(profileName);
         headerProfilePhoto = profilePhoto;
-        notifyHeaderChanged();
+        notifyHeaderTextChanged();
     }
 
     private void loadTrackArt(@NonNull ImageView target, @Nullable String imageUrl) {
@@ -1582,8 +1605,16 @@ public class PlaylistDetailFragment extends Fragment
             return false;
         }
 
-        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                && capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED);
+        if (!capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+            return false;
+        }
+
+        if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
+            return true;
+        }
+
+        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                || !capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_CAPTIVE_PORTAL);
     }
 
     private static void loadArtworkInto(@NonNull ImageView target, @Nullable String imageUrl) {
@@ -1713,10 +1744,20 @@ public class PlaylistDetailFragment extends Fragment
         return RadioArt.isRadioId(playlistId);
     }
 
-    /** YT Music auto-generated PLAYLIST ids ({@code RDCLAK5uy_…}): static cover + fixed tracklist,
-     *  rendered as single-image cards everywhere. Not a radio despite the leading "RD". */
+    /** YT Music auto-generated or official playlists (editorial, recaps, mixes, albums, radios).
+     *  These carry their OWN cover art (or radio composite) and must NEVER synthesize a 2x2 collage.
+     *  The 2x2 collage is strictly and exclusively for personal user playlists without an official cover. */
     private static boolean isAutoGeneratedPlaylistId(@Nullable String playlistId) {
-        return playlistId != null && playlistId.startsWith("RDCLAK");
+        if (playlistId == null) return false;
+        String id = playlistId.trim();
+        return id.startsWith("RDCLAK") || id.startsWith("RDTMAK") || id.startsWith("RD")
+                || id.startsWith("MPRE") || id.startsWith("OLAK") || LocalFilesStore.isLocalAlbumId(id);
+    }
+
+    private static boolean isRecapTitle(@Nullable String title) {
+        if (title == null) return false;
+        String t = title.toLowerCase(java.util.Locale.ROOT).trim();
+        return t.contains("recap") || t.contains("resumen de tu año") || t.contains("tu resumen") || t.contains("replay");
     }
 
     /** True for an album/single opened from an artist page. These carry an album BROWSE id ("MPRE…"),
@@ -1749,7 +1790,7 @@ public class PlaylistDetailFragment extends Fragment
                         buildRelativeDateLabel(playlist.publishedAt)
                 );
                 headerPlaylistInfo = buildPlaylistInfoLine(currentMeta, currentTracks.isEmpty() ? 0 : currentTracks.size());
-                notifyHeaderChanged();
+                notifyHeaderTextChanged();
             }
 
             @Override
@@ -1925,7 +1966,7 @@ public class PlaylistDetailFragment extends Fragment
 
             renderTracks(cleanedCachedTracks, playlistId, true);
             if (cleanedCachedTracks.isEmpty() && !isOfflineStatusPinned()) {
-                notifyHeaderChanged();
+                notifyHeaderStateChanged();
             }
 
             // On pull-to-refresh, try to enrich tracks missing durations
@@ -2012,7 +2053,7 @@ public class PlaylistDetailFragment extends Fragment
                 }
                 return;
             }
-            notifyHeaderChanged();
+            notifyHeaderStateChanged();
             String albumCookie = requireContext().getSharedPreferences(PREFS_PLAYER_STATE, Activity.MODE_PRIVATE)
                     .getString(AppConstants.PREF_LAST_YOUTUBE_WEB_COOKIE, "");
             if (albumCookie == null) albumCookie = "";
@@ -2087,7 +2128,7 @@ public class PlaylistDetailFragment extends Fragment
                 }
                 return;
             }
-            notifyHeaderChanged();
+            notifyHeaderStateChanged();
             String genCookie = requireContext().getSharedPreferences(PREFS_PLAYER_STATE, Activity.MODE_PRIVATE)
                     .getString(AppConstants.PREF_LAST_YOUTUBE_WEB_COOKIE, "");
             if (genCookie == null) genCookie = "";
@@ -2141,14 +2182,14 @@ public class PlaylistDetailFragment extends Fragment
                 if (!playlistId.isEmpty() && TextUtils.isEmpty(effectiveAccessToken)) {
                     scheduleTracksTokenRetry(playlistId);
                 }
-                notifyHeaderChanged();
+                notifyHeaderStateChanged();
                 revealPlaylistContentIfNeeded(true);
             }
             playlistTracksLoadMoreInFlight = false;
             return;
         }
 
-        notifyHeaderChanged();
+        notifyHeaderStateChanged();
 
         // Radio/Mix playlists (any "RD" id: RDAMVM, RDEM, RDTMAK, RDCLAK "Mixes para ti", …)
         // use the InnerTube watch endpoint with the web cookie. Regular playlists (PL/VL/OLAK…)
@@ -2293,7 +2334,7 @@ public class PlaylistDetailFragment extends Fragment
                     return;
                 }
 
-                notifyHeaderChanged();
+                notifyHeaderStateChanged();
                 currentTracks.clear();
                 trackAdapter.submitTracks(currentTracks);
                 currentTrackIndex = -1;
@@ -2352,6 +2393,10 @@ public class PlaylistDetailFragment extends Fragment
                 notifyHeaderStateChanged();
                 if (trackAdapter != null && !offlineTrackIds.isEmpty()) {
                     trackAdapter.markTracksOffline(offlineTrackIds);
+                }
+                if (!complete && isCurrentPlaylistOfflineAutoEnabled() && isInternetAvailable()
+                        && !offlineDownloadRunning && !offlineDownloadQueued) {
+                    maybeAutoDownloadForCurrentPlaylist();
                 }
             });
         });
@@ -2477,7 +2522,7 @@ public class PlaylistDetailFragment extends Fragment
 
         // Optimistic UI: show queued state immediately
         offlineDownloadQueued = true;
-        notifyHeaderChanged();
+        notifyHeaderStateChanged();
 
         trackStateLookupExecutor.execute(() -> {
             ArrayList<String> ids = new ArrayList<>();
@@ -2512,8 +2557,7 @@ public class PlaylistDetailFragment extends Fragment
             if (ids.isEmpty()) {
                 mainHandler.post(() -> {
                     offlineDownloadQueued = false;
-                    notifyHeaderChanged();
-                    AppSnackbar.show(getActivity(), "Todas las canciones ya están descargadas");
+                    notifyHeaderStateChanged();
                 });
                 return;
             }
@@ -2552,7 +2596,7 @@ public class PlaylistDetailFragment extends Fragment
                 lastActiveOfflineUniqueName = uniqueName;
 
                 offlineDownloadQueued = true;
-                notifyHeaderChanged();
+                notifyHeaderStateChanged();
                 observeOfflineDownload(uniqueName);
 
                 notifyMusicPlayerOfflineChanged();
@@ -2567,7 +2611,7 @@ public class PlaylistDetailFragment extends Fragment
 
         pendingImportTrackIds.clear();
         pendingImportTrackIds.addAll(videoIds);
-        notifyHeaderChanged();
+        notifyHeaderStateChanged();
 
         try {
             offlineImportLauncher.launch(new String[] {
@@ -2782,7 +2826,7 @@ public class PlaylistDetailFragment extends Fragment
             if (workInfos == null || workInfos.isEmpty()) {
                 if (!offlineDownloadQueued) {
                     setOfflineDownloadVisualState(false, "");
-                    notifyHeaderChanged();
+                    notifyHeaderStateChanged();
                     maybeUpdateOfflineReadyState();
                 }
                 return;
@@ -2871,7 +2915,7 @@ public class PlaylistDetailFragment extends Fragment
                     // just set above — the worker hasn't stopped. Only show a waiting header;
                     // the next progress emission re-applies fresh values when the network returns.
                     headerPlaylistInfo = "Descargando playlist • esperando conexión";
-                    notifyHeaderChanged();
+                    notifyHeaderTextChanged();
                     return;
                 }
 
@@ -2880,7 +2924,7 @@ public class PlaylistDetailFragment extends Fragment
                     status += " • " + done + " revisadas";
                 }
                 headerPlaylistInfo = status;
-                notifyHeaderChanged();
+                notifyHeaderTextChanged();
                 return;
             }
 
@@ -2914,12 +2958,12 @@ public class PlaylistDetailFragment extends Fragment
                     if (currentMeta != null) {
                         headerPlaylistInfo = buildPlaylistInfoLine(currentMeta, currentTracks.size());
                     }
-                    notifyHeaderChanged();
+                    notifyHeaderTextChanged();
                     return;
                 }
 
                 if (!isInternetAvailable()) {
-                    notifyHeaderChanged();
+                    notifyHeaderStateChanged();
                     return;
                 }
 
@@ -2933,7 +2977,7 @@ public class PlaylistDetailFragment extends Fragment
                     }
                 }
                 headerPlaylistInfo = "Descargando playlist (En cola) • " + cachedOfflineCount + "/" + safeTotal;
-                notifyHeaderChanged();
+                notifyHeaderTextChanged();
                 return;
             }
 
@@ -2944,7 +2988,7 @@ public class PlaylistDetailFragment extends Fragment
                 if (currentMeta != null) {
                     headerPlaylistInfo = buildPlaylistInfoLine(currentMeta, currentTracks.size());
                 }
-                notifyHeaderChanged();
+                notifyHeaderTextChanged();
                 return;
             }
 
@@ -2968,9 +3012,10 @@ public class PlaylistDetailFragment extends Fragment
                 boolean manualJob = terminalInfo.getTags()
                         .contains(OFFLINE_DOWNLOAD_MANUAL_TRACK_QUEUE_UNIQUE_NAME);
                 boolean freshTerminal = offlineWorkSeenActiveIds.remove(terminalInfo.getId());
+                boolean allComplete = totalOut > 0 && downloadedOut >= totalOut;
                 if (!manualJob && freshTerminal
-                        && OfflinePlaylistDownloadWorker.OUTPUT_REASON_NONE.equals(reason)
-                        && totalOut > 0 && downloadedOut >= totalOut) {
+                        && (OfflinePlaylistDownloadWorker.OUTPUT_REASON_NONE.equals(reason) || allComplete)
+                        && allComplete) {
                     persistOfflineCompleteStateForCurrentPlaylist(true);
                 }
                 // Re-notify the library tile now that files actually landed (the enqueue-time
@@ -2984,12 +3029,8 @@ public class PlaylistDetailFragment extends Fragment
                     return;
                 }
 
-                // Notify ONCE that the download finished — the only per-track feedback now that the
-                // rows no longer carry a persistent downloaded indicator. Only for user-initiated
-                // downloads (offlineObserverNotifyTerminalToasts); freshTerminal blocks replayed
-                // historical SUCCEEDED infos from re-toasting.
-                if (freshTerminal && downloadedOut > 0
-                        && OfflinePlaylistDownloadWorker.OUTPUT_REASON_NONE.equals(reason)) {
+                // Notify ONCE that the download finished — only when all requested tracks completed.
+                if (freshTerminal && downloadedOut > 0 && allComplete) {
                     AppSnackbar.show(getActivity(),
                             (manualJob || downloadedOut == 1)
                                     ? "Descarga completada"
@@ -2999,7 +3040,8 @@ public class PlaylistDetailFragment extends Fragment
                 if (currentMeta != null) {
                     headerPlaylistInfo = buildPlaylistInfoLine(currentMeta, currentTracks.size());
                 }
-                notifyHeaderChanged();
+                notifyHeaderStateChanged();
+                notifyHeaderTextChanged();
                 stopObservingOfflineDownload();
                 refreshVisibleTrackRows();
                 maybeUpdateOfflineReadyState();
@@ -3046,7 +3088,7 @@ public class PlaylistDetailFragment extends Fragment
                     headerPlaylistInfo = buildPlaylistInfoLine(currentMeta, currentTracks.size());
                 }
                 if (offlineObserverNotifyTerminalToasts) {
-                    notifyHeaderChanged();
+                    notifyHeaderTextChanged();
                 }
             }
         };
@@ -3145,7 +3187,7 @@ public class PlaylistDetailFragment extends Fragment
                     return;
                 }
 
-                notifyHeaderChanged();
+                notifyHeaderStateChanged();
                 revealPlaylistContentIfNeeded(true);
             }
         };
@@ -3600,7 +3642,9 @@ public class PlaylistDetailFragment extends Fragment
             headerPlaylistThumbnail = officialCover.trim();
         }
         boolean autoGeneratedPlaylist = isAutoGeneratedPlaylistId(playlistId) || forceSingleCoverArt
-                || !TextUtils.isEmpty(officialCover);
+                || !TextUtils.isEmpty(officialCover)
+                || isRecapTitle(headerPlaylistTitle)
+                || isRecapTitle(currentPlaylistTitle);
 
         // For YouTube playlists, use persisted grid URLs so the 2x2 never changes
         List<String> gridUrls = null;
@@ -3627,7 +3671,7 @@ public class PlaylistDetailFragment extends Fragment
         }
         headerGridUrls = (!autoGeneratedPlaylist && gridUrls != null && gridUrls.size() >= 4)
                 ? gridUrls : new ArrayList<>();
-        if (!autoGeneratedPlaylist && currentTracks.size() < 4) {
+        if (!autoGeneratedPlaylist && currentTracks.size() < 4 && TextUtils.isEmpty(headerPlaylistThumbnail)) {
             for (PlaylistTrack track : currentTracks) {
                 if (track != null && !TextUtils.isEmpty(track.imageUrl)) {
                     headerPlaylistThumbnail = track.imageUrl.trim();
@@ -4133,6 +4177,12 @@ public class PlaylistDetailFragment extends Fragment
     }
 
     private void persistGridUrls(@NonNull String playlistId, @NonNull List<String> urls) {
+        if (isAutoGeneratedPlaylistId(playlistId) || isRecapTitle(headerPlaylistTitle) || isRecapTitle(currentPlaylistTitle) || forceSingleCoverArt) {
+            try {
+                getCachePrefs().edit().remove(PREF_PLAYLIST_GRID_URLS_PREFIX + playlistId).apply();
+            } catch (Exception ignored) {}
+            return;
+        }
         try {
             StringBuilder sb = new StringBuilder();
             for (int i = 0; i < urls.size(); i++) {
@@ -4149,6 +4199,9 @@ public class PlaylistDetailFragment extends Fragment
 
     @Nullable
     private List<String> loadPersistedGridUrls(@NonNull String playlistId) {
+        if (isAutoGeneratedPlaylistId(playlistId) || isRecapTitle(headerPlaylistTitle) || isRecapTitle(currentPlaylistTitle) || forceSingleCoverArt) {
+            return null;
+        }
         try {
             String raw = getCachePrefs().getString(PREF_PLAYLIST_GRID_URLS_PREFIX + playlistId, "");
             if (TextUtils.isEmpty(raw)) return null;
@@ -6136,6 +6189,11 @@ public class PlaylistDetailFragment extends Fragment
                 for (Object payload : payloads) {
                     if (PAYLOAD_STATE_ONLY.equals(payload)) {
                         bindOfflineState(holder);
+                    } else if (PAYLOAD_TEXT_ONLY.equals(payload)) {
+                        // Refresh ONLY the text labels — never re-load cover/backdrop art.
+                        holder.tvPlaylistName.setText(headerPlaylistTitle);
+                        holder.tvGoogleProfileName.setText(headerProfileName);
+                        holder.tvPlaylistInfo.setText(headerPlaylistInfo);
                     }
                 }
                 return;
@@ -6168,6 +6226,8 @@ public class PlaylistDetailFragment extends Fragment
             if (holder.tvRadioHeaderTitle != null) holder.tvRadioHeaderTitle.setVisibility(View.GONE);
             if (holder.tvRadioHeaderBadge != null) holder.tvRadioHeaderBadge.setVisibility(View.GONE);
 
+            String officialCover = isAdded() ? OfficialCoverStore.get(requireContext(), currentPlaylistId) : null;
+
             if (isLikedPlaylistContext(currentPlaylistId)) {
                 // Liked: the gradient fills the ENTIRE header — both the cover AND the full-width
                 // backdrop use bg_music_liked_gradient so they read as ONE continuous field (not a
@@ -6194,7 +6254,12 @@ public class PlaylistDetailFragment extends Fragment
                 // forceSingleCoverArt skips this so a "recomendadas"/recap card that opened here clones
                 // its single YT cover instead of a composite (the mix still FETCHES via /next).
                 bindRadioHeaderCover(holder);
-            } else if (!headerGridUrls.isEmpty() && !forceSingleCoverArt && !isLocalFilesContext(currentPlaylistId)) {
+            } else if (!headerGridUrls.isEmpty() && !forceSingleCoverArt
+                    && !isAutoGeneratedPlaylistId(currentPlaylistId)
+                    && !isRecapTitle(headerPlaylistTitle)
+                    && !isRecapTitle(currentPlaylistTitle)
+                    && TextUtils.isEmpty(officialCover)
+                    && !isLocalFilesContext(currentPlaylistId)) {
                 holder.ivPlaylistCover.setPadding(0, 0, 0, 0);
                 holder.ivPlaylistCover.setScaleType(ImageView.ScaleType.CENTER_CROP);
                 holder.ivPlaylistCover.setBackground(null);
@@ -6252,6 +6317,8 @@ public class PlaylistDetailFragment extends Fragment
                 }
                 coverReq.into(holder.ivPlaylistCover);
                 backdropReq.into(holder.ivPlaylistBackdrop);
+                holder.vPlaylistBackdropScrim.setVisibility(View.VISIBLE);
+                holder.vPlaylistBackdropBottomFade.setVisibility(View.VISIBLE);
             } else if (isLocalFilesContext(currentPlaylistId)) {
                 boolean albumCtx = LocalFilesStore.isLocalAlbumId(currentPlaylistId);
                 holder.ivPlaylistCover.setColorFilter(null);
@@ -7216,12 +7283,15 @@ public class PlaylistDetailFragment extends Fragment
             boolean shouldShowOverlay = false;
             boolean isActuallyPlaying = false;
             if (isActive) {
-                SongPlayerFragment sp = cachedSongPlayer;
+                SongPlayerFragment sp = findSongPlayerFragment();
                 if (sp != null) {
                     String currentVideoId = sp.getLoadedVideoId();
                     shouldShowOverlay = !TextUtils.isEmpty(currentVideoId)
                             && TextUtils.equals(currentVideoId, track.videoId);
                     isActuallyPlaying = sp.isPlaying();
+                } else if (miniPlaying) {
+                    shouldShowOverlay = true;
+                    isActuallyPlaying = true;
                 }
             }
             holder.llNowPlayingOverlay.setVisibility(shouldShowOverlay ? View.VISIBLE : View.GONE);
@@ -7262,6 +7332,7 @@ public class PlaylistDetailFragment extends Fragment
                 // Local tracks don't go through loadTrackArt, so clear the artwork signature
                 // to prevent a stale URL match if this holder is later reused for a remote track.
                 holder.ivTrackArt.setTag(R.id.tag_artwork_signature, null);
+                holder.ivTrackArt.setBackgroundColor(android.graphics.Color.TRANSPARENT);
                 // Resolve the file's OWN embedded picture (per-track), not the unreliable
                 // album-level art that bled wrong/missing covers across tracks.
                 LocalArtworkResolver.loadInto(holder.ivTrackArt, track.videoId, 160);

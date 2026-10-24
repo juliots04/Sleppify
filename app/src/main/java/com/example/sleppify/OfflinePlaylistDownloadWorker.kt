@@ -90,8 +90,6 @@ class OfflinePlaylistDownloadWorker(
                 submittedTasks++
             }
 
-            var consecutiveFailures = 0
-
             for (i in 0 until submittedTasks) {
                 if (isStopped) {
                     Log.w(TAG, "doWork: worker stopped, retrying")
@@ -130,14 +128,6 @@ class OfflinePlaylistDownloadWorker(
                 if (trackResult.noNetworkEncountered) encounteredNoNetwork = true
                 if (trackResult.downloaded) {
                     downloaded = minOf(total, downloaded + 1)
-                    consecutiveFailures = 0
-                } else if (!trackResult.noNetworkEncountered) {
-                    consecutiveFailures++
-                    if (consecutiveFailures >= CONSECUTIVE_FAIL_ABORT_THRESHOLD) {
-                        Log.w(TAG, "doWork:batch_abort consecutiveFailures=$consecutiveFailures")
-                        encounteredNoNetwork = true
-                        break
-                    }
                 }
 
                 done = minOf(total, done + 1)
@@ -155,15 +145,16 @@ class OfflinePlaylistDownloadWorker(
         val reason = when {
             encounteredNoNetwork -> OUTPUT_REASON_NO_NETWORK
             downloaded <= 0 -> OUTPUT_REASON_NO_MATCH
+            downloaded < total -> OUTPUT_REASON_PARTIAL
             else -> OUTPUT_REASON_NONE
         }
 
-        if (OUTPUT_REASON_NO_NETWORK == reason) {
+        if (OUTPUT_REASON_NO_NETWORK == reason || (OUTPUT_REASON_PARTIAL == reason && !manualQueue && runAttemptCount < 3)) {
             // Manual single-track jobs share ONE unique APPEND chain (so the counter observers see
             // them). An endlessly-retrying head job would block every download appended behind it
             // (head-of-line blocking), so manual jobs get a bounded number of attempts and then
             // let the chain advance; the user can re-tap download. Playlist (auto) jobs keep
-            // unbounded retry — resuming a big batch after connectivity returns is the priority there.
+            // retrying to finish incomplete downloads.
             if (manualQueue && runAttemptCount >= MANUAL_QUEUE_MAX_RUN_ATTEMPTS - 1) {
                 Log.w(TAG, "doWork:network_unavailable manual_give_up attempt=$runAttemptCount")
                 return Result.success(
@@ -174,7 +165,7 @@ class OfflinePlaylistDownloadWorker(
                         .build()
                 )
             }
-            Log.w(TAG, "doWork:network_unavailable retrying")
+            Log.w(TAG, "doWork:retrying reason=$reason attempt=$runAttemptCount")
             return Result.retry()
         }
 
@@ -366,9 +357,11 @@ class OfflinePlaylistDownloadWorker(
         val network = connectivityManager.activeNetwork ?: return false
         val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return false
 
-        val internetReady = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
-                capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
-        if (!internetReady) return false
+        val hasInternet = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        if (!hasInternet) {
+            networkIssueTracker.markIssue()
+            return false
+        }
 
         val prefs: SharedPreferences = context.getSharedPreferences(CloudSyncManager.PREFS_SETTINGS, Context.MODE_PRIVATE)
         val allowMobileData = prefs.getBoolean(CloudSyncManager.KEY_OFFLINE_DOWNLOAD_ALLOW_MOBILE_DATA, false)
@@ -377,8 +370,9 @@ class OfflinePlaylistDownloadWorker(
         val usesCellular = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
         val usesWifi = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
         val usesEthernet = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+        val isMetered = connectivityManager.isActiveNetworkMetered
 
-        if (usesCellular && !usesWifi && !usesEthernet) {
+        if ((usesCellular && !usesWifi && !usesEthernet) || (isMetered && !usesWifi && !usesEthernet)) {
             networkIssueTracker.markIssue()
             return false
         }
@@ -441,8 +435,8 @@ class OfflinePlaylistDownloadWorker(
         }
 
         val channelCount = readAudioChannelCount(audioFile)
-        if (channelCount in 1 until MIN_STEREO_CHANNELS) {
-            Log.w(TAG, "track:non_stereo_rejected id=$videoId channels=$channelCount")
+        if (channelCount == 0) {
+            Log.w(TAG, "track:zero_channels_rejected id=$videoId")
             OfflineAudioStore.deleteOfflineAudio(context, videoId)
             return false
         }
@@ -640,8 +634,8 @@ class OfflinePlaylistDownloadWorker(
         @JvmField val OUTPUT_REASON_NONE = "none"
         @JvmField val OUTPUT_REASON_NO_NETWORK = "no_network"
         @JvmField val OUTPUT_REASON_NO_MATCH = "no_match"
+        @JvmField val OUTPUT_REASON_PARTIAL = "partial"
 
-        private const val CONSECUTIVE_FAIL_ABORT_THRESHOLD = 8
         private const val MAX_PARALLEL_DOWNLOADS_AUTO = 3
         private const val MAX_PARALLEL_DOWNLOADS_MANUAL = 3
         // Manual (single-track) jobs share one unique APPEND chain; bound their retries so a
@@ -651,6 +645,5 @@ class OfflinePlaylistDownloadWorker(
         private const val DOWNLOAD_DURATION_MIN_SAFE_SECONDS = 6
         private const val DOWNLOAD_DURATION_MATCH_RATIO = 0.88f
         private const val DOWNLOAD_DURATION_LEEWAY_SECONDS = 8
-        private const val MIN_STEREO_CHANNELS = 2
     }
 }

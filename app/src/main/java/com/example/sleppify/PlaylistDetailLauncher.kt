@@ -97,9 +97,19 @@ object PlaylistDetailLauncher {
             normTitle = title?.trim().orEmpty()
         }
         // Thumbnail is passed through raw on purpose (see class doc): the header derives HD itself
-        // and needs the raw URL as its .error() fallback.
+        // and needs the raw URL as its .error() fallback. Si OfficialCoverStore ya tiene la portada
+        // oficial de esta playlist, se usa como portada efectiva para que el detalle nazca con la
+        // misma imagen que el usuario ve en biblioteca/home y nunca parpadee entre versiones.
         val normThumb = thumbnailUrl?.trim().orEmpty()
+        val officialCover = if (normId.isNotEmpty()) OfficialCoverStore.get(activity, normId) else null
+        val effectiveThumb = if (!officialCover.isNullOrBlank()) officialCover else normThumb
         val normSubtitle = subtitle?.trim().orEmpty()
+
+        if (normId.isNotEmpty() && !downloadedOnly) {
+            RecentPlaylistsStore.recordPlaylistOpened(
+                activity, normId, normTitle, normSubtitle, effectiveThumb, isRadio
+            )
+        }
 
         val existing = fragmentManager.findFragmentByTag(TAG)
 
@@ -118,7 +128,7 @@ object PlaylistDetailLauncher {
 
         // token dropped: resolveYoutubeAccessToken("") falls back to prefs.
         val fragment = PlaylistDetailFragment.newInstance(
-            normId, normTitle, normSubtitle, normThumb, "",
+            normId, normTitle, normSubtitle, effectiveThumb, "",
             params?.trim().orEmpty(), artHint?.trim().orEmpty(), downloadedOnly
         )
         val tx = fragmentManager.beginTransaction().setReorderingAllowed(true)
@@ -183,12 +193,13 @@ object PlaylistDetailLauncher {
         return id
     }
 
-    /** Strips the three radio title conventions down to the bare seed title. */
+    /** Strips the radio title conventions down to the bare seed title. */
     @JvmStatic
     fun canonicalRadioTitle(rawTitle: String): String {
         var s = rawTitle.trim()
-        if (s.startsWith("Radio: ")) s = s.substring(7).trim()
-        if (s.endsWith(" Radio")) s = s.substring(0, s.length - 6).trim()
+        if (s.startsWith("Radio: ", ignoreCase = true)) s = s.substring(7).trim()
+        if (s.startsWith("Radio de ", ignoreCase = true)) s = s.substring(9).trim()
+        if (s.endsWith(" Radio", ignoreCase = true)) s = s.substring(0, s.length - 6).trim()
         return s
     }
 }

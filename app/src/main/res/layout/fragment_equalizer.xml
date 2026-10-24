@@ -463,15 +463,14 @@
                         android:focusable="true"
                         android:focusableInTouchMode="true"
                         android:nextFocusUp="@id/sliderBassGain"
-                        android:nextFocusDown="@id/sliderOverallGain"
                         android:background="?attr/selectableItemBackground"
                         app:labelBehavior="gone"
                         app:haloColor="@color/stitch_blue_light"
                         app:thumbColor="@color/stitch_blue_light"
                         app:trackColorActive="@color/surface_high"
                         app:trackColorInactive="@color/surface_high" />
-                        
-                     <RelativeLayout
+
+                    <RelativeLayout
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content">
                         <TextView
@@ -491,120 +490,6 @@
 
                 </LinearLayout>
             </com.google.android.material.card.MaterialCardView>
-
-            <!-- Overall Gain Card -->
-            <com.google.android.material.card.MaterialCardView
-                android:id="@+id/cardOverallGain"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="24dp"
-                app:cardBackgroundColor="@color/surface_low"
-                app:cardCornerRadius="24dp"
-                app:strokeWidth="0dp">
-
-                <LinearLayout
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:orientation="vertical"
-                    android:padding="24dp">
-
-                    <RelativeLayout
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content">
-
-                        <ImageView
-                            android:id="@+id/icGain"
-                            android:layout_width="24dp"
-                            android:layout_height="24dp"
-                            android:layout_centerVertical="true"
-                            android:src="@drawable/ic_equalizer"
-                            app:tint="@color/stitch_blue_light" />
-
-                        <TextView
-                            android:id="@+id/tvGainTitle"
-                            android:layout_width="wrap_content"
-                            android:layout_height="wrap_content"
-                            android:layout_marginStart="16dp"
-                            android:layout_toEndOf="@id/icGain"
-                            android:text="Ganancia"
-                            android:textColor="@color/text_primary"
-                            android:textSize="16sp"
-                            android:textStyle="bold" />
-                    </RelativeLayout>
-
-                    <!-- Gain Slider -->
-                    <RelativeLayout
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:layout_marginTop="20dp">
-
-                        <TextView
-                            android:layout_width="wrap_content"
-                            android:layout_height="wrap_content"
-                            android:text="Nivel de ganancia"
-                            android:textColor="@color/text_secondary"
-                            android:textSize="12sp" />
-
-                        <TextView
-                            android:id="@+id/tvOverallGainValue"
-                            android:layout_width="wrap_content"
-                            android:layout_height="wrap_content"
-                            android:layout_alignParentEnd="true"
-                            android:text="0.0 dB"
-                            android:textColor="@color/text_primary"
-                            android:textSize="14sp"
-                            android:textStyle="bold" />
-                    </RelativeLayout>
-
-                    <com.google.android.material.slider.Slider
-                        android:id="@+id/sliderOverallGain"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:value="0"
-                        android:valueFrom="-5"
-                        android:valueTo="5"
-                        android:stepSize="0.1"
-                        android:focusable="true"
-                        android:focusableInTouchMode="true"
-                        android:nextFocusUp="@id/sliderBassFrequency"
-                        android:background="?attr/selectableItemBackground"
-                        app:labelBehavior="gone"
-                        app:haloColor="@color/stitch_blue_light"
-                        app:thumbColor="@color/stitch_blue_light"
-                        app:trackColorActive="@color/surface_high"
-                        app:trackColorInactive="@color/surface_high" />
-
-                    <RelativeLayout
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content">
-
-                        <TextView
-                            android:layout_width="wrap_content"
-                            android:layout_height="wrap_content"
-                            android:text="-5 dB"
-                            android:textColor="@color/text_secondary"
-                            android:textSize="8sp" />
-
-                        <TextView
-                            android:layout_width="wrap_content"
-                            android:layout_height="wrap_content"
-                            android:layout_centerInParent="true"
-                            android:text="0 dB"
-                            android:textColor="@color/text_secondary"
-                            android:textSize="8sp" />
-
-                        <TextView
-                            android:layout_width="wrap_content"
-                            android:layout_height="wrap_content"
-                            android:layout_alignParentEnd="true"
-                            android:text="+5 dB"
-                            android:textColor="@color/text_secondary"
-                            android:textSize="8sp" />
-                    </RelativeLayout>
-
-                </LinearLayout>
-            </com.google.android.material.card.MaterialCardView>
-
 
         </LinearLayout>
     </ScrollView>

@@ -31,17 +31,16 @@ object SleppifyDownloaderResolver {
     // Kept so existing callers that do `index % SERVER_COUNT` collapse to 0 (single logical source).
     const val SERVER_COUNT = 1
 
-    private const val CONNECT_TIMEOUT_MS = 12000
+    private const val CONNECT_TIMEOUT_MS = 15000
     private const val READ_TIMEOUT_MS = 30000
     private const val MIN_VALID_BYTES = 24L * 1024L // 24KB, matches the worker's floor
     private const val MAX_ATTEMPTS = 2              // re-resolve + re-download on a hard failure
     private const val MAX_STALL_RETRIES = 5         // transient drops → retry the same chunk
 
     // googlevideo throttles a single sustained stream to ~playback speed. Requesting the file in
-    // discrete chunks via its `&range=START-END` URL parameter signals "download" mode and serves
-    // each chunk at full CDN speed — the same trick yt-dlp uses. 1MB keeps every chunk comfortably
-    // under the throttle threshold (a typical song is only a handful of chunks).
-    private const val CHUNK_SIZE = 1L * 1024 * 1024L
+    // discrete chunks via its `&range=START-END` URL parameter and HTTP Range header signals "download"
+    // mode and serves each chunk at full CDN speed. 2MB keeps RTT low and avoids throttle.
+    private const val CHUNK_SIZE = 2L * 1024 * 1024L
 
     private const val UA =
         "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) " +
@@ -112,9 +111,9 @@ object SleppifyDownloaderResolver {
 
     /**
      * Streams [streamUrl] into [tempFile] in [CHUNK_SIZE] pieces, each fetched with googlevideo's
-     * `&range=START-END` URL parameter so the CDN serves it at full speed (no streaming throttle).
-     * A chunk shorter than requested marks EOF. Returns true only when a complete, large-enough
-     * file was written. A transient chunk failure is retried up to [MAX_STALL_RETRIES] times.
+     * `&range=START-END` URL parameter and HTTP Range header so the CDN serves it at full speed
+     * (no streaming throttle). Preserves HTTP Keep-Alive across chunks for optimal speed on mobile data.
+     * Completes cleanly when the total known length is reached, on short chunk, or on HTTP 200 EOF.
      */
     private fun downloadDirect(
         streamUrl: String,
@@ -131,20 +130,35 @@ object SleppifyDownloaderResolver {
                     val rangeEnd = written + CHUNK_SIZE - 1
                     val chunkUrl = appendRangeParam(streamUrl, written, rangeEnd)
                     var connection: HttpURLConnection? = null
+                    var shouldDisconnect = false
                     try {
                         connection = (URL(chunkUrl).openConnection() as HttpURLConnection).apply {
                             requestMethod = "GET"
                             connectTimeout = CONNECT_TIMEOUT_MS
                             readTimeout = READ_TIMEOUT_MS
+                            instanceFollowRedirects = true
                             setRequestProperty("User-Agent", UA)
+                            setRequestProperty("Origin", "https://music.youtube.com")
+                            setRequestProperty("Referer", "https://music.youtube.com/")
+                            setRequestProperty("Range", "bytes=$written-$rangeEnd")
+                            setRequestProperty("Accept", "*/*")
+                            setRequestProperty("Connection", "keep-alive")
                         }
 
                         val code = connection.responseCode
                         if (code != HttpURLConnection.HTTP_OK && code != HttpURLConnection.HTTP_PARTIAL) {
+                            if (code == 416 && written >= MIN_VALID_BYTES) {
+                                // 416 Range Not Satisfiable when already written data means offset is past EOF
+                                break@loop
+                            }
                             Log.w(TAG, "cdn http=$code at offset=$written")
+                            shouldDisconnect = true
                             return false
                         }
-                        if (total < 0L) total = parseTotalLength(connection, written)
+
+                        if (total < 0L) {
+                            total = parseTotalLength(connection, written)
+                        }
 
                         var chunkRead = 0L
                         connection.inputStream.use { input ->
@@ -174,6 +188,7 @@ object SleppifyDownloaderResolver {
                             // else: a full chunk with more to come → request the next range
                         }
                     } catch (e: Exception) {
+                        shouldDisconnect = true
                         stalls++
                         if (stalls > MAX_STALL_RETRIES) {
                             Log.w(TAG, "cdn stall give_up written=$written total=$total msg=${e.message}")
@@ -187,7 +202,9 @@ object SleppifyDownloaderResolver {
                             output.channel.position(written)
                         } catch (_: Exception) { /* best-effort */ }
                     } finally {
-                        connection?.disconnect()
+                        if (shouldDisconnect) {
+                            try { connection?.disconnect() } catch (_: Exception) { }
+                        }
                     }
                 }
             }
@@ -209,8 +226,26 @@ object SleppifyDownloaderResolver {
 
     /** Appends googlevideo's `&range=start-end` download-mode parameter (never streaming-throttled). */
     private fun appendRangeParam(url: String, start: Long, end: Long): String {
-        val separator = if (url.contains('?')) '&' else '?'
-        return "$url${separator}range=$start-$end"
+        return try {
+            val uri = android.net.Uri.parse(url)
+            val builder = uri.buildUpon().clearQuery()
+            for (name in uri.queryParameterNames) {
+                if (name != "range") {
+                    for (v in uri.getQueryParameters(name)) {
+                        builder.appendQueryParameter(name, v)
+                    }
+                }
+            }
+            builder.appendQueryParameter("range", "$start-$end")
+            builder.build().toString()
+        } catch (_: Exception) {
+            val clean = url.replace(Regex("([?&])range=\\d+-\\d+(&)?")) { mr ->
+                if (mr.groupValues[1] == "?" && mr.groupValues[2] == "&") "?"
+                else ""
+            }
+            val sep = if (clean.contains('?')) '&' else '?'
+            "$clean${sep}range=$start-$end"
+        }
     }
 
     /**

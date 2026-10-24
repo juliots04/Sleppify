@@ -57,7 +57,7 @@ object ExoPlayerManager {
                         // sections are instant.
                         val loadControl = DefaultLoadControl.Builder()
                             .setBufferDurationsMs(
-                                /* minBufferMs */            15_000,
+                                /* minBufferMs */            10_000,
                                 /* maxBufferMs */            50_000,
                                 /* bufferForPlaybackMs */       250,
                                 /* bufferForPlaybackAfterRebufferMs */ 500

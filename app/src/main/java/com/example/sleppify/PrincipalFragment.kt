@@ -55,7 +55,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         // texts and side-url picks (computed with the old logic) are dropped once and recomputed.
         // v6: barras en DOS ROMBOS + color FUSIONADO de las 3 carátulas (la fusión vive en el
         // composite; el color persistido sigue siendo el del centro, solo placeholder de vBg).
-        private const val RADIO_UI_VERSION = 7
+        private const val RADIO_UI_VERSION = 8
 
         // Reintentos del home browse ante error DURO (401/timeout). Backoff 2s→6s; reset al éxito.
         private const val RECOMMENDED_MAX_RETRIES = 2
@@ -81,9 +81,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         // Last-resort: if no section produced content within this window on cold start, reveal the
         // module anyway so the loading spinner never hangs (e.g. brand-new account with no data).
         private const val COLD_START_REVEAL_SAFETY_MS = 2500L
-        // Last-resort: dismiss any still-showing cold-start skeletons after this window even if a
-        // section never loaded (e.g. covers when signed out), so a skeleton never pulses forever.
-        private const val HOME_SKELETON_SAFETY_MS = 5000L
+        private const val HOME_SKELETON_SAFETY_MS = 2000L
         // Re-entry throttle: below-the-fold carousels re-read disk/parse JSON on every module
         // re-entry even when nothing changed. Skip that work if refreshed within this window.
         private const val REENTRY_REFRESH_THROTTLE_MS = 15_000L
@@ -107,6 +105,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
     private var ivHomeBackdrop: ImageView? = null
     private var lastBackdropUrl: String? = null
     private var vStatusBarOverlay: View? = null
+    private var statusBarHeightPx: Int = 0
 
     // Content views
     private var vpShortcuts: ViewPager2? = null
@@ -222,7 +221,10 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
     private fun sectionNearViewport(anchor: View): Boolean {
         val nsv = view?.findViewById<androidx.core.widget.NestedScrollView>(R.id.nsvPrincipalContent)
             ?: return true
-        if (nsv.height <= 0) return true // pre-layout: bindea ya (comportamiento clásico)
+        if (nsv.height <= 0) {
+            // Pre-layout: solo las secciones que caben en la primera pantalla visible
+            return anchor.id == R.id.llShortcutsSkeleton || anchor.id == R.id.llNewFavesSkeleton
+        }
         var top = 0
         var v: View? = anchor
         while (v != null && v !== nsv) {
@@ -348,26 +350,25 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 // Use systemBars().top (same inset the brand headers pad with) so the overlay strip
                 // and the header's status-bar strip line up pixel-for-pixel.
                 val statusBarHeight = insets.getInsets(WindowInsetsCompat.Type.systemBars()).top
+                statusBarHeightPx = statusBarHeight
                 v.layoutParams = v.layoutParams.apply { height = statusBarHeight }
                 insets
             }
             overlay.requestApplyInsets()
         }
         val nsv = view.findViewById<androidx.core.widget.NestedScrollView>(R.id.nsvPrincipalContent)
-        // Hoisted out of the scroll callback — this used to run findViewById on every scroll frame.
-        val shortcutsHeader = view.findViewById<View>(R.id.llShortcutsHeader)
         nsv?.setOnScrollChangeListener(androidx.core.widget.NestedScrollView.OnScrollChangeListener { _, _, scrollY, _, oldScrollY ->
-            val overlay = vStatusBarOverlay
-            if (shortcutsHeader != null && overlay != null) {
-                val target = shortcutsHeader.top.toFloat()
-                overlay.alpha = if (target <= 0f) 1f else (scrollY / target).coerceIn(0f, 1f)
-            }
             updateHeaderOnScroll(scrollY, scrollY - oldScrollY)
             // Carga lazy: bindea las secciones cuyo skeleton ya se acercó al viewport.
             runDueSectionReveals()
         })
         // Seed the header/background state once laid out (covers a restored scroll position).
-        nsv?.post { if (isAdded && nsv != null) updateHeaderOnScroll(nsv.scrollY, 0) }
+        nsv?.post {
+            if (isAdded) {
+                updateHeaderOnScroll(nsv.scrollY, 0)
+                runDueSectionReveals()
+            }
+        }
 
         setupShortcuts()
         // PRIMERO: pinta el 3x3 desde el snapshot de la sesión anterior casi al instante en frío.
@@ -445,7 +446,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 refreshShortcuts()
                 refreshCovers()
                 refreshRadios()
-                refreshPlaylists()
+                refreshPlaylists(force = true)
                 refreshRecommended()
             }
         }, 150)
@@ -533,7 +534,10 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                     refreshFragHeaderProfilePhoto()
                     refreshCovers()
                     refreshRadios()
-                    refreshPlaylists()
+                    refreshPlaylists(force = true)
+                    if (recapEntries.isEmpty()) {
+                        loadCachedRecaps()
+                    }
                     // Faltaba aquí: al volver a Principal por cambio de módulo (hide()/show() dispara
                     // onHiddenChanged, NO onResume) las 4 secciones del home browse no se re-pedían,
                     // así que un primer load fallido/vacío no se recuperaba nunca hasta background+
@@ -583,15 +587,16 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         llFragBrandHeader?.let { header ->
             ViewCompat.setOnApplyWindowInsetsListener(header) { v, insets ->
                 val statusBarHeight = insets.getInsets(WindowInsetsCompat.Type.systemBars()).top
+                statusBarHeightPx = statusBarHeight
                 v.setPadding(v.paddingLeft, statusBarHeight, v.paddingRight, v.paddingBottom)
                 insets
             }
             header.requestApplyInsets()
 
-            // Background starts fully transparent (header rests over the backdrop) and turns solid
+            // Background starts fully transparent (header rests over the backdrop) and turns solid black
             // via updateHeaderOnScroll() as content scrolls underneath.
             headerBgDrawable = android.graphics.drawable.ColorDrawable(
-                ContextCompat.getColor(requireContext(), R.color.surface_dark)
+                ContextCompat.getColor(requireContext(), android.R.color.black)
             ).apply { alpha = 0 }
             header.background = headerBgDrawable
 
@@ -680,16 +685,24 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         val h = header.height
         if (h <= 0) return
         val hf = h.toFloat()
+        val density = resources.displayMetrics.density
+        val fadeDistance = (if (statusBarHeightPx > 0) statusBarHeightPx.toFloat() else (36f * density)).coerceAtLeast(24f * density)
 
+        // 1. Desvanecido suave coordinado del status bar negro y del fondo del header:
+        // Transparente en reposo sobre el backdrop, negro sólido al desplazarse.
+        val fraction = (scrollY.toFloat() / fadeDistance).coerceIn(0f, 1f)
+        vStatusBarOverlay?.alpha = fraction
+        headerBgDrawable?.alpha = (fraction * 255f).toInt()
+
+        // 2. Quick-return del header:
+        // Cerca del tope (scrollY <= fadeDistance), el header reposa en translationY = 0
+        // mientras la barra se desvanece a negro (evita que los iconos se trasladen dentro de un status bar transparente).
+        // Una vez superado fadeDistance (status bar 100% negro sólido), el header se traslada hacia arriba
+        // pasando por DETRÁS del status bar negro (vStatusBarOverlay tiene translationZ mayor que el header).
+        val scrollPastFade = (scrollY - fadeDistance).coerceAtLeast(0f)
         var offset = header.translationY - dy
-        offset = offset.coerceIn(-hf, 0f).coerceAtLeast(-scrollY.toFloat())
+        offset = offset.coerceIn(-hf, 0f).coerceAtLeast(-scrollPastFade)
         header.translationY = offset
-
-        // Transparent at rest (over the backdrop), solid while detached/floating. The ramp spans
-        // the first header-height of scroll — while the header is still "attached" — so by the
-        // time it can float over content it is already opaque, and scrolling back to the top
-        // fades it back out to reveal the backdrop.
-        headerBgDrawable?.alpha = ((scrollY / hf).coerceIn(0f, 1f) * 255f).toInt()
     }
 
     fun refreshFragHeaderProfilePhoto() {
@@ -909,16 +922,8 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                     it.visibility = if (pageCount > 1) View.VISIBLE else View.GONE
                 }
                 updateBackdropImage()
-                if (shortcutEntries.isNotEmpty()) {
-                    // Grid data landed: swap the skeleton for the real pager (same square height, no jump).
-                    vpShortcuts?.visibility = View.VISIBLE
-                    hideHomeSkeleton(llShortcutsSkeleton)
-                } else if (llShortcutsSkeleton?.visibility != View.VISIBLE) {
-                    // Warm empty state (skeleton already dismissed): keep the pager visible.
-                    vpShortcuts?.visibility = View.VISIBLE
-                }
-                // Empty on fresh install is NOT terminal — cloud hydration lands seconds later,
-                // so the skeleton keeps pulsing; the safety timer ends genuinely-empty accounts.
+                vpShortcuts?.visibility = View.VISIBLE
+                hideHomeSkeleton(llShortcutsSkeleton)
                 revealAfterFirstContentPass()
             }
 
@@ -1293,27 +1298,27 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             if (selected.size < 8) {
                 for (t in topTitles) { if (selected.size >= 8) break; if (t !in selected) selected.add(t) }
             }
-            if (selected.isEmpty()) return@submitBg
+            if (selected.isEmpty()) {
+                handler.post {
+                    if (isAdded && coversResults.isEmpty()) hideHomeSkeleton(llCoversSkeleton)
+                }
+                return@submitBg
+            }
 
             handler.post {
                 if (!isAdded) return@post
                 youTubeMusicService.fetchCoversAndRemixes(cookie, selected, object : YouTubeMusicService.CoversRemixesCallback {
                     override fun onSuccess(tracks: List<YouTubeMusicService.TrackResult>) {
                         if (!isAdded) return
-                        // Éxito VACÍO o degradado = fallo silencioso aguas arriba (cookie caducada,
-                        // 401 de InnerTube, bot-check): NUNCA sustituir contenido ya visible ni el
-                        // caché bueno de disco — era la causa de que "Covers y remixes"
-                        // desapareciera hasta recrear la vista. No se sella el TTL (un refresh
-                        // posterior reintenta) y, si la memoria está vacía, se rehidrata del disco.
                         if (tracks.isEmpty() || (tracks.size < COVERS_PER_PAGE && coversResults.size > tracks.size)) {
                             lastCoversNetworkFetchTimeMs = 0L
-                            if (coversResults.isEmpty()) loadCachedCovers()
+                            if (coversResults.isEmpty()) {
+                                loadCachedCovers()
+                                if (coversResults.isEmpty()) hideHomeSkeleton(llCoversSkeleton)
+                            }
                             return
                         }
                         lastCoversNetworkFetchTimeMs = System.currentTimeMillis()
-                        // If the fetch returned the same tracks already on screen, refresh the
-                        // timestamp silently — swapping equal content (reshuffled) made the section
-                        // visibly "refresh itself" right after opening the app.
                         val newIds = tracks.mapTo(HashSet()) { it.videoId ?: "" }
                         val currentIds = coversResults.mapTo(HashSet()) { it.videoId ?: "" }
                         if (newIds == currentIds && coversResults.isNotEmpty()) {
@@ -1328,7 +1333,10 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                         cacheCovers(coversResults)
                         updateCoversUi()
                     }
-                    override fun onError(error: String) {}
+                    override fun onError(error: String) {
+                        if (!isAdded) return
+                        if (coversResults.isEmpty()) hideHomeSkeleton(llCoversSkeleton)
+                    }
                 })
             }
         }
@@ -1730,6 +1738,8 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             llRecommendedHeader?.visibility = View.GONE
             rvRecommended?.visibility = View.GONE
             (rvRecommended?.adapter as? MixCardAdapter)?.notifyDataSetChanged()
+            hideHomeSkeleton(llRecommendedSkeleton)
+            revealAfterFirstContentPass()
             return
         }
         revealSectionWhenVisible(llRecommendedSkeleton, rvRecommended?.visibility == View.VISIBLE) {
@@ -1754,6 +1764,8 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             llRecapsHeader?.visibility = View.GONE
             rvRecaps?.visibility = View.GONE
             (rvRecaps?.adapter as? MixCardAdapter)?.notifyDataSetChanged()
+            hideHomeSkeleton(llRecapsSkeleton)
+            revealAfterFirstContentPass()
             return
         }
         revealSectionWhenVisible(llRecapsSkeleton, rvRecaps?.visibility == View.VISIBLE) {
@@ -1786,8 +1798,8 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         llNewFavesHeader?.visibility = if (has) View.VISIBLE else View.GONE
         rvNewFaves?.visibility = if (has) View.VISIBLE else View.GONE
         (rvNewFaves?.adapter as? MixCardAdapter)?.notifyDataSetChanged()
+        hideHomeSkeleton(llNewFavesSkeleton)
         if (has) {
-            hideHomeSkeleton(llNewFavesSkeleton)
             revealAfterFirstContentPass()
         }
     }
@@ -1862,11 +1874,29 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         return out
     }
 
-    private fun cacheRecommended(list: List<YouTubeMusicService.MixResult>) =
+    private fun cacheRecommended(list: List<YouTubeMusicService.MixResult>) {
+        val ctx = context?.applicationContext
+        if (ctx != null) {
+            for (m in list) {
+                if (m.thumbnailUrl.isNotEmpty()) {
+                    OfficialCoverStore.save(ctx, m.playlistId, m.thumbnailUrl)
+                }
+            }
+        }
         cacheMixList("home_recommended_data", list)
+    }
 
-    private fun cacheRecaps(list: List<YouTubeMusicService.MixResult>) =
+    private fun cacheRecaps(list: List<YouTubeMusicService.MixResult>) {
+        val ctx = context?.applicationContext
+        if (ctx != null) {
+            for (m in list) {
+                if (m.thumbnailUrl.isNotEmpty()) {
+                    OfficialCoverStore.save(ctx, m.playlistId, m.thumbnailUrl)
+                }
+            }
+        }
         cacheMixList("home_recaps_data", list)
+    }
 
     private fun cacheMixList(prefKey: String, list: List<YouTubeMusicService.MixResult>) {
         submitBg {
@@ -1903,6 +1933,12 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 if (raw.isEmpty()) return@submitBg
                 val parsed = parseRecommendedCacheList(raw)
                 if (parsed.isEmpty()) return@submitBg
+                val appCtx = ctx.applicationContext
+                for (m in parsed) {
+                    if (m.thumbnailUrl.isNotEmpty()) {
+                        OfficialCoverStore.save(appCtx, m.playlistId, m.thumbnailUrl)
+                    }
+                }
                 handler.post {
                     if (!isAdded || recapEntries.isNotEmpty()) return@post
                     recapEntries.addAll(parsed)
@@ -2277,11 +2313,10 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 radioEntries.clear()
                 radioEntries.addAll(radios)
                 if (radioEntries.isEmpty()) {
-                    // Empty ≠ loaded: on fresh install the radios arrive with cloud hydration, so
-                    // the skeleton stays until data (or the safety timer) resolves it.
                     llRadiosHeader?.visibility = View.GONE
                     rvRadios?.visibility = View.GONE
                     (rvRadios?.adapter as? RadioCarouselAdapter)?.notifyDataSetChanged()
+                    hideHomeSkeleton(llRadiosSkeleton)
                     return@post
                 }
                 // Pre-composición SIEMPRE inmediata (aunque el bind visual espere al scroll):
@@ -2488,15 +2523,54 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         val now = System.currentTimeMillis()
         if (!force && now - lastPlaylistsRefreshMs < REENTRY_REFRESH_THROTTLE_MS && playlistEntries.isNotEmpty()) return
         lastPlaylistsRefreshMs = now
-        // PlayCountStore.getRecentPlaylists() reads its in-memory snapshot (warm) or SharedPreferences
-        // + JSON (cold); run it off the UI thread either way so module entry never stalls.
+        // RecentPlaylistsStore.getRecentPlaylists() devuelve las playlists/radios abiertas
+        // recientemente por el usuario (en orden de apertura, SIN requerir reproducir canciones).
+        // Se completa con el historial de PlayCountStore si la lista es corta (p.ej. tras migración).
         val appContext = requireContext().applicationContext
         // Short (<4 urls) grid lists cached for the whole view lifetime hide grid urls persisted
         // later by PlaylistDetail (covers that never load). Snapshot those ids here (main thread —
         // the cache is main-confined) and re-resolve them from prefs on the bg pass.
         val staleGridIds = playlistGridUrlsCache.filterValues { it.size < 4 }.keys.toList()
         submitBg {
-            val playlists = PlayCountStore.getRecentPlaylists(appContext, 10)
+            val recentPlaylists = RecentPlaylistsStore.getRecentPlaylists(appContext, 15)
+            val seenIds = HashSet<String>()
+            val playlists = mutableListOf<PlayCountStore.PlayCountEntry>()
+
+            fun normPid(id: String): String {
+                val t = id.trim()
+                return if (t.startsWith("VL") && t.length > 2) t.substring(2) else t
+            }
+
+            for (rp in recentPlaylists) {
+                if (playlists.size >= 10) break
+                val nId = normPid(rp.playlistId)
+                if (!seenIds.add(nId)) continue
+                val cleanSeed = PlaylistDetailLauncher.canonicalRadioTitle(rp.title)
+                playlists.add(
+                    PlayCountStore.PlayCountEntry(
+                        videoId = rp.playlistId,
+                        title = cleanSeed,
+                        artist = rp.subtitle,
+                        imageUrl = rp.imageUrl,
+                        playlistId = rp.playlistId,
+                        playlistName = if (rp.isRadio) "Radio de $cleanSeed" else rp.title,
+                        count = 0,
+                        lastPlayedAtMs = rp.lastOpenedAtMs
+                    )
+                )
+            }
+
+            if (playlists.size < 10) {
+                val fallbackList = PlayCountStore.getRecentPlaylists(appContext, 10)
+                for (fp in fallbackList) {
+                    if (playlists.size >= 10) break
+                    val nId = normPid(fp.playlistId)
+                    if (seenIds.add(nId)) {
+                        playlists.add(fp)
+                    }
+                }
+            }
+
             val freshGridUrls = HashMap<String, List<String>>()
             for (pid in staleGridIds) {
                 freshGridUrls[pid] = computePlaylistGridUrls(appContext, pid)
@@ -2507,10 +2581,10 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                 playlistEntries.clear()
                 playlistEntries.addAll(playlists)
                 if (playlistEntries.isEmpty()) {
-                    // Empty ≠ loaded (fresh install: la data llega con la hidratación cloud).
                     llPlaylistsHeader?.visibility = View.GONE
                     rvPlaylists?.visibility = View.GONE
                     (rvPlaylists?.adapter as? PlaylistCarouselAdapter)?.notifyDataSetChanged()
+                    hideHomeSkeleton(llPlaylistsSkeleton)
                     return@post
                 }
                 revealSectionWhenVisible(llPlaylistsSkeleton, rvPlaylists?.visibility == View.VISIBLE) {
@@ -2558,8 +2632,8 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         val id = playlistId.trim()
         // "RDCLAK5uy_…": YT auto-generated playlists — fixed tracklist + own single cover, so they
         // must show that one cover (not a synthesized 2x2), matching the detail header.
-        return id.startsWith("MPRE") || id.startsWith("OLAK5uy")
-            || id.startsWith("RDCLAK") || LocalFilesStore.isLocalAlbumId(id)
+        return id.startsWith("MPRE") || id.startsWith("OLAK")
+            || id.startsWith("RDCLAK") || id.startsWith("RDTMAK") || LocalFilesStore.isLocalAlbumId(id)
     }
 
     private fun isLikedPlaylistId(playlistId: String): Boolean {
@@ -2590,13 +2664,12 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         override fun getItemCount() = playlistEntries.size
 
         override fun getItemViewType(position: Int): Int {
-            // RDCLAK5uy_… are YT auto-generated PLAYLISTS (fixed tracklist + single static cover),
-            // not radios — render them as a single-image card so the library matches how the detail
-            // header now opens them (single rounded cover, not a 3-circle radio composite).
-            // Recaps also carry their own single YT cover → never a radio card.
+            // RDCLAK5uy_… y RDTMAK… son playlists autogeneradas de YT (portada fija + tracklist propio),
+            // no radios — se renderizan como tarjeta de playlist simple.
+            // Los recaps también traen su propia portada única de YT → nunca tarjeta de radio.
             val entry = playlistEntries[position]
             val pid = entry.playlistId
-            return if (pid.startsWith("RD") && !pid.startsWith("RDCLAK") && !isRecapTitle(entry.playlistName))
+            return if (pid.startsWith("RD") && !pid.startsWith("RDCLAK") && !pid.startsWith("RDTMAK") && !isRecapTitle(entry.playlistName))
                 TYPE_RADIO else TYPE_PLAYLIST
         }
 
@@ -2705,7 +2778,8 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
             private val tvName: TextView = itemView.findViewById(R.id.tvRadioName)
 
             fun bind(entry: PlayCountStore.PlayCountEntry) {
-                tvName.text = "Radio de ${entry.title}"
+                val cleanTitle = PlaylistDetailLauncher.canonicalRadioTitle(entry.title.ifEmpty { entry.playlistName })
+                tvName.text = "Radio de $cleanTitle"
                 val clickListener = View.OnClickListener { onPlaylistClicked(entry) }
                 itemView.setOnClickListener(clickListener)
                 cardRadio.setOnClickListener(clickListener)
@@ -2722,7 +2796,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                     ivComposite,
                     entry.playlistId,
                     centerUrl,
-                    entry.title,
+                    cleanTitle,
                     radioCardWidthPx
                 )
             }
@@ -2844,9 +2918,12 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
 
                 if (isPlaylist && isAdded) {
                     LocalArtworkResolver.detach(holder.ivThumb)
-                    // Portada oficial de YT registrada → esa imagen, nunca el collage 2x2.
+                    // Portada oficial de YT registrada o playlist de carátula única → esa imagen, nunca el collage 2x2.
                     val officialUrl = OfficialCoverStore.get(holder.itemView.context, entry.playlistId)
-                    val gridUrls = if (!officialUrl.isNullOrEmpty()) emptyList()
+                    val forceSingle = isSingleCoverPlaylistId(entry.playlistId)
+                        || isRecapTitle(entry.title)
+                        || !officialUrl.isNullOrEmpty()
+                    val gridUrls = if (forceSingle) emptyList()
                         else resolvePlaylistGridUrls(entry.playlistId)
                     if (gridUrls.size >= 4) {
                         val signature = "${entry.playlistId}_${gridUrls[0]}"

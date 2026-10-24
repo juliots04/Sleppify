@@ -119,7 +119,8 @@
             android:layout_height="wrap_content"
             android:gravity="center_vertical"
             android:orientation="horizontal"
-            android:paddingVertical="14dp">
+            android:paddingVertical="14dp"
+            android:visibility="gone">
 
             <LinearLayout
                 android:layout_width="0dp"
@@ -156,7 +157,8 @@
             android:id="@+id/dividerAfterSd"
             android:layout_width="match_parent"
             android:layout_height="1dp"
-            android:background="#1AFFFFFF" />
+            android:background="#1AFFFFFF"
+            android:visibility="gone" />
 
         <!-- Descargar canciones al reproducir -->
         <LinearLayout
@@ -176,7 +178,7 @@
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="Descargar canciones al reproducir"
+                    android:text="Descargar Automaticamente"
                     android:textColor="@color/text_primary"
                     android:textSize="16sp" />
 

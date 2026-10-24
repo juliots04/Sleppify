@@ -207,8 +207,17 @@ class YouTubeMusicService @JvmOverloads constructor(
         // Canciones del shelf "Selección rápida" del home (musicResponsiveListItemRenderer rows,
         // no cards) — el resto de secciones son playlists/mixes. Defaulted so the existing 3-arg
         // constructor call keeps working.
-        @JvmField val quickPicks: MutableList<TrackResult> = mutableListOf()
-    )
+        @JvmField val quickPicks: MutableList<TrackResult> = mutableListOf(),
+        @JvmField var isFinal: Boolean = true
+    ) {
+        fun copy(): HomeBrowseResult = HomeBrowseResult(
+            ArrayList(genericMixes),
+            ArrayList(personalMixes),
+            ArrayList(allSections),
+            ArrayList(quickPicks),
+            isFinal
+        )
+    }
 
     class HomeSection(
         @JvmField val title: String,
@@ -273,11 +282,7 @@ class YouTubeMusicService @JvmOverloads constructor(
         }
         suggestionsExecutor.execute {
             try {
-                val clientContext = JSONObject().apply {
-                    put("clientName", "WEB_REMIX")
-                    put("clientVersion", buildClientVersion())
-                    put("hl", "es")
-                }
+                val clientContext = buildWebRemixClientContext()
                 val body = JSONObject().apply {
                     put("context", JSONObject().apply { put("client", clientContext) })
                     put("input", normalized)
@@ -294,6 +299,10 @@ class YouTubeMusicService @JvmOverloads constructor(
                 conn.setRequestProperty("User-Agent", "Mozilla/5.0")
                 conn.setRequestProperty("Origin", "https://music.youtube.com")
                 conn.setRequestProperty("Referer", "https://music.youtube.com/")
+                val userLocale = Locale.getDefault()
+                val hl = if (userLocale.language.isNullOrEmpty()) "es" else userLocale.language.lowercase(Locale.ROOT)
+                val gl = if (userLocale.country.isNullOrEmpty()) "ES" else userLocale.country.uppercase(Locale.ROOT)
+                conn.setRequestProperty("Accept-Language", "$hl-$gl,$hl;q=0.9,en;q=0.8")
                 if (cookieHeader.isNotEmpty()) {
                     conn.setRequestProperty("Cookie", cookieHeader)
                 }
@@ -303,11 +312,13 @@ class YouTubeMusicService @JvmOverloads constructor(
                     val status = conn.responseCode
                     val responseBody = readResponse(conn, status >= 400)
                     if (status != HttpURLConnection.HTTP_OK) {
+                        try { conn.disconnect() } catch (_: Exception) {}
                         throw IllegalStateException("Suggestions error $status")
                     }
                     root = JSONObject(responseBody)
-                } finally {
-                    conn.disconnect()
+                } catch (e: Exception) {
+                    try { conn.disconnect() } catch (_: Exception) {}
+                    throw e
                 }
 
                 val suggestions = mutableListOf<String>()
@@ -345,11 +356,7 @@ class YouTubeMusicService @JvmOverloads constructor(
         }
         executor.execute {
             try {
-                val clientContext = JSONObject().apply {
-                    put("clientName", "WEB_REMIX")
-                    put("clientVersion", buildClientVersion())
-                    put("hl", "en")
-                }
+                val clientContext = buildWebRemixClientContext()
                 val endpoint = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false"
                 val body = JSONObject().apply {
                     put("context", JSONObject().apply { put("client", clientContext) })
@@ -366,6 +373,10 @@ class YouTubeMusicService @JvmOverloads constructor(
                 conn.setRequestProperty("User-Agent", "Mozilla/5.0")
                 conn.setRequestProperty("Origin", "https://music.youtube.com")
                 conn.setRequestProperty("Referer", "https://music.youtube.com/")
+                val userLocale = Locale.getDefault()
+                val hl = if (userLocale.language.isNullOrEmpty()) "es" else userLocale.language.lowercase(Locale.ROOT)
+                val gl = if (userLocale.country.isNullOrEmpty()) "ES" else userLocale.country.uppercase(Locale.ROOT)
+                conn.setRequestProperty("Accept-Language", "$hl-$gl,$hl;q=0.9,en;q=0.8")
                 if (cookieHeader.isNotEmpty()) {
                     conn.setRequestProperty("Cookie", cookieHeader)
                 }
@@ -375,11 +386,13 @@ class YouTubeMusicService @JvmOverloads constructor(
                     val status = conn.responseCode
                     val responseBody = readResponse(conn, status >= 400)
                     if (status != HttpURLConnection.HTTP_OK) {
+                        try { conn.disconnect() } catch (_: Exception) {}
                         throw IllegalStateException("Innertube continuation error $status")
                     }
                     contJson = JSONObject(responseBody)
-                } finally {
-                    conn.disconnect()
+                } catch (e: Exception) {
+                    try { conn.disconnect() } catch (_: Exception) {}
+                    throw e
                 }
                 val tracks = parseInnertubeSearchContinuation(contJson, maxResults)
                 val nextToken = extractSearchContinuationTokenFromContinuation(contJson) ?: ""
@@ -419,13 +432,9 @@ class YouTubeMusicService @JvmOverloads constructor(
             "EgWKAQIIAWoMEA4QChADEAQQCRAF" // Songs filter (default)
         }
 
-        // Both legs run CONCURRENTLY — they are independent requests, and running them back to
-        // back doubled first-page latency. The filtered leg goes on its own thread (not the
-        // shared executor, to avoid starving the pool this method already runs on).
-        //
-        // Filtered (Songs/Videos) leg: a deep single-type shelf. It supplies the continuation
-        // token for infinite scroll plus extra tracks beyond the unfiltered page (appended at
-        // the tail, deduped, so it never disturbs the YTM page order).
+        // Both legs run CONCURRENTLY:
+        // 1. Filtered leg (Canciones / Videos): la lista oficial pura de canciones de YT Music y su token de paginación.
+        // 2. Unfiltered leg (Búsqueda general sin filtros): para extraer el Resultado Destacado principal de YT Music.
         var filteredResults: List<TrackResult> = emptyList()
         var filteredToken = ""
         var filteredError: Exception? = null
@@ -441,18 +450,19 @@ class YouTubeMusicService @JvmOverloads constructor(
         }, "innertube-filtered-search")
         filteredThread.start()
 
-        // Unfiltered leg (inline): its shelf order (top result → songs → videos) is exactly what
-        // the YT Music search page shows, so it drives the visible ranking of the first page.
-        var pageResults: List<TrackResult> = emptyList()
-        var pageToken = ""
-        var pageError: Exception? = null
+        // Búsqueda general sin filtros: para extraer el resultado destacado (musicCardShelfRenderer)
+        var topResult: TrackResult? = null
+        var unfilteredFallbackResults: List<TrackResult> = emptyList()
+        var unfilteredToken = ""
+        var unfilteredError: Exception? = null
         try {
-            val pageJson = postInnertubeSearch(query, null, cookieHeader)
-            pageResults = parseInnertubeSearchResults(pageJson, maxResults)
-            pageToken = extractSearchContinuationToken(pageJson) ?: ""
-            if (pageResults.isEmpty()) logEmptyInnertubeResponse(pageJson)
+            val unfilteredJson = postInnertubeSearch(query, null, cookieHeader)
+            topResult = extractTopResultFromInnertube(unfilteredJson)
+            unfilteredFallbackResults = parseInnertubeSearchResults(unfilteredJson, maxResults)
+            unfilteredToken = extractSearchContinuationToken(unfilteredJson) ?: ""
+            if (unfilteredFallbackResults.isEmpty()) logEmptyInnertubeResponse(unfilteredJson)
         } catch (e: Exception) {
-            pageError = e
+            unfilteredError = e
             Log.w("YouTubeMusicService", "[INNERTUBE] Unfiltered search failed: ${e.message}")
         }
 
@@ -463,26 +473,41 @@ class YouTubeMusicService @JvmOverloads constructor(
             Thread.currentThread().interrupt()
         }
 
-        // Both legs failed → propagate so the caller can fall back to the Data API.
-        if (pageError != null && filteredError != null) throw pageError
+        // Both legs failed → propagate
+        if (unfilteredError != null && filteredError != null) throw (unfilteredError ?: filteredError!!)
 
-        val results = pageResults.toMutableList()
-        val existingIds = results.mapTo(HashSet()) { it.videoId }
+        val results = mutableListOf<TrackResult>()
+        val existingIds = HashSet<String>()
+
+        // 1. Resultado destacado sin filtros (del Top Result de la búsqueda general de YT Music)
+        if (topResult != null && topResult.videoId.isNotEmpty()) {
+            results.add(topResult)
+            existingIds.add(topResult.videoId)
+        }
+
+        // 2. Resultados puros de la categoría Canciones de YT Music (o Videos si es búsqueda de video)
         for (track in filteredResults) {
-            if (track.videoId !in existingIds) {
+            if (track.videoId.isNotEmpty() && existingIds.add(track.videoId)) {
                 results.add(track)
-                existingIds.add(track.videoId)
             }
         }
-        // One leg errored and the surviving leg parsed nothing → treat as failure too, so the
-        // caller's Data-API fallback still fires instead of showing an empty "no results" page.
-        if (results.isEmpty()) {
-            (pageError ?: filteredError)?.let { throw it }
-        }
-        // Prefer the filtered continuation: it pages through the full Songs/Videos shelf.
-        val continuationToken = filteredToken.ifEmpty { pageToken }
 
-        // Return first page immediately — further pages loaded via continueInnertubeSearch + scroll
+        // 3. Respaldo por si el filtro de canciones devolvió vacío
+        if (results.isEmpty() || (results.size == 1 && topResult != null && filteredResults.isEmpty())) {
+            for (track in unfilteredFallbackResults) {
+                if (track.videoId.isNotEmpty() && existingIds.add(track.videoId)) {
+                    results.add(track)
+                }
+            }
+        }
+
+        if (results.isEmpty()) {
+            (unfilteredError ?: filteredError)?.let { throw it }
+        }
+
+        // El token de continuación preferido es el del filtro de canciones para que el scroll siga cargando canciones de YT Music
+        val continuationToken = filteredToken.ifEmpty { unfilteredToken }
+
         return SearchPageResult(results, continuationToken)
     }
 
@@ -547,11 +572,7 @@ class YouTubeMusicService @JvmOverloads constructor(
     /** POST one Innertube search request (optionally filtered) and return the parsed response. */
     @Throws(Exception::class)
     private fun postInnertubeSearch(query: String, searchParams: String?, cookieHeader: String): JSONObject {
-        val clientContext = JSONObject().apply {
-            put("clientName", "WEB_REMIX")
-            put("clientVersion", buildClientVersion())
-            put("hl", "en")
-        }
+        val clientContext = buildWebRemixClientContext()
         val body = JSONObject().apply {
             put("context", JSONObject().apply { put("client", clientContext) })
             put("query", query)
@@ -569,6 +590,10 @@ class YouTubeMusicService @JvmOverloads constructor(
         connection.setRequestProperty("User-Agent", "Mozilla/5.0")
         connection.setRequestProperty("Origin", "https://music.youtube.com")
         connection.setRequestProperty("Referer", "https://music.youtube.com/")
+        val userLocale = Locale.getDefault()
+        val hl = if (userLocale.language.isNullOrEmpty()) "es" else userLocale.language.lowercase(Locale.ROOT)
+        val gl = if (userLocale.country.isNullOrEmpty()) "ES" else userLocale.country.uppercase(Locale.ROOT)
+        connection.setRequestProperty("Accept-Language", "$hl-$gl,$hl;q=0.9,en;q=0.8")
         if (cookieHeader.isNotEmpty()) {
             connection.setRequestProperty("Cookie", cookieHeader)
         }
@@ -577,11 +602,13 @@ class YouTubeMusicService @JvmOverloads constructor(
             val statusCode = connection.responseCode
             val responseBody = readResponse(connection, statusCode >= 400)
             if (statusCode != HttpURLConnection.HTTP_OK) {
+                try { connection.disconnect() } catch (_: Exception) {}
                 throw IllegalStateException("Innertube search error $statusCode")
             }
             return JSONObject(responseBody)
-        } finally {
-            connection.disconnect()
+        } catch (e: Exception) {
+            try { connection.disconnect() } catch (_: Exception) {}
+            throw e
         }
     }
 
@@ -648,8 +675,33 @@ class YouTubeMusicService @JvmOverloads constructor(
                 if (results.size >= limit) break
                 val renderer = shelf.optJSONObject(i)
                     ?.optJSONObject("musicResponsiveListItemRenderer") ?: continue
-                val videoId = renderer.optJSONObject("playlistItemData")
+                var videoId = renderer.optJSONObject("playlistItemData")
                     ?.optString("videoId", "")?.trim() ?: ""
+                if (videoId.isEmpty()) {
+                    videoId = renderer.optJSONObject("overlay")
+                        ?.optJSONObject("musicItemThumbnailOverlayRenderer")
+                        ?.optJSONObject("content")
+                        ?.optJSONObject("musicPlayButtonRenderer")
+                        ?.optJSONObject("playNavigationEndpoint")
+                        ?.optJSONObject("watchEndpoint")
+                        ?.optString("videoId", "")?.trim() ?: ""
+                }
+                if (videoId.isEmpty()) {
+                    videoId = renderer.optJSONObject("doubleTapCommand")
+                        ?.optJSONObject("watchEndpoint")
+                        ?.optString("videoId", "")?.trim() ?: ""
+                }
+                if (videoId.isEmpty()) {
+                    videoId = renderer.optJSONArray("flexColumns")
+                        ?.optJSONObject(0)
+                        ?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")
+                        ?.optJSONObject("text")
+                        ?.optJSONArray("runs")
+                        ?.optJSONObject(0)
+                        ?.optJSONObject("navigationEndpoint")
+                        ?.optJSONObject("watchEndpoint")
+                        ?.optString("videoId", "")?.trim() ?: ""
+                }
                 if (videoId.isEmpty()) continue
 
                 val flexColumns = renderer.optJSONArray("flexColumns")
@@ -963,7 +1015,10 @@ class YouTubeMusicService @JvmOverloads constructor(
         }
         executor.execute {
             try {
-                val result = performHomeBrowseFullRequest(cookieHeader)
+                // Two-phase: la primera página se entrega inmediata vía callback dentro de
+                // performHomeBrowseFullRequest; el resultado COMPLETO (con continuaciones)
+                // se entrega aquí al terminar.
+                val result = performHomeBrowseFullRequest(cookieHeader, callback)
                 mainHandler.post { callback.onSuccess(result) }
             } catch (e: Exception) {
                 mainHandler.post { callback.onError(e.message ?: "Error cargando home.") }
@@ -1194,11 +1249,13 @@ class YouTubeMusicService @JvmOverloads constructor(
             val statusCode = connection.responseCode
             val responseBody = readResponse(connection, statusCode >= 400)
             if (statusCode != HttpURLConnection.HTTP_OK) {
+                try { connection.disconnect() } catch (_: Exception) {}
                 throw IllegalStateException("Browse home error $statusCode")
             }
             return parseHomeMixes(JSONObject(responseBody))
-        } finally {
-            connection.disconnect()
+        } catch (e: Exception) {
+            try { connection.disconnect() } catch (_: Exception) {}
+            throw e
         }
     }
 
@@ -1413,8 +1470,9 @@ class YouTubeMusicService @JvmOverloads constructor(
             val relatedBrowseId = extractWatchTabBrowseId(watchNextRenderer, 2)
             val lyricsBrowseId = extractWatchTabBrowseId(watchNextRenderer, 1)
             return WatchPlaylistResult(tracks, relatedBrowseId, lyricsBrowseId)
-        } finally {
-            connection.disconnect()
+        } catch (e: Exception) {
+            try { connection.disconnect() } catch (_: Exception) {}
+            throw e
         }
     }
 
@@ -1456,11 +1514,13 @@ class YouTubeMusicService @JvmOverloads constructor(
             val statusCode = connection.responseCode
             val responseBody = readResponse(connection, statusCode >= 400)
             if (statusCode != HttpURLConnection.HTTP_OK) {
+                try { connection.disconnect() } catch (_: Exception) {}
                 throw IllegalStateException("Mix continuation error $statusCode")
             }
             return JSONObject(responseBody)
-        } finally {
-            connection.disconnect()
+        } catch (e: Exception) {
+            try { connection.disconnect() } catch (_: Exception) {}
+            throw e
         }
     }
 
@@ -1760,11 +1820,13 @@ class YouTubeMusicService @JvmOverloads constructor(
             val statusCode = connection.responseCode
             val responseBody = readResponse(connection, statusCode >= 400)
             if (statusCode != HttpURLConnection.HTTP_OK) {
+                try { connection.disconnect() } catch (_: Exception) {}
                 throw IllegalStateException("Account menu error $statusCode")
             }
             return parseAccountMenu(JSONObject(responseBody))
-        } finally {
-            connection.disconnect()
+        } catch (e: Exception) {
+            try { connection.disconnect() } catch (_: Exception) {}
+            throw e
         }
     }
 
@@ -2046,10 +2108,23 @@ class YouTubeMusicService @JvmOverloads constructor(
 
     // ----- Full home browse (split generic + personal mixes) -----
 
-    private val MAX_HOME_CONTINUATIONS = 4
+    // Continuaciones máximas tras la primera página (las playlists personales como Rewind,
+    // recaps y mixes de YT llegan en páginas posteriores al primer lote).
+    private val MAX_HOME_CONTINUATIONS = 3
 
+    /**
+     * Two-phase home browse: devuelve la primera página inmediatamente vía [firstPageCallback]
+     * (si hay contenido) para que la UI pinte rápido, y luego carga las continuaciones. El
+     * resultado COMPLETO (primera página + continuaciones) se retorna como valor de la función.
+     *
+     * Si la primera página ya está vacía (edge case), intenta 1 continuación sincrónica antes
+     * de la entrega inmediata para evitar un home totalmente en blanco.
+     */
     @Throws(Exception::class)
-    private fun performHomeBrowseFullRequest(cookieHeader: String): HomeBrowseResult {
+    private fun performHomeBrowseFullRequest(
+        cookieHeader: String,
+        firstPageCallback: HomeBrowseCallback? = null
+    ): HomeBrowseResult {
         val endpoint = "https://music.youtube.com/youtubei/v1/browse?prettyPrint=false"
         val clientContext = JSONObject().apply {
             put("clientName", "WEB_REMIX")
@@ -2065,10 +2140,35 @@ class YouTubeMusicService @JvmOverloads constructor(
         val rootJson = JSONObject(responseBody)
         val result = parseHomeBrowseFull(rootJson)
 
-        // Extract continuation token from initial response
         var continuationToken = extractContinuationToken(rootJson)
-        var continuationCount = 0
 
+        // Si la primera página vino vacía, intenta 1 continuación ANTES de la entrega
+        // inmediata para que el usuario no vea un home en blanco.
+        if (result.allSections.isEmpty() && result.quickPicks.isEmpty() && continuationToken != null) {
+            try {
+                val contBody = JSONObject().apply {
+                    put("context", JSONObject().put("client", clientContext))
+                    put("continuation", continuationToken)
+                }.toString().toByteArray(StandardCharsets.UTF_8)
+                val contResponse = postInnerTubeBrowse(endpoint, contBody, cookieHeader)
+                val contJson = JSONObject(contResponse)
+                parseContinuationSections(contJson, result)
+                continuationToken = extractContinuationTokenFromContinuation(contJson)
+            } catch (e: Exception) {
+                Log.w("YouTubeMusicService", "Home browse fallback continuation failed: ${e.message}")
+                continuationToken = null
+            }
+        }
+
+        // ── Entrega inmediata de la primera página (UI rápida) ──
+        if (firstPageCallback != null && (result.allSections.isNotEmpty() || result.quickPicks.isNotEmpty())) {
+            val snapshot = result.copy()
+            snapshot.isFinal = false
+            mainHandler.post { firstPageCallback.onSuccess(snapshot) }
+        }
+
+        // ── Continuaciones en segundo plano ──
+        var continuationCount = 0
         while (continuationToken != null && continuationCount < MAX_HOME_CONTINUATIONS) {
             continuationCount++
             try {
@@ -2087,6 +2187,7 @@ class YouTubeMusicService @JvmOverloads constructor(
             }
         }
 
+        result.isFinal = true
         return result
     }
 
@@ -2774,11 +2875,13 @@ class YouTubeMusicService @JvmOverloads constructor(
             val statusCode = connection.responseCode
             val responseBody = readResponse(connection, statusCode >= 400)
             if (statusCode != HttpURLConnection.HTTP_OK) {
+                try { connection.disconnect() } catch (_: Exception) {}
                 throw IllegalStateException("Browse home error $statusCode")
             }
             return responseBody
-        } finally {
-            connection.disconnect()
+        } catch (e: Exception) {
+            try { connection.disconnect() } catch (_: Exception) {}
+            throw e
         }
     }
 
@@ -3182,10 +3285,162 @@ class YouTubeMusicService @JvmOverloads constructor(
         connection.outputStream.use { it.write(body) }
         val statusCode = connection.responseCode
         val responseBody = readResponse(connection, statusCode >= 400)
-        connection.disconnect()
-        if (statusCode != HttpURLConnection.HTTP_OK) return emptyList()
+        if (statusCode != HttpURLConnection.HTTP_OK) {
+            try { connection.disconnect() } catch (_: Exception) {}
+            return emptyList()
+        }
 
         return parseInnertubeSearchResults(JSONObject(responseBody), maxResults)
+    }
+
+    /** Extrae el resultado destacado (musicCardShelfRenderer) de la respuesta sin filtros de YTM. */
+    private fun extractTopResultFromInnertube(root: JSONObject): TrackResult? {
+        try {
+            val rootContents = root.optJSONObject("contents") ?: return null
+            val allSectionContents = mutableListOf<JSONArray>()
+
+            val tabbed = rootContents.optJSONObject("tabbedSearchResultsRenderer")
+            if (tabbed != null) {
+                val tabs = tabbed.optJSONArray("tabs") ?: JSONArray()
+                for (t in 0 until tabs.length()) {
+                    val c = tabs.optJSONObject(t)
+                        ?.optJSONObject("tabRenderer")
+                        ?.optJSONObject("content")
+                        ?.optJSONObject("sectionListRenderer")
+                        ?.optJSONArray("contents") ?: continue
+                    allSectionContents.add(c)
+                }
+            } else {
+                val flat = rootContents.optJSONObject("sectionListRenderer")
+                    ?.optJSONArray("contents")
+                if (flat != null) allSectionContents.add(flat)
+            }
+
+            for (contents in allSectionContents) {
+                for (c in 0 until contents.length()) {
+                    val section = contents.optJSONObject(c) ?: continue
+                    val cardShelf = section.optJSONObject("musicCardShelfRenderer") ?: continue
+
+                    var videoId = cardShelf.optJSONObject("onTap")
+                        ?.optJSONObject("watchEndpoint")
+                        ?.optString("videoId", "") ?: ""
+                    if (videoId.isEmpty()) {
+                        videoId = cardShelf.optJSONArray("buttons")
+                            ?.optJSONObject(0)
+                            ?.optJSONObject("buttonRenderer")
+                            ?.optJSONObject("command")
+                            ?.optJSONObject("watchEndpoint")
+                            ?.optString("videoId", "") ?: ""
+                    }
+                    if (videoId.isEmpty()) {
+                        videoId = cardShelf.optJSONObject("title")
+                            ?.optJSONArray("runs")
+                            ?.optJSONObject(0)
+                            ?.optJSONObject("navigationEndpoint")
+                            ?.optJSONObject("watchEndpoint")
+                            ?.optString("videoId", "") ?: ""
+                    }
+
+                    if (videoId.isNotEmpty()) {
+                        val titleRuns = cardShelf.optJSONObject("title")?.optJSONArray("runs")
+                        val title = buildString {
+                            if (titleRuns != null) {
+                                for (r in 0 until titleRuns.length()) {
+                                    append(titleRuns.optJSONObject(r)?.optString("text", "") ?: "")
+                                }
+                            }
+                        }
+                        val subtitleRuns = cardShelf.optJSONObject("subtitle")?.optJSONArray("runs")
+                        val subtitle = buildString {
+                            if (subtitleRuns != null) {
+                                for (r in 0 until subtitleRuns.length()) {
+                                    append(subtitleRuns.optJSONObject(r)?.optString("text", "") ?: "")
+                                }
+                            }
+                        }
+                        val thumbs = cardShelf.optJSONObject("thumbnail")
+                            ?.optJSONObject("musicThumbnailRenderer")
+                            ?.optJSONObject("thumbnail")
+                            ?.optJSONArray("thumbnails")
+                        val thumbUrl = thumbs?.let {
+                            it.optJSONObject(it.length() - 1)?.optString("url", "") ?: ""
+                        } ?: ""
+                        if (title.isNotEmpty()) {
+                            return TrackResult("video", videoId, title, subtitle, thumbUrl)
+                        }
+                    } else {
+                        // Tarjeta de artista o entidad sin videoId directo: extraer su canción principal de contents[]
+                        val cardContents = cardShelf.optJSONArray("contents")
+                        if (cardContents != null && cardContents.length() > 0) {
+                            for (k in 0 until cardContents.length()) {
+                                val renderer = cardContents.optJSONObject(k)
+                                    ?.optJSONObject("musicResponsiveListItemRenderer") ?: continue
+                                var vid = renderer.optJSONObject("playlistItemData")
+                                    ?.optString("videoId", "")?.trim() ?: ""
+                                if (vid.isEmpty()) {
+                                    vid = renderer.optJSONObject("overlay")
+                                        ?.optJSONObject("musicItemThumbnailOverlayRenderer")
+                                        ?.optJSONObject("content")
+                                        ?.optJSONObject("musicPlayButtonRenderer")
+                                        ?.optJSONObject("playNavigationEndpoint")
+                                        ?.optJSONObject("watchEndpoint")
+                                        ?.optString("videoId", "")?.trim() ?: ""
+                                }
+                                if (vid.isEmpty()) {
+                                    vid = renderer.optJSONObject("doubleTapCommand")
+                                        ?.optJSONObject("watchEndpoint")
+                                        ?.optString("videoId", "")?.trim() ?: ""
+                                }
+                                if (vid.isEmpty()) {
+                                    vid = renderer.optJSONArray("flexColumns")
+                                        ?.optJSONObject(0)
+                                        ?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")
+                                        ?.optJSONObject("text")
+                                        ?.optJSONArray("runs")
+                                        ?.optJSONObject(0)
+                                        ?.optJSONObject("navigationEndpoint")
+                                        ?.optJSONObject("watchEndpoint")
+                                        ?.optString("videoId", "")?.trim() ?: ""
+                                }
+                                if (vid.isEmpty()) continue
+
+                                val flexColumns = renderer.optJSONArray("flexColumns")
+                                val trackTitle = flexColumns?.optJSONObject(0)
+                                    ?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")
+                                    ?.optJSONObject("text")?.optJSONArray("runs")
+                                    ?.optJSONObject(0)?.optString("text", "") ?: ""
+                                val trackArtistRuns = flexColumns?.optJSONObject(1)
+                                    ?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")
+                                    ?.optJSONObject("text")?.optJSONArray("runs")
+                                val trackArtist = buildString {
+                                    if (trackArtistRuns != null) {
+                                        for (r in 0 until trackArtistRuns.length()) {
+                                            append(trackArtistRuns.optJSONObject(r)?.optString("text", "") ?: "")
+                                        }
+                                    }
+                                }
+                                val thumbs2 = renderer.optJSONObject("thumbnail")
+                                    ?.optJSONObject("musicThumbnailRenderer")
+                                    ?.optJSONObject("thumbnail")?.optJSONArray("thumbnails")
+                                val thumbUrl2 = thumbs2?.let {
+                                    it.optJSONObject(it.length() - 1)?.optString("url", "") ?: ""
+                                } ?: ""
+                                val trackDuration = artistRunsToText(
+                                    renderer.optJSONArray("fixedColumns")?.optJSONObject(0)
+                                        ?.optJSONObject("musicResponsiveListItemFixedColumnRenderer")?.optJSONObject("text")
+                                )
+                                if (trackTitle.isNotEmpty()) {
+                                    return TrackResult("video", vid, trackTitle, trackArtist, thumbUrl2, trackDuration)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w("YouTubeMusicService", "extractTopResultFromInnertube error: ${e.message}")
+        }
+        return null
     }
 
     private fun parseInnertubeSearchResults(root: JSONObject, maxResults: Int): List<TrackResult> {
@@ -3332,6 +3587,22 @@ class YouTubeMusicService @JvmOverloads constructor(
                                 ?.optJSONObject("watchEndpoint")
                                 ?.optString("videoId", "")?.trim() ?: ""
                         }
+                        if (videoId.isEmpty()) {
+                            videoId = renderer.optJSONObject("doubleTapCommand")
+                                ?.optJSONObject("watchEndpoint")
+                                ?.optString("videoId", "")?.trim() ?: ""
+                        }
+                        if (videoId.isEmpty()) {
+                            videoId = renderer.optJSONArray("flexColumns")
+                                ?.optJSONObject(0)
+                                ?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")
+                                ?.optJSONObject("text")
+                                ?.optJSONArray("runs")
+                                ?.optJSONObject(0)
+                                ?.optJSONObject("navigationEndpoint")
+                                ?.optJSONObject("watchEndpoint")
+                                ?.optString("videoId", "")?.trim() ?: ""
+                        }
                         if (videoId.isEmpty()) continue
  
                         val flexColumns = renderer.optJSONArray("flexColumns")
@@ -3471,6 +3742,18 @@ class YouTubeMusicService @JvmOverloads constructor(
 
         private val SHARED_EXECUTOR: ExecutorService = Executors.newFixedThreadPool(3)
         private val SUGGESTIONS_EXECUTOR: ExecutorService = Executors.newFixedThreadPool(2)
+
+        private fun buildWebRemixClientContext(): JSONObject {
+            val userLocale = Locale.getDefault()
+            val hl = if (userLocale.language.isNullOrEmpty()) "es" else userLocale.language.lowercase(Locale.ROOT)
+            val gl = if (userLocale.country.isNullOrEmpty()) "ES" else userLocale.country.uppercase(Locale.ROOT)
+            return JSONObject().apply {
+                put("clientName", "WEB_REMIX")
+                put("clientVersion", buildClientVersion())
+                put("hl", hl)
+                put("gl", gl)
+            }
+        }
 
         private fun buildClientVersion(): String {
             val sdf = java.text.SimpleDateFormat("yyyyMMdd", Locale.US)

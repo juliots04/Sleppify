@@ -43,7 +43,7 @@ object RadioArtComposer {
 
     // Se sube cuando cambia la geometría/estilo para que ningún composite viejo (memoria/disco) se
     // reutilice con el diseño nuevo.
-    private const val STYLE_VERSION = "v9-frost"
+    private const val STYLE_VERSION = "v10-frost"
 
     // Por debajo de este tamaño (px) NO se pinta el panel esmerilado: solo la carátula. Bajo para
     // que las filas de biblioteca / detalle (thumbs ~48-50dp) también muestren el panel.
@@ -260,11 +260,12 @@ object RadioArtComposer {
         canvas.restore()
     }
 
-    /** Panel inferior estilo glassmorphism: smear difuminado de la carátula + degradado oscuro +
-     *  hairline superior + "RADIO" y el título. */
+    /** Panel inferior estilo glassmorphism: smear difuminado de la carátula + degradado suave
+     *  + hairline superior con brillo suave + "RADIO" y el título. */
     private fun drawFrostPanel(canvas: Canvas, cover: Bitmap, s: Float, title: String) {
-        // Panel más bajo (ocupa ~28% del alto, no ~36%): el blur empieza más abajo.
+        // Panel más bajo (ocupa ~28% del alto)
         val panelTop = s * 0.72f
+        val transitionTop = panelTop - (s * 0.045f)
         val panelRect = RectF(0f, panelTop, s, s)
 
         // 2a. "Vidrio": un downscale fuerte de la carátula reescalado a todo el cuadrado y recortado
@@ -285,20 +286,37 @@ object RadioArtComposer {
             if (small != cover) small.recycle()
         }
 
-        // 2b. Degradado oscuro para legibilidad (arriba translúcido → abajo casi opaco).
+        // 2b. Transición suave y degradado oscuro para legibilidad:
+        // Se extiende sutilmente desde transitionTop para que el paso entre la imagen nítida
+        // y el smear esmerilado sea totalmente suave y natural.
+        val transitionRect = RectF(0f, transitionTop, s, s)
+        val stopLine = (panelTop - transitionTop) / (s - transitionTop)
         val darken = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             shader = LinearGradient(
-                0f, panelTop, 0f, s,
-                0x40101014, 0xF0090909.toInt(),
+                0f, transitionTop, 0f, s,
+                intArrayOf(0x00000000, 0x48101014, 0xF2090909.toInt()),
+                floatArrayOf(0f, stopLine, 1f),
                 Shader.TileMode.CLAMP
             )
         }
-        canvas.drawRect(panelRect, darken)
+        canvas.drawRect(transitionRect, darken)
 
-        // 2c. Hairline superior (borde de vidrio).
+        // 2c. Sombra suave bajo la línea para realce sutil
+        val lineShadow = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0x30000000
+            strokeWidth = Math.max(1f, s * 0.005f)
+        }
+        canvas.drawLine(0f, panelTop + 1f, s, panelTop + 1f, lineShadow)
+
+        // 2d. Línea superior de vidrio (hairline con gradiente especular centrado)
         val hair = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = 0x22FFFFFF
-            strokeWidth = Math.max(1f, s * 0.004f)
+            shader = LinearGradient(
+                0f, panelTop, s, panelTop,
+                intArrayOf(0x20FFFFFF, 0x75FFFFFF.toInt(), 0x20FFFFFF),
+                floatArrayOf(0f, 0.5f, 1f),
+                Shader.TileMode.CLAMP
+            )
+            strokeWidth = Math.max(1.2f, s * 0.005f)
         }
         canvas.drawLine(0f, panelTop, s, panelTop, hair)
 

@@ -1,0 +1,151 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/rootWelcomeAuth"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@android:color/black"
+    android:clickable="true"
+    android:focusable="true">
+
+    <!-- 1. Fondo animado de colores difuminados (Aurora) -->
+    <com.example.sleppify.AmbientAuroraView
+        android:id="@+id/ambientAuroraBackground"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <!-- 2. Viñetas superior e inferior para contraste impecable -->
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="180dp"
+        android:layout_gravity="top"
+        android:background="@drawable/bg_welcome_vignette_top" />
+
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="260dp"
+        android:layout_gravity="bottom"
+        android:background="@drawable/bg_welcome_vignette_bottom" />
+
+    <!-- 3. Contenido principal con soporte Edge-to-Edge -->
+    <androidx.constraintlayout.widget.ConstraintLayout
+        android:id="@+id/clWelcomeContent"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:paddingHorizontal="28dp">
+
+        <!-- Sección Superior / Central: Logo y Marca Minimalista -->
+        <LinearLayout
+            android:id="@+id/llWelcomeHero"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:gravity="center_horizontal"
+            android:orientation="vertical"
+            app:layout_constraintBottom_toTopOf="@+id/llWelcomeActions"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toTopOf="parent"
+            app:layout_constraintVertical_bias="0.44">
+
+            <!-- Icono de la app sin marco -->
+            <ImageView
+                android:id="@+id/ivWelcomeAppIcon"
+                android:layout_width="88dp"
+                android:layout_height="88dp"
+                android:layout_gravity="center_horizontal"
+                android:contentDescription="@string/app_name"
+                android:src="@mipmap/ic_launcher" />
+
+            <!-- Título de la aplicación -->
+            <TextView
+                android:id="@+id/tvWelcomeBrandTitle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="24dp"
+                android:fontFamily="@font/manrope_variable"
+                android:letterSpacing="0.14"
+                android:text="SLEPPIFY"
+                android:textAllCaps="true"
+                android:textColor="@android:color/white"
+                android:textSize="32sp"
+                android:textStyle="bold" />
+
+            <!-- Lema / Descripción sutil -->
+            <TextView
+                android:id="@+id/tvWelcomeTagline"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:fontFamily="@font/inter_variable"
+                android:gravity="center"
+                android:lineSpacingMultiplier="1.25"
+                android:paddingHorizontal="20dp"
+                android:text="Toda tu música favorita, sin límites.\nInicia sesión para sincronizar tu biblioteca."
+                android:textColor="@color/text_secondary"
+                android:textSize="14sp" />
+        </LinearLayout>
+
+        <!-- Sección Inferior: Botones de Acción -->
+        <LinearLayout
+            android:id="@+id/llWelcomeActions"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:gravity="center_horizontal"
+            android:orientation="vertical"
+            android:paddingBottom="24dp"
+            app:layout_constraintBottom_toBottomOf="parent"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent">
+
+            <!-- Contenedor del botón de Google y spinner de carga -->
+            <FrameLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content">
+
+                <!-- Botón de Google idéntico al estilo de la aplicación -->
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnWelcomeGoogle"
+                    android:layout_width="match_parent"
+                    android:layout_height="54dp"
+                    android:backgroundTint="@android:color/white"
+                    android:fontFamily="@font/inter_variable"
+                    android:text="Continuar con Google"
+                    android:textAllCaps="false"
+                    android:textColor="#1F2B42"
+                    android:textSize="15sp"
+                    android:textStyle="bold"
+                    app:cornerRadius="27dp"
+                    app:elevation="4dp"
+                    app:icon="@drawable/ic_google_logo"
+                    app:iconGravity="textStart"
+                    app:iconPadding="12dp"
+                    app:iconSize="22dp"
+                    app:iconTint="@null"
+                    app:rippleColor="#2200419E" />
+
+                <ProgressBar
+                    android:id="@+id/progressWelcomeGoogle"
+                    android:layout_width="26dp"
+                    android:layout_height="26dp"
+                    android:layout_gravity="center"
+                    android:indeterminate="true"
+                    android:indeterminateTint="#1F2B42"
+                    android:visibility="gone" />
+            </FrameLayout>
+
+            <!-- Aviso de privacidad y seguridad -->
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:fontFamily="@font/inter_variable"
+                android:gravity="center"
+                android:text="Conexión oficial y segura con Google y YouTube Music"
+                android:textColor="#6B7280"
+                android:textSize="11sp" />
+        </LinearLayout>
+
+    </androidx.constraintlayout.widget.ConstraintLayout>
+
+</FrameLayout>

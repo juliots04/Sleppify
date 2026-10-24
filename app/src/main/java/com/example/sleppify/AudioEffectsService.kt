@@ -26,10 +26,11 @@ import android.media.audiofx.DynamicsProcessing
  * Motor DSP avanzado basado en DynamicsProcessing (API 28+).
  *
  * Proporciona un ecualizador parametrico de 9 bandas con filtros biquad IIR,
- * ajuste de graves independiente (low-shelf), y cero limitador/compresor/auto-ganancia.
+ * ajuste de graves independiente (low-shelf) y limitador de pico rapido a -0.1 dBFS
+ * para evitar distorsion y saturacion digital en el hardware sin bajar el volumen.
  *
- * Al subir las bandas el volumen general NO se reduce.
- * Se aplica globalmente (session 0) para afectar todo el audio del sistema.
+ * Al subir las bandas el volumen general NO se reduce (cero auto-atenuacion).
+ * Se aplica globalmente (session 0) o atado a la sesion del reproductor segun configuracion.
  */
 class AudioEffectsService : Service() {
 
@@ -43,9 +44,11 @@ class AudioEffectsService : Service() {
     private val deviceCallback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<AudioDeviceInfo>?) {
             syncAndRefresh()
+            mainHandler.postDelayed({ syncAndRefresh() }, 400L)
         }
         override fun onAudioDevicesRemoved(removedDevices: Array<AudioDeviceInfo>?) {
             syncAndRefresh()
+            mainHandler.postDelayed({ syncAndRefresh() }, 400L)
         }
     }
 
@@ -59,7 +62,8 @@ class AudioEffectsService : Service() {
                 if (sessionId > 0) {
                     lastExternalSessionId = sessionId
                     val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-                    if (prefs.getBoolean(KEY_APPLY_GLOBAL, true) && prefs.getBoolean(KEY_ENABLED, false)) {
+                    val shouldRun = prefs.getBoolean(KEY_ENABLED, false) || prefs.getBoolean(KEY_VOLUME_NORMALIZATION, true)
+                    if (prefs.getBoolean(KEY_APPLY_GLOBAL, true) && shouldRun) {
                         applyEffects()
                     }
                 }
@@ -68,7 +72,8 @@ class AudioEffectsService : Service() {
                 if (sessionId == lastExternalSessionId) {
                     lastExternalSessionId = 0
                     val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-                    if (prefs.getBoolean(KEY_APPLY_GLOBAL, true) && prefs.getBoolean(KEY_ENABLED, false)) {
+                    val shouldRun = prefs.getBoolean(KEY_ENABLED, false) || prefs.getBoolean(KEY_VOLUME_NORMALIZATION, true)
+                    if (prefs.getBoolean(KEY_APPLY_GLOBAL, true) && shouldRun) {
                         applyEffects()
                     }
                 }
@@ -230,8 +235,9 @@ class AudioEffectsService : Service() {
 
 
         val enabled = prefs.getBoolean(KEY_ENABLED, false)
+        val normEnabled = prefs.getBoolean(KEY_VOLUME_NORMALIZATION, true)
 
-        if (!enabled) {
+        if (!enabled && !normEnabled) {
             releaseEngine()
             exitForeground()
             stopSelf()
@@ -289,6 +295,13 @@ class AudioEffectsService : Service() {
      *
      * This ensures ZERO volume reduction when boosting bands.
      */
+    /**
+     * Creates a DynamicsProcessing engine with:
+     * - 9-band pre-EQ (biquad parametric)
+     * - NO multi-band compressor
+     * - NO post-EQ
+     * - Transparent peak brickwall limiter (-0.1 dBFS) to protect against digital clipping and distortion
+     */
     private fun createDynamicsProcessingEngine(sessionId: Int): DynamicsProcessing {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
             throw UnsupportedOperationException("DynamicsProcessing requires API 28+")
@@ -299,15 +312,14 @@ class AudioEffectsService : Service() {
             /* channelCount */ 2,
             /* preEqInUse */ true,
             /* preEqBandCount */ EQ_BAND_COUNT,
-            /* mbcInUse */ false,       // NO compressor
+            /* mbcInUse */ false,       // NO multi-band compressor
             /* mbcBandCount */ 0,
             /* postEqInUse */ false,     // NO post-EQ
             /* postEqBandCount */ 0,
-            /* limiterInUse */ false     // NO limiter
+            /* limiterInUse */ true      // Brickwall limiter para evitar clipping
         )
 
-        // Configure pre-EQ channel 0
-        val preEqChannel0 = DynamicsProcessing.EqBand(true, 1000f, 0f)
+        // Configure pre-EQ
         val eqConfig = DynamicsProcessing.Eq(
             true,  // inUse
             true,  // enabled
@@ -320,56 +332,79 @@ class AudioEffectsService : Service() {
         config.setPreEqByChannelIndex(0, eqConfig)
         config.setPreEqByChannelIndex(1, eqConfig)
 
-        // Build and configure
-        val dp = DynamicsProcessing(0, sessionId, config.build())
+        // Limiter configurado como brickwall de pico a -0.1 dBFS.
+        // Corta exclusivamente los picos que exceden -0 dBFS cuando Normalizar volumen está activo,
+        // sin bombeo ni compresión audible (ataque de 1ms y liberación rápida de 25ms).
+        val limiterConfig = DynamicsProcessing.Limiter(
+            true,   // inUse
+            false,  // enabled (se activa dinámicamente si KEY_VOLUME_NORMALIZATION está activado)
+            0,      // linkGroup
+            1.0f,   // attackTime (1 ms)
+            25.0f,  // releaseTime (25 ms - recuperación ultra rápida sin pérdida de volumen)
+            10.0f,  // ratio
+            -0.1f,  // threshold (-0.1 dBFS para asegurar tope a -0)
+            0.0f    // postGain (0 dB)
+        )
+        config.setLimiterByChannelIndex(0, limiterConfig)
+        config.setLimiterByChannelIndex(1, limiterConfig)
 
-        // Explicitly disable limiter on each channel
-        for (ch in 0..1) {
-            try {
-                val limiter = dp.getLimiterByChannelIndex(ch)
-                limiter.isEnabled = false
-                dp.setLimiterByChannelIndex(ch, limiter)
-            } catch (ignored: Exception) {
-                // Some devices may not support limiter configuration
-            }
-        }
-
-        // Set input gain according to configured overall gain
-        try {
-            val initialGain = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-                .getFloat(KEY_OVERALL_GAIN_DB, OVERALL_GAIN_DEFAULT_DB)
-                .coerceIn(OVERALL_GAIN_MIN_DB, OVERALL_GAIN_MAX_DB)
-            dp.setInputGainAllChannelsTo(initialGain)
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to set input gain", e)
-        }
-
-
-        return dp
+        // Build and return
+        return DynamicsProcessing(0, sessionId, config.build())
     }
 
     /**
-     * Reads all EQ band values, bass settings from SharedPreferences
+     * Reads all EQ band values, bass settings and volume normalization from SharedPreferences
      * and applies them to the DynamicsProcessing engine.
      *
-     * NO auto-gain compensation is applied — bands boost freely.
+     * Si normalizar volumen está desactivado: cero compresión, cero limitador y cero atenuación.
+     * Si normalizar volumen está activado: el limitador de pico corta en -0.1 dBFS y se aplica
+     * una compensación de ganancia negativa sutil vinculada al aumento de graves/bandas para
+     * prevenir distorsión/clipeo sin bajar sensiblemente el volumen.
      */
     private fun applyParametersFromPrefs(prefs: SharedPreferences) {
         val dp = dynamicsProcessing ?: return
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return
 
-        // Apply 9-band EQ values
+        val eqEnabled = prefs.getBoolean(KEY_ENABLED, false)
+        val normEnabled = prefs.getBoolean(KEY_VOLUME_NORMALIZATION, true)
+
+        val bassDb = if (eqEnabled) prefs.getFloat(KEY_BASS_DB, 0f).coerceIn(0f, BASS_DB_MAX) else 0f
+        val bassCutoffHz = if (bassDb > 0.1f) {
+            prefs.getFloat(KEY_BASS_FREQUENCY_HZ, BASS_FREQUENCY_DEFAULT_HZ)
+                .coerceIn(BASS_FREQUENCY_MIN_HZ, BASS_FREQUENCY_MAX_HZ)
+        } else 0f
+
+        var maxEffectiveGain = 0f
+
+        // Apply 9-band EQ values and unified bass enhancement
         for (bandIndex in 0 until EQ_BAND_COUNT) {
-            val gainDb = prefs.getFloat(bandDbKey(bandIndex), 0f)
-                .coerceIn(EQ_GAIN_MIN_DB, EQ_GAIN_MAX_DB)
+            val currentBandGain = if (eqEnabled) {
+                prefs.getFloat(bandDbKey(bandIndex), 0f).coerceIn(EQ_GAIN_MIN_DB, EQ_GAIN_MAX_DB)
+            } else 0f
             val freq = WAVELET_9_BAND_FREQUENCIES_HZ[bandIndex].toFloat()
+
+            var effectiveGain = currentBandGain
+            if (bassDb > 0.1f && freq <= bassCutoffHz * 2f) {
+                val ratio = if (freq <= bassCutoffHz) {
+                    1.0f
+                } else {
+                    val logRatio = Math.log10((bassCutoffHz * 2f / freq).toDouble()).toFloat()
+                    logRatio.coerceIn(0f, 1f)
+                }
+                effectiveGain = (currentBandGain + bassDb * ratio)
+                    .coerceIn(EQ_GAIN_MIN_DB * 2f, EQ_GAIN_MAX_DB * 2f)
+            }
+
+            if (effectiveGain > maxEffectiveGain) {
+                maxEffectiveGain = effectiveGain
+            }
 
             for (ch in 0..1) {
                 try {
                     val band = dp.getPreEqBandByChannelIndex(ch, bandIndex)
                     band.cutoffFrequency = freq
-                    band.gain = gainDb
-                    band.isEnabled = true
+                    band.gain = if (eqEnabled) effectiveGain else 0f
+                    band.isEnabled = eqEnabled
                     dp.setPreEqBandByChannelIndex(ch, bandIndex, band)
                 } catch (e: Exception) {
                     Log.w(TAG, "eq:set_band_failed ch=$ch band=$bandIndex", e)
@@ -377,55 +412,36 @@ class AudioEffectsService : Service() {
             }
         }
 
-        // Apply bass boost via input gain (low-shelf simulation)
-        // DynamicsProcessing doesn't have a dedicated bass shelf, so we use the
-        // lowest EQ band (62.5 Hz) with additional gain from the bass tuner
-        val bassDb = prefs.getFloat(KEY_BASS_DB, 0f).coerceIn(0f, BASS_DB_MAX)
-        if (bassDb > 0.1f) {
-            // Add bass gain to the lowest frequency bands
-            val bassCutoffHz = prefs.getFloat(KEY_BASS_FREQUENCY_HZ, BASS_FREQUENCY_DEFAULT_HZ)
-                .coerceIn(BASS_FREQUENCY_MIN_HZ, BASS_FREQUENCY_MAX_HZ)
-
-            for (bandIndex in 0 until EQ_BAND_COUNT) {
-                val bandFreq = WAVELET_9_BAND_FREQUENCIES_HZ[bandIndex].toFloat()
-                if (bandFreq > bassCutoffHz * 2f) break
-
-                // Scale bass contribution by how far the band is below cutoff
-                val ratio = if (bandFreq <= bassCutoffHz) {
-                    1.0f
-                } else {
-                    val logRatio = Math.log10((bassCutoffHz * 2f / bandFreq).toDouble()).toFloat()
-                    logRatio.coerceIn(0f, 1f)
-                }
-
-                val additionalBassGain = bassDb * ratio
-                val currentBandGain = prefs.getFloat(bandDbKey(bandIndex), 0f)
-                    .coerceIn(EQ_GAIN_MIN_DB, EQ_GAIN_MAX_DB)
-                val totalGain = (currentBandGain + additionalBassGain)
-                    .coerceIn(EQ_GAIN_MIN_DB * 2f, EQ_GAIN_MAX_DB * 2f) // Extended range for bass
-
-                for (ch in 0..1) {
-                    try {
-                        val band = dp.getPreEqBandByChannelIndex(ch, bandIndex)
-                        band.gain = totalGain
-                        dp.setPreEqBandByChannelIndex(ch, bandIndex, band)
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Failed to set EQ band gain ch=$ch band=$bandIndex", e)
-                    }
-                }
-            }
+        // Limitador de pico (garantiza tope máximo de -0 dBFS cuando Normalizar volumen está activo)
+        for (ch in 0..1) {
+            try {
+                val limiter = dp.getLimiterByChannelIndex(ch)
+                limiter.isEnabled = normEnabled
+                limiter.attackTime = 1.0f
+                limiter.releaseTime = 25.0f
+                limiter.ratio = 10.0f
+                limiter.threshold = -0.1f
+                limiter.postGain = 0.0f
+                dp.setLimiterByChannelIndex(ch, limiter)
+            } catch (_: Exception) {}
         }
 
-        // Apply overall input gain (-5 dB to +5 dB)
-        val overallGainDb = prefs.getFloat(KEY_OVERALL_GAIN_DB, OVERALL_GAIN_DEFAULT_DB)
-            .coerceIn(OVERALL_GAIN_MIN_DB, OVERALL_GAIN_MAX_DB)
+        // Compensación de ganancia negativa:
+        // Si normalizar está desactivado: 0 dB de ganancia (sin reducción de volumen, libre).
+        // Si normalizar está activado: calcula ganancia negativa sutil vinculada al boost del EQ
+        // (30% del realce máximo, con tope máximo de -2.5 dB) para prevenir distorsión/clipeo digital
+        // al subir mucho los graves sin una caída notoria de volumen ("casi nada").
+        val inputGainDb = if (normEnabled && eqEnabled && maxEffectiveGain > 0f) {
+            -(maxEffectiveGain * 0.30f).coerceAtMost(2.5f)
+        } else {
+            0f
+        }
+
         try {
-            dp.setInputGainAllChannelsTo(overallGainDb)
+            dp.setInputGainAllChannelsTo(inputGainDb)
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to set input gain after apply", e)
+            Log.w(TAG, "Failed to set input gain", e)
         }
-
-
     }
 
     private fun resolveTargetSession(prefs: SharedPreferences): Int {
@@ -447,8 +463,8 @@ class AudioEffectsService : Service() {
 
         val changed = AudioDeviceProfileStore.syncActiveProfileForOutput(prefs, selected, this)
         if (changed) {
-
-            if (prefs.getBoolean(KEY_ENABLED, false)) {
+            val shouldRun = prefs.getBoolean(KEY_ENABLED, false) || prefs.getBoolean(KEY_VOLUME_NORMALIZATION, true)
+            if (shouldRun) {
                 applyEffects()
             }
         }
@@ -493,16 +509,13 @@ class AudioEffectsService : Service() {
         const val PREFS_NAME = "global_eq_prefs"
 
         const val KEY_ENABLED = "enabled"
+        const val KEY_VOLUME_NORMALIZATION = "volume_normalization"
         // Scope del EQ: true = todo el sistema (session 0, comportamiento clásico); false = solo
         // Sleppify (se ata al audio session del player — más liviano y sin tocar otras apps).
         const val KEY_APPLY_GLOBAL = "apply_global"
         // Última sesión de audio real reportada por el player (ExoMediaPlayer.onAudioSessionIdChanged).
         const val KEY_PLAYER_SESSION_ID = "player_session_id"
         const val KEY_BASS_DB = "bass_db"
-        const val KEY_OVERALL_GAIN_DB = "overall_gain_db"
-        const val OVERALL_GAIN_DEFAULT_DB = 0f
-        const val OVERALL_GAIN_MIN_DB = -5f
-        const val OVERALL_GAIN_MAX_DB = 5f
         const val KEY_BASS_FREQUENCY_HZ = "bass_frequency_hz"
         const val KEY_BASS_TYPE = "bass_type"
         const val KEY_SPATIAL_ENABLED = "spatial_enabled"
@@ -546,8 +559,9 @@ class AudioEffectsService : Service() {
         fun sendApply(context: Context) {
             val prefs = context.getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
             val enabled = prefs.getBoolean(KEY_ENABLED, false)
+            val normEnabled = prefs.getBoolean(KEY_VOLUME_NORMALIZATION, true)
 
-            if (!enabled) {
+            if (!enabled && !normEnabled) {
                 sendStop(context)
                 return
             }
@@ -580,7 +594,8 @@ class AudioEffectsService : Service() {
             val prefs = context.getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
             if (prefs.getInt(KEY_PLAYER_SESSION_ID, GLOBAL_SESSION_ID) == sessionId) return
             prefs.edit().putInt(KEY_PLAYER_SESSION_ID, sessionId).apply()
-            if (!prefs.getBoolean(KEY_APPLY_GLOBAL, true) && prefs.getBoolean(KEY_ENABLED, false)) {
+            val shouldRun = prefs.getBoolean(KEY_ENABLED, false) || prefs.getBoolean(KEY_VOLUME_NORMALIZATION, true)
+            if (!prefs.getBoolean(KEY_APPLY_GLOBAL, true) && shouldRun) {
                 sendApply(context)
             }
         }
@@ -598,7 +613,8 @@ class AudioEffectsService : Service() {
             val prefs = context.getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
             if (!prefs.contains(KEY_PLAYER_SESSION_ID)) return
             prefs.edit().remove(KEY_PLAYER_SESSION_ID).apply()
-            if (!prefs.getBoolean(KEY_APPLY_GLOBAL, true) && prefs.getBoolean(KEY_ENABLED, false)) {
+            val shouldRun = prefs.getBoolean(KEY_ENABLED, false) || prefs.getBoolean(KEY_VOLUME_NORMALIZATION, true)
+            if (!prefs.getBoolean(KEY_APPLY_GLOBAL, true) && shouldRun) {
                 sendApply(context)
             }
         }

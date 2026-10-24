@@ -35,7 +35,11 @@ object OfficialCoverStore {
             if (loaded) return
             try {
                 for ((k, v) in prefs(ctx).all) {
-                    if (v is String && v.isNotEmpty()) mem.putIfAbsent(k, v)
+                    if (v is String && v.isNotEmpty()) {
+                        mem.putIfAbsent(k, v)
+                        val bareId = if (k.startsWith("VL") && k.length > 2) k.substring(2) else k
+                        mem.putIfAbsent(bareId, v)
+                    }
                 }
             } catch (_: Exception) {
             }
@@ -53,9 +57,12 @@ object OfficialCoverStore {
         if (!u.startsWith("http")) return
         if (LocalFilesStore.isLocalAlbumId(id) || LocalFilesStore.PLAYLIST_ID == id) return
         ensureLoaded(ctx)
-        if (mem.put(id, u) == u) return
+        val bareId = if (id.startsWith("VL") && id.length > 2) id.substring(2) else id
+        val prevBare = mem.put(bareId, u)
+        val prevId = mem.put(id, u)
+        if (prevBare == u && prevId == u) return
         try {
-            prefs(ctx).edit().putString(id, u).apply()
+            prefs(ctx).edit().putString(bareId, u).putString(id, u).apply()
         } catch (_: Exception) {
         }
     }
@@ -66,6 +73,7 @@ object OfficialCoverStore {
         val id = playlistId?.trim().orEmpty()
         if (id.isEmpty()) return null
         ensureLoaded(ctx)
-        return mem[id]?.takeIf { it.isNotEmpty() }
+        val bareId = if (id.startsWith("VL") && id.length > 2) id.substring(2) else id
+        return (mem[id] ?: mem[bareId] ?: mem["VL$bareId"])?.takeIf { it.isNotEmpty() }
     }
 }
