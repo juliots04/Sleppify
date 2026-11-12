@@ -1,13 +1,30 @@
 package com.example.sleppify
 
 import android.content.Context
-import android.media.MediaMetadataRetriever
 import android.os.Environment
 import android.os.StatFs
 import java.io.File
 import java.util.LinkedHashMap
 
 object OfflineAudioStore {
+    private val deletionExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    fun interface DeleteCallback { fun onComplete(deleted: Int) }
+
+    @JvmStatic @JvmOverloads
+    fun deleteOfflineAudioAsync(context: Context, ids: List<String>, callback: DeleteCallback? = null) {
+        val app = context.applicationContext
+        val snapshot = ids.toList()
+        deletionExecutor.execute {
+            val deleted = try { deleteOfflineAudio(app, snapshot) } catch (error: Exception) {
+                android.util.Log.w("OfflineAudioStore", "Cannot delete downloaded audio", error)
+                0
+            }
+            PlaybackEventBus.notifyPlaybackSnapshotUpdated()
+            if (callback != null) mainHandler.post { callback.onComplete(deleted) }
+        }
+    }
+
     private const val OFFLINE_AUDIO_DIR = "offline_audio"
     private const val OFFLINE_AUDIO_EXTENSION_WEBM = ".webm"
     private const val OFFLINE_AUDIO_EXTENSION = ".m4a"
@@ -28,10 +45,7 @@ object OfflineAudioStore {
         LEGACY_OFFLINE_AUDIO_EXTENSION,
         LEGACY_BIN_OFFLINE_AUDIO_EXTENSION
     )
-    private const val MIN_VALID_AUDIO_FILE_BYTES = 24L * 1024L
-    private const val MIN_VALID_AUDIO_DURATION_SECONDS = 6
-    private const val EXPECTED_DURATION_MATCH_RATIO = 0.88f
-    private const val EXPECTED_DURATION_LEEWAY_SECONDS = 8
+    private const val MIN_VALID_AUDIO_FILE_BYTES = AudioValidationPolicy.MIN_BYTES
     private const val OFFLINE_STATE_CACHE_MAX_ENTRIES = 4096
 
     private val OFFLINE_STATE_CACHE_LOCK = Any()
@@ -41,16 +55,12 @@ object OfflineAudioStore {
         }
     }
 
-    // Fingerprints (path:size:mtime) of files that PASSED full validation this process. Full
-    // validation opens a MediaMetadataRetriever per file (10-100ms of disk+parse); the UI calls
-    // hasValidatedOfflineAudio for every visible row on every scroll-settle and for EVERY track
-    // of a playlist on each ready-state recompute — re-parsing unchanged files over and over was
-    // the main source of jank until caches "warmed". A file that changes on disk (re-download,
-    // truncation) changes its size/mtime, so the fingerprint self-invalidates.
-    private val VALIDATED_FINGERPRINTS = object : LinkedHashMap<String, String>(128, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>): Boolean {
-            return size > OFFLINE_STATE_CACHE_MAX_ENTRIES
-        }
+    // Cache file inspection separately from duration expectations. A row without duration and
+    // a playlist scan with duration reuse the same read, but both run the appropriate policy.
+    private data class InspectionCache(val fingerprint: String, val metadata: AudioFileMetadata)
+    private val INSPECTIONS = object : LinkedHashMap<String, InspectionCache>(128, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, InspectionCache>): Boolean =
+            size > OFFLINE_STATE_CACHE_MAX_ENTRIES
     }
 
     private fun fingerprintOf(file: File): String {
@@ -186,6 +196,14 @@ object OfflineAudioStore {
         return File(getOfflineAudioDir(context), normalized + OFFLINE_AUDIO_EXTENSION)
     }
 
+    /** Playback uses content URIs for public/custom folders and paths for legacy staging files. */
+    @JvmStatic
+    fun getPlaybackSource(context: Context, trackId: String): String? {
+        val file = getExistingOfflineAudioFile(context, trackId)
+        return file.takeIf { it.isFile && it.length() > 0 }?.absolutePath
+            ?: DownloadLocationStore.get(context, trackId)?.uri?.toString()
+    }
+
     @JvmStatic
     fun hasOfflineAudio(context: Context, trackId: String): Boolean {
         val normalized = normalizeTrackId(trackId)
@@ -211,87 +229,50 @@ object OfflineAudioStore {
     }
 
     @JvmStatic
-    fun hasValidatedOfflineAudio(context: Context, trackId: String, expectedDurationLabel: String?): Boolean {
+    fun hasValidatedOfflineAudio(context: Context, trackId: String, expectedDurationLabel: String?): Boolean =
+        validateOfflineAudio(context, trackId, expectedDurationLabel) == AudioValidationPolicy.Result.VALID
+
+    /** UNREADABLE never authorizes deletion: a folder/decoder may be temporarily unavailable. */
+    @JvmStatic
+    fun validateOfflineAudio(context: Context, trackId: String, expectedDurationLabel: String?): AudioValidationPolicy.Result {
         val normalized = normalizeTrackId(trackId)
-
-        // Always check disk — do NOT short-circuit on the boolean cache. This method is the
-        // "source of truth" that callers rely on to detect failed downloads.
         val existing = getExistingOfflineAudioFile(context, normalized)
-        if (!existing.isFile || existing.length() <= 0L) {
-            putCachedOfflineState(normalized, false)
-            synchronized(OFFLINE_STATE_CACHE_LOCK) { VALIDATED_FINGERPRINTS.remove(normalized) }
-            return false
+        val stored = if (existing.isFile) null else DownloadLocationStore.get(context, normalized)
+        if (stored == null && !existing.isFile) {
+            markOfflineAudioState(normalized, false)
+            return AudioValidationPolicy.Result.INVALID
         }
-
-        // Fingerprint fast-path: if this exact file (path+size+mtime) already passed FULL
-        // validation this process, it is still valid — skip the expensive MediaMetadataRetriever
-        // parse. The disk stat above still guarantees a deleted/replaced file is re-checked.
-        val fingerprint = fingerprintOf(existing)
-        synchronized(OFFLINE_STATE_CACHE_LOCK) {
-            if (VALIDATED_FINGERPRINTS[normalized] == fingerprint) {
+        val uri = stored?.uri ?: android.net.Uri.fromFile(existing)
+        val size = if (stored == null) existing.length() else try {
+            context.contentResolver.openAssetFileDescriptor(uri, "r")?.use {
+                if (it.length >= 0) it.length else it.parcelFileDescriptor.statSize.takeIf { n -> n >= 0 } ?: stored.bytes
+            } ?: return AudioValidationPolicy.Result.UNREADABLE
+        } catch (_: Exception) { return AudioValidationPolicy.Result.UNREADABLE }
+        val fingerprint = if (stored == null) fingerprintOf(existing) else "$uri:$size"
+        val cached = synchronized(OFFLINE_STATE_CACHE_LOCK) { INSPECTIONS[normalized] }
+        val metadata = if (size < MIN_VALID_AUDIO_FILE_BYTES) null
+            else if (cached?.fingerprint == fingerprint) cached.metadata
+            else AudioFileMetadata.read(context, uri)
+        val result = AudioValidationPolicy.evaluate(size, metadata?.durationSeconds ?: -1,
+            metadata?.audioTracks ?: -1, metadata?.channels ?: -1,
+            TrackDuration.parseSeconds(expectedDurationLabel, -1))
+        when (result) {
+            AudioValidationPolicy.Result.VALID -> synchronized(OFFLINE_STATE_CACHE_LOCK) {
+                INSPECTIONS[normalized] = InspectionCache(fingerprint, metadata!!)
                 OFFLINE_STATE_CACHE[normalized] = true
-                return true
+            }
+            AudioValidationPolicy.Result.INVALID -> deleteOfflineAudio(context, normalized)
+            AudioValidationPolicy.Result.UNREADABLE -> synchronized(OFFLINE_STATE_CACHE_LOCK) {
+                INSPECTIONS.remove(normalized)
             }
         }
-
-        val actualDurationSeconds = readAudioDurationSeconds(existing)
-
-        // Genuinely-tiny files are junk — safe to remove.
-        if (existing.length() < MIN_VALID_AUDIO_FILE_BYTES) {
-            deleteOfflineAudio(context, normalized)
-            return false
-        }
-
-        // Duration could not be read (transient MediaMetadataRetriever failure) on an
-        // otherwise size-valid file: do NOT delete. This method is called from read-only UI
-        // status scans, and deleting here would destroy a good download and make the progress
-        // circle regress on a mere refresh. Report not-validated-now without poisoning the cache.
-        if (actualDurationSeconds < 0) {
-            return false
-        }
-
-        // Positively too short -> corrupt/partial download, remove it.
-        if (actualDurationSeconds < MIN_VALID_AUDIO_DURATION_SECONDS) {
-            deleteOfflineAudio(context, normalized)
-            return false
-        }
-
-        val expectedDurationSeconds = parseDurationSeconds(expectedDurationLabel)
-        if (expectedDurationSeconds <= 0) {
-            // Deliberately NOT fingerprinting this pass: without an expected duration the
-            // ratio check was skipped, so this is a WEAKER validation. Fingerprinting it would
-            // let a later call WITH a real duration label short-circuit to true on a partial
-            // file that the ratio check exists to catch (and the worker would never repair it).
-            // Only the full-strictness PASS below stores the fingerprint.
-            putCachedOfflineState(normalized, true)
-            return true
-        }
-
-        val scaledExpectedSeconds = kotlin.math.round(expectedDurationSeconds * EXPECTED_DURATION_MATCH_RATIO).toInt()
-        val minimumAllowedDurationSeconds = kotlin.math.max(
-            MIN_VALID_AUDIO_DURATION_SECONDS,
-            scaledExpectedSeconds - EXPECTED_DURATION_LEEWAY_SECONDS
-        )
-
-        val matchesExpectedDuration = actualDurationSeconds >= minimumAllowedDurationSeconds
-        if (!matchesExpectedDuration) {
-            android.util.Log.w("OfflineAudioStore", "validation:fail id=$normalized actual=$actualDurationSeconds expected=$expectedDurationLabel (min=$minimumAllowedDurationSeconds)")
-            // Shorter than expected. Don't delete on a read-only scan; just report not-validated
-            // so a re-download can replace it. The worker's own post-download
-            // validateDownloadedTrackFile still prunes genuinely-bad downloads at fetch time.
-            putCachedOfflineState(normalized, false)
-            return false
-        }
-
-        putCachedOfflineState(normalized, true)
-        synchronized(OFFLINE_STATE_CACHE_LOCK) { VALIDATED_FINGERPRINTS[normalized] = fingerprint }
-        return true
+        return result
     }
 
     @JvmStatic
     fun deleteOfflineAudio(context: Context, trackId: String): Boolean {
         val normalized = normalizeTrackId(trackId)
-        var removedAny = false
+        var removedAny = DownloadLocationStore.delete(context, normalized)
         // Purga en TODOS los volúmenes: la pista pudo descargarse antes de cambiar el toggle SD.
         for (dir in allOfflineAudioDirs(context)) {
             for (ext in LOOKUP_EXTENSIONS) {
@@ -301,8 +282,8 @@ object OfflineAudioStore {
                 }
             }
         }
-        putCachedOfflineState(normalized, false)
-        synchronized(OFFLINE_STATE_CACHE_LOCK) { VALIDATED_FINGERPRINTS.remove(normalized) }
+        putCachedOfflineState(normalized, hasOfflineAudioOnDisk(context, normalized))
+        synchronized(OFFLINE_STATE_CACHE_LOCK) { INSPECTIONS.remove(normalized) }
         return removedAny
     }
 
@@ -322,7 +303,7 @@ object OfflineAudioStore {
 
     @JvmStatic
     fun deleteAllOfflineAudio(context: Context): Int {
-        var removedCount = 0
+        var removedCount = DownloadLocationStore.deleteAll(context)
         for (dir in allOfflineAudioDirs(context)) {
             val files = dir.listFiles() ?: continue
             for (file in files) {
@@ -337,7 +318,7 @@ object OfflineAudioStore {
 
     @JvmStatic
     fun getDownloadsTotalBytes(context: Context): Long {
-        var total = 0L
+        var total = DownloadLocationStore.totalBytes(context)
         for (dir in allOfflineAudioDirs(context)) {
             val files = dir.listFiles() ?: continue
             for (file in files) {
@@ -360,6 +341,9 @@ object OfflineAudioStore {
     @JvmStatic
     fun listDownloadedTrackIds(context: Context): Set<String> {
         val ids = HashSet<String>()
+        for (id in DownloadLocationStore.ids(context)) {
+            if (DownloadLocationStore.exists(context, id)) ids.add(id)
+        }
         for (dir in allOfflineAudioDirs(context)) {
             val files = dir.listFiles() ?: continue
             for (file in files) {
@@ -403,19 +387,30 @@ object OfflineAudioStore {
 
     @JvmStatic
     fun getThumbnailUri(context: Context, trackId: String): android.net.Uri? {
+        DownloadLocationStore.get(context, trackId)?.let { return it.uri }
         val file = getExistingOfflineAudioFile(context, trackId)
         return if (file.exists()) android.net.Uri.fromFile(file) else null
+    }
+
+    @JvmStatic
+    fun invalidateOfflineAudioState(trackId: String) {
+        val key = normalizeTrackId(trackId)
+        synchronized(OFFLINE_STATE_CACHE_LOCK) {
+            OFFLINE_STATE_CACHE.remove(key)
+            INSPECTIONS.remove(key)
+        }
     }
 
     @JvmStatic
     fun clearOfflineAudioStateCache() {
         synchronized(OFFLINE_STATE_CACHE_LOCK) {
             OFFLINE_STATE_CACHE.clear()
-            VALIDATED_FINGERPRINTS.clear()
+            INSPECTIONS.clear()
         }
     }
 
     private fun hasOfflineAudioOnDisk(context: Context, normalizedTrackId: String): Boolean {
+        if (DownloadLocationStore.exists(context, normalizedTrackId)) return true
         for (dir in allOfflineAudioDirs(context)) {
             for (ext in LOOKUP_EXTENSIONS) {
                 val file = File(dir, normalizedTrackId + ext)
@@ -425,58 +420,6 @@ object OfflineAudioStore {
             }
         }
         return false
-    }
-
-    private fun readAudioDurationSeconds(file: File): Int {
-        val retriever = MediaMetadataRetriever()
-        return try {
-            retriever.setDataSource(file.absolutePath)
-            val durationMsValue = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-            if (durationMsValue.isNullOrBlank()) {
-                -1
-            } else {
-                val durationMs = durationMsValue.trim().toLong()
-                if (durationMs <= 0L) {
-                    -1
-                } else {
-                    kotlin.math.max(1L, durationMs / 1000L).toInt()
-                }
-            }
-        } catch (_: Exception) {
-            -1
-        } finally {
-            try {
-                retriever.release()
-            } catch (e: Exception) {
-                android.util.Log.w("OfflineAudioStore", "Failed to release MediaMetadataRetriever", e)
-            }
-        }
-    }
-
-    private fun parseDurationSeconds(durationLabel: String?): Int {
-        if (durationLabel.isNullOrBlank()) {
-            return -1
-        }
-
-        val parts = durationLabel.trim().split(":")
-        return try {
-            when (parts.size) {
-                2 -> {
-                    val minutes = parts[0].toInt()
-                    val seconds = parts[1].toInt()
-                    (minutes * 60) + seconds
-                }
-                3 -> {
-                    val hours = parts[0].toInt()
-                    val minutes = parts[1].toInt()
-                    val seconds = parts[2].toInt()
-                    (hours * 3600) + (minutes * 60) + seconds
-                }
-                else -> -1
-            }
-        } catch (_: Exception) {
-            -1
-        }
     }
 
     private fun getCachedOfflineState(normalizedTrackId: String): Boolean? {

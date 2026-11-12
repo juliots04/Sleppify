@@ -316,7 +316,9 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
         }
     }
 
-    private void openFullPlayer() {
+    public void openFullPlayer() {
+        if (activity.isFinishing() || activity.isDestroyed()
+                || activity.getSupportFragmentManager().isStateSaved()) return;
         // Animate mini-player out
         animateOut();
 

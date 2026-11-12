@@ -358,6 +358,8 @@ class CommentsBottomSheet(
 
         rvComments.layoutManager = LinearLayoutManager(context)
         rvComments.adapter = adapter
+        rvComments.itemAnimator = null
+        rvComments.addItemDecoration(adapter.threadGuides())
         rvComments.addOnScrollListener(object : RecyclerView.OnScrollListener() {
             override fun onScrolled(rv: RecyclerView, dx: Int, dy: Int) {
                 if (!rv.canScrollVertically(1) && !isLoading && nextPageToken != null) {
@@ -1183,6 +1185,47 @@ class CommentsBottomSheet(
 
         override fun getItemCount() = rows.size
         override fun getItemViewType(position: Int) = rows[position].type
+
+        fun threadGuides() = object : RecyclerView.ItemDecoration() {
+            private val density = context.resources.displayMetrics.density
+            private val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                color = 0xFF555555.toInt()
+                strokeWidth = density
+                style = android.graphics.Paint.Style.STROKE
+                strokeCap = android.graphics.Paint.Cap.ROUND
+            }
+            private val branch = android.graphics.Path()
+
+            override fun onDraw(canvas: android.graphics.Canvas, parent: RecyclerView, state: RecyclerView.State) {
+                val rtl = parent.layoutDirection == View.LAYOUT_DIRECTION_RTL
+                fun x(dp: Float): Float = if (rtl) parent.width - dp * density else dp * density
+                val spine = x(34f)
+                for (i in 0 until parent.childCount) {
+                    val child = parent.getChildAt(i)
+                    val position = parent.getChildAdapterPosition(child)
+                    val row = rows.getOrNull(position) ?: continue
+                    val top = child.y
+                    val bottom = top + child.height
+                    if (row.type == TYPE_COMMENT) {
+                        if (rows.getOrNull(position + 1)?.commentIdx == row.commentIdx) {
+                            // Start below the parent avatar and continue across recycled rows.
+                            canvas.drawLine(spine, top + 54f * density, spine, bottom, paint)
+                        }
+                        continue
+                    }
+                    val center = if (row.type == TYPE_REPLY) top + 24f * density
+                        else top + child.height / 2f
+                    val radius = 8f * density
+                    canvas.drawLine(spine, top, spine,
+                        if (row.type == TYPE_REPLY) bottom else center - radius, paint)
+                    branch.reset()
+                    branch.moveTo(spine, center - radius)
+                    branch.quadTo(spine, center, x(42f), center)
+                    branch.lineTo(x(58f), center)
+                    canvas.drawPath(branch, paint)
+                }
+            }
+        }
 
         /**
          * Range-notify one comment's reply expand/collapse (rows must already be rebuilt).

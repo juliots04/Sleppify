@@ -14,7 +14,7 @@
         android:id="@+id/ivTopPlayedThumb"
         android:layout_width="140dp"
         android:layout_height="140dp"
-        android:background="@color/surface_high"
+        android:background="@color/artwork_background"
         android:scaleType="fitCenter" />
 
     <TextView

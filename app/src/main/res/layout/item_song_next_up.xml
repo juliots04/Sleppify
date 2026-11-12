@@ -4,26 +4,29 @@
     android:id="@+id/rootNextUpItem"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
-    android:layout_marginBottom="10dp"
+    android:layout_marginBottom="4dp"
     android:background="@drawable/bg_playlist_track_default"
     android:clickable="true"
     android:focusable="true"
     android:foreground="?attr/selectableItemBackground"
     android:gravity="center_vertical"
     android:orientation="horizontal"
-    android:padding="8dp">
+    android:paddingVertical="8dp"
+    android:paddingHorizontal="16dp">
 
-    <ImageView
+    <com.google.android.material.imageview.ShapeableImageView
         android:id="@+id/ivNextUpArt"
-        android:layout_width="50dp"
-        android:layout_height="50dp"
-        android:scaleType="fitCenter"
-        android:background="@color/surface_high" />
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:scaleType="centerCrop"
+        android:background="@color/artwork_background"
+        app:shapeAppearanceOverlay="@style/ShapeAppearance.Sleppify.TrackThumb" />
 
     <LinearLayout
         android:layout_width="0dp"
         android:layout_height="wrap_content"
-        android:layout_marginStart="12dp"
+        android:layout_marginStart="14dp"
+        android:layout_marginEnd="12dp"
         android:layout_weight="1"
         android:orientation="vertical">
 
@@ -31,11 +34,10 @@
             android:id="@+id/tvNextUpTitle"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginEnd="30dp"
             android:ellipsize="end"
             android:fontFamily="sans-serif-black"
-            android:maxLines="2"
-            android:text="Cancion"
+            android:maxLines="1"
+            android:text="Canción"
             android:textColor="@color/text_primary"
             android:textSize="14sp"
             android:textStyle="bold"
@@ -45,24 +47,22 @@
             android:id="@+id/tvNextUpArtist"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="2dp"
+            android:layout_marginTop="3dp"
             android:ellipsize="end"
             android:fontFamily="@font/inter_variable"
             android:maxLines="1"
             android:text="Artista"
             android:textColor="@color/text_secondary"
-            android:textSize="14sp"
+            android:textSize="12sp"
             android:includeFontPadding="false" />
     </LinearLayout>
 
     <ImageView
         android:id="@+id/ivQueueDragHandle"
-        android:layout_width="40dp"
-        android:layout_height="40dp"
-        android:layout_marginStart="8dp"
-        android:layout_marginEnd="4dp"
-        android:padding="8dp"
-        android:src="@android:drawable/ic_menu_sort_by_size"
+        android:layout_width="36dp"
+        android:layout_height="36dp"
+        android:padding="6dp"
+        android:src="@drawable/ic_reorder_two_bars"
         app:tint="@color/text_secondary" />
 
 </LinearLayout>

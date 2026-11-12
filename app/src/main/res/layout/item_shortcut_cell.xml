@@ -16,6 +16,7 @@
         android:foreground="?attr/selectableItemBackground">
 
         <ImageView
+        android:background="@color/artwork_background"
             android:id="@+id/ivShortcutThumb"
             android:layout_width="0dp"
             android:layout_height="0dp"

@@ -30,7 +30,7 @@ object AppUpdateManager {
     private const val TAG = "AppUpdateManager"
 
     // Panel real en alwaysdata (la app busca version.json en la raíz del dominio).
-    private const val UPDATE_BASE_URL = "https://sleppifymanagerupdate.alwaysdata.net/"
+    private const val UPDATE_BASE_URL = "https://sleppifyupdates21.alwaysdata.net/"
     private const val MANIFEST_URL = UPDATE_BASE_URL + "version.json"
 
     class UpdateInfo(

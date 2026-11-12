@@ -206,8 +206,19 @@ object RadioHistoryStore {
             val id = obj.optString("radioPlaylistId", "")
             if (id.isEmpty()) continue
             val existing = byId[id]
-            if (existing == null || obj.optLong("createdAt", 0L) > existing.optLong("createdAt", 0L)) {
+            if (existing == null) {
                 byId[id] = obj
+            } else {
+                val bestCount = Math.max(
+                    existing.optInt("playCount", MIN_PLAYS_FOR_TOP),
+                    obj.optInt("playCount", MIN_PLAYS_FOR_TOP)
+                )
+                if (obj.optLong("createdAt", 0L) > existing.optLong("createdAt", 0L)) {
+                    obj.put("playCount", bestCount)
+                    byId[id] = obj
+                } else {
+                    existing.put("playCount", bestCount)
+                }
             }
         }
 

@@ -2,8 +2,6 @@ package com.example.sleppify
 
 import android.content.Context
 import android.content.SharedPreferences
-import android.media.MediaExtractor
-import android.media.MediaMetadataRetriever
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.text.TextUtils
@@ -11,7 +9,6 @@ import android.util.Log
 import androidx.work.Data
 import androidx.work.Worker
 import androidx.work.WorkerParameters
-import java.io.File
 import java.io.InterruptedIOException
 import java.net.ConnectException
 import java.net.SocketException
@@ -28,10 +25,27 @@ class OfflinePlaylistDownloadWorker(
     context: Context,
     params: WorkerParameters
 ) : Worker(context, params) {
+    @Volatile private var storageFailure = false
 
     override fun doWork(): Result {
+        val token = inputData.getString(INPUT_MANIFEST)
+        val manifest = if (token == null) null else try {
+            OfflineDownloadManifest.read(OfflineDownloadScheduler.directory(applicationContext), token)
+        } catch (error: java.io.IOException) {
+            Log.e(TAG, "Cannot read download manifest", error)
+            return Result.failure()
+        }
+        val result = download(manifest)
+        // Keep the payload across retries and process death; release it after terminal work.
+        if (token != null && result !is Result.Retry) {
+            OfflineDownloadManifest.delete(OfflineDownloadScheduler.directory(applicationContext), token)
+        }
+        return result
+    }
+
+    private fun download(manifest: OfflineDownloadManifest?): Result {
         val appContext = applicationContext
-        val ids = inputData.getStringArray(INPUT_VIDEO_IDS)
+        val ids = manifest?.ids ?: inputData.getStringArray(INPUT_VIDEO_IDS)
         if (ids == null || ids.isEmpty()) {
             return Result.failure(
                 Data.Builder()
@@ -47,9 +61,9 @@ class OfflinePlaylistDownloadWorker(
             inputData.getString(INPUT_PLAYLIST_TITLE),
             inputData.getString(INPUT_PLAYLIST_ID)
         )
-        val titles = inputData.getStringArray(INPUT_TITLES)
-        val artists = inputData.getStringArray(INPUT_ARTISTS)
-        val durations = inputData.getStringArray(INPUT_DURATIONS)
+        val titles = manifest?.titles ?: inputData.getStringArray(INPUT_TITLES)
+        val artists = manifest?.artists ?: inputData.getStringArray(INPUT_ARTISTS)
+        val durations = manifest?.durations ?: inputData.getStringArray(INPUT_DURATIONS)
 
         val pendingTotal = ids.size
         val alreadyOfflineCount = maxOf(0, inputData.getInt(INPUT_ALREADY_OFFLINE_COUNT, 0))
@@ -80,10 +94,9 @@ class OfflinePlaylistDownloadWorker(
                 }
 
                 val trackIndex = i
-                val serverIndex = trackIndex % SleppifyDownloaderResolver.SERVER_COUNT
                 completionService.submit {
                     processSingleTrackDownload(
-                        appContext, userInitiated, trackIndex, serverIndex, ids, titles, artists, durations,
+                        appContext, userInitiated, trackIndex, ids, titles, artists, durations,
                         activeTrackIds, activeTrackProgressFractions
                     )
                 }
@@ -143,6 +156,7 @@ class OfflinePlaylistDownloadWorker(
         }
 
         val reason = when {
+            storageFailure -> OUTPUT_REASON_STORAGE
             encounteredNoNetwork -> OUTPUT_REASON_NO_NETWORK
             downloaded <= 0 -> OUTPUT_REASON_NO_MATCH
             downloaded < total -> OUTPUT_REASON_PARTIAL
@@ -220,7 +234,6 @@ class OfflinePlaylistDownloadWorker(
         context: Context,
         userInitiated: Boolean,
         trackIndex: Int,
-        serverIndex: Int,
         ids: Array<String?>,
         titles: Array<String?>?,
         artists: Array<String?>?,
@@ -247,6 +260,7 @@ class OfflinePlaylistDownloadWorker(
         val networkIssueTracker = NetworkIssueTracker()
 
         if (downloaded) {
+            if (!DownloadLocationStore.publish(context, id, title, artist)) storageFailure = true
             return TrackDownloadResult.downloaded(id, title, false)
         }
 
@@ -266,7 +280,7 @@ class OfflinePlaylistDownloadWorker(
                 return TrackDownloadResult.failed(id, title, true)
             }
 
-            downloaded = downloadTrack(context, id, serverIndex, networkIssueTracker, progressReporter)
+            downloaded = downloadTrack(context, id, networkIssueTracker, progressReporter)
             noNetworkEncountered = noNetworkEncountered || networkIssueTracker.hasIssue()
 
             if (!downloaded) {
@@ -275,20 +289,25 @@ class OfflinePlaylistDownloadWorker(
                 return TrackDownloadResult.failed(id, title, noNetworkEncountered)
             }
 
-            if (!validateDownloadedTrackFile(context, id, expectedDurationLabel)) {
+            val validation = OfflineAudioStore.validateOfflineAudio(context, id, expectedDurationLabel)
+            if (validation == AudioValidationPolicy.Result.UNREADABLE) {
+                Log.w(TAG, "track:temporarily_unreadable id=$id; keeping original file")
+                return TrackDownloadResult.failed(id, title, noNetworkEncountered)
+            }
+            if (validation == AudioValidationPolicy.Result.INVALID) {
                 Log.w(TAG, "track:validation_failed id=$id expectedDuration='$expectedDurationLabel' retrying once")
-                // Retry once: delete and redownload
-                OfflineAudioStore.deleteOfflineAudio(context, id)
+                // Validation already removed confirmed corrupt data. Retry the download once.
                 progressReporter.onProgress(0.05f)
-                val retryOk = downloadTrack(context, id, serverIndex, networkIssueTracker, progressReporter)
+                val retryOk = downloadTrack(context, id, networkIssueTracker, progressReporter)
                 noNetworkEncountered = noNetworkEncountered || networkIssueTracker.hasIssue()
-                if (!retryOk || !validateDownloadedTrackFile(context, id, expectedDurationLabel)) {
+                if (!retryOk || !OfflineAudioStore.hasValidatedOfflineAudio(context, id, expectedDurationLabel)) {
                     Log.w(TAG, "track:retry_validation_failed id=$id")
                     OfflineAudioStore.markOfflineAudioState(id, false)
                     return TrackDownloadResult.failed(id, title, noNetworkEncountered)
                 }
             }
 
+            if (!DownloadLocationStore.publish(context, id, title, artist)) storageFailure = true
             progressReporter.onProgress(1f)
             OfflineAudioStore.markOfflineAudioState(id, true)
             // Notify UI that a track was downloaded (so playlist offline state can be recalculated)
@@ -387,7 +406,6 @@ class OfflinePlaylistDownloadWorker(
     private fun downloadTrack(
         context: Context,
         videoId: String,
-        primaryServer: Int,
         networkIssueTracker: NetworkIssueTracker,
         progressReporter: ProgressReporter?
     ): Boolean {
@@ -412,132 +430,6 @@ class OfflinePlaylistDownloadWorker(
         }
 
         return false
-    }
-
-    private fun validateDownloadedTrackFile(
-        context: Context,
-        videoId: String,
-        expectedDurationLabel: String?
-    ): Boolean {
-        val audioFile = OfflineAudioStore.getExistingOfflineAudioFile(context, videoId)
-        if (!audioFile.isFile) return false
-
-        val sizeBytes = maxOf(0L, audioFile.length())
-        if (sizeBytes < MIN_VALID_AUDIO_FILE_BYTES) {
-            OfflineAudioStore.deleteOfflineAudio(context, videoId)
-            return false
-        }
-
-        val actualDurationSeconds = readAudioDurationSeconds(audioFile)
-        if (actualDurationSeconds < DOWNLOAD_DURATION_MIN_SAFE_SECONDS) {
-            OfflineAudioStore.deleteOfflineAudio(context, videoId)
-            return false
-        }
-
-        val channelCount = readAudioChannelCount(audioFile)
-        if (channelCount == 0) {
-            Log.w(TAG, "track:zero_channels_rejected id=$videoId")
-            OfflineAudioStore.deleteOfflineAudio(context, videoId)
-            return false
-        }
-
-        // Playability check: verify file can be read by MediaExtractor (detects corrupt/incomplete)
-        if (!isFilePlayable(audioFile)) {
-            Log.w(TAG, "track:not_playable id=$videoId")
-            OfflineAudioStore.deleteOfflineAudio(context, videoId)
-            return false
-        }
-
-        val expectedDurationSeconds = parseDurationSeconds(expectedDurationLabel)
-        if (expectedDurationSeconds <= 0) return true
-
-        val minimumAllowedDuration = maxOf(
-            DOWNLOAD_DURATION_MIN_SAFE_SECONDS,
-            Math.round(expectedDurationSeconds * DOWNLOAD_DURATION_MATCH_RATIO) - DOWNLOAD_DURATION_LEEWAY_SECONDS
-        )
-
-        if (actualDurationSeconds >= minimumAllowedDuration) return true
-
-        Log.w(
-            TAG,
-            "track:duration_mismatch id=$videoId expectedSec=$expectedDurationSeconds" +
-                    " actualSec=$actualDurationSeconds minAllowedSec=$minimumAllowedDuration"
-        )
-        OfflineAudioStore.deleteOfflineAudio(context, videoId)
-        return false
-    }
-
-    private fun readAudioDurationSeconds(file: File): Int {
-        val retriever = MediaMetadataRetriever()
-        try {
-            retriever.setDataSource(file.absolutePath)
-            val durationMsValue = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-            if (TextUtils.isEmpty(durationMsValue)) return -1
-            val durationMs = durationMsValue!!.trim().toLong()
-            if (durationMs <= 0L) return -1
-            return maxOf(1L, durationMs / 1000L).toInt()
-        } catch (_: Exception) {
-            return -1
-        } finally {
-            runCatching { retriever.release() }
-        }
-    }
-
-    private fun readAudioChannelCount(file: File): Int {
-        val extractor = MediaExtractor()
-        try {
-            extractor.setDataSource(file.absolutePath)
-            val trackCount = extractor.trackCount
-            for (i in 0 until trackCount) {
-                val format = extractor.getTrackFormat(i)
-                if (!format.containsKey(android.media.MediaFormat.KEY_MIME)) continue
-                val mime = format.getString(android.media.MediaFormat.KEY_MIME)
-                if (TextUtils.isEmpty(mime) || mime?.startsWith("audio/") != true) continue
-                if (format.containsKey(android.media.MediaFormat.KEY_CHANNEL_COUNT)) {
-                    val channels = format.getInteger(android.media.MediaFormat.KEY_CHANNEL_COUNT)
-                    if (channels > 0) return channels
-                }
-            }
-            return -1
-        } catch (_: Exception) {
-            return -1
-        } finally {
-            runCatching { extractor.release() }
-        }
-    }
-
-    private fun isFilePlayable(file: File): Boolean {
-        val extractor = MediaExtractor()
-        try {
-            extractor.setDataSource(file.absolutePath)
-            if (extractor.trackCount <= 0) return false
-            // Verify at least one audio or video track exists
-            for (i in 0 until extractor.trackCount) {
-                val format = extractor.getTrackFormat(i)
-                val mime = format.getString(android.media.MediaFormat.KEY_MIME) ?: continue
-                if (mime.startsWith("audio/") || mime.startsWith("video/")) return true
-            }
-            return false
-        } catch (_: Exception) {
-            return false
-        } finally {
-            runCatching { extractor.release() }
-        }
-    }
-
-    private fun parseDurationSeconds(durationLabel: String?): Int {
-        if (durationLabel.isNullOrEmpty()) return -1
-
-        val parts = durationLabel.trim().split(":")
-        return try {
-            when (parts.size) {
-                2 -> parts[0].toInt() * 60 + parts[1].toInt()
-                3 -> parts[0].toInt() * 3600 + parts[1].toInt() * 60 + parts[2].toInt()
-                else -> -1
-            }
-        } catch (_: Exception) {
-            -1
-        }
     }
 
     private fun isLikelyNetworkException(throwable: Throwable?): Boolean {
@@ -609,6 +501,7 @@ class OfflinePlaylistDownloadWorker(
         private const val PREF_PLAYLIST_OFFLINE_FRACTION_PREFIX = "playlist_offline_fraction_"
 
         @JvmField val INPUT_PLAYLIST_ID = "input_playlist_id"
+        @JvmField val INPUT_MANIFEST = "input_manifest"
         @JvmField val INPUT_VIDEO_IDS = "input_video_ids"
         @JvmField val INPUT_TITLES = "input_titles"
         @JvmField val INPUT_ARTISTS = "input_artists"
@@ -635,15 +528,12 @@ class OfflinePlaylistDownloadWorker(
         @JvmField val OUTPUT_REASON_NO_NETWORK = "no_network"
         @JvmField val OUTPUT_REASON_NO_MATCH = "no_match"
         @JvmField val OUTPUT_REASON_PARTIAL = "partial"
+        @JvmField val OUTPUT_REASON_STORAGE = "storage"
 
         private const val MAX_PARALLEL_DOWNLOADS_AUTO = 3
         private const val MAX_PARALLEL_DOWNLOADS_MANUAL = 3
         // Manual (single-track) jobs share one unique APPEND chain; bound their retries so a
         // stuck head job can't block every appended download behind it (head-of-line blocking).
         private const val MANUAL_QUEUE_MAX_RUN_ATTEMPTS = 2
-        private const val MIN_VALID_AUDIO_FILE_BYTES = 24L * 1024L
-        private const val DOWNLOAD_DURATION_MIN_SAFE_SECONDS = 6
-        private const val DOWNLOAD_DURATION_MATCH_RATIO = 0.88f
-        private const val DOWNLOAD_DURATION_LEEWAY_SECONDS = 8
     }
 }

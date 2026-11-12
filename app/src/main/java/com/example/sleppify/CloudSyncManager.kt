@@ -148,7 +148,7 @@ class CloudSyncManager private constructor(context: Context) {
             string(KEY_VIDEO_QUALITY_MOBILE, STREAMING_QUALITY_MEDIUM)
             bool(KEY_LIMIT_MOBILE_DATA, false)
             bool(KEY_WIFI_ONLY_PLAYBACK, false)
-            bool(KEY_NO_MUSIC_VIDEOS, true)
+            bool(KEY_NO_MUSIC_VIDEOS, false)
             bool(KEY_NO_PODCAST_VIDEOS, false)
             bool(KEY_AUTO_DOWNLOAD_PLAYED_SONGS, true)
         }

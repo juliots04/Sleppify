@@ -270,9 +270,9 @@ public final class CrossfadeManager {
 
         // 3. Offline files
         if (appContext != null && OfflineAudioStore.hasValidatedOfflineAudio(appContext, nextTrack.videoId, nextTrack.duration)) {
-            File nextFile = OfflineAudioStore.getExistingOfflineAudioFile(appContext, nextTrack.videoId);
-            if (nextFile != null && nextFile.isFile() && nextFile.length() > 0L) {
-                crossfadeWithSource(outgoing, nextIndex, nextTrack.videoId, nextFile.getAbsolutePath(), false, crossfadeDurationMs);
+            String source = OfflineAudioStore.getPlaybackSource(appContext, nextTrack.videoId);
+            if (!TextUtils.isEmpty(source)) {
+                crossfadeWithSource(outgoing, nextIndex, nextTrack.videoId, source, false, crossfadeDurationMs);
                 return;
             }
         }

@@ -3,8 +3,6 @@ package com.example.sleppify
 import android.content.Context
 import android.content.Intent
 import android.graphics.Color
-import android.net.ConnectivityManager
-import android.net.NetworkCapabilities
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -48,10 +46,7 @@ import org.json.JSONObject
 import androidx.core.content.res.ResourcesCompat
 import java.text.Normalizer
 import java.util.Locale
-import androidx.work.Constraints
 import androidx.work.Data
-import androidx.work.NetworkType
-import androidx.work.OneTimeWorkRequest
 import androidx.work.WorkManager
 
 // The canonical recents model now lives in the app-scoped RecentSearchesStore (per-uid prefs +
@@ -97,8 +92,8 @@ class SearchFragment : Fragment() {
         // favorites + every custom playlist + ALL cached playlist JSON blobs + history + radios on
         // EVERY onResume/onHiddenChanged; now it rebuilds only when the cheap staleness signature
         // over those sources changes (see loadLocalTrackIndex).
-        @Volatile private var cachedLocalTrackIndex: List<IndexedTrack>? = null
-        @Volatile private var cachedLocalTrackIndexSignature = 0L
+        private data class LocalIndexCache(val signature: Long, val items: List<IndexedTrack>)
+        @Volatile private var cachedLocalTrackIndex: LocalIndexCache? = null
 
         fun newInstance() = SearchFragment()
     }
@@ -204,8 +199,12 @@ class SearchFragment : Fragment() {
         // load/hydrate landing later re-pools the visible suggestions.
         RecentSearchesStore.ensureInitialized(requireContext())
         recentSearchesListener = RecentSearchesStore.Listener {
-            if (isAdded) refreshSearchSuggestions(etSearchQuery.text?.toString()?.trim() ?: "")
+            if (isAdded) {
+                preloadRecentArtwork()
+                refreshSearchSuggestions(etSearchQuery.text?.toString()?.trim() ?: "")
+            }
         }.also { RecentSearchesStore.addListener(it) }
+        preloadRecentArtwork()
         refreshSearchSuggestions("")
 
         setupBackNavigation()
@@ -418,14 +417,18 @@ class SearchFragment : Fragment() {
     }
 
 
+    private var localIndexJob: kotlinx.coroutines.Job? = null
+
     private fun loadLocalTrackIndex() {
-        lifecycleScope.launch(Dispatchers.IO) {
-            val ctx = context ?: return@launch
+        if (localIndexJob?.isActive == true) return
+        val ownerView = view ?: return
+        val ctx = context?.applicationContext ?: return
+        localIndexJob = viewLifecycleOwner.lifecycleScope.launch(Dispatchers.IO) {
 
             // Cheap staleness signature over the index's sources. Favorites, custom playlists,
             // history and radios are memory-cached by their stores after the first parse; the
             // playlist_tracks_data_* blobs (which have no parsed cache) are represented by
-            // key + raw length, so no JSON is touched unless something actually changed.
+            // key + content hash, so equal-length metadata edits also invalidate the index.
             val favorites = try { FavoritesPlaylistStore.loadFavorites(ctx) } catch (e: Exception) { emptyList() }
             val customPlaylists = try {
                 CustomPlaylistsStore.getAllPlaylistNames(ctx).map { name ->
@@ -444,24 +447,26 @@ class SearchFragment : Fragment() {
 
             var signature = 1125899906842597L
             fun mix(h: Int) { signature = signature * 31 + h }
-            for (t in favorites) mix(t.videoId.hashCode())
+            fun mixTrack(id: String, title: String, artist: String, duration: String, image: String) {
+                mix(id.hashCode()); mix(title.hashCode()); mix(artist.hashCode())
+                mix(duration.hashCode()); mix(image.hashCode())
+            }
+            for (t in favorites) mixTrack(t.videoId, t.title, t.artist, t.duration, t.imageUrl)
             for ((name, playlistTracks) in customPlaylists) {
                 mix(name.hashCode())
-                for (t in playlistTracks) mix(t.videoId.hashCode())
+                for (t in playlistTracks) mixTrack(t.videoId, t.title, t.artist, t.duration, t.imageUrl)
             }
-            for (t in history) mix(t.videoId.hashCode())
-            for (radio in radios) for (t in radio.tracks) mix(t.videoId.hashCode())
-            for ((key, value) in cachedBlobs) {
+            for (t in history) mixTrack(t.videoId, t.title, t.artist, t.duration, t.imageUrl)
+            for (radio in radios) for (t in radio.tracks) mixTrack(t.videoId, t.title, t.artist, "", t.thumbnailUrl)
+            for ((key, value) in cachedBlobs.toSortedMap()) {
                 mix(key.hashCode())
-                mix((value as String).length)
+                mix((value as String).hashCode())
             }
 
             val cached = cachedLocalTrackIndex
-            if (cached != null && cachedLocalTrackIndexSignature == signature) {
-                launch(Dispatchers.Main) {
-                    if (!isAdded) return@launch
-                    localTrackIndex.clear()
-                    localTrackIndex.addAll(cached)
+            if (cached?.signature == signature) {
+                kotlinx.coroutines.withContext(Dispatchers.Main) {
+                    publishLocalTrackIndex(ownerView, cached.items)
                 }
                 return@launch
             }
@@ -516,17 +521,20 @@ class SearchFragment : Fragment() {
                     normArtist.split(WHITESPACE_REGEX).filter { it.isNotEmpty() }
                 )
             }
-            cachedLocalTrackIndex = indexed
-            cachedLocalTrackIndexSignature = signature
-
-            launch(Dispatchers.Main) {
-                if (!isAdded) return@launch
-                localTrackIndex.clear()
-                localTrackIndex.addAll(indexed)
+            kotlinx.coroutines.withContext(Dispatchers.Main) {
+                if (view !== ownerView) return@withContext
+                cachedLocalTrackIndex = LocalIndexCache(signature, indexed)
+                publishLocalTrackIndex(ownerView, indexed)
             }
         }
     }
 
+    private fun publishLocalTrackIndex(ownerView: View, items: List<IndexedTrack>) {
+        if (!isAdded || view !== ownerView) return
+        localTrackIndex.clear()
+        localTrackIndex.addAll(items)
+        refreshSearchSuggestions(etSearchQuery.text?.toString())
+    }
 
     private fun showSuggestionsMode() {
         val query = etSearchQuery.text?.toString()?.trim() ?: ""
@@ -1339,7 +1347,7 @@ class SearchFragment : Fragment() {
             dialog.dismiss()
             if (hasOfflineAudio) {
                 if (videoId.isNotEmpty()) {
-                    OfflineAudioStore.deleteOfflineAudio(ctx.applicationContext, arrayListOf(videoId))
+                    OfflineAudioStore.deleteOfflineAudioAsync(ctx, listOf(videoId))
                 }
             } else {
                 downloadTrackFromSearch(track)
@@ -1485,36 +1493,12 @@ class SearchFragment : Fragment() {
         val ctx = requireContext()
         val title = track.title ?: "Tema"
         val artist = extractArtistFromSubtitle(track.subtitle)
-        val input = Data.Builder()
-            .putString(OfflinePlaylistDownloadWorker.INPUT_PLAYLIST_ID, "search")
-            .putString(OfflinePlaylistDownloadWorker.INPUT_PLAYLIST_TITLE, "Búsqueda")
-            .putStringArray(OfflinePlaylistDownloadWorker.INPUT_VIDEO_IDS, arrayOf(videoId))
-            .putStringArray(OfflinePlaylistDownloadWorker.INPUT_TITLES, arrayOf(title))
-            .putStringArray(OfflinePlaylistDownloadWorker.INPUT_ARTISTS, arrayOf(artist))
-            .putStringArray(OfflinePlaylistDownloadWorker.INPUT_DURATIONS, arrayOf("--:--"))
-            .putInt(OfflinePlaylistDownloadWorker.INPUT_ALREADY_OFFLINE_COUNT, 0)
-            .putInt(OfflinePlaylistDownloadWorker.INPUT_TOTAL_WITH_VIDEO_ID, 1)
-            .putBoolean(OfflinePlaylistDownloadWorker.INPUT_USER_INITIATED, true)
-            .putBoolean(OfflinePlaylistDownloadWorker.INPUT_MANUAL_QUEUE, true)
-            .build()
-        val prefs = ctx.getSharedPreferences(CloudSyncManager.PREFS_SETTINGS, Context.MODE_PRIVATE)
-        val allowMobile = prefs.getBoolean(CloudSyncManager.KEY_OFFLINE_DOWNLOAD_ALLOW_MOBILE_DATA, false)
-        val constraints = Constraints.Builder()
-            .setRequiredNetworkType(if (allowMobile) NetworkType.CONNECTED else NetworkType.UNMETERED)
-            .build()
-        val request = OneTimeWorkRequest.Builder(OfflinePlaylistDownloadWorker::class.java)
-            .setInputData(input)
-            .setConstraints(constraints)
-            // Short linear backoff: this request APPENDs into the shared manual chain, so a
-            // retrying head must resolve fast or it blocks everything appended after it.
-            .setBackoffCriteria(androidx.work.BackoffPolicy.LINEAR, 10, java.util.concurrent.TimeUnit.SECONDS)
+        val request = OfflineDownloadScheduler.Request(
+            "search", "Búsqueda",
+            arrayOf(videoId), arrayOf(title), arrayOf(artist), arrayOf("--:--"),
+            0, 1, true, true)
             .addTag("offline_search_dl_$videoId")
-            .build()
-        WorkManager.getInstance(ctx).enqueueUniqueWork(
-            AppConstants.OFFLINE_MANUAL_TRACK_QUEUE,
-            androidx.work.ExistingWorkPolicy.APPEND_OR_REPLACE,
-            request
-        )
+        OfflineDownloadScheduler.enqueue(ctx, request, AppConstants.OFFLINE_MANUAL_TRACK_QUEUE)
     }
 
     private fun showSaveToPlaylistSheet(track: YouTubeMusicService.TrackResult) {
@@ -1903,35 +1887,12 @@ class SearchFragment : Fragment() {
         if (!offlineAuto) return
         if (OfflineAudioStore.hasOfflineAudio(ctx, videoId)) return
         try {
-            val inputData = androidx.work.Data.Builder()
-                .putString(OfflinePlaylistDownloadWorker.INPUT_PLAYLIST_ID, playlistKey)
-                .putString(OfflinePlaylistDownloadWorker.INPUT_PLAYLIST_TITLE, playlistKey)
-                .putStringArray(OfflinePlaylistDownloadWorker.INPUT_VIDEO_IDS, arrayOf(videoId))
-                .putStringArray(OfflinePlaylistDownloadWorker.INPUT_TITLES, arrayOf(title))
-                .putStringArray(OfflinePlaylistDownloadWorker.INPUT_ARTISTS, arrayOf(artist))
-                .putStringArray(OfflinePlaylistDownloadWorker.INPUT_DURATIONS, arrayOf("--:--"))
-                .putInt(OfflinePlaylistDownloadWorker.INPUT_ALREADY_OFFLINE_COUNT, 0)
-                .putInt(OfflinePlaylistDownloadWorker.INPUT_TOTAL_WITH_VIDEO_ID, 1)
-                .putBoolean(OfflinePlaylistDownloadWorker.INPUT_USER_INITIATED, true)
-                .putBoolean(OfflinePlaylistDownloadWorker.INPUT_MANUAL_QUEUE, true)
-                .build()
-            val prefs = ctx.getSharedPreferences(CloudSyncManager.PREFS_SETTINGS, android.content.Context.MODE_PRIVATE)
-            val allowMobile = prefs.getBoolean(CloudSyncManager.KEY_OFFLINE_DOWNLOAD_ALLOW_MOBILE_DATA, false)
-            val constraints = androidx.work.Constraints.Builder()
-                .setRequiredNetworkType(if (allowMobile) androidx.work.NetworkType.CONNECTED else androidx.work.NetworkType.UNMETERED)
-                .build()
-            val request = androidx.work.OneTimeWorkRequest.Builder(OfflinePlaylistDownloadWorker::class.java)
-                .setInputData(inputData)
-                .setConstraints(constraints)
-                // Short linear backoff — see downloadSingleTrack: shared manual chain, no stuck heads.
-                .setBackoffCriteria(androidx.work.BackoffPolicy.LINEAR, 10, java.util.concurrent.TimeUnit.SECONDS)
+            val request = OfflineDownloadScheduler.Request(
+                playlistKey, playlistKey,
+                arrayOf(videoId), arrayOf(title), arrayOf(artist), arrayOf("--:--"),
+                0, 1, true, true)
                 .addTag("offline_add_track_$videoId")
-                .build()
-            androidx.work.WorkManager.getInstance(ctx).enqueueUniqueWork(
-                AppConstants.OFFLINE_MANUAL_TRACK_QUEUE,
-                androidx.work.ExistingWorkPolicy.APPEND_OR_REPLACE,
-                request
-            )
+            OfflineDownloadScheduler.enqueue(ctx, request, AppConstants.OFFLINE_MANUAL_TRACK_QUEUE)
         } catch (e: Exception) {
             Log.w(TAG, "Unexpected error", e)
         }
@@ -2054,12 +2015,13 @@ class SearchFragment : Fragment() {
     }
 
     private fun refreshSearchSuggestions(draft: String?) {
+        val owner = viewLifecycleOwnerLiveData.value ?: return
         suggestionsJob?.cancel()
         val norm = draft?.trim() ?: ""
         val recentSnapshot = RecentSearchesStore.snapshot()
         val trackSnapshot = localTrackIndex.toList()
         val serverSnapshot = if (norm.isNotEmpty() && norm == serverSuggestionsQuery) serverSuggestions else emptyList()
-        suggestionsJob = lifecycleScope.launch {
+        suggestionsJob = owner.lifecycleScope.launch {
             val items = kotlinx.coroutines.withContext(Dispatchers.Default) {
                 poolSuggestionItems(norm, recentSnapshot, trackSnapshot, serverSnapshot)
             }
@@ -2071,21 +2033,32 @@ class SearchFragment : Fragment() {
     }
 
     /** Fetch YT Music autocomplete for the current draft (once per draft; merged on arrival). */
+    private var pendingServerSuggestionsQuery = ""
+
     private fun maybeFetchServerSuggestions(draft: String) {
-        if (draft.length < 2 || draft == serverSuggestionsQuery) return
+        if (draft.length < 2) {
+            latestServerSuggestionsToken++
+            pendingServerSuggestionsQuery = ""
+            return
+        }
+        if (draft == serverSuggestionsQuery || draft == pendingServerSuggestionsQuery) return
         val requestToken = ++latestServerSuggestionsToken
+        pendingServerSuggestionsQuery = draft
         youTubeMusicService.fetchSearchSuggestions(draft, getCookieHeader(), object : YouTubeMusicService.SearchSuggestionsCallback {
             override fun onSuccess(suggestions: List<String>) {
                 if (!isAdded) return
                 // A newer draft's request is in flight — a late stale response must not
                 // clobber its suggestions.
-                if (requestToken != latestServerSuggestionsToken) return
+                if (requestToken != latestServerSuggestionsToken || view == null) return
+                pendingServerSuggestionsQuery = ""
                 serverSuggestionsQuery = draft
                 serverSuggestions = suggestions
                 // Re-pool only if the user is still on this draft (otherwise the next debounce wins).
                 if (etSearchQuery.text?.toString()?.trim() == draft) refreshSearchSuggestions(draft)
             }
-            override fun onError(error: String) { /* local suggestions remain */ }
+            override fun onError(error: String) {
+                if (requestToken == latestServerSuggestionsToken) pendingServerSuggestionsQuery = ""
+            }
         })
     }
 
@@ -2346,9 +2319,7 @@ class SearchFragment : Fragment() {
     }
 
     private fun isNetworkAvailable(): Boolean {
-        val cm = requireContext().getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
-        val caps = cm.getNetworkCapabilities(cm.activeNetwork) ?: return false
-        return caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) || caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) || caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+        return NetworkStatus.isOnline(context)
     }
 
     private fun getCookieHeader(): String {
@@ -2520,6 +2491,9 @@ class SearchFragment : Fragment() {
     }
 
     override fun onDestroyView() {
+        latestSearchRequestId++
+        searching = false
+        searchPaginationInFlight = false
         // Cover the rare case where the view is torn down without onPause running first, and
         // shut down the adapter's single-thread lookup executor so it doesn't leak a thread.
         suggestionsDebounceRunnable?.let { suggestionsDebounceHandler.removeCallbacks(it) }
@@ -2527,6 +2501,11 @@ class SearchFragment : Fragment() {
         adapter?.shutdown()
         recentSearchesListener?.let { RecentSearchesStore.removeListener(it) }
         recentSearchesListener = null
+        localIndexJob?.cancel()
+        localIndexJob = null
+        latestServerSuggestionsToken++
+        pendingServerSuggestionsQuery = ""
+        preloadedRecentArtwork.clear()
         super.onDestroyView()
     }
 
@@ -2796,6 +2775,8 @@ class SearchFragment : Fragment() {
                             improveHorizontalScrollDetection(vh.rv)
                             vh.rv.adapter = it
                             vh.rv.itemAnimator = null
+                            vh.rv.setItemViewCacheSize(4)
+                            (vh.rv.layoutManager as LinearLayoutManager).initialPrefetchItemCount = 4
                         }
                     imgAdapter.updateItems(item.items)
                 }
@@ -2826,10 +2807,41 @@ class SearchFragment : Fragment() {
         }
     }
 
+    private val preloadedRecentArtwork = mutableSetOf<String>()
+
+    private fun recentArtworkSize(): Int {
+        val metrics = resources.displayMetrics
+        return (((metrics.widthPixels - 32 * metrics.density) * 0.4f).toInt()
+            .coerceIn(192, 512) + 63) / 64 * 64
+    }
+
+    private fun recentArtworkRequest(url: String): com.bumptech.glide.RequestBuilder<Drawable> {
+        val size = recentArtworkSize()
+        return Glide.with(this).load(ThumbnailUrls.atSize(url, size, 72))
+            .transform(SHARED_YT_CROP)
+            .format(com.bumptech.glide.load.DecodeFormat.PREFER_RGB_565)
+            .override(size, size)
+            .diskCacheStrategy(DiskCacheStrategy.ALL)
+            .placeholder(R.color.artwork_background)
+            .error(R.color.artwork_background)
+            .dontAnimate()
+    }
+
+    private fun preloadRecentArtwork() {
+        if (!isAdded) return
+        if (preloadedRecentArtwork.size > 16) preloadedRecentArtwork.clear()
+        RecentSearchesStore.snapshot().asSequence().filter { it.thumbnail.isNotEmpty() }.take(4).forEach {
+            if (preloadedRecentArtwork.add(it.thumbnail)) {
+                recentArtworkRequest(it.thumbnail).preload(recentArtworkSize(), recentArtworkSize())
+            }
+        }
+    }
+
     private inner class RecentSearchImageAdapter(val onClick: (RecentSearch) -> Unit) : RecyclerView.Adapter<RecentSearchImageAdapter.ViewHolder>() {
         private val data = mutableListOf<RecentSearch>()
 
         fun updateItems(newList: List<RecentSearch>) {
+            if (data == newList) return
             val diffCallback = object : DiffUtil.Callback() {
                 override fun getOldListSize() = data.size
                 override fun getNewListSize() = newList.size
@@ -2869,54 +2881,13 @@ class SearchFragment : Fragment() {
             val item = data[p]
             h.title.text = item.title.ifEmpty { item.query }
             
-            // Show loading placeholder
-            h.loadingPlaceholder.visibility = View.VISIBLE
-            h.image.alpha = 0f
-            
-            if (item.thumbnail.isNotEmpty()) {
-                Glide.with(this@SearchFragment)
-                    // Request the CDN at the carousel cell size so recent-search covers load fast
-                    // instead of pulling full-resolution art.
-                    .load(ThumbnailUrls.atSize(item.thumbnail, 360))
-                    .transform(SHARED_YT_CROP)
-                    .format(com.bumptech.glide.load.DecodeFormat.PREFER_RGB_565)
-                    .override(360, 360)
-                    .diskCacheStrategy(DiskCacheStrategy.ALL)
-                    .listener(object : RequestListener<Drawable> {
-                        override fun onLoadFailed(
-                            e: GlideException?,
-                            model: Any?,
-                            target: Target<Drawable>,
-                            isFirstResource: Boolean
-                        ): Boolean {
-                            h.loadingPlaceholder.visibility = View.GONE
-                            return false
-                        }
+            // Cached covers are visible immediately; recycled rows never retain a stale fade.
+            h.image.animate().cancel()
+            h.loadingPlaceholder.animate().cancel()
+            h.image.alpha = 1f
+            h.loadingPlaceholder.visibility = View.GONE
+            recentArtworkRequest(item.thumbnail).into(h.image)
 
-                        override fun onResourceReady(
-                            resource: Drawable,
-                            model: Any,
-                            target: Target<Drawable>?,
-                            dataSource: DataSource,
-                            isFirstResource: Boolean
-                        ): Boolean {
-                            h.loadingPlaceholder.animate()
-                                .alpha(0f)
-                                .setDuration(250)
-                                .withEndAction { h.loadingPlaceholder.visibility = View.GONE }
-                                .start()
-                            h.image.animate()
-                                .alpha(1f)
-                                .setDuration(300)
-                                .start()
-                            return false
-                        }
-                    })
-                    .into(h.image)
-            } else {
-                h.loadingPlaceholder.visibility = View.GONE
-            }
-            
             h.itemView.setOnClickListener { onClick(item) }
         }
 

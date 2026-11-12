@@ -15,7 +15,7 @@
             android:id="@+id/ivArtistBackdrop"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
-            android:background="@color/surface_high"
+            android:background="@color/artwork_background"
             android:contentDescription="@null"
             android:scaleType="centerCrop" />
 
@@ -126,6 +126,7 @@
                 android:background="@drawable/bg_artist_play_fab" />
 
             <ImageView
+        android:background="@color/artwork_background"
                 android:id="@+id/btnArtistPlay"
                 android:layout_width="match_parent"
                 android:layout_height="match_parent"

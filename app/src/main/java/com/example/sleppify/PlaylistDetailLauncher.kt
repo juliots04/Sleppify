@@ -115,10 +115,8 @@ object PlaylistDetailLauncher {
 
         showChrome(activity)
 
-        if (reuseIfSameId && existing is PlaylistDetailFragment && existing.isAdded) {
-            // Reuse the live instance (the player button reuses rather than rebuilds the queue's
-            // detail). No id check: the caller only triggers this when the showing detail IS the
-            // queue's playlist, matching the pre-refactor behavior.
+        if (reuseIfSameId && existing is PlaylistDetailFragment && existing.isAdded
+            && existing.matchesPlaylist(normId, downloadedOnly)) {
             fragmentManager.beginTransaction()
                 .setReorderingAllowed(true)
                 .show(existing)
@@ -127,9 +125,11 @@ object PlaylistDetailLauncher {
         }
 
         // token dropped: resolveYoutubeAccessToken("") falls back to prefs.
+        val saved = SavedPlaylistsStore.get(activity, normId)
         val fragment = PlaylistDetailFragment.newInstance(
             normId, normTitle, normSubtitle, effectiveThumb, "",
-            params?.trim().orEmpty(), artHint?.trim().orEmpty(), downloadedOnly
+            params?.trim()?.takeIf { it.isNotEmpty() } ?: saved?.optString("params").orEmpty(),
+            artHint?.trim()?.takeIf { it.isNotEmpty() } ?: saved?.optString("artHint").orEmpty(), downloadedOnly
         )
         val tx = fragmentManager.beginTransaction().setReorderingAllowed(true)
         if (removeExisting && existing != null && existing.isAdded) {

@@ -142,6 +142,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var topAppBar: View
     private lateinit var fragmentContainer: View
     private lateinit var moduleLoadingOverlay: View
+    private var moduleLoadingGeneration = 0L
+    private var pendingOpenCurrentPlayer = false
     private var btnSignInHeader: MaterialButton? = null
 
     private var inSettings = false
@@ -591,6 +593,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     fun handlePlayFromSearchIntent(intent: Intent) {
+        if (intent.action == ACTION_OPEN_CURRENT_PLAYER) {
+            // Use the same entry as the mini-player, including snapshot restoration.
+            // Opening a notification must not navigate through (or recreate) Library.
+            pendingOpenCurrentPlayer = true
+            fragmentContainer.post { openPendingCurrentPlayer() }
+            intent.action = null
+            return
+        }
 
         if (currentMainNavItemId != R.id.nav_music) {
             // switchToMainModule reconciles the footer itself; setting selectedItemId here
@@ -602,6 +612,20 @@ class MainActivity : AppCompatActivity() {
         if (!invokedNow) {
             bottomNav.postDelayed({ invokeSearchActionOnMusicFragment(intent) }, 220L)
         }
+    }
+
+    override fun onPostResume() {
+        super.onPostResume()
+        fragmentContainer.post { openPendingCurrentPlayer() }
+    }
+
+    private fun openPendingCurrentPlayer() {
+        if (!pendingOpenCurrentPlayer || isFinishing || isDestroyed
+            || supportFragmentManager.isStateSaved
+            || !lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) return
+        pendingOpenCurrentPlayer = false
+        hideModuleLoadingOverlayImmediate()
+        globalMiniPlayer?.openFullPlayer()
     }
 
     private fun invokeSearchActionOnMusicFragment(intent: Intent): Boolean {
@@ -766,11 +790,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun isNetworkOnline(caps: android.net.NetworkCapabilities?): Boolean {
-        if (caps == null) return false
-        if (!caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)) return false
-        if (caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR)) return true
-        return caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED)
-                || !caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_CAPTIVE_PORTAL)
+        return NetworkStatus.isOnline(caps)
     }
 
     private fun registerNetworkCallback() {
@@ -1420,9 +1440,10 @@ class MainActivity : AppCompatActivity() {
         if (bottomNav.selectedItemId == R.id.nav_music) markStreamingEntryAsLibrary()
 
         inSettings = true
-        globalMiniPlayer?.hide()
-        setOverlayFullscreen(true)
-        showModuleLoadingOverlay()
+        if (entry != SettingsEntry.HISTORY) globalMiniPlayer?.hide()
+        configureLoadingOverlay()
+        if (entry == SettingsEntry.HISTORY || (target.isAdded && target.view != null)) hideModuleLoadingOverlayImmediate()
+        else showModuleLoadingOverlay()
         fragmentContainer.post {
             if (isFinishing || isDestroyed) return@post
             supportFragmentManager.beginTransaction().apply {
@@ -1439,8 +1460,8 @@ class MainActivity : AppCompatActivity() {
             }
             topAppBar.visibility = View.GONE
             setSolidNavigationBar(true)
-            bottomNav.visibility = View.GONE
-            fragmentContainer.post { fragmentContainer.post { revealModuleContent() } }
+            bottomNav.visibility = if (entry == SettingsEntry.HISTORY) View.VISIBLE else View.GONE
+            postModuleReveal()
         }
     }
 
@@ -1464,8 +1485,9 @@ class MainActivity : AppCompatActivity() {
         }
         val target = getMainModuleFragment(selectedId) ?: getOrCreateMainModuleFragment(selectedId)
         val isNew = target?.isAdded == false
-        setOverlayFullscreen(false)
-        showModuleLoadingOverlay()
+        configureLoadingOverlay()
+        if (target?.isAdded == true && target.view != null) hideModuleLoadingOverlayImmediate()
+        else showModuleLoadingOverlay()
         fragmentContainer.post {
             if (isFinishing || isDestroyed) return@post
             supportFragmentManager.beginTransaction().apply {
@@ -1483,7 +1505,7 @@ class MainActivity : AppCompatActivity() {
             setSolidNavigationBar(false)
             bottomNav.visibility = View.VISIBLE
             updateHeaderTitleForModule(selectedId)
-            fragmentContainer.post { fragmentContainer.post { revealModuleContent() } }
+            postModuleReveal()
         }
     }
 
@@ -1642,17 +1664,17 @@ class MainActivity : AppCompatActivity() {
         val name = SongSubtitle.artistOnly(artistName)
         if (name.isEmpty() || isFinishing || isDestroyed) return
         dismissSavedBar()
-        showModuleLoadingOverlay()
+        val loadingToken = showModuleLoadingOverlay()
         val cookie = getSharedPreferences(AppConstants.PREFS_PLAYER_STATE, MODE_PRIVATE)
             .getString(AppConstants.PREF_LAST_YOUTUBE_WEB_COOKIE, "")?.trim() ?: ""
         artistLookupService.searchArtistByName(name, cookie, object : YouTubeMusicService.ArtistSearchCallback {
             override fun onSuccess(artist: YouTubeMusicService.ArtistResult) {
-                if (isFinishing || isDestroyed) return
+                if (isFinishing || isDestroyed || loadingToken != moduleLoadingGeneration) return
                 openArtistDetail(artist)
             }
 
             override fun onError(error: String) {
-                if (isFinishing || isDestroyed) return
+                if (isFinishing || isDestroyed || loadingToken != moduleLoadingGeneration) return
                 openSearchFragmentWithQuery(name)
             }
         })
@@ -1693,7 +1715,7 @@ class MainActivity : AppCompatActivity() {
         // Search feel like a fresh load each time. First create keeps the overlay (SearchFragment
         // has its own scoped one too).
         val isWarmReentry = target.isAdded && target.view != null
-        if (!isWarmReentry) showModuleLoadingOverlay()
+        if (!isWarmReentry) showModuleLoadingOverlay() else hideModuleLoadingOverlayImmediate()
         suppressNavListener = true
         bottomNav.selectedItemId = R.id.nav_search
         suppressNavListener = false
@@ -1721,7 +1743,7 @@ class MainActivity : AppCompatActivity() {
         topAppBar.visibility = View.GONE
 
         if (!isWarmReentry) {
-            fragmentContainer.post { fragmentContainer.post { revealModuleContent() } }
+            postModuleReveal()
         } else if (moduleLoadingOverlay.visibility == View.VISIBLE) {
             // A stray overlay from another flow must not stay stuck over the warm fragment.
             revealModuleContent()
@@ -1732,11 +1754,13 @@ class MainActivity : AppCompatActivity() {
         suppressNavListener = true
         bottomNav.selectedItemId = currentMainNavItemId
         suppressNavListener = false
-        showModuleLoadingOverlay()
         
         val selectedId = bottomNav.selectedItemId
         val target = getMainModuleFragment(selectedId) ?: getOrCreateMainModuleFragment(selectedId)
-        val isNew = target?.isAdded == false
+        val detail = supportFragmentManager.findFragmentByTag(TAG_PLAYLIST_DETAIL)
+        if ((target?.isAdded == true && target.view != null) || (detail?.isAdded == true && detail.view != null)) {
+            hideModuleLoadingOverlayImmediate()
+        } else showModuleLoadingOverlay()
 
         // Keep SearchFragment ALIVE on close: hide it and cap at STARTED (like the other resident
         // modules) instead of the old popBackStackImmediate INCLUSIVE that destroyed it. Destroying
@@ -1787,7 +1811,7 @@ class MainActivity : AppCompatActivity() {
             updateHeaderTitleForModule(selectedId)
         }
         
-        fragmentContainer.post { fragmentContainer.post { revealModuleContent() } }
+        postModuleReveal()
     }
 
     private fun restoreMainModuleReferences() {
@@ -1934,6 +1958,7 @@ class MainActivity : AppCompatActivity() {
             ?.let { it.isAdded && !it.isHidden } == true
         val isTrulySwitching = currentMainNavItemId != itemId || !target.isAdded || target.isHidden || artistDetailVisible
         if (!isTrulySwitching && !inSettings) {
+            hideModuleLoadingOverlayImmediate()
             updateHeaderTitleForModule(itemId)
             if (itemId == R.id.nav_music) {
                 (target as? MusicPlayerFragment)?.scrollToTop()
@@ -1961,7 +1986,7 @@ class MainActivity : AppCompatActivity() {
             // the thing that reveals an empty/black home early (the exact bug we're fixing).
             val gateReveal = itemId == R.id.nav_principal
             if (gateReveal) {
-                setOverlayFullscreen(false)
+                configureLoadingOverlay()
                 showModuleLoadingOverlay()
             }
             supportFragmentManager.beginTransaction().apply {
@@ -1981,7 +2006,7 @@ class MainActivity : AppCompatActivity() {
             // re-loads the photo after the first frame. Skip the redundant pre-first-frame call.
             updateHeaderTitleForModule(itemId)
             if (gateReveal) {
-                fragmentContainer.postDelayed({ revealModuleContent() }, 3500L)
+                postModuleReveal(3500L)
             }
             finishMainModuleNavigation(itemId)
             return true
@@ -1992,9 +2017,10 @@ class MainActivity : AppCompatActivity() {
         // instantly, so we skip the loading overlay and the extra reveal frame entirely — showing
         // the dark spinner on every re-entry is what made navigation feel like a fresh load.
         val isWarmSwitch = target.isAdded && target.view != null
+        if (isWarmSwitch || itemId == R.id.nav_music) hideModuleLoadingOverlayImmediate()
         // Normal path: show overlay (cold target only, except nav_music which handles its own smooth rendering), then post fragment work
         if (!isWarmSwitch && itemId != R.id.nav_music) {
-            setOverlayFullscreen(false)
+            configureLoadingOverlay()
             showModuleLoadingOverlay()
         }
         // Warm target or nav_music: run the transaction synchronously to eliminate frame latency
@@ -2045,7 +2071,7 @@ class MainActivity : AppCompatActivity() {
             // clear any overlay that happened to be left visible so a warm switch can't get stuck
             // behind it.
             if (!isWarmSwitch && itemId != R.id.nav_music) {
-                fragmentContainer.post { revealModuleContent() }
+                postModuleReveal()
             } else if (moduleLoadingOverlay.visibility == View.VISIBLE) {
                 revealModuleContent()
             }
@@ -2058,34 +2084,52 @@ class MainActivity : AppCompatActivity() {
         return true
     }
 
-    fun showModuleLoadingOverlay() {
+    fun showModuleLoadingOverlay(): Long {
+        moduleLoadingGeneration++
+        moduleLoadingOverlay.animate().cancel()
         moduleLoadingOverlay.alpha = 1f
         moduleLoadingOverlay.visibility = View.VISIBLE
+        return moduleLoadingGeneration
     }
 
-    private fun setOverlayFullscreen(fullscreen: Boolean) {
+    private fun configureLoadingOverlay() {
         val lp = moduleLoadingOverlay.layoutParams as? androidx.constraintlayout.widget.ConstraintLayout.LayoutParams ?: return
-        if (fullscreen) {
-            // Settings / equalizer: cover everything except mini player & footer
-            lp.bottomToTop = R.id.llGlobalMiniPlayer
-            lp.bottomToBottom = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.UNSET
-        } else {
-            // Normal module switch: stop above the mini player (which chains to bottomNav)
-            lp.bottomToTop = R.id.llGlobalMiniPlayer
-            lp.bottomToBottom = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.UNSET
-        }
+        lp.bottomToTop = R.id.llGlobalMiniPlayer
+        lp.bottomToBottom = androidx.constraintlayout.widget.ConstraintLayout.LayoutParams.UNSET
         lp.bottomMargin = 0
         moduleLoadingOverlay.layoutParams = lp
     }
 
-    fun revealModuleContent() {
+    @JvmOverloads
+    fun revealModuleContent(source: Fragment? = null) {
         if (isFinishing || isDestroyed) return
+        if (source != null) {
+            val sourceView = source.view ?: return
+            if (!source.isAdded || source.isHidden || sourceView.parent !== fragmentContainer) return
+            val container = fragmentContainer as android.view.ViewGroup
+            // A still-started fragment underneath another detail must not reveal that detail.
+            for (i in container.indexOfChild(sourceView) + 1 until container.childCount) {
+                if (container.getChildAt(i).visibility == View.VISIBLE) return
+            }
+        }
+        if (moduleLoadingOverlay.visibility != View.VISIBLE) return
+        val token = moduleLoadingGeneration
         moduleLoadingOverlay.animate().cancel()
         moduleLoadingOverlay.animate()
             .alpha(0f)
             .setDuration(200L)
-            .withEndAction { moduleLoadingOverlay.visibility = View.GONE }
+            .withEndAction { if (token == moduleLoadingGeneration) moduleLoadingOverlay.visibility = View.GONE }
             .start()
+    }
+
+    private fun postModuleReveal(delayMillis: Long = 0L) {
+        val token = moduleLoadingGeneration
+        fragmentContainer.postDelayed({
+            if (token != moduleLoadingGeneration || isFinishing || isDestroyed) return@postDelayed
+            fragmentContainer.post {
+                if (token == moduleLoadingGeneration) revealModuleContent()
+            }
+        }, delayMillis)
     }
 
     /**
@@ -2095,6 +2139,7 @@ class MainActivity : AppCompatActivity() {
      */
     fun hideModuleLoadingOverlayImmediate() {
         if (isFinishing || isDestroyed) return
+        moduleLoadingGeneration++
         moduleLoadingOverlay.animate().cancel()
         moduleLoadingOverlay.alpha = 0f
         moduleLoadingOverlay.visibility = View.GONE

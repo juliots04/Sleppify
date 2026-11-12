@@ -102,6 +102,8 @@ public class ArtistDetailFragment extends Fragment {
     private YouTubeMusicService youTubeMusicService;
     private ArtistAdapter adapter;
     private boolean loaded = false;
+    private long viewGeneration;
+    private OnBackPressedCallback backCallback;
     private boolean following = false;
 
     private int heroDominantColor = 0;
@@ -182,6 +184,7 @@ public class ArtistDetailFragment extends Fragment {
     @Override
     public void onViewCreated(@NonNull View view, @Nullable Bundle savedInstanceState) {
         super.onViewCreated(view, savedInstanceState);
+        viewGeneration++;
 
         // A recreated view means a fresh header ImageView: forget the last hero load so the
         // rebind reloads (from cache), and re-arm the overlay reveal gate.
@@ -226,13 +229,13 @@ public class ArtistDetailFragment extends Fragment {
             }
         });
 
-        requireActivity().getOnBackPressedDispatcher().addCallback(getViewLifecycleOwner(),
-                new OnBackPressedCallback(true) {
+        backCallback = new OnBackPressedCallback(!isHidden()) {
                     @Override
                     public void handleOnBackPressed() {
                         goBack();
                     }
-                });
+                };
+        requireActivity().getOnBackPressedDispatcher().addCallback(getViewLifecycleOwner(), backCallback);
 
         if (getActivity() instanceof MainActivity) {
             ((MainActivity) getActivity()).hideTopAppBarForPlaylistDetail();
@@ -245,15 +248,16 @@ public class ArtistDetailFragment extends Fragment {
 
     private void loadArtist() {
         if (loaded) {
-            revealNow();
+            finishLoad();
             return;
         }
+        final long generation = viewGeneration;
         String cookie = readCookie();
         youTubeMusicService.fetchArtistPage(channelId, cookie,
                 new YouTubeMusicService.ArtistPageCallback() {
                     @Override
                     public void onSuccess(@NonNull YouTubeMusicService.ArtistPage page) {
-                        if (!isAdded()) return;
+                        if (!isCurrentView(generation)) return;
                         if (!TextUtils.isEmpty(page.subtitle)) monthlyListeners = page.subtitle;
                         if (!TextUtils.isEmpty(page.thumbnailUrl)) heroImageUrl = page.thumbnailUrl;
                         moreSongsBrowseId = page.moreSongsBrowseId == null
@@ -278,13 +282,14 @@ public class ArtistDetailFragment extends Fragment {
 
                     @Override
                     public void onError(@NonNull String error) {
-                        if (!isAdded()) return;
+                        if (!isCurrentView(generation)) return;
                         fetchViaSearch();
                     }
                 });
     }
 
     private void fetchViaSearch() {
+        final long generation = viewGeneration;
         // Search results aren't the artist's songs shelf — a "Ver más" browse over them would mix
         // two different orderings, so the button only exists on the real browse path.
         moreSongsBrowseId = "";
@@ -299,7 +304,7 @@ public class ArtistDetailFragment extends Fragment {
                 new YouTubeMusicService.SearchPageCallback() {
                     @Override
                     public void onSuccess(@NonNull YouTubeMusicService.SearchPageResult pageResult) {
-                        if (!isAdded()) return;
+                        if (!isCurrentView(generation)) return;
                         loaded = true;
                         songs.clear();
                         songs.addAll(dedupeSongs(pageResult.tracks));
@@ -308,7 +313,7 @@ public class ArtistDetailFragment extends Fragment {
 
                     @Override
                     public void onError(@NonNull String error) {
-                        if (!isAdded()) return;
+                        if (!isCurrentView(generation)) return;
                         loaded = true;
                         finishLoad();
                     }
@@ -353,25 +358,43 @@ public class ArtistDetailFragment extends Fragment {
     }
 
     private void doRevealNow() {
-        if (revealDone) return;
+        if (revealDone || !isAdded() || getView() == null || isHidden()) return;
         revealDone = true;
         if (getActivity() instanceof MainActivity) {
-            ((MainActivity) getActivity()).revealModuleContent();
+            ((MainActivity) getActivity()).revealModuleContent(this);
         }
     }
 
     /** Hero Glide request finished (ready OR failed) — release the reveal gate. */
-    private void onHeroImageSettled() {
+    private void onHeroImageSettled(long generation) {
         revealHandler.post(() -> {
+            if (!isCurrentView(generation)) return;
             heroReady = true;
             if (revealRequested) doRevealNow();
         });
     }
 
     @Override
+    public void onHiddenChanged(boolean hidden) {
+        super.onHiddenChanged(hidden);
+        if (backCallback != null) backCallback.setEnabled(!hidden);
+    }
+
+    @Override
     public void onDestroyView() {
+        viewGeneration++;
+        backCallback = null;
+        moreSongsLoading = false;
+        adapter = null;
+        tvState = null;
+        tvToolbarTitle = null;
+        toolbar = null;
         revealHandler.removeCallbacksAndMessages(null);
         super.onDestroyView();
+    }
+
+    private boolean isCurrentView(long generation) {
+        return generation == viewGeneration && isAdded() && getView() != null;
     }
 
     private void goBack() {
@@ -615,6 +638,7 @@ public class ArtistDetailFragment extends Fragment {
      * ("Ver más" / "Ver menos") with no further network.
      */
     private void onToggleSongs() {
+        final long generation = viewGeneration;
         if (moreSongsLoading) return;
         if (moreSongsFetched) {
             songsExpanded = !songsExpanded;
@@ -634,7 +658,7 @@ public class ArtistDetailFragment extends Fragment {
                 new YouTubeMusicService.MixTracksCallback() {
                     @Override
                     public void onSuccess(@NonNull List<YouTubeMusicService.TrackResult> tracks) {
-                        if (!isAdded()) return;
+                        if (!isCurrentView(generation)) return;
                         moreSongsLoading = false;
                         moreSongsFetched = true;
                         // Keep only songs we're not already showing.
@@ -654,7 +678,7 @@ public class ArtistDetailFragment extends Fragment {
 
                     @Override
                     public void onError(@NonNull String error) {
-                        if (!isAdded()) return;
+                        if (!isCurrentView(generation)) return;
                         moreSongsLoading = false;
                         moreSongsFetched = true; // don't hammer a failing browse; hide the button
                         if (adapter != null) adapter.notifyDataSetChanged();
@@ -710,7 +734,11 @@ public class ArtistDetailFragment extends Fragment {
          * request, the reload is skipped so the header doesn't visibly re-load.
          */
         void loadHero() {
-            if (TextUtils.isEmpty(heroImageUrl)) return;
+            final long generation = viewGeneration;
+            if (TextUtils.isEmpty(heroImageUrl)) {
+                onHeroImageSettled(generation);
+                return;
+            }
             DisplayMetrics dm = getResources().getDisplayMetrics();
             int w = dm.widthPixels;
             int h = (int) (HERO_HEIGHT_DP * dm.density);
@@ -738,7 +766,7 @@ public class ArtistDetailFragment extends Fragment {
                         @Override
                         public boolean onLoadFailed(@Nullable GlideException e, Object model,
                                                     Target<Drawable> target, boolean isFirstResource) {
-                            onHeroImageSettled();
+                            onHeroImageSettled(generation);
                             return false;
                         }
 
@@ -746,7 +774,7 @@ public class ArtistDetailFragment extends Fragment {
                         public boolean onResourceReady(Drawable resource, Object model,
                                                        Target<Drawable> target, DataSource dataSource,
                                                        boolean isFirstResource) {
-                            onHeroImageSettled();
+                            onHeroImageSettled(generation);
                             return false;
                         }
                     })

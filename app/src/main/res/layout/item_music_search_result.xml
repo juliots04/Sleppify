@@ -39,6 +39,7 @@
                 android:visibility="gone" />
 
             <ImageView
+        android:background="@color/artwork_background"
                 android:id="@+id/ivTrackThumb"
                 android:layout_width="match_parent"
                 android:layout_height="match_parent"

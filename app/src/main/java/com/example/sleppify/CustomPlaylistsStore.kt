@@ -25,6 +25,7 @@ object CustomPlaylistsStore {
         return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     }
 
+    @Synchronized
     fun getAllPlaylistNames(context: Context): List<String> {
         namesCache?.let { return it }
         val arr = getPrefs(context).getJsonArray(KEY_PLAYLIST_NAMES)
@@ -38,6 +39,7 @@ object CustomPlaylistsStore {
         return sorted
     }
 
+    @Synchronized
     fun createPlaylist(context: Context, name: String): Boolean {
         val trimmed = name.trim()
         if (TextUtils.isEmpty(trimmed)) return false
@@ -56,6 +58,7 @@ object CustomPlaylistsStore {
         return true
     }
 
+    @Synchronized
     fun addTrackToPlaylist(context: Context, playlistName: String, videoId: String, title: String, subtitle: String, duration: String, thumbnailUrl: String) {
         val prefs = getPrefs(context)
         val key = CUSTOM_PLAYLIST_PREFIX + playlistName
@@ -91,6 +94,7 @@ object CustomPlaylistsStore {
         
         prefs.edit().putString(key, newArr.toString()).apply()
         trackListCache.remove(key)
+        PlaylistSyncWorker.enqueue(context, key, videoId, true)
 
         // Sync to cloud if signed in
         if (AuthManager.getInstance(context).isSignedIn()) {
@@ -99,6 +103,7 @@ object CustomPlaylistsStore {
         }
     }
 
+    @Synchronized
     fun removeTrackFromPlaylist(context: Context, playlistName: String, videoId: String) {
         val prefs = getPrefs(context)
         val key = CUSTOM_PLAYLIST_PREFIX + playlistName
@@ -113,6 +118,7 @@ object CustomPlaylistsStore {
         }
         prefs.edit().putString(key, newArr.toString()).apply()
         trackListCache.remove(key)
+        PlaylistSyncWorker.enqueue(context, key, videoId, false)
 
         if (AuthManager.getInstance(context).isSignedIn()) {
             val updatedTracks = getTracksFromPlaylist(context, playlistName)
@@ -122,7 +128,9 @@ object CustomPlaylistsStore {
 
     // --- YT mirror playlist methods ---
 
-    fun addTrackToYtMirror(context: Context, playlistId: String, videoId: String, title: String, subtitle: String, duration: String, thumbnailUrl: String, insertAtTop: Boolean = false) {
+    @JvmOverloads
+    @Synchronized
+    fun addTrackToYtMirror(context: Context, playlistId: String, videoId: String, title: String, subtitle: String, duration: String, thumbnailUrl: String, insertAtTop: Boolean = false, syncToYouTube: Boolean = true) {
         if (videoId.isBlank() || playlistId.isBlank()) return
         val prefs = getPrefs(context)
         val key = YT_MIRROR_PREFIX + playlistId
@@ -164,13 +172,16 @@ object CustomPlaylistsStore {
         }
         trackListCache.remove(key)
 
+        if (syncToYouTube) PlaylistSyncWorker.enqueue(context, key, videoId, true)
         if (AuthManager.getInstance(context).isSignedIn()) {
             val updatedTracks = getYtMirrorTracks(context, playlistId)
             CloudSyncManager.getInstance(context).syncPlaylistToCloud(YT_MIRROR_PREFIX + playlistId, updatedTracks)
         }
     }
 
-    fun removeTrackFromYtMirror(context: Context, playlistId: String, videoId: String) {
+    @JvmOverloads
+    @Synchronized
+    fun removeTrackFromYtMirror(context: Context, playlistId: String, videoId: String, syncToYouTube: Boolean = true) {
         if (videoId.isBlank() || playlistId.isBlank()) return
         val prefs = getPrefs(context)
         val key = YT_MIRROR_PREFIX + playlistId
@@ -184,12 +195,14 @@ object CustomPlaylistsStore {
         prefs.edit().putString(key, newArr.toString()).apply()
         trackListCache.remove(key)
 
+        if (syncToYouTube) PlaylistSyncWorker.enqueue(context, key, videoId, false)
         if (AuthManager.getInstance(context).isSignedIn()) {
             val updatedTracks = getYtMirrorTracks(context, playlistId)
             CloudSyncManager.getInstance(context).syncPlaylistToCloud(YT_MIRROR_PREFIX + playlistId, updatedTracks)
         }
     }
 
+    @Synchronized
     fun getYtMirrorTracks(context: Context, playlistId: String): List<FavoritesPlaylistStore.FavoriteTrack> {
         val key = YT_MIRROR_PREFIX + playlistId
         trackListCache[key]?.let { return it }
@@ -212,6 +225,7 @@ object CustomPlaylistsStore {
 
     // --- Custom playlist methods ---
 
+    @Synchronized
     fun getTracksFromPlaylist(context: Context, playlistName: String): List<FavoritesPlaylistStore.FavoriteTrack> {
         val key = CUSTOM_PLAYLIST_PREFIX + playlistName
         trackListCache[key]?.let { return it }
@@ -228,6 +242,7 @@ object CustomPlaylistsStore {
         return parsed
     }
 
+    @Synchronized
     fun savePlaylist(context: Context, playlistName: String, tracks: List<FavoritesPlaylistStore.FavoriteTrack>) {
         val prefs = getPrefs(context)
         val key = CUSTOM_PLAYLIST_PREFIX + playlistName
@@ -262,6 +277,7 @@ object CustomPlaylistsStore {
         namesCache = null
     }
 
+    @Synchronized
     fun deletePlaylist(context: Context, name: String): Boolean {
         val trimmed = name.trim()
         if (TextUtils.isEmpty(trimmed)) return false
@@ -285,6 +301,7 @@ object CustomPlaylistsStore {
         return true
     }
 
+    @Synchronized
     fun renamePlaylist(context: Context, oldName: String, newName: String): Boolean {
         val from = oldName.trim()
         val to = newName.trim()

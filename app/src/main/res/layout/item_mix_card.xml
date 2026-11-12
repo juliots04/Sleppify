@@ -13,7 +13,7 @@
         android:id="@+id/ivMixThumb"
         android:layout_width="170dp"
         android:layout_height="170dp"
-        android:background="@color/surface_high"
+        android:background="@color/artwork_background"
         android:scaleType="centerCrop"
         app:shapeAppearanceOverlay="@style/ShapeAppearance.Sleppify.MixRound" />
 

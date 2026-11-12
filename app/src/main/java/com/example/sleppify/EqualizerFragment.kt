@@ -65,6 +65,18 @@ class EqualizerFragment : Fragment() {
     private var forceSpeakerFallbackUntilMs: Long = 0L
     private var lastOutputRefreshAtMs: Long = 0L
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val entryRefresh = Runnable {
+        if (isAdded && !isHidden && isResumed && view != null) {
+            refreshOutputDeviceAndProfile(false, !hasLoadedUi)
+            refreshEqModuleState()
+            ensureEqServiceActive()
+        }
+    }
+
+    private fun scheduleEntryRefresh() {
+        mainHandler.removeCallbacks(entryRefresh)
+        if (view != null && !isHidden) mainHandler.post(entryRefresh)
+    }
 
     private val outputDeviceCallback: AudioDeviceCallback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<AudioDeviceInfo>?) {
@@ -150,26 +162,22 @@ class EqualizerFragment : Fragment() {
 
         setupListeners()
         applyCardStyles(view)
-        refreshOutputDeviceAndProfile(false, true)
-        refreshEqModuleState()
-        ensureEqServiceActive()
+        scheduleEntryRefresh()
     }
 
     override fun onHiddenChanged(hidden: Boolean) {
         super.onHiddenChanged(hidden)
         if (!hidden) {
             view?.findViewById<android.widget.ScrollView>(R.id.scrollEqContent)?.scrollTo(0, 0)
-            refreshOutputDeviceAndProfile(true, false)
-            refreshEqModuleState()
-            ensureEqServiceActive()
+            scheduleEntryRefresh()
+        } else {
+            mainHandler.removeCallbacks(entryRefresh)
         }
     }
 
     override fun onResume() {
         super.onResume()
-        refreshOutputDeviceAndProfile(true, false)
-        refreshEqModuleState()
-        ensureEqServiceActive()
+        scheduleEntryRefresh()
     }
 
     fun onCloudEqHydrationCompleted() {

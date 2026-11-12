@@ -16,7 +16,7 @@
         android:id="@+id/ivHistoryThumb"
         android:layout_width="48dp"
         android:layout_height="48dp"
-        android:background="@color/surface_high"
+        android:background="@color/artwork_background"
         android:scaleType="fitCenter" />
 
     <LinearLayout

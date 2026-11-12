@@ -15,18 +15,19 @@
         app:cardCornerRadius="8dp"
         app:cardElevation="0dp"
         app:strokeWidth="0dp"
-        app:cardBackgroundColor="@color/surface_high">
+        app:cardBackgroundColor="@color/artwork_background">
 
         <FrameLayout
             android:layout_width="match_parent"
             android:layout_height="match_parent">
 
             <ImageView
+        android:background="@color/artwork_background"
                 android:id="@+id/ivRecentSearchImage"
                 android:layout_width="match_parent"
                 android:layout_height="match_parent"
                 android:scaleType="centerCrop"
-                android:alpha="0"
+                android:alpha="1"
                 android:contentDescription="Miniatura de búsqueda reciente" />
 
             <!-- Loading placeholder -->
@@ -34,7 +35,7 @@
                 android:id="@+id/vLoadingPlaceholder"
                 android:layout_width="match_parent"
                 android:layout_height="match_parent"
-                android:background="@color/surface_high" />
+                android:background="@color/artwork_background" />
         </FrameLayout>
     </com.google.android.material.card.MaterialCardView>
 

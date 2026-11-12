@@ -257,7 +257,7 @@ object FavoritesPlaylistStore {
 
             updateCache(tracks)
             saveFavorites(context, tracks)
-            OfflineAudioStore.deleteOfflineAudio(context, safeVideoId)
+            OfflineAudioStore.deleteOfflineAudioAsync(context, listOf(safeVideoId))
             return true
         }
     }

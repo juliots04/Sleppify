@@ -152,7 +152,7 @@ object LocalArtworkResolver {
     private fun bindBytes(imageView: ImageView, videoId: String, bytes: ByteArray, sizePx: Int) {
         // Arte embebido REAL: llena el thumbnail (centerCrop) como cualquier carátula de red.
         imageView.scaleType = ImageView.ScaleType.CENTER_CROP
-        imageView.setBackgroundColor(Color.TRANSPARENT)
+        imageView.setBackgroundColor(Color.BLACK)
         var req = Glide.with(imageView)
             .load(bytes)
             .signature(ObjectKey("localart:$videoId"))

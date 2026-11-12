@@ -145,7 +145,7 @@
                         android:maxWidth="150dp"
                         android:minWidth="84dp"
                         android:adjustViewBounds="true"
-                        android:background="@color/surface_high"
+                        android:background="@color/artwork_background"
                         android:scaleType="fitCenter" />
 
                     <LinearLayout

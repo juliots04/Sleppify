@@ -116,17 +116,19 @@
         android:id="@+id/flPlayerHero"
         android:layout_width="0dp"
         android:layout_height="0dp"
-        android:layout_marginTop="4dp"
+        android:layout_marginTop="8dp"
         android:background="@drawable/bg_player_cover_rounded"
         android:clipChildren="false"
         android:clipToPadding="false"
         android:clipToOutline="true"
         app:layout_constraintTop_toBottomOf="@id/llPlayerNavBar"
         app:layout_constraintBottom_toTopOf="@id/llPlayerInfo"
+        app:layout_constraintVertical_bias="0.5"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent">
 
         <ImageView
+        android:background="@color/artwork_background"
             android:id="@+id/ivPlayerCover"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
@@ -152,38 +154,67 @@
             app:barColor="@color/stitch_blue" />
     </FrameLayout>
 
-    <!-- Title + subtitle. Anchored bottom-up to the social pills so the block stays glued
-         directly above them in every state. It deliberately has NO top constraint to
-         flPlayerHero: pairing the two created a 2-element vertical chain that, once the hero
-         got a fixed dimensionRatio at runtime, fell back to CHAIN_SPREAD and opened a gap that
-         pushed the title/subtitle up away from the pills. -->
     <LinearLayout
         android:id="@+id/llPlayerInfo"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
         android:layout_marginHorizontal="24dp"
-        android:layout_marginBottom="14dp"
+        android:layout_marginBottom="10dp"
         android:orientation="vertical"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintBottom_toTopOf="@id/hsSocialActions">
 
-        <TextView
-            android:id="@+id/tvPlayerTitle"
+        <androidx.constraintlayout.widget.ConstraintLayout
+            android:id="@+id/llPlayerTitleContainer"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:ellipsize="marquee"
-            android:requiresFadingEdge="none"
-            android:focusable="true"
-            android:focusableInTouchMode="true"
-            android:fontFamily="sans-serif-black"
-            android:layerType="hardware"
-            android:marqueeRepeatLimit="marquee_forever"
-            android:scrollHorizontally="true"
-            android:singleLine="true"
-            android:text="Canción"
-            android:textColor="@color/text_primary"
-            android:textSize="26sp" />
+            android:paddingVertical="2dp"
+            android:clickable="true"
+            android:focusable="true">
+
+            <TextView
+                android:id="@+id/tvPlayerTitle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:ellipsize="marquee"
+                android:requiresFadingEdge="none"
+                android:clickable="false"
+                android:focusable="false"
+                android:fontFamily="sans-serif-black"
+                android:layerType="hardware"
+                android:marqueeRepeatLimit="marquee_forever"
+                android:scrollHorizontally="true"
+                android:singleLine="true"
+                android:text="Canción"
+                android:textColor="@color/text_primary"
+                android:textSize="26sp"
+                app:layout_constrainedWidth="true"
+                app:layout_constraintHorizontal_bias="0.0"
+                app:layout_constraintHorizontal_chainStyle="packed"
+                app:layout_constraintStart_toStartOf="parent"
+                app:layout_constraintEnd_toStartOf="@id/ivPlayerTitleChevron"
+                app:layout_constraintTop_toTopOf="parent"
+                app:layout_constraintBottom_toBottomOf="parent" />
+
+            <TextView
+                android:id="@+id/ivPlayerTitleChevron"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="12dp"
+                android:clickable="false"
+                android:focusable="false"
+                android:text="›"
+                android:fontFamily="sans-serif-black"
+                android:textSize="26sp"
+                android:textStyle="bold"
+                android:textColor="#B3FFFFFF"
+                app:layout_constraintStart_toEndOf="@id/tvPlayerTitle"
+                app:layout_constraintEnd_toEndOf="parent"
+                app:layout_constraintHorizontal_bias="0.0"
+                app:layout_constraintTop_toTopOf="@id/tvPlayerTitle"
+                app:layout_constraintBottom_toBottomOf="@id/tvPlayerTitle" />
+        </androidx.constraintlayout.widget.ConstraintLayout>
 
         <TextView
             android:id="@+id/tvPlayerArtist"
@@ -203,7 +234,7 @@
         android:id="@+id/hsSocialActions"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
-        android:layout_marginTop="6dp"
+        android:layout_marginBottom="4dp"
         android:layout_marginHorizontal="24dp"
         android:clipToPadding="false"
         android:overScrollMode="never"
@@ -211,7 +242,7 @@
         android:scrollbars="none"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintBottom_toTopOf="@id/flSeekBarContainer">
+        app:layout_constraintBottom_toTopOf="@id/llSeekBarAndTimes">
 
         <LinearLayout
             android:id="@+id/llSocialActionsRow"
@@ -358,82 +389,94 @@
         </LinearLayout>
     </HorizontalScrollView>
 
-    <FrameLayout
-        android:id="@+id/flSeekBarContainer"
+    <!-- SeekBar + Times -->
+    <LinearLayout
+        android:id="@+id/llSeekBarAndTimes"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
-        android:layout_marginTop="4dp"
         android:layout_marginHorizontal="24dp"
+        android:layout_marginBottom="12dp"
+        android:orientation="vertical"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintBottom_toTopOf="@id/tvCurrentTime">
+        app:layout_constraintBottom_toTopOf="@id/llPlayerControls">
 
-        <SeekBar
-            android:id="@+id/sbPlaybackProgress"
+        <FrameLayout
+            android:id="@+id/flSeekBarContainer"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:minHeight="48dp"
-            android:maxHeight="3dp"
-            android:max="1000"
-            android:progress="0"
-            android:progressDrawable="@drawable/player_seekbar_track"
-            android:thumb="@drawable/ic_seekbar_thumb"
-            android:thumbOffset="7dp"
-            android:splitTrack="false"
-            android:thumbTint="@android:color/transparent" />
+            android:layout_marginTop="-4dp">
 
-        <ProgressBar
-            android:id="@+id/pbSeekBarLoading"
-            style="?android:attr/progressBarStyleHorizontal"
+            <SeekBar
+                android:id="@+id/sbPlaybackProgress"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:minHeight="28dp"
+                android:maxHeight="3dp"
+                android:max="1000"
+                android:progress="0"
+                android:progressDrawable="@drawable/player_seekbar_track"
+                android:thumb="@drawable/ic_seekbar_thumb"
+                android:thumbOffset="7dp"
+                android:splitTrack="false"
+                android:paddingTop="4dp"
+                android:paddingBottom="4dp"
+                android:thumbTint="@android:color/transparent" />
+
+            <ProgressBar
+                android:id="@+id/pbSeekBarLoading"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="match_parent"
+                android:layout_height="4dp"
+                android:layout_gravity="center_vertical"
+                android:paddingHorizontal="16dp"
+                android:indeterminate="true"
+                android:indeterminateTint="@color/stitch_blue"
+                android:visibility="gone" />
+
+        </FrameLayout>
+
+        <RelativeLayout
             android:layout_width="match_parent"
-            android:layout_height="4dp"
-            android:layout_gravity="center_vertical"
-            android:paddingHorizontal="16dp"
-            android:indeterminate="true"
-            android:indeterminateTint="@color/stitch_blue"
-            android:visibility="gone" />
+            android:layout_height="wrap_content"
+            android:layout_marginTop="-6dp">
 
-    </FrameLayout>
+            <TextView
+                android:id="@+id/tvCurrentTime"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_alignParentStart="true"
+                android:fontFamily="@font/inter_variable"
+                android:text="00:00"
+                android:textColor="@color/text_secondary"
+                android:textSize="13sp"
+                android:textStyle="bold" />
 
-    <TextView
-        android:id="@+id/tvCurrentTime"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="-8dp"
-        android:layout_marginStart="24dp"
-        android:fontFamily="@font/inter_variable"
-        android:text="00:00"
-        android:textColor="@color/text_secondary"
-        android:textSize="13sp"
-        android:textStyle="bold"
-        app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintBottom_toTopOf="@id/llPlayerControls" />
+            <TextView
+                android:id="@+id/tvTotalTime"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_alignParentEnd="true"
+                android:fontFamily="@font/inter_variable"
+                android:text="00:00"
+                android:textColor="@color/text_secondary"
+                android:textSize="13sp"
+                android:textStyle="bold" />
+        </RelativeLayout>
 
-    <TextView
-        android:id="@+id/tvTotalTime"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="-8dp"
-        android:layout_marginEnd="24dp"
-        android:fontFamily="@font/inter_variable"
-        android:text="00:00"
-        android:textColor="@color/text_secondary"
-        android:textSize="13sp"
-        android:textStyle="bold"
-        app:layout_constraintEnd_toEndOf="parent"
-        app:layout_constraintBottom_toTopOf="@id/llPlayerControls" />
+    </LinearLayout>
 
     <LinearLayout
         android:id="@+id/llPlayerControls"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
         android:layout_marginHorizontal="24dp"
-        android:layout_marginBottom="70dp"
+        android:layout_marginBottom="60dp"
         android:gravity="center"
         android:orientation="horizontal"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintBottom_toTopOf="@id/llPlayerFooter">
+        app:layout_constraintBottom_toTopOf="@id/flQueueDragTrigger">
 
         <LinearLayout android:layout_width="64dp" android:layout_height="64dp" android:gravity="center_horizontal" android:orientation="vertical">
             <ImageButton android:id="@+id/btnShuffle" android:layout_width="64dp" android:layout_height="64dp" android:background="?attr/selectableItemBackgroundBorderless" android:padding="1dp" android:src="@drawable/ic_shuffle_custom" app:tint="@color/text_primary" />
@@ -450,70 +493,26 @@
         </LinearLayout>
     </LinearLayout>
 
-    <LinearLayout
-        android:id="@+id/llPlayerFooter"
-        android:layout_width="0dp"
-        android:layout_height="wrap_content"
-        android:layout_marginBottom="12dp"
-        android:layout_marginStart="24dp"
-        android:layout_marginEnd="24dp"
-        android:gravity="center_vertical"
-        android:orientation="horizontal"
+    <!-- Handle line below play button for Queue BottomSheet -->
+    <FrameLayout
+        android:id="@+id/flQueueDragTrigger"
+        android:layout_width="match_parent"
+        android:layout_height="44dp"
+        android:layout_marginBottom="16dp"
+        android:clickable="true"
+        android:focusable="true"
+        android:background="?attr/selectableItemBackgroundBorderless"
+        app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintEnd_toEndOf="parent"
-        app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintBottom_toBottomOf="parent">
+        app:layout_constraintStart_toStartOf="parent">
 
-        <LinearLayout
-            android:id="@+id/llSimilarTrigger"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:background="?attr/selectableItemBackground"
-            android:clickable="true"
-            android:focusable="true"
-            android:gravity="center_vertical"
-            android:orientation="horizontal"
-            android:paddingVertical="8dp"
-            android:paddingStart="8dp"
-            android:paddingEnd="14dp">
-
-            <TextView
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:fontFamily="@font/inter_variable"
-                android:text="VER SIMILARES"
-                android:textColor="@color/text_primary"
-                android:textSize="13sp"
-                android:textStyle="bold" />
-        </LinearLayout>
-
-        <!-- Flexible spacer -->
         <View
-            android:layout_width="0dp"
-            android:layout_height="1dp"
-            android:layout_weight="1" />
+            android:id="@+id/vQueueDragHandle"
+            android:layout_width="40dp"
+            android:layout_height="4dp"
+            android:layout_gravity="center"
+            android:background="@drawable/bg_drag_handle" />
 
-        <LinearLayout
-            android:id="@+id/llQueueTrigger"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:background="?attr/selectableItemBackground"
-            android:clickable="true"
-            android:focusable="true"
-            android:gravity="center_vertical"
-            android:orientation="horizontal"
-            android:paddingVertical="8dp"
-            android:paddingStart="8dp"
-            android:paddingEnd="8dp">
-
-            <TextView
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:fontFamily="@font/inter_variable"
-                android:text="A CONTINUACIÓN"
-                android:textColor="@color/text_primary"
-                android:textSize="13sp"
-                android:textStyle="bold" />
-        </LinearLayout>
-    </LinearLayout>
+    </FrameLayout>
 
 </com.example.sleppify.SwipeInterceptLayout>

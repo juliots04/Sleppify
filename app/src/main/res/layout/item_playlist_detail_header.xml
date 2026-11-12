@@ -77,6 +77,7 @@
                     android:layout_marginBottom="18dp">
 
                     <com.google.android.material.imageview.ShapeableImageView
+        android:background="@color/artwork_background"
                         android:id="@+id/ivPlaylistCover"
                         android:layout_width="match_parent"
                         android:layout_height="match_parent"

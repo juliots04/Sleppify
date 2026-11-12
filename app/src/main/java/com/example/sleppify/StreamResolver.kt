@@ -42,6 +42,12 @@ import java.util.concurrent.atomic.AtomicBoolean
 object StreamResolver {
 
     private const val TAG = "StreamResolver"
+    const val PERF_TAG = "SLEPPIFY_PERF"
+
+    @JvmStatic
+    fun logPerf(msg: String) {
+        Log.i(PERF_TAG, "[SLEPPIFY_PERF] $msg")
+    }
     private const val DIRECT_CACHE_TTL_MS = 3 * 60 * 60 * 1000L + 30 * 60 * 1000L // 3.5h
     private const val DISK_CACHE_PREFS = "stream_resolver_cache"
     private const val DISK_KEY_VIDEO_ID = "last_video_id"
@@ -340,6 +346,10 @@ object StreamResolver {
                     if (!url.isNullOrBlank()) {
                         urlCache[videoId] = CachedStream(url, SourceType.DIRECT, System.currentTimeMillis())
                         Log.d(TAG, "preResolveQueue ok videoId=$videoId")
+                        // Pre-calentar la cabecera (512KB) para que al reproducir los primeros segundos lean directo de disco
+                        if (videoId == videoIds.firstOrNull()) {
+                            ExoMediaPlayer.warmStreamHead(appCtx, url, getHeadersFor(videoId), 512 * 1024L)
+                        }
                     }
                     future.complete(url)
                 } catch (e: Exception) {
@@ -437,6 +447,23 @@ object StreamResolver {
     fun isPreferVideoMode(): Boolean = preferVideoMode
 
     /**
+     * Devuelve de inmediato (0ms, thread-safe) la URL directa o de video si ya está en la caché en
+     * memoria RAM y aún no ha vencido su TTL. Si no está en RAM o el tipo no coincide con el modo
+     * actual (Audio vs Video), devuelve null para que el llamador resuelva en red en segundo plano.
+     */
+    @JvmStatic
+    fun getMemoryCachedUrl(videoId: String?): String? {
+        if (videoId.isNullOrBlank() || videoId.startsWith("local_")) return null
+        val wantVideo = preferVideoMode
+        val expectedType = if (wantVideo) SourceType.VIDEO else SourceType.DIRECT
+        val cached = urlCache[videoId] ?: return null
+        if (cached.type == expectedType && System.currentTimeMillis() - cached.timestamp < DIRECT_CACHE_TTL_MS) {
+            return cached.url
+        }
+        return null
+    }
+
+    /**
      * Resolves a playable stream URL for [videoId] via NewPipe — audio by default, or the muxed
      * mp4-360 music video while the player's Audio|Video pill is on VIDEO ([setPreferVideoMode]).
      * A track with no muxed video falls back to audio so it always plays.
@@ -512,6 +539,7 @@ object StreamResolver {
         urlCache[videoId]?.let { cached ->
             if (cached.type == SourceType.DIRECT
                 && System.currentTimeMillis() - cached.timestamp < DIRECT_CACHE_TTL_MS) {
+                logPerf("  ⚡ [RESOLVE] CACHE HIT en memoria para $videoId (0ms)")
                 Log.d(TAG, "cache[$videoId] type=DIRECT")
                 return cached.url
             }
@@ -525,6 +553,7 @@ object StreamResolver {
         audioPrefetchCache[videoId]?.let { pf ->
             if (System.currentTimeMillis() - pf.timestamp < DIRECT_CACHE_TTL_MS) {
                 urlCache[videoId] = CachedStream(pf.url, SourceType.DIRECT, pf.timestamp)
+                logPerf("  ⚡ [RESOLVE] SIDE-CACHE HIT para $videoId (0ms)")
                 Log.d(TAG, "audio_prefetch[$videoId] hit (skipped network)")
                 return pf.url
             }
@@ -534,8 +563,10 @@ object StreamResolver {
         // 2. Dedup: if another thread is already resolving this videoId, wait for it
         val existingFuture = inFlightResolutions[videoId]
         if (existingFuture != null) {
+            val tDedup = System.currentTimeMillis()
             return try {
                 val result = existingFuture.get(15, java.util.concurrent.TimeUnit.SECONDS)
+                logPerf("  ⚡ [RESOLVE] REUSADO in-flight concurrente para $videoId (${System.currentTimeMillis() - tDedup}ms de espera)")
                 Log.d(TAG, "dedup[$videoId] reused in-flight result")
                 result
             } catch (e: Exception) {
@@ -549,9 +580,6 @@ object StreamResolver {
         //      (~0.3-0.6s), SIN descargar ni ejecutar el base.js de YouTube.
         //    FALLBACK: NewPipe, que SÍ baja el base.js (~1.5-2.5MB) y corre un motor JS (Rhino) para
         //      descifrar firma + parámetro 'n' de cada stream — ~3-6s.
-        //    El orden estaba INVERTIDO y era la causa raíz de los ~8s para empezar a sonar. ANDROID_VR
-        //    ya estaba verificado en vivo como fallback, así que promoverlo a primario es seguro y cae
-        //    a NewPipe para lo que no cubra (p.ej. "made for kids", IP bloqueada).
         val itags = getPreferredItags(context)
         val future = java.util.concurrent.CompletableFuture<String?>()
         inFlightResolutions[videoId] = future
@@ -559,6 +587,7 @@ object StreamResolver {
             val tStart = System.currentTimeMillis()
             var directUrl: String? = null
             var via = "innertube"
+            logPerf("  🔍 [RESOLVE] Iniciando resolución en red para $videoId...")
             try {
                 directUrl = resolveViaInnerTubeFallback(videoId, itags, context)?.url
             } catch (e: Exception) {
@@ -566,15 +595,18 @@ object StreamResolver {
             }
             if (directUrl.isNullOrBlank()) {
                 via = "newpipe"
+                val tNewPipe = System.currentTimeMillis()
+                logPerf("  ⏳ [RESOLVE] InnerTube no entregó URL directa. Iniciando NewPipe extractor para $videoId...")
                 try {
                     directUrl = resolveViaNewPipe(videoId, itags, context)
                 } catch (e: Exception) {
                     Log.w(TAG, "newpipe[$videoId] failed: ${e.javaClass.simpleName} — ${e.message}")
                 }
+                logPerf("  ⏱️ [RESOLVE] NewPipe terminó en ${System.currentTimeMillis() - tNewPipe}ms (éxito=${!directUrl.isNullOrBlank()})")
             }
-            // Medición de latencia (filtra en logcat por el TAG de StreamResolver): muestra por qué
-            // ruta se resolvió y cuántos ms tardó. android_vr debería rondar cientos de ms; newpipe segundos.
-            Log.d(TAG, "resolve[$videoId] via=$via took=${System.currentTimeMillis() - tStart}ms ok=${!directUrl.isNullOrBlank()}")
+            val totalResolveMs = System.currentTimeMillis() - tStart
+            logPerf("  ✅ [RESOLVE] URL final lista para $videoId (vía=$via, total=${totalResolveMs}ms, ok=${!directUrl.isNullOrBlank()})")
+            Log.d(TAG, "resolve[$videoId] via=$via took=${totalResolveMs}ms ok=${!directUrl.isNullOrBlank()}")
             if (!directUrl.isNullOrBlank()) {
                 val now = System.currentTimeMillis()
                 urlCache[videoId] = CachedStream(directUrl, SourceType.DIRECT, now)
@@ -594,7 +626,7 @@ object StreamResolver {
     /** Lee el ajuste "No reproducir videos musicales" (default ON). Ver gate en [resolveStreamUrl]. */
     private fun noMusicVideosBlocked(context: Context): Boolean = try {
         context.getSharedPreferences(AppConstants.PREFS_SETTINGS, Context.MODE_PRIVATE)
-            .getBoolean(CloudSyncManager.KEY_NO_MUSIC_VIDEOS, true)
+            .getBoolean(CloudSyncManager.KEY_NO_MUSIC_VIDEOS, false)
     } catch (e: Exception) {
         false
     }
@@ -1065,6 +1097,7 @@ object StreamResolver {
         }
 
         for (attempt in 0..1) {
+            val t0 = System.currentTimeMillis()
             try {
                 val clientObj = org.json.JSONObject().apply {
                     put("clientName", "VISIONOS")
@@ -1083,13 +1116,16 @@ object StreamResolver {
                 }
 
                 val root = postInnerTubePlayer(client, clientObj, videoId, jsonMediaType, context)
+                val status = root?.optJSONObject("playabilityStatus")?.optString("status", "") ?: if (root == null) "HTTP_FAIL" else "EMPTY"
+                val elapsed = System.currentTimeMillis() - t0
+                logPerf("    [INNERTUBE] VISIONOS (intento $attempt): status=$status (${elapsed}ms)")
                 if (root != null) {
-                    val status = root.optJSONObject("playabilityStatus")?.optString("status", "") ?: ""
                     if (status == "OK") {
                         val streamingData = root.optJSONObject("streamingData")
                         if (streamingData != null) {
                             val audio = extractAudioFromStreamingData(streamingData, preferredItags)
                             if (audio != null) {
+                                logPerf("    [INNERTUBE] VISIONOS entregó audio directo en ${elapsed}ms!")
                                 Log.d(TAG, "innertube_player[$videoId] ok (VISIONOS itag=${audio.itag})")
                                 return audio
                             }
@@ -1108,12 +1144,15 @@ object StreamResolver {
                     }
                 }
             } catch (e: Exception) {
+                val elapsed = System.currentTimeMillis() - t0
+                logPerf("    [INNERTUBE] VISIONOS falló en ${elapsed}ms: ${e.message}")
                 Log.w(TAG, "innertube_player[$videoId] VISIONOS failed: ${e.message}")
             }
             break
         }
 
         // ── Cliente 2: ANDROID_VR (Meta Quest client, URLs directas sin firma ni throttling) ──
+        val tVr = System.currentTimeMillis()
         try {
             val vrClient = org.json.JSONObject().apply {
                 put("clientName", "ANDROID_VR")
@@ -1127,13 +1166,16 @@ object StreamResolver {
             }
 
             val vrRoot = postInnerTubePlayer(client, vrClient, videoId, jsonMediaType, context)
+            val status = vrRoot?.optJSONObject("playabilityStatus")?.optString("status", "") ?: if (vrRoot == null) "HTTP_FAIL" else "EMPTY"
+            val elapsed = System.currentTimeMillis() - tVr
+            logPerf("    [INNERTUBE] ANDROID_VR: status=$status (${elapsed}ms)")
             if (vrRoot != null) {
-                val status = vrRoot.optJSONObject("playabilityStatus")?.optString("status", "") ?: ""
                 if (status == "OK") {
                     val streamingData = vrRoot.optJSONObject("streamingData")
                     if (streamingData != null) {
                         val audio = extractAudioFromStreamingData(streamingData, preferredItags)
                         if (audio != null) {
+                            logPerf("    [INNERTUBE] ANDROID_VR entregó audio directo en ${elapsed}ms!")
                             Log.d(TAG, "innertube_player[$videoId] ok (ANDROID_VR itag=${audio.itag})")
                             return audio
                         }
@@ -1141,10 +1183,13 @@ object StreamResolver {
                 }
             }
         } catch (e: Exception) {
+            val elapsed = System.currentTimeMillis() - tVr
+            logPerf("    [INNERTUBE] ANDROID_VR falló en ${elapsed}ms: ${e.message}")
             Log.w(TAG, "innertube_player[$videoId] ANDROID_VR failed: ${e.message}")
         }
 
         // ── Cliente 3: ANDROID_TESTSUITE (ligero, URLs directas) ──
+        val tTest = System.currentTimeMillis()
         try {
             val testClient = org.json.JSONObject().apply {
                 put("clientName", "ANDROID_TESTSUITE")
@@ -1156,13 +1201,16 @@ object StreamResolver {
             }
 
             val testRoot = postInnerTubePlayer(client, testClient, videoId, jsonMediaType, context)
+            val status = testRoot?.optJSONObject("playabilityStatus")?.optString("status", "") ?: if (testRoot == null) "HTTP_FAIL" else "EMPTY"
+            val elapsed = System.currentTimeMillis() - tTest
+            logPerf("    [INNERTUBE] ANDROID_TESTSUITE: status=$status (${elapsed}ms)")
             if (testRoot != null) {
-                val status = testRoot.optJSONObject("playabilityStatus")?.optString("status", "") ?: ""
                 if (status == "OK") {
                     val streamingData = testRoot.optJSONObject("streamingData")
                     if (streamingData != null) {
                         val audio = extractAudioFromStreamingData(streamingData, preferredItags)
                         if (audio != null) {
+                            logPerf("    [INNERTUBE] ANDROID_TESTSUITE entregó audio directo en ${elapsed}ms!")
                             Log.d(TAG, "innertube_player[$videoId] ok (ANDROID_TESTSUITE itag=${audio.itag})")
                             return audio
                         }
@@ -1170,10 +1218,13 @@ object StreamResolver {
                 }
             }
         } catch (e: Exception) {
+            val elapsed = System.currentTimeMillis() - tTest
+            logPerf("    [INNERTUBE] ANDROID_TESTSUITE falló en ${elapsed}ms: ${e.message}")
             Log.w(TAG, "innertube_player[$videoId] ANDROID_TESTSUITE failed: ${e.message}")
         }
 
         // ── Cliente 4: TVHTML5_SIMPLY_EMBEDDED_PLAYER (bypass para videos con restricción de edad / LOGIN_REQUIRED) ──
+        val tTv = System.currentTimeMillis()
         try {
             val tvClient = org.json.JSONObject().apply {
                 put("clientName", "TVHTML5_SIMPLY_EMBEDDED_PLAYER")
@@ -1184,13 +1235,16 @@ object StreamResolver {
             }
 
             val tvRoot = postInnerTubePlayer(client, tvClient, videoId, jsonMediaType, context, thirdPartyEmbed = true)
+            val status = tvRoot?.optJSONObject("playabilityStatus")?.optString("status", "") ?: if (tvRoot == null) "HTTP_FAIL" else "EMPTY"
+            val elapsed = System.currentTimeMillis() - tTv
+            logPerf("    [INNERTUBE] TVHTML5: status=$status (${elapsed}ms)")
             if (tvRoot != null) {
-                val status = tvRoot.optJSONObject("playabilityStatus")?.optString("status", "") ?: ""
                 if (status == "OK") {
                     val streamingData = tvRoot.optJSONObject("streamingData")
                     if (streamingData != null) {
                         val audio = extractAudioFromStreamingData(streamingData, preferredItags)
                         if (audio != null) {
+                            logPerf("    [INNERTUBE] TVHTML5 entregó audio directo en ${elapsed}ms!")
                             Log.d(TAG, "innertube_player[$videoId] ok (TVHTML5_SIMPLY_EMBEDDED itag=${audio.itag})")
                             return audio
                         }
@@ -1200,6 +1254,8 @@ object StreamResolver {
                 }
             }
         } catch (e: Exception) {
+            val elapsed = System.currentTimeMillis() - tTv
+            logPerf("    [INNERTUBE] TVHTML5 falló en ${elapsed}ms: ${e.message}")
             Log.w(TAG, "innertube_player[$videoId] TVHTML5_SIMPLY_EMBEDDED failed: ${e.message}")
         }
 

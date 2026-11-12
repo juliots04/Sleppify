@@ -27,7 +27,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="match_parent"
                 android:scaleType="fitCenter"
-                android:background="@color/surface_high"
+                android:background="@color/artwork_background"
                 />
 
             <!-- Insignia "RADIO" sobre el composite (solo sheets de radio, ver RadioArt.bindThumb). -->
@@ -349,6 +349,7 @@
             android:focusable="true"
             android:visibility="gone">
             <ImageView
+        android:background="@color/artwork_background"
                 android:id="@+id/ivBsGoToArtist"
                 android:layout_width="22dp"
                 android:layout_height="22dp"

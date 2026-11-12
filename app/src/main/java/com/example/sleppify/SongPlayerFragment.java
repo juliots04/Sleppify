@@ -18,7 +18,6 @@ import android.media.AudioAttributes;
 import android.media.AudioManager;
 import android.net.Uri;
 import android.net.ConnectivityManager;
-import android.net.NetworkCapabilities;
 import androidx.media3.exoplayer.ExoPlayer;
 import com.google.android.material.bottomsheet.BottomSheetDialog;
 import com.google.android.material.bottomsheet.BottomSheetBehavior;
@@ -37,6 +36,7 @@ import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.ViewGroup;
 import android.view.ViewTreeObserver;
+import android.widget.Toast;
 import android.widget.HorizontalScrollView;
 import android.widget.ImageButton;
 import android.widget.ImageView;
@@ -63,6 +63,7 @@ import androidx.fragment.app.Fragment;
 import androidx.fragment.app.FragmentManager;
 import androidx.recyclerview.widget.ItemTouchHelper;
 import androidx.recyclerview.widget.LinearLayoutManager;
+import androidx.recyclerview.widget.PagerSnapHelper;
 import androidx.recyclerview.widget.RecyclerView;
 
 import android.support.v4.media.MediaMetadataCompat;
@@ -143,6 +144,12 @@ public class SongPlayerFragment extends Fragment {
     private static final String AUDIUS_APP_NAME = "sleppify";
     private static final int AUDIUS_SEARCH_LIMIT = 6;
     private static final int PLAYER_HERO_DEFAULT_HEIGHT_DP = 370;
+    private static final String PERF_TAG = "SLEPPIFY_PERF";
+    private static void logPerf(String message) {
+        Log.i(PERF_TAG, "[SLEPPIFY_PERF] " + message);
+    }
+    private long perfPlaybackRequestedAtMs = 0L;
+    private long perfExoPrepareStartedAtMs = 0L;
 
     private final List<PlayerTrack> tracks = new ArrayList<>();
     private static final int MAX_NEXT_UP = 50;
@@ -203,8 +210,6 @@ public class SongPlayerFragment extends Fragment {
     private TextView tvActionFavoriteLabel;
     private TextView tvCurrentTime;
     private TextView tvTotalTime;
-    private View llSimilarTrigger;
-    private View llQueueTrigger;
     private View llPlayerNavBar;
     private ImageButton btnPlayerClose;
     private SeekBar sbPlaybackProgress;
@@ -286,7 +291,7 @@ public class SongPlayerFragment extends Fragment {
     // su layout en cada tap era el grueso de la latencia de apertura. Se descarta en
     // onDestroyView porque referencia el contexto/inflater de la vista vieja.
     @Nullable
-    private BottomSheetDialog queueSheetDialog;
+    private PlayerQueueSheet queueSheetDialog;
     @Nullable
     private RecyclerView rvQueueSheet;
     @Nullable
@@ -294,6 +299,76 @@ public class SongPlayerFragment extends Fragment {
     /** Precalentado (debounced) de carátulas de la cola para la hoja «A continuación». */
     @Nullable
     private Runnable nextUpPrewarmRunnable;
+
+    // Unified BottomSheet (Queue + Similares)
+    @Nullable
+    private View llSheetMiniPlayer;
+    @Nullable
+    private ImageView sheetMiniArt;
+    @Nullable
+    private TextView tvSheetMiniTitle;
+    @Nullable
+    private TextView tvSheetMiniArtist;
+    @Nullable
+    private ImageButton btnSheetMiniPrev;
+    @Nullable
+    private ImageButton btnSheetMiniPlayPause;
+    @Nullable
+    private ImageButton btnSheetMiniNext;
+
+    // Queue Panel
+    @Nullable
+    private View llQueuePanel;
+    @Nullable
+    private TextView tvQueuePlayingFromLabel;
+    @Nullable
+    private TextView tvQueueSourceName;
+    @Nullable
+    private View btnQueueSave;
+    @Nullable
+    private TextView chipQueueAll;
+    @Nullable
+    private TextView chipQueueKnown;
+    @Nullable
+    private TextView chipQueuePopular;
+    @Nullable
+    private TextView chipQueueRecommended;
+    private String currentQueueFilter = "all";
+    private final List<PlayerTrack> fullComputedQueue = new ArrayList<>();
+
+    // Similares Panel
+    @Nullable
+    private View llSimilarPanel;
+    @Nullable
+    private TextView tvSimilarHeaderTitle;
+    @Nullable
+    private ImageButton btnSimilarClose;
+    @Nullable
+    private RecyclerView rvSimilarSongsCarousel;
+    @Nullable
+    private View pbSimilarSongsLoading;
+    private TextView tvSimilarSongsState;
+    @Nullable
+    private RecyclerView rvSimilarPlaylistsCarousel;
+    @Nullable
+    private ProgressBar pbSimilarPlaylistsLoading;
+    @Nullable
+    private SimilarSongsCarouselAdapter similarSongsCarouselAdapter;
+    @Nullable
+    private SimilarPlaylistsAdapter similarPlaylistsAdapter;
+    private String lastSimilarFetchedVideoId = "";
+    private String pendingSimilarVideoId = "";
+    private int similarRequestGeneration;
+    private String sheetMiniArtworkKey = "";
+    private final List<YouTubeMusicService.TrackResult> cachedSimilarTracks = new ArrayList<>();
+
+    // Main Player Trigger Views
+    @Nullable
+    private View llPlayerTitleContainer;
+    @Nullable
+    private TextView ivPlayerTitleChevron;
+    @Nullable
+    private View flQueueDragTrigger;
 
     @Nullable
     private OnBackPressedCallback backPressedCallback;
@@ -463,7 +538,7 @@ public class SongPlayerFragment extends Fragment {
     // Used so a rapid skip to a DIFFERENT track does not get falsely short-circuited by the
     // pending-resolution guard in playCurrentTrack().
     @NonNull
-    private String pendingResolutionVideoId = "";
+    private long streamResolutionGeneration;
     @Nullable
     private Runnable sourcePrepareTimeoutRunnable;
     private boolean localSourcePreparing = false;
@@ -563,7 +638,6 @@ public class SongPlayerFragment extends Fragment {
     private com.bumptech.glide.request.target.CustomTarget<Bitmap> playerCoverTarget;
     @Nullable
     private Runnable nextUpRevealRunnable;
-    private int nextUpRevealCursor = 0;
     private boolean playerArtworkBootstrapPending = true;
     @Nullable
     private Bitmap mediaSessionArtwork;
@@ -868,8 +942,21 @@ public class SongPlayerFragment extends Fragment {
         vPlayerShuffleIndicator = view.findViewById(R.id.vPlayerShuffleIndicator);
         vPlayerRepeatIndicator = view.findViewById(R.id.vPlayerRepeatIndicator);
         btnPlayPause = view.findViewById(R.id.btnPlayPause);
-        llQueueTrigger = view.findViewById(R.id.llQueueTrigger);
-        llQueueTrigger.setOnClickListener(v -> showQueueBottomSheet());
+        flQueueDragTrigger = view.findViewById(R.id.flQueueDragTrigger);
+        if (flQueueDragTrigger != null) {
+            setupQueueDragHandleGesture(flQueueDragTrigger);
+        }
+        llPlayerTitleContainer = view.findViewById(R.id.llPlayerTitleContainer);
+        if (llPlayerTitleContainer != null) {
+            llPlayerTitleContainer.setOnClickListener(v -> showSimilarBottomSheet());
+        }
+        ivPlayerTitleChevron = view.findViewById(R.id.ivPlayerTitleChevron);
+        if (ivPlayerTitleChevron != null) {
+            ivPlayerTitleChevron.setClickable(false);
+        }
+        if (tvPlayerTitle != null) {
+            tvPlayerTitle.setClickable(false);
+        }
         llPlayerNavBar = view.findViewById(R.id.llPlayerNavBar);
         btnPlayerClose = view.findViewById(R.id.btnPlayerClose);
         if (btnPlayerClose != null) {
@@ -901,10 +988,6 @@ public class SongPlayerFragment extends Fragment {
             }
             return insets;
         });
-        llSimilarTrigger = view.findViewById(R.id.llSimilarTrigger);
-        if (llSimilarTrigger != null) {
-            llSimilarTrigger.setOnClickListener(v -> openRadioForCurrentTrack());
-        }
 
         // Wire the swipe-to-dismiss gesture SYNCHRONOUSLY (not deferred to phase1 below). It only
         // reads ViewConfiguration + display metrics, so it's cheap. Deferring it via view.post()
@@ -1198,6 +1281,7 @@ public class SongPlayerFragment extends Fragment {
         if (!isPlaying) {
             return false;
         }
+        if (localSourcePreparing || hasPendingStreamResolution()) return true;
         if (localExoMediaPlayer != null) {
             try {
                 return localExoMediaPlayer.isPlaying();
@@ -1235,6 +1319,37 @@ public class SongPlayerFragment extends Fragment {
         tvEmptyQueueSheet = null;
         nextUpAdapter = null;
         nextUpItemTouchHelper = null;
+        llSheetMiniPlayer = null;
+        sheetMiniArt = null;
+        tvSheetMiniTitle = null;
+        tvSheetMiniArtist = null;
+        btnSheetMiniPrev = null;
+        btnSheetMiniPlayPause = null;
+        btnSheetMiniNext = null;
+        llQueuePanel = null;
+        tvQueuePlayingFromLabel = null;
+        tvQueueSourceName = null;
+        btnQueueSave = null;
+        chipQueueAll = null;
+        chipQueueKnown = null;
+        chipQueuePopular = null;
+        chipQueueRecommended = null;
+        llSimilarPanel = null;
+        tvSimilarHeaderTitle = null;
+        btnSimilarClose = null;
+        rvSimilarSongsCarousel = null;
+        pbSimilarSongsLoading = null;
+        tvSimilarSongsState = null;
+        rvSimilarPlaylistsCarousel = null;
+        pbSimilarPlaylistsLoading = null;
+        similarRequestGeneration++;
+        pendingSimilarVideoId = "";
+        sheetMiniArtworkKey = "";
+        similarSongsCarouselAdapter = null;
+        similarPlaylistsAdapter = null;
+        llPlayerTitleContainer = null;
+        ivPlayerTitleChevron = null;
+        flQueueDragTrigger = null;
         // Un hot-swap de modo Audio/Video a medio preparar no debe filtrar su player.
         if (pendingModeSwapPlayer != null) {
             try { pendingModeSwapPlayer.release(); } catch (Exception ignored) { }
@@ -1535,6 +1650,7 @@ public class SongPlayerFragment extends Fragment {
         }
 
         currentIndex = targetIndex;
+        pauseRequestedByUser = false;
         isPlaying = true;
         currentSeconds = 0;
         playCurrentTrack();
@@ -1704,29 +1820,13 @@ public class SongPlayerFragment extends Fragment {
             return;
         }
 
-        // While the current online track is still resolving/preparing (the restore/cold-start "still
-        // loading" window), treat every play tap as an idempotent "start when it's ready" instead of
-        // toggling isPlaying's parity. Previously, taps during this window flipped isPlaying on/off
-        // and onPrepared honored whatever parity it landed on — which is exactly why the last-played
-        // track needed several taps to actually start and appeared to "reload" on each one. Keeping
-        // isPlaying=true here lets onPrepared (shouldStart = isPlaying || playWhenReady) auto-start
-        // once, from a single tap, without re-triggering a resolve.
-        if (!usingOfflineSource) {
-            String curVideoId = tracks.isEmpty() ? "" : tracks.get(currentIndex).videoId;
-            boolean currentTrackLoading =
-                    (localSourcePreparing && localExoMediaPlayer != null)
-                    || (hasPendingStreamResolution() && TextUtils.equals(pendingResolutionVideoId, curVideoId));
-            if (currentTrackLoading) {
-                Log.d(TAG, "[PLAYBACK_DBG] togglePlayback: track still loading, arming play-when-ready (idempotent)");
-                pauseRequestedByUser = false;
-                isPlaying = true;
-                updatePlayPauseIcon();
-                updateMediaSessionState();
-                updateMediaNotification();
-                syncMiniStateWithPlaylist();
-                persistPlaybackSnapshot(false);
-                return;
-            }
+        // Honor the button during loading as well: pausing must cancel the pending autoplay.
+        if (localSourcePreparing || hasPendingStreamResolution()) {
+            isPlaying = !isPlaying;
+            pauseRequestedByUser = !isPlaying;
+            if (localExoMediaPlayer != null) localExoMediaPlayer.setPlayWhenReady(isPlaying);
+            notifyPlaybackStateChanged();
+            return;
         }
 
         if (isPlaying) {
@@ -1822,6 +1922,14 @@ public class SongPlayerFragment extends Fragment {
         updateMediaNotification();
         syncMiniStateWithPlaylist();
         persistPlaybackSnapshot(false);
+        updateSheetMiniPlayerViews();
+        if (queueSheetDialog != null && queueSheetDialog.isShowing()) {
+            if (llQueuePanel != null && llQueuePanel.getVisibility() == View.VISIBLE) {
+                showQueueBottomSheet();
+            } else if (llSimilarPanel != null && llSimilarPanel.getVisibility() == View.VISIBLE) {
+                loadSimilarDataForCurrentTrack();
+            }
+        }
     }
 
     private void registerBecomingNoisyReceiver() {
@@ -1868,11 +1976,23 @@ public class SongPlayerFragment extends Fragment {
         updateMediaNotification();
         syncMiniStateWithPlaylist();
         persistPlaybackSnapshot(false);
+        updateSheetMiniPlayerViews();
+        if (queueSheetDialog != null && queueSheetDialog.isShowing()) {
+            if (llQueuePanel != null && llQueuePanel.getVisibility() == View.VISIBLE) {
+                showQueueBottomSheet();
+            } else if (llSimilarPanel != null && llSimilarPanel.getVisibility() == View.VISIBLE) {
+                loadSimilarDataForCurrentTrack();
+            }
+        }
     }
 
     private void handlePlayerPlayWhenReadyChanged(@NonNull ExoMediaPlayer player, boolean playWhenReady, int reason) {
         if (!isAdded()) return;
-        if (player != localExoMediaPlayer) return;
+        if (player != localExoMediaPlayer || player.getPlayWhenReady() != playWhenReady) return;
+        // Internal prepare/reset calls are not user pauses. Explicit pause paths update intent
+        // themselves. Audio-focus and noisy events still take precedence while loading.
+        if (!playWhenReady && reason == androidx.media3.common.Player.PLAY_WHEN_READY_CHANGE_REASON_USER_REQUEST
+                && (localSourcePreparing || hasPendingStreamResolution())) return;
 
         Log.d(TAG, "handlePlayerPlayWhenReadyChanged: playWhenReady=" + playWhenReady + ", reason=" + reason + ", isPlaying=" + isPlaying);
 
@@ -2075,6 +2195,8 @@ public class SongPlayerFragment extends Fragment {
         }
 
         final PlayerTrack track = tracks.get(currentIndex);
+        perfPlaybackRequestedAtMs = SystemClock.elapsedRealtime();
+        logPerf("▶️ [PLAY_REQUEST] playCurrentTrack: videoId=" + track.videoId + ", title=\"" + track.title + "\", mode=" + (StreamResolver.isPreferVideoMode() ? "VIDEO" : "AUDIO"));
         Log.d(TAG, "[PLAYBACK_DBG] playCurrentTrack videoId=" + track.videoId + " idx=" + currentIndex, new Throwable("caller"));
 
         // Detach the pre-buffered player for THIS track before cancelOfflineCrossfade —
@@ -2131,6 +2253,7 @@ public class SongPlayerFragment extends Fragment {
                 && snapshot.currentTrack().videoId.equals(track.videoId);
 
         if (isSharedPlayerActive && localExoMediaPlayer == null) {
+            logPerf("  ⚡ [SOURCE] SHARED_EXOPLAYER_ACTIVE para videoId=" + track.videoId);
             if (adoptablePreBuffered != null) {
                 releaseSingleExoMediaPlayer(adoptablePreBuffered);
                 adoptablePreBuffered = null;
@@ -2158,6 +2281,13 @@ public class SongPlayerFragment extends Fragment {
             return;
         }
 
+        // Retire the previous source before resolving the selected track. Its late callbacks
+        // must not overwrite the new selection's autoplay intent.
+        stopLocalProgressTicker();
+        releaseLocalExoMediaPlayer();
+        cancelPendingStreamResolver();
+        localSourcePreparing = true;
+
         // Bind metadata. forceZero=true resets UI to 0, but we restore resume position after.
         bindCurrentTrackInternal(false, true);
         // Reset state BEFORE restoring resumeSeconds
@@ -2167,14 +2297,6 @@ public class SongPlayerFragment extends Fragment {
         lastPlaybackStartRequestAtMs = SystemClock.elapsedRealtime();
 
         cancelPlaybackErrorRetry();
-        if (hasPendingStreamResolution() && TextUtils.equals(pendingResolutionVideoId, track.videoId)) {
-            if (adoptablePreBuffered != null) {
-                releaseSingleExoMediaPlayer(adoptablePreBuffered);
-            }
-            return;
-        }
-        cancelPendingStreamResolver();
-
         // requestToken already incremented above
         final long token = activePlaybackRequestToken;
 
@@ -2186,6 +2308,7 @@ public class SongPlayerFragment extends Fragment {
                 || (!StreamResolver.isPreferVideoMode()
                         && OfflineAudioStore.hasOfflineAudio(requireContext(), track.videoId));
         if (hasOfflineLocal) {
+            logPerf("  📁 [SOURCE] OFFLINE_LOCAL detectado para videoId=" + track.videoId);
             // Offline/local sources start instantly anyway; the pre-buffered network player
             // (if any) is not needed. adoptGaplessPlayer assumes a network source, so do
             // not adopt it for offline tracks.
@@ -2200,6 +2323,7 @@ public class SongPlayerFragment extends Fragment {
 
         // GAPLESS: if pre-buffered player is ready for this track, use it instantly
         if (adoptablePreBuffered != null) {
+            logPerf("  ⚡ [SOURCE] GAPLESS_PREBUFFER_HIT para videoId=" + track.videoId);
             adoptGaplessPlayer(track, adoptablePreBuffered, requestToken);
             return;
         }
@@ -2211,11 +2335,24 @@ public class SongPlayerFragment extends Fragment {
             String url = prefetchedNextUrl;
             prefetchedNextVideoId = null;
             prefetchedNextUrl = null;
+            logPerf("  ⚡ [SOURCE] PREFETCH_URL_HIT para videoId=" + track.videoId);
             startMediaPlaybackFromSource(track, url, requestToken, () -> {
                 resolveAndPlayOnlineTrack(track, requestToken);
             });
             return;
         }
+
+        // MEMORY CACHE FAST-PATH: URL already in memory (e.g. preResolveQueue or previous resolution)
+        String memoryCachedUrl = StreamResolver.getMemoryCachedUrl(track.videoId);
+        if (!TextUtils.isEmpty(memoryCachedUrl)) {
+            logPerf("  ⚡ [SOURCE] MEMORY_CACHE_FASTPATH para videoId=" + track.videoId + " (0ms sin executor)");
+            startMediaPlaybackFromSource(track, memoryCachedUrl, requestToken, () -> {
+                resolveAndPlayOnlineTrack(track, requestToken);
+            });
+            return;
+        }
+
+        logPerf("  🌐 [SOURCE] ONLINE_RESOLVE necesario para videoId=" + track.videoId);
         resolveAndPlayOnlineTrack(track, requestToken);
     }
 
@@ -2239,6 +2376,9 @@ public class SongPlayerFragment extends Fragment {
 
         try {
             preBuffered.start();
+            long now = SystemClock.elapsedRealtime();
+            logPerf("  🔊 [GAPLESS_START] adoptGaplessPlayer iniciado para " + track.videoId
+                    + " (latenciaTotalDesdeTap=" + (perfPlaybackRequestedAtMs > 0 ? (now - perfPlaybackRequestedAtMs) : -1) + "ms)");
         } catch (Exception e) {
             Log.e(TAG, "adoptGaplessPlayer: start failed", e);
             releaseLocalExoMediaPlayer();
@@ -2340,39 +2480,26 @@ public class SongPlayerFragment extends Fragment {
             } catch (Exception ignored) {
             }
         }
-        // Record which track this in-flight resolution is for so playCurrentTrack's
-        // pending-resolution guard can tell a re-entrant call for the SAME track from a skip
-        // to a DIFFERENT track.
-        pendingResolutionVideoId = track.videoId;
-        // Capture the app context now: requireContext() inside the executor lambda throws
-        // if the fragment detaches mid-flight, silently aborting the resolution.
         final Context resolveCtx = requireContext().getApplicationContext();
-        pendingStreamResolverFuture = immediateResolverExecutor.submit(() -> {
-            String resolvedUrl = StreamResolver.resolveStreamUrl(resolveCtx, track.videoId, forceAlternativeClient);
-
-            localProgressHandler.post(() -> {
-                if (requestToken != activePlaybackRequestToken || !isAdded()) return;
-                pendingStreamResolverFuture = null;
-
-                if (!TextUtils.isEmpty(resolvedUrl)) {
-                    startMediaPlaybackFromSource(track, resolvedUrl, requestToken, () -> {
-                        StreamResolver.invalidate(track.videoId);
-                        // La URL resolvió pero su reproducción falló/colgó: el próximo intento de
-                        // ESTA pista debe usar el cliente ANDROID_VR (URL directa más reproducible)
-                        // en vez de re-pedir la misma URL de NewPipe que se colgó.
-                        markForceAltClient(track.videoId);
-                        tryReresolveOrSkipCurrentTrack("Fallo de reproducción directa: re-resolviendo.", false);
-                    });
-                } else {
-                    if (!tryReresolveOrSkipCurrentTrack("No se pudo resolver el stream directo. Reintentando.", false)
+        resolveStreamAsync(track, requestToken,
+                () -> StreamResolver.resolveStreamUrl(resolveCtx, track.videoId, forceAlternativeClient),
+                resolvedUrl -> {
+                    if (!TextUtils.isEmpty(resolvedUrl)) {
+                        startMediaPlaybackFromSource(track, resolvedUrl, requestToken, () -> {
+                            StreamResolver.invalidate(track.videoId);
+                            markForceAltClient(track.videoId);
+                            tryReresolveOrSkipCurrentTrack("Fallo de reproducción directa: re-resolviendo.", false);
+                        });
+                    } else if (!tryReresolveOrSkipCurrentTrack("No se pudo resolver el stream directo. Reintentando.", false)
                             && !isNetworkAvailable()) {
-                        // Offline dead-end: tryReresolveOrSkipCurrentTrack returns false without
-                        // advancing or clearing the spinner. Notify confirmed to dismiss spinner.
+                        localSourcePreparing = false;
+                        isPlaying = false;
                         PlaybackLoadingBus.notifyAudioConfirmed(track.videoId);
+                        updatePlayPauseIcon();
+                        updateMediaSessionState();
+                        syncMiniStateWithPlaylist();
                     }
-                }
-            });
-        });
+                });
         updateSeekBarLoadingState();
     }
 
@@ -2406,11 +2533,10 @@ public class SongPlayerFragment extends Fragment {
             streamResolverExecutor.submit(() -> {
                 String url = StreamResolver.resolveStreamUrl(appCtx, videoId);
                 if (TextUtils.isEmpty(url) || !isImmediate) return;
-                // resolveStreamUrl reads the LIVE mode on this bg thread, so the source it produced
-                // may not match the mode captured at submit time (user toggled and toggled back
-                // during the resolve). Tag from the ACTUAL resolved source type, not the captured
-                // intent, and commit only if that actual type matches the current live mode.
                 final boolean resolvedIsVideo = StreamResolver.isVideoSource(videoId);
+                if (!resolvedIsVideo) {
+                    ExoMediaPlayer.warmStreamHead(appCtx, url, StreamResolver.getHeadersFor(videoId), 512 * 1024L);
+                }
                 localProgressHandler.post(() -> {
                     if (!isAdded() || tracks.size() <= 1) return;
                     if (StreamResolver.isPreferVideoMode() != resolvedIsVideo) return;
@@ -2462,6 +2588,7 @@ public class SongPlayerFragment extends Fragment {
         }
 
         streamDownloadingVideoId = normalized;
+        final List<PlayerTrack> downloadMetadata = new ArrayList<>(tracks);
         backgroundDownloadExecutor.execute(() -> {
             try {
                 // Re-check on background thread
@@ -2474,20 +2601,42 @@ public class SongPlayerFragment extends Fragment {
                 // the offline file path/extension (.m4a/.webm) and cleans up its own temp on failure.
                 boolean ok = SleppifyDownloaderResolver.downloadTrackAudio(appContext, normalized);
 
+                // Find expected duration to validate the newly saved file
+                String expectedDuration = null;
+                String downloadTitle = normalized;
+                String downloadArtist = "";
+                for (PlayerTrack pt : downloadMetadata) {
+                    if (pt != null && normalized.equals(pt.videoId)) {
+                        expectedDuration = pt.duration;
+                        downloadTitle = pt.title;
+                        downloadArtist = pt.artist;
+                        break;
+                    }
+                }
+
                 if (ok) {
-                    OfflineAudioStore.markOfflineAudioState(normalized, true);
-                    Log.d(TAG, "stream-as-download: saved " + normalized);
-                    localProgressHandler.post(() -> {
-                        if (!isAdded()) return;
-                        try {
-                            Fragment playlist = getParentFragmentManager().findFragmentByTag("playlist_detail");
-                            if (playlist instanceof PlaylistDetailFragment) {
-                                ((PlaylistDetailFragment) playlist).externalRefreshOfflineState();
+                    AudioValidationPolicy.Result validation = OfflineAudioStore.validateOfflineAudio(appContext, normalized, expectedDuration);
+                    if (validation == AudioValidationPolicy.Result.VALID) {
+                        DownloadLocationStore.publish(appContext, normalized, downloadTitle, downloadArtist);
+                        OfflineAudioStore.markOfflineAudioState(normalized, true);
+                        Log.d(TAG, "stream-as-download: saved and validated " + normalized);
+                        localProgressHandler.post(() -> {
+                            if (!isAdded()) return;
+                            try {
+                                Fragment playlist = getParentFragmentManager().findFragmentByTag("playlist_detail");
+                                if (playlist instanceof PlaylistDetailFragment) {
+                                    ((PlaylistDetailFragment) playlist).externalRefreshOfflineState();
+                                }
+                            } catch (Exception e) {
+                                Log.w(TAG, "Failed to refresh playlist offline state", e);
                             }
-                        } catch (Exception e) {
-                            Log.w(TAG, "Failed to refresh playlist offline state", e);
-                        }
-                    });
+                        });
+                    } else {
+                        Log.w(TAG, "stream-as-download: validation=" + validation + " for " + normalized);
+                        // The shared validator deletes only confirmed invalid data. An unreadable
+                        // source is retained for a later attempt (e.g. temporary folder access).
+                        OfflineAudioStore.markOfflineAudioState(normalized, false);
+                    }
                 } else {
                     OfflineAudioStore.markOfflineAudioState(normalized, false);
                 }
@@ -2557,11 +2706,8 @@ public class SongPlayerFragment extends Fragment {
             url = LocalFilesStore.getContentUriForVideoId(requireContext(), nextTrack.videoId);
             isLocalOrOffline = true;
         } else if (!wantVideo && OfflineAudioStore.hasOfflineAudio(requireContext(), nextTrack.videoId)) {
-            java.io.File offlineFile = OfflineAudioStore.getExistingOfflineAudioFile(requireContext(), nextTrack.videoId);
-            if (offlineFile != null && offlineFile.isFile() && offlineFile.length() > 0L) {
-                url = offlineFile.getAbsolutePath();
-                isLocalOrOffline = true;
-            }
+            url = OfflineAudioStore.getPlaybackSource(requireContext(), nextTrack.videoId);
+            isLocalOrOffline = !TextUtils.isEmpty(url);
         }
 
         if (!isLocalOrOffline) {
@@ -2793,7 +2939,12 @@ public class SongPlayerFragment extends Fragment {
             long requestToken,
             @NonNull Runnable onFailure
     ) {
+        perfExoPrepareStartedAtMs = SystemClock.elapsedRealtime();
         final boolean networkSource = isHttpStreamSource(source);
+        long fromTapMs = perfPlaybackRequestedAtMs > 0 ? (perfExoPrepareStartedAtMs - perfPlaybackRequestedAtMs) : -1;
+        logPerf("  🚀 [EXO_START] startMediaPlaybackFromSource para " + track.videoId
+                + " (fuente=" + (networkSource ? "STREAM_NETWORK" : "LOCAL_FILE")
+                + ", tiempoDesdeTap=" + fromTapMs + "ms)");
         stopLocalProgressTicker();
         releaseLocalExoMediaPlayer();
         usingOfflineSource = !networkSource;
@@ -2883,6 +3034,10 @@ public class SongPlayerFragment extends Fragment {
         player.setOnRenderedFirstFrameListener(mp -> {
             if (!isAdded() || requestToken != activePlaybackRequestToken) return;
             if (localExoMediaPlayer != mp || !TextUtils.equals(track.videoId, loadedVideoId)) return;
+            long frameAt = SystemClock.elapsedRealtime();
+            long totalAudible = perfPlaybackRequestedAtMs > 0 ? (frameAt - perfPlaybackRequestedAtMs) : -1;
+            logPerf("  🔊 [AUDIBLE_FIRST_FRAME] Primer frame renderizado para " + track.videoId
+                    + " (latenciaTotalDesdeTap=" + totalAudible + "ms)");
             PlaybackLoadingBus.notifyAudioConfirmed(track.videoId);
             if (pbVideoLoading != null) pbVideoLoading.setVisibility(View.GONE);
         });
@@ -2891,6 +3046,12 @@ public class SongPlayerFragment extends Fragment {
             cancelSourcePrepareTimeout();
             localSourcePreparing = false;
             updateSeekBarLoadingState();
+
+            long onPreparedAt = SystemClock.elapsedRealtime();
+            long prepareDuration = perfExoPrepareStartedAtMs > 0 ? (onPreparedAt - perfExoPrepareStartedAtMs) : -1;
+            long totalStartup = perfPlaybackRequestedAtMs > 0 ? (onPreparedAt - perfPlaybackRequestedAtMs) : -1;
+            logPerf("  🎵 [EXO_PREPARED] onPrepared para " + track.videoId
+                    + " (exoPrepare=" + prepareDuration + "ms, latenciaTotal=" + totalStartup + "ms)");
 
             Log.d(TAG, "[PLAYBACK_DBG] onPrepared fired for videoId=" + track.videoId
                     + " isAdded=" + isAdded()
@@ -2924,17 +3085,16 @@ public class SongPlayerFragment extends Fragment {
 
             totalSeconds = resolvedTotal;
 
-            // Also start if ExoPlayer's playWhenReady was already set (e.g. by ensureActive)
-            boolean shouldStart = isPlaying || mp.getPlayWhenReady();
+            // Preserve the latest play/pause intent while this source was preparing.
+            boolean shouldStart = isPlaying && !pauseRequestedByUser;
             if (shouldStart) {
-                if (!isPlaying) {
-                    Log.d(TAG, "[PLAYBACK_DBG] onPrepared: isPlaying=false but playWhenReady=true, correcting");
-                    isPlaying = true;
-                    pauseRequestedByUser = false;
-                }
                 try {
                     mp.setVolume(1f, 1f);
                     mp.start();
+                    long startAt = SystemClock.elapsedRealtime();
+                    long startLatency = perfPlaybackRequestedAtMs > 0 ? (startAt - perfPlaybackRequestedAtMs) : -1;
+                    logPerf("  ▶️ [EXO_PLAYING] mp.start() ejecutado para " + track.videoId
+                            + " (latenciaTotal=" + startLatency + "ms)");
                     Log.d(TAG, "[PLAYBACK_FLOW] mp.start() called, AUDIO PLAYING for videoId=" + track.videoId);
                     if (!LocalFilesStore.isLocalVideoId(track.videoId)) {
                         PlaybackLoadingBus.notifyAudioConfirmed(track.videoId);
@@ -3164,6 +3324,14 @@ public class SongPlayerFragment extends Fragment {
         updateMediaNotification();
         syncMiniStateWithPlaylist();
         persistPlaybackSnapshot(false);
+        updateSheetMiniPlayerViews();
+        if (queueSheetDialog != null && queueSheetDialog.isShowing()) {
+            if (llQueuePanel != null && llQueuePanel.getVisibility() == View.VISIBLE) {
+                showQueueBottomSheet();
+            } else if (llSimilarPanel != null && llSimilarPanel.getVisibility() == View.VISIBLE) {
+                loadSimilarDataForCurrentTrack();
+            }
+        }
     }
 
     private void setPlaybackUiForPreparedSource() {
@@ -3224,9 +3392,9 @@ public class SongPlayerFragment extends Fragment {
         }
 
         if (isAdded() && OfflineAudioStore.hasOfflineAudio(requireContext(), track.videoId)) {
-            File file = OfflineAudioStore.getExistingOfflineAudioFile(requireContext(), track.videoId);
-            if (file.isFile() && file.length() > 0L) {
-                orderedSources.add(file.getAbsolutePath());
+            String source = OfflineAudioStore.getPlaybackSource(requireContext(), track.videoId);
+            if (!TextUtils.isEmpty(source)) {
+                orderedSources.add(source);
                 // Decisión de arranque solo con el chequeo BARATO de existencia: la validación
                 // completa (MediaMetadataRetriever) y el probe de video (MediaExtractor) eran dos
                 // parseos síncronos del archivo entero EN EL MAIN THREAD antes del primer play —
@@ -3285,15 +3453,42 @@ public class SongPlayerFragment extends Fragment {
     }
 
     private void cancelPendingStreamResolver() {
-        pendingResolutionVideoId = "";
+        streamResolutionGeneration++;
         if (pendingStreamResolverFuture != null) {
             pendingStreamResolverFuture.cancel(true);
             pendingStreamResolverFuture = null;
         }
     }
 
+    /** Only the latest resolver may publish a source or clear the pending request. */
+    private void resolveStreamAsync(@NonNull PlayerTrack track, long requestToken,
+                                    @NonNull java.util.concurrent.Callable<String> resolver,
+                                    @NonNull java.util.function.Consumer<String> onResolved) {
+        cancelPendingStreamResolver();
+        final long generation = streamResolutionGeneration;
+        localSourcePreparing = true;
+        pendingStreamResolverFuture = immediateResolverExecutor.submit(() -> {
+            String value;
+            try {
+                value = resolver.call();
+            } catch (Exception error) {
+                if (Thread.currentThread().isInterrupted()) return;
+                Log.w(TAG, "Source resolution failed", error);
+                value = "";
+            }
+            final String source = value;
+            localProgressHandler.post(() -> {
+                if (!isAdded() || generation != streamResolutionGeneration
+                        || requestToken != activePlaybackRequestToken
+                        || !TextUtils.equals(track.videoId, loadedVideoId)) return;
+                pendingStreamResolverFuture = null;
+                onResolved.accept(source);
+            });
+        });
+    }
+
     private boolean hasPendingStreamResolution() {
-        return pendingStreamResolverFuture != null && !pendingStreamResolverFuture.isDone();
+        return pendingStreamResolverFuture != null;
     }
 
     private boolean tryReresolveOrSkipCurrentTrack(@NonNull String reason, boolean forceAttempt) {
@@ -3346,34 +3541,15 @@ public class SongPlayerFragment extends Fragment {
         
         Log.w(TAG, "tryResolveAudiusAndReplay: start videoId=" + track.videoId + " requestToken=" + requestToken);
 
-        cancelPendingStreamResolver();
-        pendingStreamResolverFuture = immediateResolverExecutor.submit(() -> {
-            String resolved = fetchAudiusStreamUrl(track);
-
-            localProgressHandler.post(() -> {
-                pendingStreamResolverFuture = null;
-                if (!isAdded()) {
-                    return;
-                }
-                if (requestToken != activePlaybackRequestToken
-                        || !TextUtils.equals(track.videoId, loadedVideoId)) {
-                    return;
-                }
-
-                if (TextUtils.isEmpty(resolved)) {
-                    stopPlaybackAfterErrors("No se pudo reproducir en YouTube ni encontrar audio alternativo gratuito.");
-                    return;
-                }
-
-                resetPlaybackErrorState();
-                playerEngineRecoveryAttempts = 0;
-                startMediaPlaybackFromSource(
-                        track,
-                        resolved,
-                        requestToken,
-                        () -> stopPlaybackAfterErrors("No se pudo abrir la fuente de audio alternativa.")
-                );
-            });
+        resolveStreamAsync(track, requestToken, () -> fetchAudiusStreamUrl(track), resolved -> {
+            if (TextUtils.isEmpty(resolved)) {
+                stopPlaybackAfterErrors("No se pudo reproducir en YouTube ni encontrar audio alternativo gratuito.");
+                return;
+            }
+            resetPlaybackErrorState();
+            playerEngineRecoveryAttempts = 0;
+            startMediaPlaybackFromSource(track, resolved, requestToken,
+                    () -> stopPlaybackAfterErrors("No se pudo abrir la fuente de audio alternativa."));
         });
         return true;
     }
@@ -3704,22 +3880,7 @@ public class SongPlayerFragment extends Fragment {
     }
 
     private boolean queryNetworkAvailable() {
-        ConnectivityManager cm = ContextCompat.getSystemService(requireContext(), ConnectivityManager.class);
-        if (cm == null) {
-            return false;
-        }
-        android.net.Network network = cm.getActiveNetwork();
-        if (network == null) {
-            return false;
-        }
-        NetworkCapabilities capabilities = cm.getNetworkCapabilities(network);
-        if (capabilities == null) {
-            return false;
-        }
-        return capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
-                || capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
-                || capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
-                || capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN);
+        return NetworkStatus.isOnline(getContext());
     }
 
     private int resolveNextIndexForCompletionCrossfade() {
@@ -4081,7 +4242,11 @@ public class SongPlayerFragment extends Fragment {
         if (actionShare != null) actionShare.setVisibility(isLocalFile ? View.GONE : View.VISIBLE);
         if (actionDownloadTrack != null) actionDownloadTrack.setVisibility(isLocalFile ? View.GONE : View.VISIBLE);
         if (actionGoToArtist != null) actionGoToArtist.setVisibility(!TextUtils.isEmpty(track.artist) ? View.VISIBLE : View.GONE);
-        if (llSimilarTrigger != null) llSimilarTrigger.setVisibility(isLocalFile ? View.GONE : View.VISIBLE);
+        if (ivPlayerTitleChevron != null) ivPlayerTitleChevron.setVisibility(isLocalFile ? View.GONE : View.VISIBLE);
+        if (llPlayerTitleContainer != null) {
+            llPlayerTitleContainer.setEnabled(!isLocalFile);
+            llPlayerTitleContainer.setClickable(!isLocalFile);
+        }
 
         refreshSocialActionsForCurrentTrack(track);
         refreshFavoriteActionForCurrentTrack();
@@ -4132,6 +4297,14 @@ public class SongPlayerFragment extends Fragment {
         }
         syncMiniStateWithPlaylist();
         persistPlaybackSnapshot(false);
+        updateSheetMiniPlayerViews();
+        if (queueSheetDialog != null && queueSheetDialog.isShowing()) {
+            if (llQueuePanel != null && llQueuePanel.getVisibility() == View.VISIBLE) {
+                showQueueBottomSheet();
+            } else if (llSimilarPanel != null && llSimilarPanel.getVisibility() == View.VISIBLE) {
+                loadSimilarDataForCurrentTrack();
+            }
+        }
     }
 
     /** Carga la carátula + color dominante de la pista en el hero (rama música) o aplica la
@@ -4678,73 +4851,16 @@ public class SongPlayerFragment extends Fragment {
     }
 
     private void openRadioForCurrentTrack() {
-        if (!isAdded() || tracks.isEmpty() || currentIndex < 0 || currentIndex >= tracks.size()) return;
+        if (!isAdded() || currentIndex < 0 || currentIndex >= tracks.size()) return;
         if (getParentFragmentManager().isStateSaved()) return;
-        PlayerTrack track = tracks.get(currentIndex);
-        if (TextUtils.isEmpty(track.videoId)) return;
-        String radioPlaylistId = "RDAMVM" + track.videoId;
-        String radioTitle = TextUtils.isEmpty(track.title) ? "Radio" : track.title;
-        SharedPreferences prefs = requireContext().getSharedPreferences(PREFS_PLAYER_STATE, Activity.MODE_PRIVATE);
-
-        // Close player with animation
+        final PlayerTrack track = tracks.get(currentIndex);
+        if (TextUtils.isEmpty(track.videoId) || LocalFilesStore.isLocalVideoId(track.videoId)) return;
         collapseToMiniMode(true);
-
-        // Open radio PlaylistDetail after a short delay for animation. The launcher derives the
-        // RDAMVM id + canonical title from the seed videoId and owns the transaction/chrome.
-        final String seedVideoId = track.videoId;
-        final String seedArtist = TextUtils.isEmpty(track.artist) ? "" : track.artist;
-        final String seedThumb = TextUtils.isEmpty(track.imageUrl) ? "" : track.imageUrl;
-        View view = getView();
-        if (view != null) {
-            view.postDelayed(() -> {
-                if (getActivity() == null) return;
-                androidx.fragment.app.FragmentManager fm;
-                try { fm = getParentFragmentManager(); } catch (Exception e) { return; }
-                if (fm.isStateSaved()) return;
-                PlaylistDetailLauncher.open(
-                        getActivity(), fm,
-                        /* id */ null, radioTitle, seedArtist, seedThumb,
-                        /* seedVideoId */ seedVideoId);
-            }, 350L);
-        }
-
-        // Fetch radio tracks and save to RadioHistoryStore for library display
-        String cookie = safeValue(prefs.getString(AppConstants.PREF_LAST_YOUTUBE_WEB_COOKIE, ""));
-        final String selectedVideoId = track.videoId;
-        final String selectedTitle = TextUtils.isEmpty(track.title) ? "Tema" : track.title;
-        final String selectedArtist = TextUtils.isEmpty(track.artist) ? "" : track.artist;
-        final String selectedThumb = TextUtils.isEmpty(track.imageUrl) ? "" : track.imageUrl;
-        radioMusicService.fetchMixTracks(cookie, radioPlaylistId, new YouTubeMusicService.MixTracksCallback() {
-            @Override
-            public void onSuccess(@NonNull java.util.List<YouTubeMusicService.TrackResult> radioTracks) {
-                if (radioTracks.isEmpty()) return;
-                java.util.List<RadioHistoryStore.RadioTrack> radioStoreTracks = new ArrayList<>();
-                radioStoreTracks.add(new RadioHistoryStore.RadioTrack(
-                        selectedVideoId, selectedTitle, selectedArtist, selectedThumb));
-                for (YouTubeMusicService.TrackResult t : radioTracks) {
-                    if (TextUtils.isEmpty(t.videoId) || TextUtils.equals(t.videoId, selectedVideoId)) continue;
-                    radioStoreTracks.add(new RadioHistoryStore.RadioTrack(
-                            t.videoId,
-                            TextUtils.isEmpty(t.title) ? "" : t.title,
-                            SongSubtitle.artistOnly(t.subtitle, t.title),
-                            t.thumbnailUrl == null ? "" : t.thumbnailUrl));
-                }
-                Context ctx = persistentAppContext;
-                if (ctx != null) {
-                    RadioHistoryStore.INSTANCE.saveRadio(ctx, radioPlaylistId, selectedTitle, selectedThumb, radioStoreTracks);
-                }
-                localProgressHandler.post(() -> {
-                    if (getActivity() instanceof MainActivity) {
-                        ((MainActivity) getActivity()).refreshMusicLibrary();
-                    }
-                });
-            }
-
-            @Override
-            public void onError(@NonNull String error) {
-                // Radio fetch failed — no action needed
-            }
-        });
+        localProgressHandler.postDelayed(() -> {
+            if (!isAdded() || getParentFragmentManager().isStateSaved()) return;
+            PlaylistDetailLauncher.open(getActivity(), getParentFragmentManager(), null,
+                    track.title, track.artist, track.imageUrl, track.videoId);
+        }, 350L);
     }
 
     private void refreshDownloadChipState() {
@@ -4814,13 +4930,15 @@ public class SongPlayerFragment extends Fragment {
         PlayerTrack track = tracks.get(currentIndex);
         if (TextUtils.isEmpty(track.videoId)) return;
 
-        boolean isDownloaded = OfflineAudioStore.hasValidatedOfflineAudio(requireContext(), track.videoId, null);
+        boolean isDownloaded = OfflineAudioStore.hasOfflineAudio(requireContext(), track.videoId);
         if (isDownloaded) {
             pendingDownloadVideoId = "";
-            OfflineAudioStore.deleteOfflineAudio(requireContext(), track.videoId);
-            AppSnackbar.showInView(getPlayerToastRoot(), "Descarga eliminada",
-                    null, null, playerToastBottomMarginPx());
-            refreshDownloadChipState();
+            OfflineAudioStore.deleteOfflineAudioAsync(requireContext(), Collections.singletonList(track.videoId), deleted -> {
+                if (!isAdded() || getView() == null) return;
+                AppSnackbar.showInView(getPlayerToastRoot(), deleted > 0 ? "Descarga eliminada" : "Revisa el acceso a la carpeta de descargas",
+                        null, null, playerToastBottomMarginPx());
+                refreshDownloadChipState();
+            });
         } else {
             pendingDownloadVideoId = track.videoId;
             enqueueOfflineDownloadForTrack(track);
@@ -4831,33 +4949,12 @@ public class SongPlayerFragment extends Fragment {
     }
 
     private void enqueueOfflineDownloadForTrack(PlayerTrack track) {
-        androidx.work.Data input = new androidx.work.Data.Builder()
-                .putString(OfflinePlaylistDownloadWorker.INPUT_PLAYLIST_ID, "")
-                .putString(OfflinePlaylistDownloadWorker.INPUT_PLAYLIST_TITLE, "Descargas Manuales")
-                .putStringArray(OfflinePlaylistDownloadWorker.INPUT_VIDEO_IDS, new String[]{track.videoId})
-                .putStringArray(OfflinePlaylistDownloadWorker.INPUT_TITLES, new String[]{track.title})
-                .putStringArray(OfflinePlaylistDownloadWorker.INPUT_ARTISTS, new String[]{track.artist})
-                .putStringArray(OfflinePlaylistDownloadWorker.INPUT_DURATIONS, new String[]{track.duration})
-                .putInt(OfflinePlaylistDownloadWorker.INPUT_ALREADY_OFFLINE_COUNT, 0)
-                .putInt(OfflinePlaylistDownloadWorker.INPUT_TOTAL_WITH_VIDEO_ID, 1)
-                .putBoolean(OfflinePlaylistDownloadWorker.INPUT_USER_INITIATED, true)
-                .putBoolean(OfflinePlaylistDownloadWorker.INPUT_MANUAL_QUEUE, true)
-                .build();
-        SharedPreferences prefs = requireContext().getSharedPreferences(CloudSyncManager.PREFS_SETTINGS, Context.MODE_PRIVATE);
-        boolean allowMobileData = prefs.getBoolean(CloudSyncManager.KEY_OFFLINE_DOWNLOAD_ALLOW_MOBILE_DATA, false);
-        androidx.work.Constraints constraints = new androidx.work.Constraints.Builder()
-                .setRequiredNetworkType(allowMobileData ? androidx.work.NetworkType.CONNECTED : androidx.work.NetworkType.UNMETERED)
-                .build();
-        androidx.work.OneTimeWorkRequest request = new androidx.work.OneTimeWorkRequest.Builder(OfflinePlaylistDownloadWorker.class)
-                .setInputData(input)
-                .setConstraints(constraints)
-                // Short linear backoff: manual jobs share one APPEND chain — a retrying head
-                // must resolve fast or it blocks every download appended behind it.
-                .setBackoffCriteria(androidx.work.BackoffPolicy.LINEAR, 10, java.util.concurrent.TimeUnit.SECONDS)
-                .addTag(AppConstants.OFFLINE_MANUAL_TRACK_QUEUE)
-                .build();
-        androidx.work.WorkManager.getInstance(requireContext().getApplicationContext())
-                .enqueueUniqueWork(AppConstants.OFFLINE_MANUAL_TRACK_QUEUE, androidx.work.ExistingWorkPolicy.APPEND_OR_REPLACE, request);
+        OfflineDownloadScheduler.Request request = new OfflineDownloadScheduler.Request(
+                "", "Descargas Manuales",
+                new String[]{track.videoId}, new String[]{track.title}, new String[]{track.artist}, new String[]{track.duration},
+                0, 1, true, true)
+                .addTag(AppConstants.OFFLINE_MANUAL_TRACK_QUEUE);
+        OfflineDownloadScheduler.enqueue(requireContext().getApplicationContext(), request, AppConstants.OFFLINE_MANUAL_TRACK_QUEUE);
     }
 
     private void refreshSocialActionsForCurrentTrack(@Nullable PlayerTrack track) {
@@ -5469,10 +5566,10 @@ public class SongPlayerFragment extends Fragment {
             String tDuration = current.duration == null ? "" : current.duration;
             String tImage = current.imageUrl == null ? "" : current.imageUrl;
             CustomPlaylistsStore.INSTANCE.addTrackToYtMirror(
-                    ctx, likedPid, current.videoId, tTitle, tArtist, tDuration, tImage, true);
+                    ctx, likedPid, current.videoId, tTitle, tArtist, tDuration, tImage, true, false);
             FavoritesPlaylistStore.clearLikedTombstone(ctx, current.videoId);
         } else {
-            CustomPlaylistsStore.INSTANCE.removeTrackFromYtMirror(ctx, likedPid, current.videoId);
+            CustomPlaylistsStore.INSTANCE.removeTrackFromYtMirror(ctx, likedPid, current.videoId, false);
             FavoritesPlaylistStore.removeFromLikedMusic(ctx, current.videoId);
         }
         FavoritesPlaylistStore.invalidateLikedMusicCache();
@@ -5564,7 +5661,10 @@ public class SongPlayerFragment extends Fragment {
 
         currentIndex = index;
         isPlaying = true;
-        bindCurrentTrack(!startFromBeginning);
+        pauseRequestedByUser = false;
+        cancelAutoplayRecovery();
+        resetPlaybackErrorState();
+        lastSnapshotDispatchedAtMs = 0;
         playCurrentTrack();
         persistPlaybackSnapshot(false);
     }
@@ -5991,6 +6091,7 @@ public class SongPlayerFragment extends Fragment {
 
         currentIndex = Math.max(0, Math.min(selectedIndex, tracks.size() - 1));
         isPlaying = keepPlaying;
+        pauseRequestedByUser = !keepPlaying;
         
         // Only clear loadedVideoId if we are actually switching tracks OR starting from beginning.
         // This prevents the current song from RESTARTING when only the rest of the queue changed.
@@ -6008,9 +6109,10 @@ public class SongPlayerFragment extends Fragment {
         }
 
         if (!sameAsLoaded || startFromBeginning) {
-            bindCurrentTrack(!startFromBeginning);
             if (isPlaying) {
                 playCurrentTrack();
+            } else {
+                bindCurrentTrack(!startFromBeginning);
             }
         } else {
             // Queue changed but current song is the same: lightweight sync only.
@@ -6046,7 +6148,11 @@ public class SongPlayerFragment extends Fragment {
         backPressedCallback = new OnBackPressedCallback(false) {
             @Override
             public void handleOnBackPressed() {
-                collapseToMiniMode(true);
+                if (queueSheetDialog != null && queueSheetDialog.isShowing()) {
+                    queueSheetDialog.dismiss();
+                } else {
+                    collapseToMiniMode(true);
+                }
             }
         };
         requireActivity().getOnBackPressedDispatcher().addCallback(getViewLifecycleOwner(), backPressedCallback);
@@ -6209,7 +6315,7 @@ public class SongPlayerFragment extends Fragment {
     private boolean noMusicVideosEnabled() {
         try {
             return requireContext().getSharedPreferences(AppConstants.PREFS_SETTINGS, Context.MODE_PRIVATE)
-                    .getBoolean(CloudSyncManager.KEY_NO_MUSIC_VIDEOS, true);
+                    .getBoolean(CloudSyncManager.KEY_NO_MUSIC_VIDEOS, false);
         } catch (Exception e) {
             return false;
         }
@@ -6391,13 +6497,13 @@ public class SongPlayerFragment extends Fragment {
             if (!videoMode) {
                 // Modo audio: preferir el archivo offline si existe (sin red, instantáneo).
                 java.io.File offline = OfflineAudioStore.getExistingOfflineAudioFile(appCtx, swapVideoId);
-                if (offline.isFile() && offline.length() > 0L) {
-                    source = offline.getAbsolutePath();
+                source = OfflineAudioStore.getPlaybackSource(appCtx, swapVideoId);
+                if (source != null) {
                     // El commit leerá isVideoTrack → offlineVideoProbeCache. Resolver el probe
                     // AQUÍ (ya estamos en background) da al commit la respuesta definitiva; el
                     // viejo flip async post-commit dejaba el hero negro (presentación de video
                     // sin superficie adjunta) cuando el .mp4 descargado sí traía video.
-                    ensureOfflineVideoProbeCached(swapVideoId, offline);
+                    if (offline.isFile()) ensureOfflineVideoProbeCached(swapVideoId, offline);
                     // El playback real vuelve a audio SIN pasar por resolveStreamUrl: degradar la
                     // entrada VIDEO global para que isVideoSource() no siga reportando video.
                     StreamResolver.demoteVideoEntry(swapVideoId);
@@ -7049,6 +7155,7 @@ public class SongPlayerFragment extends Fragment {
             animatedEqPlayer.setAnimating(isEffectivePlaying());
         }
         updateSeekBarLoadingState();
+        updateSheetMiniPlayerViews();
     }
 
     private void showSeekBarThumb() {
@@ -7181,12 +7288,14 @@ public class SongPlayerFragment extends Fragment {
 
         // Intento de abrir la app al tocar la notificacion
         Intent openAppIntent = new Intent(persistentAppContext, MainActivity.class)
+                .setAction(MainActivity.ACTION_OPEN_CURRENT_PLAYER)
                 .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
         int pendingFlags = PendingIntent.FLAG_UPDATE_CURRENT;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             pendingFlags |= PendingIntent.FLAG_IMMUTABLE;
         }
         PendingIntent contentIntent = PendingIntent.getActivity(persistentAppContext, 8701, openAppIntent, pendingFlags);
+        mediaSession.setSessionActivity(contentIntent);
 
         int mediaPendingFlags = PendingIntent.FLAG_UPDATE_CURRENT;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -7436,8 +7545,9 @@ public class SongPlayerFragment extends Fragment {
             return;
         }
 
+        List<PlayerTrack> reordered = PlaybackQueueOrder.apply(tracks, currentIndex, nextUpTracks);
         tracks.clear();
-        tracks.addAll(nextUpTracks);
+        tracks.addAll(reordered);
         currentIndex = 0;
 
         if (!shuffleEnabled) {
@@ -7567,7 +7677,6 @@ public class SongPlayerFragment extends Fragment {
             localProgressHandler.removeCallbacks(nextUpRevealRunnable);
             nextUpRevealRunnable = null;
         }
-        nextUpRevealCursor = 0;
     }
 
     /** Programa (con debounce) el precalentado de carátulas de la cola. Diferido para no
@@ -7608,74 +7717,18 @@ public class SongPlayerFragment extends Fragment {
         }
     }
 
-    private void appendNextUpBatch(int totalCount, int batchSize) {
-        if (nextUpAdapter == null || tracks.size() <= 1 || batchSize <= 0) {
-            return;
-        }
 
-        int start = nextUpRevealCursor;
-        int end = Math.min(totalCount, start + batchSize);
-        if (end <= start) {
-            return;
-        }
-
-        for (int offset = start + 1; offset <= end; offset++) {
-            int idx = (currentIndex + offset) % tracks.size();
-            if (nextUpTracks.size() < MAX_NEXT_UP) {
-                PlayerTrack t = tracks.get(idx);
-                nextUpTracks.add(t);
-                nextUpAdapter.getItems().add(t);
-            }
-        }
-
-        nextUpAdapter.notifyItemRangeInserted(start, end - start);
-        nextUpRevealCursor = end;
-    }
 
     private void refreshNextUp() {
-        cancelNextUpReveal();
-        // El head de la cola cambió: dejar las carátulas de las próximas pistas calientes en el
-        // cache de Glide para que la hoja «A continuación» abra con binds instantáneos.
         scheduleNextUpArtworkPrewarm();
-        nextUpTracks.clear();
-        if (nextUpAdapter == null) {
-            return;
+        if (queueSheetDialog != null && queueSheetDialog.isShowing()
+                && llQueuePanel != null && llQueuePanel.getVisibility() == View.VISIBLE) {
+            prepareQueueBottomSheet();
         }
-
-        if (tracks.size() <= 1) {
-            nextUpAdapter.setItems(nextUpTracks);
-            return;
-        }
-
-        nextUpAdapter.setItems(nextUpTracks);
-
-        int maxQueue = 10;
-        int total = Math.min(tracks.size() - 1, maxQueue);
-        appendNextUpBatch(total, maxQueue);
     }
 
     private int parseDurationSeconds(@NonNull String duration) {
-        if (duration.isEmpty() || duration.contains("--")) {
-            return 1;
-        }
-
-        String[] parts = duration.split(":");
-        try {
-            if (parts.length == 2) {
-                int minutes = Integer.parseInt(parts[0]);
-                int seconds = Integer.parseInt(parts[1]);
-                return (minutes * 60) + seconds;
-            }
-            if (parts.length == 3) {
-                int hours = Integer.parseInt(parts[0]);
-                int minutes = Integer.parseInt(parts[1]);
-                int seconds = Integer.parseInt(parts[2]);
-                return (hours * 3600) + (minutes * 60) + seconds;
-            }
-        } catch (NumberFormatException ignored) {
-            return 1;
-        }
-        return 1;
+        return TrackDuration.parseSeconds(duration, 1);
     }
 
     @NonNull
@@ -7898,6 +7951,193 @@ public class SongPlayerFragment extends Fragment {
         }
     }
 
+    private static final class SimilarSongsCarouselAdapter extends RecyclerView.Adapter<SimilarSongsCarouselAdapter.ColumnViewHolder> {
+        interface OnTrackClickListener {
+            void onTrackClick(@NonNull YouTubeMusicService.TrackResult track);
+            void onTrackAddClick(@NonNull YouTubeMusicService.TrackResult track);
+        }
+
+        private final List<YouTubeMusicService.TrackResult> tracks = new ArrayList<>();
+        private final OnTrackClickListener listener;
+
+        SimilarSongsCarouselAdapter(@NonNull OnTrackClickListener listener) {
+            this.listener = listener;
+        }
+
+        void setTracks(@NonNull List<YouTubeMusicService.TrackResult> newTracks) {
+            tracks.clear();
+            tracks.addAll(newTracks);
+            notifyDataSetChanged();
+        }
+
+        @Override
+        public int getItemCount() {
+            return (int) Math.ceil((double) tracks.size() / 4.0);
+        }
+
+        @NonNull
+        @Override
+        public ColumnViewHolder onCreateViewHolder(@NonNull ViewGroup parent, int viewType) {
+            View v = LayoutInflater.from(parent.getContext()).inflate(R.layout.item_similar_column, parent, false);
+            int parentWidth = parent.getMeasuredWidth();
+            if (parentWidth <= 0) {
+                parentWidth = parent.getWidth();
+            }
+            if (parentWidth <= 0) {
+                parentWidth = parent.getResources().getDisplayMetrics().widthPixels;
+            }
+            int colWidth = Math.max(0, parentWidth);
+            ViewGroup.LayoutParams lp = v.getLayoutParams();
+            if (lp != null && colWidth > 0) {
+                lp.width = colWidth;
+                v.setLayoutParams(lp);
+            }
+            return new ColumnViewHolder(v);
+        }
+
+        @Override
+        public void onBindViewHolder(@NonNull ColumnViewHolder holder, int position) {
+            if (holder.itemView.getParent() instanceof View) {
+                View parentView = (View) holder.itemView.getParent();
+                int parentWidth = parentView.getMeasuredWidth() > 0 ? parentView.getMeasuredWidth() : parentView.getWidth();
+                if (parentWidth > 0 && holder.itemView.getLayoutParams() != null &&
+                        holder.itemView.getLayoutParams().width != parentWidth) {
+                    holder.itemView.getLayoutParams().width = parentWidth;
+                    holder.itemView.requestLayout();
+                }
+            }
+            int baseIdx = position * 4;
+            holder.bindSlot(0, baseIdx < tracks.size() ? tracks.get(baseIdx) : null, listener);
+            holder.bindSlot(1, baseIdx + 1 < tracks.size() ? tracks.get(baseIdx + 1) : null, listener);
+            holder.bindSlot(2, baseIdx + 2 < tracks.size() ? tracks.get(baseIdx + 2) : null, listener);
+            holder.bindSlot(3, baseIdx + 3 < tracks.size() ? tracks.get(baseIdx + 3) : null, listener);
+        }
+
+        static class ColumnViewHolder extends RecyclerView.ViewHolder {
+            final View[] rows = new View[4];
+            final ImageView[] arts = new ImageView[4];
+            final TextView[] titles = new TextView[4];
+            final TextView[] artists = new TextView[4];
+            final ImageButton[] adds = new ImageButton[4];
+
+            ColumnViewHolder(@NonNull View itemView) {
+                super(itemView);
+                rows[0] = itemView.findViewById(R.id.rowTrack1);
+                arts[0] = itemView.findViewById(R.id.ivSimilarArt1);
+                titles[0] = itemView.findViewById(R.id.tvSimilarTitle1);
+                artists[0] = itemView.findViewById(R.id.tvSimilarArtist1);
+                adds[0] = itemView.findViewById(R.id.btnSimilarAdd1);
+
+                rows[1] = itemView.findViewById(R.id.rowTrack2);
+                arts[1] = itemView.findViewById(R.id.ivSimilarArt2);
+                titles[1] = itemView.findViewById(R.id.tvSimilarTitle2);
+                artists[1] = itemView.findViewById(R.id.tvSimilarArtist2);
+                adds[1] = itemView.findViewById(R.id.btnSimilarAdd2);
+
+                rows[2] = itemView.findViewById(R.id.rowTrack3);
+                arts[2] = itemView.findViewById(R.id.ivSimilarArt3);
+                titles[2] = itemView.findViewById(R.id.tvSimilarTitle3);
+                artists[2] = itemView.findViewById(R.id.tvSimilarArtist3);
+                adds[2] = itemView.findViewById(R.id.btnSimilarAdd3);
+
+                rows[3] = itemView.findViewById(R.id.rowTrack4);
+                arts[3] = itemView.findViewById(R.id.ivSimilarArt4);
+                titles[3] = itemView.findViewById(R.id.tvSimilarTitle4);
+                artists[3] = itemView.findViewById(R.id.tvSimilarArtist4);
+                adds[3] = itemView.findViewById(R.id.btnSimilarAdd4);
+            }
+
+            void bindSlot(int slot, @Nullable YouTubeMusicService.TrackResult track, @NonNull OnTrackClickListener listener) {
+                if (track == null) {
+                    rows[slot].setVisibility(View.GONE);
+                    return;
+                }
+                rows[slot].setVisibility(View.VISIBLE);
+                titles[slot].setText(track.title != null ? track.title : "");
+                String artistText = SongSubtitle.artistOnly(track.subtitle, track.title);
+                artists[slot].setText(!TextUtils.isEmpty(artistText) ? artistText : (track.subtitle != null ? track.subtitle : ""));
+
+                if (!TextUtils.isEmpty(track.thumbnailUrl)) {
+                    Glide.with(itemView.getContext())
+                            .load(track.thumbnailUrl)
+                            .override(120, 120)
+                            .centerCrop()
+                            .placeholder(R.color.artwork_background)
+                            .into(arts[slot]);
+                } else {
+                    arts[slot].setImageResource(R.color.artwork_background);
+                }
+
+                rows[slot].setOnClickListener(v -> listener.onTrackClick(track));
+                adds[slot].setOnClickListener(v -> listener.onTrackAddClick(track));
+            }
+        }
+    }
+
+    private static final class SimilarPlaylistsAdapter extends RecyclerView.Adapter<SimilarPlaylistsAdapter.PlaylistViewHolder> {
+        interface OnPlaylistClickListener {
+            void onPlaylistClick(@NonNull YouTubeMusicService.MixResult playlist);
+        }
+
+        private final List<YouTubeMusicService.MixResult> playlists = new ArrayList<>();
+        private final OnPlaylistClickListener listener;
+
+        SimilarPlaylistsAdapter(@NonNull OnPlaylistClickListener listener) {
+            this.listener = listener;
+        }
+
+        void setPlaylists(@NonNull List<YouTubeMusicService.MixResult> newPlaylists) {
+            playlists.clear();
+            playlists.addAll(newPlaylists);
+            notifyDataSetChanged();
+        }
+
+        @Override
+        public int getItemCount() {
+            return playlists.size();
+        }
+
+        @NonNull
+        @Override
+        public PlaylistViewHolder onCreateViewHolder(@NonNull ViewGroup parent, int viewType) {
+            View v = LayoutInflater.from(parent.getContext()).inflate(R.layout.item_similar_playlist, parent, false);
+            return new PlaylistViewHolder(v);
+        }
+
+        @Override
+        public void onBindViewHolder(@NonNull PlaylistViewHolder holder, int position) {
+            YouTubeMusicService.MixResult item = playlists.get(position);
+            if (item == null) return;
+            holder.tvTitle.setText(item.title != null ? item.title : "");
+            holder.tvSubtitle.setText(item.subtitle != null ? item.subtitle : "Playlist");
+
+            if (!TextUtils.isEmpty(item.thumbnailUrl)) {
+                Glide.with(holder.itemView.getContext())
+                        .load(item.thumbnailUrl)
+                        .override(240, 240)
+                        .centerCrop()
+                        .placeholder(R.color.artwork_background)
+                        .into(holder.ivArt);
+            } else {
+                holder.ivArt.setImageResource(R.color.artwork_background);
+            }
+
+            holder.itemView.setOnClickListener(v -> listener.onPlaylistClick(item));
+        }
+
+        static class PlaylistViewHolder extends RecyclerView.ViewHolder {
+            final ImageView ivArt;
+            final TextView tvTitle;
+            final TextView tvSubtitle;
+
+            PlaylistViewHolder(@NonNull View itemView) {
+                super(itemView);
+                ivArt = itemView.findViewById(R.id.ivSimilarPlaylistArt);
+                tvTitle = itemView.findViewById(R.id.tvSimilarPlaylistTitle);
+                tvSubtitle = itemView.findViewById(R.id.tvSimilarPlaylistSubtitle);
+            }
+        }
+    }
 
     private void showSaveToPlaylistSheetFromPlayer() {
         if (!isAdded() || tracks.isEmpty() || currentIndex < 0 || currentIndex >= tracks.size()) return;
@@ -8299,34 +8539,12 @@ public class SongPlayerFragment extends Fragment {
         if (!offlineAuto) return;
         if (OfflineAudioStore.hasOfflineAudio(requireContext(), videoId)) return;
         try {
-            androidx.work.Data inputData = new androidx.work.Data.Builder()
-                    .putString(OfflinePlaylistDownloadWorker.INPUT_PLAYLIST_ID, playlistId)
-                    .putString(OfflinePlaylistDownloadWorker.INPUT_PLAYLIST_TITLE, playlistId)
-                    .putStringArray(OfflinePlaylistDownloadWorker.INPUT_VIDEO_IDS, new String[]{videoId})
-                    .putStringArray(OfflinePlaylistDownloadWorker.INPUT_TITLES, new String[]{title})
-                    .putStringArray(OfflinePlaylistDownloadWorker.INPUT_ARTISTS, new String[]{artist})
-                    .putStringArray(OfflinePlaylistDownloadWorker.INPUT_DURATIONS, new String[]{duration})
-                    .putInt(OfflinePlaylistDownloadWorker.INPUT_ALREADY_OFFLINE_COUNT, 0)
-                    .putInt(OfflinePlaylistDownloadWorker.INPUT_TOTAL_WITH_VIDEO_ID, 1)
-                    .putBoolean(OfflinePlaylistDownloadWorker.INPUT_USER_INITIATED, true)
-                    .putBoolean(OfflinePlaylistDownloadWorker.INPUT_MANUAL_QUEUE, true)
-                    .build();
-            android.content.SharedPreferences prefs = requireContext().getSharedPreferences(CloudSyncManager.PREFS_SETTINGS, android.content.Context.MODE_PRIVATE);
-            boolean allowMobile = prefs.getBoolean(CloudSyncManager.KEY_OFFLINE_DOWNLOAD_ALLOW_MOBILE_DATA, false);
-            androidx.work.Constraints constraints = new androidx.work.Constraints.Builder()
-                    .setRequiredNetworkType(allowMobile ? androidx.work.NetworkType.CONNECTED : androidx.work.NetworkType.UNMETERED)
-                    .build();
-            androidx.work.OneTimeWorkRequest request = new androidx.work.OneTimeWorkRequest.Builder(OfflinePlaylistDownloadWorker.class)
-                    .setInputData(inputData)
-                    .setConstraints(constraints)
-                    // Short linear backoff — shared manual chain, no stuck heads (see above).
-                    .setBackoffCriteria(androidx.work.BackoffPolicy.LINEAR, 10, java.util.concurrent.TimeUnit.SECONDS)
-                    .addTag("offline_add_track_" + videoId)
-                    .build();
-            androidx.work.WorkManager.getInstance(requireContext()).enqueueUniqueWork(
-                    AppConstants.OFFLINE_MANUAL_TRACK_QUEUE,
-                    androidx.work.ExistingWorkPolicy.APPEND_OR_REPLACE,
-                    request);
+            OfflineDownloadScheduler.Request request = new OfflineDownloadScheduler.Request(
+                    playlistId, playlistId,
+                    new String[]{videoId}, new String[]{title}, new String[]{artist}, new String[]{duration},
+                    0, 1, true, true)
+                    .addTag("offline_add_track_" + videoId);
+            OfflineDownloadScheduler.enqueue(requireContext(), request, AppConstants.OFFLINE_MANUAL_TRACK_QUEUE);
         } catch (Exception e) {
             Log.w(TAG, "Failed to enqueue offline download", e);
         }
@@ -8379,36 +8597,213 @@ public class SongPlayerFragment extends Fragment {
                 () -> actionClick.onClick(getView()), playerToastBottomMarginPx(), 4000L);
     }
 
+    private void setupQueueDragHandleGesture(@NonNull View view) {
+        final int slop = ViewConfiguration.get(requireContext()).getScaledTouchSlop();
+        view.setOnClickListener(v -> showQueueBottomSheet());
+        view.setContentDescription("Abrir cola de reproducción");
+        view.setOnTouchListener(new View.OnTouchListener() {
+            private float startX, startY;
+            private boolean dragging;
+            private android.view.VelocityTracker velocity;
+
+            @Override public boolean onTouch(View v, MotionEvent event) {
+                int action = event.getActionMasked();
+                if (action == MotionEvent.ACTION_DOWN) {
+                    startX = event.getRawX();
+                    startY = event.getRawY();
+                    dragging = false;
+                    if (velocity != null) velocity.recycle();
+                    velocity = android.view.VelocityTracker.obtain();
+                    v.getParent().requestDisallowInterceptTouchEvent(true);
+                }
+                if (velocity != null) velocity.addMovement(event);
+                float distance = startY - event.getRawY();
+                if (action == MotionEvent.ACTION_MOVE) {
+                    if (!dragging && distance > slop
+                            && distance > Math.abs(event.getRawX() - startX)) {
+                        prepareQueueBottomSheet();
+                        if (queueSheetDialog != null) {
+                            dragging = true;
+                            queueSheetDialog.beginDrag();
+                        }
+                    }
+                    if (dragging) queueSheetDialog.dragTo(distance);
+                } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                    if (dragging && queueSheetDialog != null) {
+                        if (velocity != null) velocity.computeCurrentVelocity(1000);
+                        queueSheetDialog.endDrag(velocity == null ? 0f : -velocity.getYVelocity(),
+                                action == MotionEvent.ACTION_CANCEL);
+                    } else if (action == MotionEvent.ACTION_UP && Math.abs(distance) <= slop
+                            && Math.abs(event.getRawX() - startX) <= slop) {
+                        v.performClick();
+                    }
+                    if (velocity != null) { velocity.recycle(); velocity = null; }
+                    dragging = false;
+                    v.getParent().requestDisallowInterceptTouchEvent(false);
+                }
+                return true;
+            }
+        });
+    }
+
+    private void updateSheetMiniPlayerViews() {
+        if (!isAdded()) return;
+        if (tracks.isEmpty() || currentIndex < 0 || currentIndex >= tracks.size()) return;
+
+        PlayerTrack cur = tracks.get(currentIndex);
+        if (tvSheetMiniTitle != null) {
+            tvSheetMiniTitle.setText(cur.title != null ? cur.title : "");
+            tvSheetMiniTitle.setSelected(true);
+        }
+        if (tvSheetMiniArtist != null) {
+            tvSheetMiniArtist.setText(cur.artist != null ? cur.artist : "");
+        }
+        String artworkKey = cur.videoId + "|" + cur.imageUrl;
+        if (sheetMiniArt != null && !TextUtils.equals(sheetMiniArtworkKey, artworkKey)) {
+            sheetMiniArtworkKey = artworkKey;
+            if (LocalFilesStore.isLocalVideoId(cur.videoId)) {
+                LocalArtworkResolver.loadInto(sheetMiniArt, cur.videoId, 120);
+            } else if (!TextUtils.isEmpty(cur.imageUrl)) {
+                LocalArtworkResolver.detach(sheetMiniArt);
+                Glide.with(this)
+                        .load(cur.imageUrl)
+                        .override(120, 120)
+                        .centerCrop()
+                        .placeholder(R.color.artwork_background)
+                        .into(sheetMiniArt);
+            } else {
+                LocalArtworkResolver.detach(sheetMiniArt);
+                sheetMiniArt.setImageResource(R.color.artwork_background);
+            }
+        }
+        if (btnSheetMiniPlayPause != null) {
+            btnSheetMiniPlayPause.setImageResource(isPlaying ? R.drawable.ic_player_pause : R.drawable.ic_player_play);
+        }
+    }
+
+    private void updateQueueChipStyles() {
+        TextView[] chips = new TextView[]{chipQueueAll, chipQueueKnown, chipQueuePopular, chipQueueRecommended};
+        String[] modes = new String[]{"all", "known", "popular", "recommended"};
+
+        for (int i = 0; i < chips.length; i++) {
+            TextView chip = chips[i];
+            if (chip == null) continue;
+            boolean selected = TextUtils.equals(currentQueueFilter, modes[i]);
+            if (selected) {
+                chip.setBackgroundResource(R.drawable.bg_chip_white_pill);
+                chip.setTextColor(Color.BLACK);
+                chip.setTypeface(null, android.graphics.Typeface.BOLD);
+            } else {
+                chip.setBackgroundResource(R.drawable.bg_chip_dark_pill);
+                chip.setTextColor(Color.WHITE);
+                chip.setTypeface(null, android.graphics.Typeface.NORMAL);
+            }
+        }
+    }
+
+    private void applyQueueFilter(String mode) {
+        cancelNextUpReveal();
+        currentQueueFilter = mode;
+        updateQueueChipStyles();
+
+        if (fullComputedQueue.isEmpty() || nextUpAdapter == null) return;
+
+        List<PlayerTrack> filtered = new ArrayList<>();
+        PlayerTrack nowPlaying = fullComputedQueue.get(0);
+        filtered.add(nowPlaying);
+
+        List<PlayerTrack> rest = new ArrayList<>(fullComputedQueue.subList(1, fullComputedQueue.size()));
+
+        if ("known".equals(mode)) {
+            for (PlayerTrack pt : rest) {
+                if (pt != null && PlayCountStore.getPlayCount(requireContext(), pt.videoId) > 0) {
+                    filtered.add(pt);
+                }
+            }
+            if (filtered.size() <= 1) {
+                Toast.makeText(requireContext(), "No hay canciones conocidas en la cola", Toast.LENGTH_SHORT).show();
+                filtered.clear();
+                filtered.addAll(fullComputedQueue);
+            }
+        } else if ("popular".equals(mode)) {
+            java.util.Collections.sort(rest, (a, b) -> {
+                int ca = (a != null) ? PlayCountStore.getPlayCount(requireContext(), a.videoId) : 0;
+                int cb = (b != null) ? PlayCountStore.getPlayCount(requireContext(), b.videoId) : 0;
+                return Integer.compare(cb, ca);
+            });
+            filtered.addAll(rest);
+        } else if ("recommended".equals(mode)) {
+            if (!cachedSimilarTracks.isEmpty()) {
+                for (YouTubeMusicService.TrackResult tr : cachedSimilarTracks) {
+                    filtered.add(new PlayerTrack(
+                            tr.videoId,
+                            tr.title != null ? tr.title : "",
+                            SongSubtitle.artistOnly(tr.subtitle, tr.title),
+                            tr.duration != null ? tr.duration : "--:--",
+                            tr.thumbnailUrl != null ? tr.thumbnailUrl : ""
+                    ));
+                }
+            } else {
+                filtered.addAll(rest);
+            }
+        } else { // "all"
+            filtered.addAll(rest);
+        }
+
+        nextUpTracks.clear();
+        nextUpTracks.addAll(filtered);
+        nextUpAdapter.setItems(nextUpTracks);
+        if (rvQueueSheet != null) {
+            rvQueueSheet.scrollToPosition(0);
+        }
+    }
+
     private void showQueueBottomSheet() {
+        prepareQueueBottomSheet();
+        if (queueSheetDialog != null) queueSheetDialog.show();
+    }
+
+    private void prepareQueueBottomSheet() {
         if (!isAdded()) return;
 
-        // Diálogo REUTILIZADO: se construye una sola vez por vista (buildQueueBottomSheet);
-        // las aperturas siguientes solo reponen datos. Construir + inflar en cada tap era el
-        // grueso de la latencia de apertura.
         if (queueSheetDialog == null) {
             buildQueueBottomSheet();
         }
         if (queueSheetDialog == null || nextUpAdapter == null) return;
 
-        // Queue computation is O(n) on an in-memory ArrayList — no need for a background thread
-        List<PlayerTrack> computedQueue = new ArrayList<>();
+        updateSheetMiniPlayerViews();
+
+        selectQueueSheetPanel(false);
+
+        // Update queue source name header
+        if (tvQueueSourceName != null) {
+            if (!tracks.isEmpty() && currentIndex >= 0 && currentIndex < tracks.size()) {
+                PlayerTrack cur = tracks.get(currentIndex);
+                String title = cur.title != null ? cur.title : "";
+                tvQueueSourceName.setText("Mix de " + title);
+            }
+        }
+
+        List<PlayerTrack> computed = new ArrayList<>();
         if (!tracks.isEmpty() && currentIndex >= 0 && currentIndex < tracks.size()) {
-            computedQueue.add(tracks.get(currentIndex));
+            computed.add(tracks.get(currentIndex));
         }
         for (int i = 1; i < tracks.size(); i++) {
             int idx = (currentIndex + i) % tracks.size();
-            computedQueue.add(tracks.get(idx));
+            computed.add(tracks.get(idx));
         }
-        final int totalCount = Math.min(computedQueue.size(), MAX_NEXT_UP);
+        if (queueSheetDialog.isShowing() && computed.equals(fullComputedQueue)) return;
+        fullComputedQueue.clear();
+        fullComputedQueue.addAll(computed);
+        final int totalCount = Math.min(fullComputedQueue.size(), MAX_NEXT_UP);
         final int initialCount = Math.min(totalCount, QUEUE_SHEET_INITIAL_ROWS);
 
-        // Poblar ANTES de show(): el primer layout pass ya bindea los datos finales — sin un
-        // segundo notifyDataSetChanged re-layouteando en plena animación de expansión. El
-        // reset de estado pre-show (scroll a 0 + items frescos) es lo que hace innecesario el
-        // viejo alpha-0 + fade de 150ms del «ghost flash» de la segunda apertura.
+        currentQueueFilter = "all";
+        updateQueueChipStyles();
+
         cancelNextUpReveal();
         nextUpTracks.clear();
-        nextUpTracks.addAll(computedQueue.subList(0, initialCount));
+        nextUpTracks.addAll(fullComputedQueue.subList(0, initialCount));
         nextUpAdapter.setItems(nextUpTracks);
         if (rvQueueSheet != null) {
             rvQueueSheet.scrollToPosition(0);
@@ -8421,17 +8816,13 @@ public class SongPlayerFragment extends Fragment {
             tvEmptyQueueSheet.setVisibility(queueEmpty ? View.VISIBLE : View.GONE);
         }
 
-        // Relleno escalonado: solo lo visible (~12 filas) se bindea antes del show(); el resto
-        // (hasta MAX_NEXT_UP) entra vía notifyItemRangeInserted cuando la animación ya asentó.
         if (totalCount > initialCount) {
-            final List<PlayerTrack> rest = new ArrayList<>(computedQueue.subList(initialCount, totalCount));
+            final List<PlayerTrack> rest = new ArrayList<>(fullComputedQueue.subList(initialCount, totalCount));
             nextUpRevealRunnable = () -> {
                 nextUpRevealRunnable = null;
                 if (nextUpAdapter == null || queueSheetDialog == null || !queueSheetDialog.isShowing()) {
                     return;
                 }
-                // La cola pudo cambiar mientras tanto (tap, cambio de pista); solo append si el
-                // head sigue intacto — un refreshNextUp intermedio ya canceló este runnable.
                 if (nextUpTracks.size() != initialCount || nextUpAdapter.getItems().size() != initialCount) {
                     return;
                 }
@@ -8442,55 +8833,255 @@ public class SongPlayerFragment extends Fragment {
             localProgressHandler.postDelayed(nextUpRevealRunnable, 350L);
         }
 
+    }
+
+    private void showSimilarBottomSheet() {
+        if (!isAdded()) return;
+        if (currentIndex >= 0 && currentIndex < tracks.size()) {
+            PlayerTrack cur = tracks.get(currentIndex);
+            if (cur != null && LocalFilesStore.isLocalVideoId(cur.videoId)) return;
+        }
+
+        if (queueSheetDialog == null) {
+            buildQueueBottomSheet();
+        }
+        if (queueSheetDialog == null) return;
+
+        updateSheetMiniPlayerViews();
+
+        selectQueueSheetPanel(true);
+
+        loadSimilarPlaylists();
+        loadSimilarDataForCurrentTrack();
+        if (rvSimilarSongsCarousel != null) {
+            rvSimilarSongsCarousel.stopScroll();
+            ((LinearLayoutManager) rvSimilarSongsCarousel.getLayoutManager())
+                    .scrollToPositionWithOffset(0, 0);
+        }
         queueSheetDialog.show();
     }
 
-    /** Construye (una vez por vista) la hoja «A continuación»: diálogo, layout, adapter y drag.
-     *  El contenido ya no se oculta con alpha-0 + fade: ese workaround del «ghost flash» de la
-     *  segunda apertura solo era necesario porque cada apertura inflaba un diálogo nuevo. */
+    private void selectQueueSheetPanel(boolean similar) {
+        if (llQueuePanel != null) llQueuePanel.setVisibility(similar ? View.GONE : View.VISIBLE);
+        if (llSimilarPanel != null) {
+            llSimilarPanel.setVisibility(similar ? View.VISIBLE : View.GONE);
+            View scroll = llSimilarPanel.findViewById(R.id.nsvSimilarContent);
+            if (scroll != null) androidx.core.view.ViewCompat.setNestedScrollingEnabled(scroll, similar);
+        }
+        // BottomSheetBehavior must follow the visible vertical scroller, never the hidden queue.
+        if (rvQueueSheet != null) rvQueueSheet.setNestedScrollingEnabled(!similar);
+    }
+
+    private void loadSimilarDataForCurrentTrack() {
+        if (!isAdded() || tracks.isEmpty() || currentIndex < 0 || currentIndex >= tracks.size()) return;
+        PlayerTrack current = tracks.get(currentIndex);
+        if (current == null || TextUtils.isEmpty(current.videoId)) return;
+
+        final String videoId = current.videoId;
+
+        if (TextUtils.equals(lastSimilarFetchedVideoId, videoId)) {
+            if (pbSimilarSongsLoading != null) pbSimilarSongsLoading.setVisibility(View.GONE);
+            showSimilarSongsState(cachedSimilarTracks.isEmpty() ? "No se encontraron canciones similares." : "", false);
+            if (similarSongsCarouselAdapter != null) {
+                if (similarSongsCarouselAdapter.getItemCount() == 0 && !cachedSimilarTracks.isEmpty()) {
+                    similarSongsCarouselAdapter.setTracks(cachedSimilarTracks);
+                }
+            }
+            return;
+        }
+        if (TextUtils.equals(pendingSimilarVideoId, videoId)) return;
+        pendingSimilarVideoId = videoId;
+        final int generation = ++similarRequestGeneration;
+        cachedSimilarTracks.clear();
+        if (similarSongsCarouselAdapter != null) similarSongsCarouselAdapter.setTracks(cachedSimilarTracks);
+
+        if (pbSimilarSongsLoading != null) pbSimilarSongsLoading.setVisibility(View.VISIBLE);
+        showSimilarSongsState("", false);
+
+        SharedPreferences prefs = requireContext().getSharedPreferences(PREFS_PLAYER_STATE, Activity.MODE_PRIVATE);
+        String cookie = safeValue(prefs.getString(AppConstants.PREF_LAST_YOUTUBE_WEB_COOKIE, ""));
+        String radioId = "RDAMVM" + videoId;
+
+        radioMusicService.fetchMixTracks(cookie, radioId, new YouTubeMusicService.MixTracksCallback() {
+            @Override
+            public void onSuccess(@NonNull java.util.List<YouTubeMusicService.TrackResult> resultTracks) {
+                if (!isAdded() || getView() == null || generation != similarRequestGeneration) return;
+                pendingSimilarVideoId = "";
+                if (currentIndex < 0 || currentIndex >= tracks.size()
+                        || !TextUtils.equals(tracks.get(currentIndex).videoId, videoId)) return;
+                lastSimilarFetchedVideoId = videoId;
+                cachedSimilarTracks.clear();
+                for (YouTubeMusicService.TrackResult tr : resultTracks) {
+                    if (tr != null && !TextUtils.isEmpty(tr.videoId) && !TextUtils.equals(tr.videoId, videoId)) {
+                        cachedSimilarTracks.add(tr);
+                    }
+                }
+                if (pbSimilarSongsLoading != null) {
+                    pbSimilarSongsLoading.setVisibility(View.GONE);
+                }
+                if (similarSongsCarouselAdapter != null) {
+                    similarSongsCarouselAdapter.setTracks(cachedSimilarTracks);
+                }
+                showSimilarSongsState(cachedSimilarTracks.isEmpty() ? "No se encontraron canciones similares." : "", false);
+            }
+
+            @Override
+            public void onError(@NonNull String error) {
+                if (!isAdded() || getView() == null || generation != similarRequestGeneration) return;
+                pendingSimilarVideoId = "";
+                if (currentIndex < 0 || currentIndex >= tracks.size()
+                        || !TextUtils.equals(tracks.get(currentIndex).videoId, videoId)) return;
+                if (pbSimilarSongsLoading != null) {
+                    pbSimilarSongsLoading.setVisibility(View.GONE);
+                }
+                showSimilarSongsState("No se pudieron cargar los similares. Toca para reintentar.", true);
+            }
+        });
+    }
+
+    private void showSimilarSongsState(String message, boolean retry) {
+        if (tvSimilarSongsState == null) return;
+        tvSimilarSongsState.setText(message);
+        tvSimilarSongsState.setVisibility(message.isEmpty() ? View.GONE : View.VISIBLE);
+        tvSimilarSongsState.setOnClickListener(retry ? v -> loadSimilarDataForCurrentTrack() : null);
+    }
+
+    private void loadSimilarPlaylists() {
+        if (!isAdded()) return;
+        List<YouTubeMusicService.MixResult> playlists = new ArrayList<>();
+        try {
+            SharedPreferences cachePrefs = requireContext().getSharedPreferences(AppConstants.PREFS_STREAMING_CACHE, Context.MODE_PRIVATE);
+            String raw = cachePrefs.getString("home_recommended_data", "");
+            if (!TextUtils.isEmpty(raw)) {
+                JSONArray arr = new JSONArray(raw);
+                for (int i = 0; i < arr.length(); i++) {
+                    JSONObject obj = arr.optJSONObject(i);
+                    if (obj == null) continue;
+                    String pid = obj.optString("playlistId", "");
+                    String title = obj.optString("title", "");
+                    if (pid.isEmpty() || title.isEmpty()) continue;
+                    playlists.add(new YouTubeMusicService.MixResult(
+                            pid, title, obj.optString("subtitle", "Playlist"),
+                            obj.optString("thumbnailUrl", ""), obj.optString("params", "")
+                    ));
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Error loading cached playlists for similar", e);
+        }
+
+        if (playlists.isEmpty()) {
+            List<RadioHistoryStore.RadioEntry> radios = RadioHistoryStore.INSTANCE.getRadios(requireContext());
+            if (radios != null) {
+                for (RadioHistoryStore.RadioEntry r : radios) {
+                    if (r != null && !TextUtils.isEmpty(r.getRadioPlaylistId())) {
+                        playlists.add(new YouTubeMusicService.MixResult(
+                                r.getRadioPlaylistId(),
+                                "Radio: " + r.getSongTitle(),
+                                "Radio",
+                                r.getSongThumbnail() != null ? r.getSongThumbnail() : "",
+                                ""
+                        ));
+                    }
+                }
+            }
+        }
+
+        if (similarPlaylistsAdapter != null) {
+            similarPlaylistsAdapter.setPlaylists(playlists);
+        }
+        if (pbSimilarPlaylistsLoading != null) {
+            pbSimilarPlaylistsLoading.setVisibility(View.GONE);
+        }
+    }
+
+    /** Construye (una vez por vista) la hoja «A continuación» y «Similares». */
     private void buildQueueBottomSheet() {
         if (!isAdded()) return;
 
-        BottomSheetDialog bottomSheetDialog = new BottomSheetDialog(requireContext());
         View bsv = getLayoutInflater().inflate(R.layout.bottom_sheet_player_queue, null);
-        bottomSheetDialog.setContentView(bsv);
+        PlayerQueueSheet bottomSheetDialog = new PlayerQueueSheet((ViewGroup) getView(), bsv, requireActivity().getWindow());
+
+        // Top mini player in sheet
+        llSheetMiniPlayer = bsv.findViewById(R.id.llSheetMiniPlayer);
+        sheetMiniArt = bsv.findViewById(R.id.ivSheetMiniArt);
+        tvSheetMiniTitle = bsv.findViewById(R.id.tvSheetMiniTitle);
+        tvSheetMiniArtist = bsv.findViewById(R.id.tvSheetMiniArtist);
+        btnSheetMiniPrev = bsv.findViewById(R.id.btnSheetMiniPrev);
+        btnSheetMiniPlayPause = bsv.findViewById(R.id.btnSheetMiniPlayPause);
+        btnSheetMiniNext = bsv.findViewById(R.id.btnSheetMiniNext);
+
+        if (btnSheetMiniPrev != null) {
+            btnSheetMiniPrev.setOnClickListener(v -> {
+                moveTrack(-1);
+                updateSheetMiniPlayerViews();
+            });
+        }
+        if (btnSheetMiniPlayPause != null) {
+            btnSheetMiniPlayPause.setOnClickListener(v -> {
+                togglePlayback();
+                updateSheetMiniPlayerViews();
+            });
+        }
+        if (btnSheetMiniNext != null) {
+            btnSheetMiniNext.setOnClickListener(v -> {
+                moveTrack(1);
+                updateSheetMiniPlayerViews();
+            });
+        }
+        View miniInfo = bsv.findViewById(R.id.llSheetMiniInfo);
+        if (miniInfo != null) {
+            miniInfo.setOnClickListener(v -> {
+                if (queueSheetDialog != null) queueSheetDialog.dismiss();
+            });
+        }
+
+        // Queue panel views
+        llQueuePanel = bsv.findViewById(R.id.llQueuePanel);
+        tvQueuePlayingFromLabel = bsv.findViewById(R.id.tvQueuePlayingFromLabel);
+        tvQueueSourceName = bsv.findViewById(R.id.tvQueueSourceName);
+        btnQueueSave = bsv.findViewById(R.id.btnQueueSave);
+        if (btnQueueSave != null) {
+            btnQueueSave.setOnClickListener(v -> showSaveToPlaylistSheetFromPlayer());
+        }
+
+        chipQueueAll = bsv.findViewById(R.id.chipQueueAll);
+        chipQueueKnown = bsv.findViewById(R.id.chipQueueKnown);
+        chipQueuePopular = bsv.findViewById(R.id.chipQueuePopular);
+        chipQueueRecommended = bsv.findViewById(R.id.chipQueueRecommended);
+
+        if (chipQueueAll != null) chipQueueAll.setOnClickListener(v -> applyQueueFilter("all"));
+        if (chipQueueKnown != null) chipQueueKnown.setOnClickListener(v -> applyQueueFilter("known"));
+        if (chipQueuePopular != null) chipQueuePopular.setOnClickListener(v -> applyQueueFilter("popular"));
+        if (chipQueueRecommended != null) chipQueueRecommended.setOnClickListener(v -> applyQueueFilter("recommended"));
 
         RecyclerView rvQueue = bsv.findViewById(R.id.rvQueue);
         tvEmptyQueueSheet = bsv.findViewById(R.id.tvEmptyQueue);
-        ProgressBar pbQueueLoading = bsv.findViewById(R.id.pbQueueLoading);
-        // Los datos se poblan antes de show() — el spinner de carga ya no tiene ventana.
-        pbQueueLoading.setVisibility(View.GONE);
+        View pbQueueLoading = bsv.findViewById(R.id.pbQueueLoading);
+        if (pbQueueLoading != null) pbQueueLoading.setVisibility(View.GONE);
+
         LinearLayoutManager layoutManager = new LinearLayoutManager(requireContext());
         rvQueue.setLayoutManager(layoutManager);
-        // Filas de alto fijo en un RecyclerView match_parent: holders extra en cache para que
-        // el primer scroll no vuelva a inflar.
         rvQueue.setHasFixedSize(true);
         rvQueue.setItemViewCacheSize(12);
         rvQueueSheet = rvQueue;
 
         nextUpAdapter = new NextUpAdapter(position -> {
-            if (position == 0) {
-                return;
-            }
+            if (position == 0) return;
             if (position >= 0 && position < nextUpTracks.size()) {
                 PlayerTrack tapped = nextUpTracks.get(position);
                 int realIdx = -1;
                 for (int j = 0; j < tracks.size(); j++) {
-                    if (tracks.get(j) == tapped) {
-                        realIdx = j;
-                        break;
-                    }
+                    if (tracks.get(j) == tapped) { realIdx = j; break; }
                 }
-
+                if (realIdx == -1 && "recommended".equals(currentQueueFilter)) {
+                    realIdx = Math.min(tracks.size(), currentIndex + 1);
+                    tracks.add(realIdx, tapped);
+                    cacheOriginalQueueOrder();
+                }
                 if (realIdx != -1) {
-                    currentIndex = realIdx;
-                    isPlaying = true;
-                    currentSeconds = 0;
-                    bindCurrentTrack(false);
-                    playCurrentTrack();
-                    if (queueSheetDialog != null) {
-                        queueSheetDialog.dismiss();
-                    }
+                    if (queueSheetDialog != null) queueSheetDialog.dismiss();
+                    externalPlayTrackFromStart(realIdx);
                 }
             }
         }, holder -> {
@@ -8498,30 +9089,15 @@ public class SongPlayerFragment extends Fragment {
                 nextUpItemTouchHelper.startDrag(holder);
             }
         });
-
         rvQueue.setAdapter(nextUpAdapter);
-
-        bottomSheetDialog.setOnShowListener(dialog -> {
-            BottomSheetDialog d = (BottomSheetDialog) dialog;
-            View bottomSheet = d.findViewById(com.google.android.material.R.id.design_bottom_sheet);
-            if (bottomSheet != null) {
-                bottomSheet.setBackgroundResource(android.R.color.transparent);
-                BottomSheetBehavior<View> behavior = BottomSheetBehavior.from(bottomSheet);
-                behavior.setSkipCollapsed(true);
-                try {
-                    behavior.setHideFriction(0.5f);
-                } catch (Throwable ignored) {
-                }
-                behavior.setState(BottomSheetBehavior.STATE_EXPANDED);
-            }
-        });
 
         ItemTouchHelper.SimpleCallback dragCallback = new ItemTouchHelper.SimpleCallback(
                 ItemTouchHelper.UP | ItemTouchHelper.DOWN, 0
         ) {
             @Override
             public int getMovementFlags(@NonNull RecyclerView recyclerView, @NonNull RecyclerView.ViewHolder viewHolder) {
-                if (viewHolder.getBindingAdapterPosition() == 0) return 0; // Now Playing: no drag
+                if (viewHolder.getBindingAdapterPosition() <= 0
+                        || !"all".equals(currentQueueFilter)) return 0;
                 return super.getMovementFlags(recyclerView, viewHolder);
             }
 
@@ -8529,7 +9105,7 @@ public class SongPlayerFragment extends Fragment {
             public boolean onMove(@NonNull RecyclerView recyclerView, @NonNull RecyclerView.ViewHolder viewHolder, @NonNull RecyclerView.ViewHolder target) {
                 int from = viewHolder.getBindingAdapterPosition();
                 int to = target.getBindingAdapterPosition();
-                if (from == RecyclerView.NO_POSITION || to == RecyclerView.NO_POSITION) return false;
+                if (from <= 0 || to <= 0 || !"all".equals(currentQueueFilter)) return false;
                 return nextUpAdapter.moveItem(from, to);
             }
 
@@ -8546,18 +9122,97 @@ public class SongPlayerFragment extends Fragment {
             @Override
             public void clearView(@NonNull RecyclerView recyclerView, @NonNull RecyclerView.ViewHolder viewHolder) {
                 super.clearView(recyclerView, viewHolder);
-                // Sync nextUpTracks from the drag-mutated list before applying to queue
                 nextUpTracks.clear();
                 nextUpTracks.addAll(nextUpAdapter.getItems());
                 applyNextUpOrderToQueue();
             }
         };
-
         nextUpItemTouchHelper = new ItemTouchHelper(dragCallback);
         nextUpItemTouchHelper.attachToRecyclerView(rvQueue);
 
-        // NOTA: sin onDismissListener que anule adapter/helper — el diálogo se reutiliza tal
-        // cual en la próxima apertura; todo se descarta junto en onDestroyView.
+        // Similares panel views
+        llSimilarPanel = bsv.findViewById(R.id.llSimilarPanel);
+        tvSimilarHeaderTitle = bsv.findViewById(R.id.tvSimilarHeaderTitle);
+        btnSimilarClose = bsv.findViewById(R.id.btnSimilarClose);
+        if (btnSimilarClose != null) {
+            btnSimilarClose.setOnClickListener(v -> {
+                if (queueSheetDialog != null) queueSheetDialog.dismiss();
+            });
+        }
+
+        rvSimilarSongsCarousel = bsv.findViewById(R.id.rvSimilarSongsCarousel);
+        pbSimilarSongsLoading = bsv.findViewById(R.id.pbSimilarSongsLoading);
+        tvSimilarSongsState = bsv.findViewById(R.id.tvSimilarSongsState);
+        rvSimilarPlaylistsCarousel = bsv.findViewById(R.id.rvSimilarPlaylistsCarousel);
+        pbSimilarPlaylistsLoading = bsv.findViewById(R.id.pbSimilarPlaylistsLoading);
+
+        similarSongsCarouselAdapter = new SimilarSongsCarouselAdapter(new SimilarSongsCarouselAdapter.OnTrackClickListener() {
+            @Override
+            public void onTrackClick(@NonNull YouTubeMusicService.TrackResult track) {
+                if (!isAdded()) return;
+                PlayerTrack pt = new PlayerTrack(
+                        track.videoId,
+                        track.title != null ? track.title : "",
+                        SongSubtitle.artistOnly(track.subtitle, track.title),
+                        track.duration != null ? track.duration : "--:--",
+                        track.thumbnailUrl != null ? track.thumbnailUrl : ""
+                );
+                int insertPos = Math.min(tracks.size(), currentIndex + 1);
+                tracks.add(insertPos, pt);
+                cacheOriginalQueueOrder();
+                if (queueSheetDialog != null) queueSheetDialog.dismiss();
+                externalPlayTrackFromStart(insertPos);
+            }
+
+            @Override
+            public void onTrackAddClick(@NonNull YouTubeMusicService.TrackResult track) {
+                if (!isAdded()) return;
+                PlayerTrack pt = new PlayerTrack(
+                        track.videoId,
+                        track.title != null ? track.title : "",
+                        SongSubtitle.artistOnly(track.subtitle, track.title),
+                        track.duration != null ? track.duration : "--:--",
+                        track.thumbnailUrl != null ? track.thumbnailUrl : ""
+                );
+                tracks.add(pt);
+                cacheOriginalQueueOrder();
+                invalidateNextTrackPreparations();
+                lastSnapshotDispatchedAtMs = 0;
+                persistPlaybackSnapshot(false);
+                Toast.makeText(requireContext(), "Añadida a la cola", Toast.LENGTH_SHORT).show();
+            }
+        });
+        if (rvSimilarSongsCarousel != null) {
+            rvSimilarSongsCarousel.setLayoutManager(new LinearLayoutManager(requireContext(), LinearLayoutManager.HORIZONTAL, false));
+            rvSimilarSongsCarousel.setAdapter(similarSongsCarouselAdapter);
+            rvSimilarSongsCarousel.setOnFlingListener(null);
+            new PagerSnapHelper().attachToRecyclerView(rvSimilarSongsCarousel);
+        }
+
+        similarPlaylistsAdapter = new SimilarPlaylistsAdapter(playlist -> {
+            if (!isAdded()) return;
+            if (queueSheetDialog != null) queueSheetDialog.dismiss();
+            collapseToMiniMode(true);
+            View view = getView();
+            if (view != null) {
+                view.postDelayed(() -> {
+                    if (getActivity() == null) return;
+                    androidx.fragment.app.FragmentManager fm;
+                    try { fm = getParentFragmentManager(); } catch (Exception e) { return; }
+                    if (fm.isStateSaved()) return;
+                    PlaylistDetailLauncher.open(
+                            getActivity(), fm,
+                            playlist.playlistId, playlist.title, playlist.subtitle, playlist.thumbnailUrl,
+                            /* seedVideoId */ null, false, true, playlist.params,
+                            PlaylistDetailFragment.ART_HINT_SINGLE);
+                }, 350L);
+            }
+        });
+        if (rvSimilarPlaylistsCarousel != null) {
+            rvSimilarPlaylistsCarousel.setLayoutManager(new LinearLayoutManager(requireContext(), LinearLayoutManager.HORIZONTAL, false));
+            rvSimilarPlaylistsCarousel.setAdapter(similarPlaylistsAdapter);
+        }
+
         queueSheetDialog = bottomSheetDialog;
     }
     private void setupSwipeToDismiss(View root) {
@@ -8580,6 +9235,7 @@ public class SongPlayerFragment extends Fragment {
         ((SwipeInterceptLayout) root).setSwipeInterceptCallback(new SwipeInterceptLayout.SwipeInterceptCallback() {
             @Override
             public boolean onInterceptSwipe(MotionEvent e) {
+                if (queueSheetDialog != null && queueSheetDialog.isShowing()) return false;
                 return handleSwipeDismissTouch(root, scrollView, e,
                         initialTouchY, dragStartY, lastTouchY, initialTouchTimeMs, isDragging, canStart);
             }

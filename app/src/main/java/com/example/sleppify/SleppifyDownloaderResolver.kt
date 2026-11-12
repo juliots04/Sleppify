@@ -69,6 +69,7 @@ object SleppifyDownloaderResolver {
         val lock = lockFor(videoId)
         lock.lock()
         try {
+            if (DownloadLocationStore.exists(context, videoId)) return true
             // Another concurrent task may have just finished this exact track (any extension).
             val existing = OfflineAudioStore.getExistingOfflineAudioFile(context, videoId)
             if (existing.isFile && existing.length() >= MIN_VALID_BYTES) {
@@ -111,23 +112,30 @@ object SleppifyDownloaderResolver {
 
     /**
      * Streams [streamUrl] into [tempFile] in [CHUNK_SIZE] pieces, each fetched with googlevideo's
-     * `&range=START-END` URL parameter and HTTP Range header so the CDN serves it at full speed
-     * (no streaming throttle). Preserves HTTP Keep-Alive across chunks for optimal speed on mobile data.
-     * Completes cleanly when the total known length is reached, on short chunk, or on HTTP 200 EOF.
+     * `&range=START-END` URL parameter so the CDN serves it at full speed (no streaming throttle).
+     * Preserves HTTP Keep-Alive across chunks for optimal speed on mobile data.
+     * Completes cleanly when the known total length is reached, on short chunk, or on HTTP 200 EOF.
+     *
+     * NOTE: only the `&range=` URL parameter is used — adding an HTTP `Range:` header alongside it
+     * causes the CDN to report the chunk size as Content-Range total instead of the real file size,
+     * which makes parseTotalLength() break the loop after the first chunk (truncated download).
      */
     private fun downloadDirect(
         streamUrl: String,
         tempFile: File,
         onProgress: ((Float) -> Unit)?
     ): Boolean {
-        var total = -1L
+        // Direct CDN streams usually include the exact file size via `clen=...` parameter.
+        var total = try {
+            android.net.Uri.parse(streamUrl).getQueryParameter("clen")?.toLongOrNull()?.takeIf { it > 0L } ?: -1L
+        } catch (_: Exception) { -1L }
         var written = 0L
         var stalls = 0
 
         try {
             FileOutputStream(tempFile, false).use { output ->
                 loop@ while (true) {
-                    val rangeEnd = written + CHUNK_SIZE - 1
+                    val rangeEnd = if (total > 0L) minOf(written + CHUNK_SIZE - 1, total - 1) else (written + CHUNK_SIZE - 1)
                     val chunkUrl = appendRangeParam(streamUrl, written, rangeEnd)
                     var connection: HttpURLConnection? = null
                     var shouldDisconnect = false
@@ -140,7 +148,9 @@ object SleppifyDownloaderResolver {
                             setRequestProperty("User-Agent", UA)
                             setRequestProperty("Origin", "https://music.youtube.com")
                             setRequestProperty("Referer", "https://music.youtube.com/")
-                            setRequestProperty("Range", "bytes=$written-$rangeEnd")
+                            // NOTE: Do NOT send the HTTP Range header when &range= is already in chunkUrl.
+                            // The googlevideo CDN scopes the response to &range=; adding a Range header
+                            // causes the CDN to report the chunk's length as Content-Range total, breaking the loop.
                             setRequestProperty("Accept", "*/*")
                             setRequestProperty("Connection", "keep-alive")
                         }

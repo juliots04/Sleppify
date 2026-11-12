@@ -77,11 +77,21 @@ object PlayCountStore {
     }
 
     @JvmStatic
+    fun getPlayCount(context: Context, videoId: String): Int {
+        if (videoId.isEmpty()) return 0
+        val entries = loadEntriesMutable(context.applicationContext)
+        return entries.firstOrNull { it.videoId == videoId }?.count ?: 0
+    }
+
+    @JvmStatic
     fun getTopEntries(context: Context, limit: Int): List<PlayCountEntry> {
         val entries = loadEntriesMutable(context.applicationContext)
-        entries.sortWith(compareByDescending<PlayCountEntry> { it.count }
-            .thenByDescending { it.lastPlayedAtMs })
-        return entries.take(limit)
+        return entries.asSequence()
+            .filter { it.count > 0 && it.videoId.isNotEmpty() && (it.playlistId.isEmpty() || it.videoId != it.playlistId) }
+            .sortedWith(compareByDescending<PlayCountEntry> { it.count }
+                .thenByDescending { it.lastPlayedAtMs })
+            .take(limit)
+            .toList()
     }
 
     @JvmStatic
@@ -162,6 +172,7 @@ object PlayCountStore {
             ) continue
 
             val totalCount = tracks.sumOf { it.count }
+            if (totalCount <= 0) continue
             val mostRecent = tracks.maxOf { it.lastPlayedAtMs }
             val bestTrack = tracks.maxByOrNull { it.count } ?: continue
             // Merged id variants: prefer the local-favorites identity for name/art when present,
@@ -295,14 +306,19 @@ object PlayCountStore {
     private fun jsonToEntry(obj: JSONObject): PlayCountEntry? {
         val videoId = obj.optString("videoId", "").trim()
         if (videoId.isEmpty()) return null
+        val playlistId = obj.optString("playlistId", "")
+        // Ignorar pseudo-entradas agregadas de playlists y entradas con conteo inválido
+        if (playlistId.isNotEmpty() && videoId == playlistId) return null
+        val count = obj.optInt("count", 1)
+        if (count <= 0) return null
         return PlayCountEntry(
             videoId = videoId,
             title = obj.optString("title", ""),
             artist = obj.optString("artist", ""),
             imageUrl = obj.optString("imageUrl", ""),
-            playlistId = obj.optString("playlistId", ""),
+            playlistId = playlistId,
             playlistName = obj.optString("playlistName", ""),
-            count = obj.optInt("count", 1),
+            count = count,
             lastPlayedAtMs = obj.optLong("lastPlayedAtMs", 0L)
         )
     }

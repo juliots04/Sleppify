@@ -43,7 +43,7 @@ object RadioArtComposer {
 
     // Se sube cuando cambia la geometría/estilo para que ningún composite viejo (memoria/disco) se
     // reutilice con el diseño nuevo.
-    private const val STYLE_VERSION = "v10-frost"
+    private const val STYLE_VERSION = "v11-frost-title"
 
     // Por debajo de este tamaño (px) NO se pinta el panel esmerilado: solo la carátula. Bajo para
     // que las filas de biblioteca / detalle (thumbs ~48-50dp) también muestren el panel.
@@ -336,7 +336,7 @@ object RadioArtComposer {
         }
         val avail = s - 2f * padX
         canvas.drawText("RADIO", padX, s - s * 0.135f, kicker)
-        val t = title.trim().ifEmpty { "Radio" }
+        val t = title.trim().takeUnless { it.isEmpty() || it.equals("Radio", true) } ?: "Tu selección"
         val shown = TextUtils.ellipsize(t, titlePaint, avail, TextUtils.TruncateAt.END).toString()
         canvas.drawText(shown, padX, s - s * 0.05f, titlePaint)
     }

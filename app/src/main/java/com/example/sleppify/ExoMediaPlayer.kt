@@ -379,11 +379,14 @@ class ExoMediaPlayer {
         override fun onPlaybackStateChanged(playbackState: Int) {
             if (playbackState == Player.STATE_READY && !prepared) {
                 prepared = true
+                Log.i("SLEPPIFY_PERF", "[SLEPPIFY_PERF]     [EXO_INTERNAL] Player.STATE_READY alcanzado (listo para reproducir)")
                 mainHandler.post {
                     if (!released) {
                         preparedListener?.onPrepared(this@ExoMediaPlayer)
                     }
                 }
+            } else if (playbackState == Player.STATE_BUFFERING) {
+                Log.i("SLEPPIFY_PERF", "[SLEPPIFY_PERF]     [EXO_INTERNAL] Player.STATE_BUFFERING (descargando/decodificando buffer inicial)")
             } else if (playbackState == Player.STATE_ENDED) {
                 mainHandler.post {
                     if (!released) {
@@ -563,6 +566,7 @@ class ExoMediaPlayer {
         player.stop()
         player.setMediaSource(source)
         player.volume = Math.max(leftVolume, rightVolume)
+        Log.i("SLEPPIFY_PERF", "[SLEPPIFY_PERF]     [EXO_INTERNAL] player.prepare() invocado (isHttp=$pendingIsHttpSource, ownsPlayer=$ownsPlayer)")
         player.prepare()
         prepared = false
     }

@@ -1187,32 +1187,74 @@ class YouTubeMusicService @JvmOverloads constructor(
     ): Boolean {
         // Migrado de la Data API OAuth (/playlistItems) a InnerTube edit_playlist con la cookie web
         // (firmada con SAPISIDHASH por postInnerTubeBrowse). El token queda ignorado. Sin cuota.
-        val cookieHeader = StreamResolver.getAuthCookieHeader().trim()
-        if (cookieHeader.isEmpty()) return false
-        val bareId = if (playlistId.length > 2 && playlistId.startsWith("VL")) playlistId.substring(2) else playlistId
-        val endpoint = "https://music.youtube.com/youtubei/v1/browse/edit_playlist?prettyPrint=false"
-        val body = JSONObject().apply {
-            put("context", JSONObject().apply {
-                put("client", JSONObject().apply {
-                    put("clientName", "WEB_REMIX")
-                    put("clientVersion", buildClientVersion())
-                    put("hl", "es")
-                })
-            })
-            put("playlistId", bareId)
-            put("actions", JSONArray().apply {
-                put(JSONObject().apply {
-                    put("action", "ACTION_ADD_VIDEO")
-                    put("addedVideoId", videoId)
-                })
-            })
-        }.toString().toByteArray(StandardCharsets.UTF_8)
-        return try {
-            val response = postInnerTubeBrowse(endpoint, body, cookieHeader)
-            JSONObject(response).optString("status", "").equals("STATUS_SUCCEEDED", ignoreCase = true)
-        } catch (e: Exception) {
-            Log.w(TAG, "edit_playlist add failed: ${e.message}")
-            false
+        syncPlaylistMembership(StreamResolver.getAuthCookieHeader().trim(), playlistId, videoId, true)
+        return true
+    }
+
+    /** Blocking write API for WorkManager. Cookie is captured for one account, never read mid-request. */
+    internal fun syncPlaylistMembership(cookie: String, playlistId: String, videoId: String, add: Boolean) {
+        require(cookie.isNotBlank()) { "Inicia sesión en YouTube Music para sincronizar." }
+        require(PlaylistMembershipPlan.isYouTubeVideo(videoId)) { "La canción no pertenece a YouTube Music." }
+        val id = PlaylistDetailLauncher.normalizeOpenId(playlistId)
+        if (id == SPECIAL_LIKED_VIDEOS_ID) {
+            val action = if (add) "like" else "removelike"
+            writeMusicRequest(cookie, "like/$action", JSONObject().put("target", JSONObject().put("videoId", videoId)))
+            return
+        }
+        val entries = findPlaylistEntries(cookie, id, videoId)
+        val plan = PlaylistMembershipPlan.fromServerState(add, entries)
+        if (plan.action == PlaylistMembershipPlan.Action.NONE) return
+        val actions = JSONArray()
+        if (plan.action == PlaylistMembershipPlan.Action.ADD) actions.put(JSONObject().put("action", "ACTION_ADD_VIDEO").put("addedVideoId", videoId))
+        else for (entry in plan.removeEntryIds) {
+            actions.put(JSONObject().put("action", "ACTION_REMOVE_VIDEO")
+                .put("removedVideoId", videoId).put("setVideoId", entry))
+        }
+        val result = writeMusicRequest(cookie, "browse/edit_playlist", JSONObject().put("playlistId", id).put("actions", actions))
+        check(result.optString("status") == "STATUS_SUCCEEDED") {
+            "YouTube no permitió editar esta playlist. Comprueba que sea tuya o colaborativa."
+        }
+    }
+
+    internal fun createPrivatePlaylist(cookie: String, title: String, videoIds: List<String>): String {
+        val result = writeMusicRequest(cookie, "playlist/create", JSONObject()
+            .put("title", title.replace("<", "").replace(">", ""))
+            .put("description", "Creada desde Sleppify")
+            .put("privacyStatus", "PRIVATE").put("videoIds", JSONArray(videoIds.distinct())))
+        return result.optString("playlistId").also { check(it.isNotBlank()) { "No se pudo crear la playlist en YouTube Music." } }
+    }
+
+    private fun writeMusicRequest(cookie: String, path: String, body: JSONObject): JSONObject {
+        body.put("context", JSONObject().put("client", JSONObject()
+            .put("clientName", "WEB_REMIX").put("clientVersion", buildClientVersion()).put("hl", "es")))
+        val result = JSONObject(postInnerTubeBrowse("https://music.youtube.com/youtubei/v1/$path?prettyPrint=false",
+            body.toString().toByteArray(StandardCharsets.UTF_8), cookie))
+        check(!result.has("error")) { "YouTube rechazó la actualización de la playlist." }
+        return result
+    }
+
+    private fun findPlaylistEntries(cookie: String, playlistId: String, videoId: String): List<String> {
+        val endpoint = "https://music.youtube.com/youtubei/v1/browse?prettyPrint=false"
+        var root = JSONObject(postInnerTubeBrowse(endpoint, buildLibraryBrowseBody("VL$playlistId", null), cookie))
+        var shelf = findPlaylistShelf(root)
+        check(shelf != null) { "No se pudo leer la playlist de YouTube Music." }
+        var contents = shelf?.optJSONArray("contents")
+        val entries = mutableListOf<String>()
+        val seenContinuations = hashSetOf<String>()
+        while (true) {
+            if (Thread.currentThread().isInterrupted) throw java.io.InterruptedIOException("Playlist sync cancelled")
+            for (i in 0 until (contents?.length() ?: 0)) {
+                val renderer = contents?.optJSONObject(i)?.optJSONObject("musicResponsiveListItemRenderer") ?: continue
+                val item = renderer.optJSONObject("playlistItemData") ?: continue
+                if (item.optString("videoId") == videoId) entries.add(item.optString("playlistSetVideoId"))
+            }
+            val continuation = extractPlaylistShelfContinuation(shelf, contents, root) ?: return entries
+            check(seenContinuations.add(continuation) && seenContinuations.size <= 500) { "La playlist no terminó de cargar." }
+            root = JSONObject(postInnerTubeBrowse(endpoint, buildLibraryBrowseBody(null, continuation), cookie))
+            shelf = root.optJSONObject("continuationContents")?.optJSONObject("musicPlaylistShelfContinuation")
+                ?: root.optJSONObject("continuationContents")?.optJSONObject("musicShelfContinuation")
+            contents = shelf?.optJSONArray("contents") ?: extractModernContinuationItems(root)
+            check(contents != null) { "No se pudo leer el resto de la playlist." }
         }
     }
 
@@ -2879,9 +2921,8 @@ class YouTubeMusicService @JvmOverloads constructor(
                 throw IllegalStateException("Browse home error $statusCode")
             }
             return responseBody
-        } catch (e: Exception) {
-            try { connection.disconnect() } catch (_: Exception) {}
-            throw e
+        } finally {
+            connection.disconnect()
         }
     }
 

@@ -8,6 +8,11 @@
 /.idea/navEditor.xml
 /.idea/assetWizardSettings.xml
 .DS_Store
+.kotlin/
+hs_err_pid*.log
+*.hprof
+__pycache__/
+*.pyc
 /build
 /captures
 .externalNativeBuild

@@ -57,6 +57,9 @@ object SongPlayerLauncher {
         if (openPlayerUi) mini?.animateOut()
 
         val safeIndex = startIndex.coerceIn(0, ids.size - 1)
+        val selectedId = ids.getOrNull(safeIndex) ?: ""
+        val selectedTitle = titles.getOrNull(safeIndex) ?: ""
+        android.util.Log.i("SLEPPIFY_PERF", "[SLEPPIFY_PERF] 👆 [TAP] Usuario tocó canción: videoId=$selectedId, title=\"$selectedTitle\", idx=$safeIndex")
 
         // Pre-resuelve la pista tocada YA (fire-and-forget, hilos propios de preResolveQueue):
         // la resolución NewPipe (~0.5-3s) corre en paralelo con la transacción/animación del

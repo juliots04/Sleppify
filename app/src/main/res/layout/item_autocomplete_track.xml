@@ -17,7 +17,7 @@
         android:layout_height="50dp"
         android:layout_marginStart="4dp"
         android:layout_marginEnd="12dp"
-        android:background="@color/surface_high"
+        android:background="@color/artwork_background"
         android:scaleType="fitCenter" />
 
     <LinearLayout

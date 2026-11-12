@@ -54,8 +54,6 @@ class SettingsFragment : Fragment() {
         private const val SECTION_DATA_SAVER = 5
         private const val HISTORY_PAGE_SIZE = 20
         private const val HISTORY_DAY_VISIBLE_LIMIT = 20
-        // Única fuente de verdad de la clave: OfflineAudioStore (quien la consume al descargar).
-        private const val KEY_USE_SD_CARD = OfflineAudioStore.KEY_USE_SD_CARD
         private const val STATE_CURRENT_SECTION = "settings_current_section"
         private const val STATE_ENTRY_SECTION = "settings_entry_section"
         private const val STATE_PENDING_ENTRY = "settings_pending_entry"
@@ -102,15 +100,44 @@ class SettingsFragment : Fragment() {
     private lateinit var tvDownloadsSdFree: TextView
     private lateinit var tvDownloadsSdUsed: TextView
     private lateinit var pbStorageSd: ProgressBar
-    private lateinit var rowUseSdCard: View
-    private lateinit var tvUseSdCardSubtitle: TextView
-    private lateinit var swUseSdCard: MaterialSwitch
-    private var dividerAfterSd: View? = null
     private lateinit var rowAutoDownloadOnPlay: View
     private lateinit var swAutoDownloadOnPlay: MaterialSwitch
     private lateinit var swShowDeviceFiles: MaterialSwitch
     private lateinit var swDownloadWifiOnly: MaterialSwitch
     private lateinit var tvDownloadsDeleteTitle: TextView
+    private lateinit var swCustomDownloadLocation: MaterialSwitch
+    private lateinit var tvDownloadLocation: TextView
+    private lateinit var tvDownloadLocationStatus: TextView
+    private var downloadedTrackCount: Int? = null
+    private var downloadedTrackBytes: Long? = null
+
+    private val downloadFolderLauncher = registerForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        val ctx = context ?: return@registerForActivityResult
+        if (uri != null) {
+            try {
+                DownloadLocationStore.chooseFolder(ctx, uri)
+                DownloadLocationMigrationWorker.enqueue(ctx)
+            } catch (_: Exception) {
+                Toast.makeText(ctx, "No se puede escribir en esa carpeta. Elige otra ubicación.", Toast.LENGTH_LONG).show()
+            }
+        }
+        if (view != null) renderDownloadLocation()
+    }
+
+    private val downloadWritePermissionLauncher = registerForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        val ctx = context ?: return@registerForActivityResult
+        if (granted) {
+            DownloadLocationStore.useDefault(ctx)
+            DownloadLocationMigrationWorker.enqueue(ctx)
+        } else {
+            Toast.makeText(ctx, "Elige una carpeta personalizada para guardar tus descargas.", Toast.LENGTH_LONG).show()
+        }
+        if (view != null) renderDownloadLocation()
+    }
 
     // History sub-section
     private lateinit var rvHistory: RecyclerView
@@ -275,6 +302,7 @@ class SettingsFragment : Fragment() {
 
     override fun onResume() {
         super.onResume()
+        if (isHidden || view == null) return
         // Activación en cola de archivos locales: si el usuario concedió el permiso desde la
         // pantalla de info de la app, completar ahora la acción que había pedido.
         if (pendingEnableAfterSettings) {
@@ -485,82 +513,61 @@ class SettingsFragment : Fragment() {
         tvDownloadsSdFree = view.findViewById(R.id.tvDownloadsSdFree)
         tvDownloadsSdUsed = view.findViewById(R.id.tvDownloadsSdUsed)
         pbStorageSd = view.findViewById(R.id.pbStorageSd)
-        rowUseSdCard = view.findViewById(R.id.rowUseSdCard)
-        tvUseSdCardSubtitle = view.findViewById(R.id.tvUseSdCardSubtitle)
-        swUseSdCard = view.findViewById(R.id.swUseSdCard)
-        dividerAfterSd = view.findViewById(R.id.dividerAfterSd)
         rowAutoDownloadOnPlay = view.findViewById(R.id.rowAutoDownloadOnPlay)
         swAutoDownloadOnPlay = view.findViewById(R.id.swAutoDownloadOnPlay)
         rowAutoDownloadOnPlay.setOnClickListener { swAutoDownloadOnPlay.toggle() }
         swShowDeviceFiles = view.findViewById(R.id.swShowDeviceFiles)
         swDownloadWifiOnly = view.findViewById(R.id.swDownloadWifiOnly)
         tvDownloadsDeleteTitle = view.findViewById(R.id.tvDownloadsDeleteTitle)
+        swCustomDownloadLocation = view.findViewById(R.id.swCustomDownloadLocation)
+        tvDownloadLocation = view.findViewById(R.id.tvDownloadLocation)
+        tvDownloadLocationStatus = view.findViewById(R.id.tvDownloadLocationStatus)
+        view.findViewById<View>(R.id.rowCustomDownloadLocation).setOnClickListener { swCustomDownloadLocation.toggle() }
+        view.findViewById<View>(R.id.btnChooseDownloadFolder).setOnClickListener {
+            com.google.android.material.dialog.MaterialAlertDialogBuilder(requireContext())
+                .setTitle("Guardar descargas en")
+                .setItems(arrayOf("Music/Sleppify (predeterminada)", "Elegir otra carpeta")) { _, which ->
+                    if (which == 0) selectDefaultDownloadLocation()
+                    else downloadFolderLauncher.launch(DownloadLocationStore.tree(requireContext()))
+                }.show()
+        }
+        androidx.work.WorkManager.getInstance(requireContext())
+            .getWorkInfosForUniqueWorkLiveData(DownloadLocationMigrationWorker.WORK_NAME)
+            .observe(viewLifecycleOwner) { works ->
+                val running = works.firstOrNull { !it.state.isFinished }
+                val latest = running ?: works.maxByOrNull { work ->
+                    work.tags.firstOrNull { it.startsWith(DownloadLocationMigrationWorker.CREATED_TAG) }
+                        ?.removePrefix(DownloadLocationMigrationWorker.CREATED_TAG)?.toLongOrNull() ?: 0L
+                } ?: return@observe
+                val data = if (running != null) latest.progress else latest.outputData
+                tvDownloadLocationStatus.text = when {
+                    running != null -> "Moviendo descargas: ${data.getInt("moved", 0)} de ${data.getInt("total", 0)}"
+                    latest.state == androidx.work.WorkInfo.State.SUCCEEDED -> ""
+                    latest.state == androidx.work.WorkInfo.State.FAILED -> "No se pudieron mover ${data.getInt("failed", 0)} archivos. Los originales se conservaron. ${data.getString("error").orEmpty()}"
+                    else -> "Traslado cancelado. Puedes volver a intentarlo."
+                }
+                tvDownloadLocationStatus.visibility = if (tvDownloadLocationStatus.text.isEmpty()) View.GONE else View.VISIBLE
+                if (running == null && currentSection == SECTION_DOWNLOADS) {
+                    storageInfoJob?.cancel()
+                    storageInfoJob = null
+                    renderDownloadsSection()
+                }
+            }
 
         view.findViewById<View>(R.id.rowDownloadsDelete)?.setOnClickListener { showDeleteAllDownloadsConfirmation() }
     }
 
-    private fun applySdDisabledState() {
-        sectionSdStorage.visibility = View.GONE
-        rowUseSdCard.visibility = View.GONE
-        dividerAfterSd?.visibility = View.GONE
-        tvUseSdCardSubtitle.text = "Descargar contenido en la tarjeta SD"
-        rowUseSdCard.alpha = 1.0f
-        rowUseSdCard.setOnClickListener(null)
-        rowUseSdCard.isClickable = false
-        swUseSdCard.apply {
-            setOnCheckedChangeListener(null)
-            isChecked = false
-            isEnabled = false
-        }
-    }
-
-    private fun applySdEnabledState() {
-        rowUseSdCard.visibility = View.VISIBLE
-        dividerAfterSd?.visibility = View.VISIBLE
-        tvUseSdCardSubtitle.text = "Descargar contenido en la tarjeta SD"
-        rowUseSdCard.alpha = 1.0f
-        rowUseSdCard.isClickable = true
-        rowUseSdCard.isEnabled = true
-        val useSd = settingsPrefs.getBoolean(KEY_USE_SD_CARD, false)
-        swUseSdCard.apply {
-            isEnabled = true
-            setOnCheckedChangeListener(null)
-            isChecked = useSd
-            setOnCheckedChangeListener { _, c ->
-                if (c && !OfflineAudioStore.hasSdCard(requireContext())) {
-                    setOnCheckedChangeListener(null)
-                    isChecked = false
-                    settingsPrefs.edit().putBoolean(KEY_USE_SD_CARD, false).apply()
-                    applySdDisabledState()
-                    return@setOnCheckedChangeListener
-                }
-                settingsPrefs.edit().putBoolean(KEY_USE_SD_CARD, c).apply()
-                OfflineAudioStore.clearOfflineAudioStateCache()
-            }
-        }
-        rowUseSdCard.setOnClickListener {
-            if (swUseSdCard.isEnabled) {
-                swUseSdCard.toggle()
-            }
-        }
-    }
+    private var storageInfoJob: kotlinx.coroutines.Job? = null
 
     private fun renderDownloadsSection() {
         if (!isAdded) return
+        val ownerView = view ?: return
         val appCtx = requireContext().applicationContext
-
-        // Verificación inicial inmediata para evitar saltos o parpadeos en la UI
-        val hasSdInitial = OfflineAudioStore.hasSdCard(appCtx)
-        if (!hasSdInitial) {
-            settingsPrefs.edit().putBoolean(KEY_USE_SD_CARD, false).apply()
-            applySdDisabledState()
-        } else {
-            applySdEnabledState()
-        }
+        renderDownloadLocation()
 
         // Storage info. "En uso" = lo que OCUPA LA APP en ese volumen (descargas + caches),
         // no el uso total del dispositivo; la barra muestra ese uso relativo al volumen.
-        viewLifecycleOwner.lifecycleScope.launch(Dispatchers.IO) {
+        if (storageInfoJob?.isActive != true) storageInfoJob = viewLifecycleOwner.lifecycleScope.launch(Dispatchers.IO) {
             // Internal volume totals
             val stat = try { StatFs(Environment.getDataDirectory().absolutePath) } catch (_: Exception) { null }
             val totalInternal = stat?.totalBytes ?: 1L
@@ -571,6 +578,8 @@ class SettingsFragment : Fragment() {
             val internalDownloads = calculateSize(File(appCtx.filesDir, "offline_audio"))
             val internalCaches = calculateSize(appCtx.cacheDir)
             val appUsedInternal = internalDownloads + internalCaches
+            val downloadedBytes = OfflineAudioStore.getDownloadsTotalBytes(appCtx)
+            val downloadedCount = OfflineAudioStore.listDownloadedTrackIds(appCtx).size
             val internalPercent = appUsagePercent(appUsedInternal, totalInternal)
 
             // SD volume (slot 0 of getExternalFilesDirs is ALWAYS the primary/internal one)
@@ -595,20 +604,21 @@ class SettingsFragment : Fragment() {
             val sdPercent = if (hasValidSd) appUsagePercent(appUsedSd, totalSd) else 0
 
             withContext(Dispatchers.Main) {
-                if (!isAdded) return@withContext
+                if (!isAdded || view !== ownerView) return@withContext
                 tvDownloadsStorageFree.text = "${formatSize(freeInternal)} libres"
-                tvDownloadsStorageUsed.text = "${formatSize(appUsedInternal)} en uso"
+                tvDownloadsStorageUsed.text = "${formatSize(appUsedInternal)} en datos privados y caché"
+                downloadedTrackBytes = downloadedBytes
+                downloadedTrackCount = downloadedCount
+                updateDownloadLocationSummary()
                 pbStorageInternal.progress = internalPercent
 
                 if (hasValidSd) {
                     sectionSdStorage.visibility = View.VISIBLE
                     tvDownloadsSdFree.text = "${formatSize(freeSd)} libres"
-                    tvDownloadsSdUsed.text = "${formatSize(appUsedSd)} en uso"
+                    tvDownloadsSdUsed.text = "${formatSize(appUsedSd)} en datos privados y caché"
                     pbStorageSd.progress = sdPercent
-                    applySdEnabledState()
                 } else {
-                    settingsPrefs.edit().putBoolean(KEY_USE_SD_CARD, false).apply()
-                    applySdDisabledState()
+                    sectionSdStorage.visibility = View.GONE
                 }
             }
         }
@@ -647,6 +657,52 @@ class SettingsFragment : Fragment() {
         }
 
         tvDownloadsDeleteTitle.text = if (downloadCleanupInFlight) "Eliminando…" else "Borrar descargas"
+    }
+
+    private fun renderDownloadLocation() {
+        val ctx = context ?: return
+        swCustomDownloadLocation.setOnCheckedChangeListener(null)
+        swCustomDownloadLocation.isChecked = DownloadLocationStore.isVisibleInStorage(ctx)
+        updateDownloadLocationSummary()
+        view?.findViewById<View>(R.id.btnChooseDownloadFolder)?.visibility =
+            if (swCustomDownloadLocation.isChecked) View.VISIBLE else View.GONE
+        val error = DownloadLocationStore.lastError(ctx)
+        if (error.isNotEmpty()) {
+            tvDownloadLocationStatus.text = error
+            tvDownloadLocationStatus.visibility = View.VISIBLE
+        }
+        swCustomDownloadLocation.setOnCheckedChangeListener { _, checked ->
+            if (checked) {
+                if (DownloadLocationStore.isCustom(ctx)) {
+                    DownloadLocationStore.setVisibleInStorage(ctx, true)
+                    DownloadLocationMigrationWorker.enqueue(ctx)
+                } else selectDefaultDownloadLocation()
+            } else {
+                DownloadLocationStore.setVisibleInStorage(ctx, false)
+                DownloadLocationMigrationWorker.enqueue(ctx)
+            }
+            renderDownloadLocation()
+        }
+    }
+
+    private fun updateDownloadLocationSummary() {
+        val ctx = context ?: return
+        val parts = mutableListOf(DownloadLocationStore.description(ctx))
+        downloadedTrackBytes?.let { parts.add(formatSize(it)) }
+        downloadedTrackCount?.let { parts.add(if (it == 1) "1 canción" else "$it canciones") }
+        tvDownloadLocation.text = parts.joinToString(" · ")
+    }
+
+    private fun selectDefaultDownloadLocation() {
+        val ctx = requireContext()
+        if (Build.VERSION.SDK_INT <= 28 && ContextCompat.checkSelfPermission(ctx,
+                android.Manifest.permission.WRITE_EXTERNAL_STORAGE) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            downloadWritePermissionLauncher.launch(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        } else {
+            DownloadLocationStore.useDefault(ctx)
+            DownloadLocationMigrationWorker.enqueue(ctx)
+            renderDownloadLocation()
+        }
     }
 
     private fun renderShowDeviceFiles() {
@@ -735,7 +791,7 @@ class SettingsFragment : Fragment() {
         }
         swNoMusicVideos.apply {
             setOnCheckedChangeListener(null)
-            isChecked = settingsPrefs.getBoolean(CloudSyncManager.KEY_NO_MUSIC_VIDEOS, true)
+            isChecked = settingsPrefs.getBoolean(CloudSyncManager.KEY_NO_MUSIC_VIDEOS, false)
             setOnCheckedChangeListener { _, c ->
                 settingsPrefs.edit().putBoolean(CloudSyncManager.KEY_NO_MUSIC_VIDEOS, c).apply()
                 // Candado en vivo: si el player está montado, aplica ya (oculta/muestra la
@@ -908,14 +964,22 @@ class SettingsFragment : Fragment() {
         })
     }
 
+    private var historyLoadJob: kotlinx.coroutines.Job? = null
+    private var historyLoadIsReset = false
+
     private fun loadHistory(reset: Boolean) {
         if (!isAdded) return
+        val ownerView = view ?: return
+        val ctx = requireContext().applicationContext
+        if (historyLoadJob?.isActive == true && (!reset || historyLoadIsReset)) return
+        historyLoadJob?.cancel()
+        historyLoadIsReset = reset
         if (reset) historyLoaded = 0
         val offset = historyLoaded
-        viewLifecycleOwner.lifecycleScope.launch(Dispatchers.IO) {
-            val page = ListenHistoryStore.getPage(requireContext(), offset, HISTORY_PAGE_SIZE)
+        historyLoadJob = viewLifecycleOwner.lifecycleScope.launch(Dispatchers.IO) {
+            val page = ListenHistoryStore.getPage(ctx, offset, HISTORY_PAGE_SIZE)
             withContext(Dispatchers.Main) {
-                if (!isAdded) return@withContext
+                if (!isAdded || view !== ownerView) return@withContext
                 if (reset) historyAdapter?.setItems(page)
                 else historyAdapter?.appendItems(page)
                 historyLoaded = offset + page.size
@@ -954,7 +1018,7 @@ class SettingsFragment : Fragment() {
         if (LocalFilesStore.isLocalVideoId(entry.videoId)) {
             LocalArtworkResolver.loadInto(ivArt, entry.videoId)
         } else if (entry.imageUrl.isNotEmpty()) {
-            Glide.with(ivArt).load(entry.imageUrl).transform(SHARED_YT_CROP).placeholder(R.color.surface_high).into(ivArt)
+            Glide.with(ivArt).load(entry.imageUrl).transform(SHARED_YT_CROP).placeholder(R.color.artwork_background).into(ivArt)
         }
         view.findViewById<View>(R.id.ivBsOfflineState)?.visibility = View.GONE
 
@@ -975,8 +1039,10 @@ class SettingsFragment : Fragment() {
         btnDownload.setOnClickListener {
             dialog.dismiss()
             if (hasOffline) {
-                OfflineAudioStore.deleteOfflineAudio(ctx, entry.videoId)
-                AppSnackbar.show(activity, "Descarga eliminada")
+                OfflineAudioStore.deleteOfflineAudioAsync(ctx, listOf(entry.videoId)) { deleted ->
+                    if (isAdded && view != null) AppSnackbar.show(activity, if (deleted > 0)
+                        "Descarga eliminada" else "Revisa el acceso a la carpeta de descargas")
+                }
             } else {
                 AppSnackbar.show(activity, "Descarga iniciada")
             }
@@ -1085,7 +1151,7 @@ class SettingsFragment : Fragment() {
             val photo = authManager.getPhotoUrl()?.toString()
             if (!photo.isNullOrEmpty()) {
                 Glide.with(this).load(photo).circleCrop()
-                    .placeholder(R.color.surface_high).error(R.color.surface_high).into(ivAccountPhoto)
+                    .placeholder(R.color.artwork_background).error(R.color.artwork_background).into(ivAccountPhoto)
             } else {
                 ivAccountPhoto.setImageDrawable(ColorDrawable(ContextCompat.getColor(requireContext(), R.color.surface_high)))
             }
@@ -1350,7 +1416,10 @@ class SettingsFragment : Fragment() {
         tvDownloadsDeleteTitle.text = "Eliminando…"
         val appContext = requireContext().applicationContext
         viewLifecycleOwner.lifecycleScope.launch(Dispatchers.IO) {
+            androidx.work.WorkManager.getInstance(appContext)
+                .cancelUniqueWork(DownloadLocationMigrationWorker.WORK_NAME).result.get()
             OfflineAudioStore.deleteAllOfflineAudio(appContext)
+            val remaining = OfflineAudioStore.getDownloadsTotalBytes(appContext)
             val cachePrefs = appContext.getSharedPreferences(CloudSyncManager.PREFS_STREAMING_CACHE, Context.MODE_PRIVATE)
             val editor = cachePrefs.edit()
             for (key in cachePrefs.all.keys) {
@@ -1361,7 +1430,8 @@ class SettingsFragment : Fragment() {
                 if (!isAdded) return@withContext
                 downloadCleanupInFlight = false
                 tvDownloadsDeleteTitle.text = "Borrar descargas"
-                AppSnackbar.show(activity, "Todas las descargas eliminadas")
+                AppSnackbar.show(activity, if (remaining == 0L) "Todas las descargas eliminadas"
+                    else "Quedan archivos sin eliminar. Revisa el acceso a la carpeta de descargas.")
                 renderDownloadsSection()
                 (activity as? MainActivity)?.onAllDownloadsDeleted()
             }
@@ -1544,7 +1614,7 @@ class SettingsFragment : Fragment() {
                     LocalArtworkResolver.loadInto(ivThumb, entry.videoId)
                 } else if (entry.imageUrl.isNotEmpty()) {
                     LocalArtworkResolver.detach(ivThumb)
-                    Glide.with(ivThumb).load(entry.imageUrl).transform(SHARED_YT_CROP).placeholder(R.color.surface_high).into(ivThumb)
+                    Glide.with(ivThumb).load(entry.imageUrl).transform(SHARED_YT_CROP).placeholder(R.color.artwork_background).into(ivThumb)
                 } else {
                     LocalArtworkResolver.detach(ivThumb)
                     ivThumb.setImageDrawable(ColorDrawable(ContextCompat.getColor(ivThumb.context, R.color.surface_high)))
@@ -1580,7 +1650,7 @@ class SettingsFragment : Fragment() {
                     LocalArtworkResolver.loadInto(ivThumb, entry.videoId)
                 } else if (entry.imageUrl.isNotEmpty()) {
                     LocalArtworkResolver.detach(ivThumb)
-                    Glide.with(ivThumb).load(entry.imageUrl).transform(SHARED_YT_CROP).placeholder(R.color.surface_high).into(ivThumb)
+                    Glide.with(ivThumb).load(entry.imageUrl).transform(SHARED_YT_CROP).placeholder(R.color.artwork_background).into(ivThumb)
                 } else {
                     LocalArtworkResolver.detach(ivThumb)
                     ivThumb.setImageDrawable(ColorDrawable(ContextCompat.getColor(ivThumb.context, R.color.surface_high)))

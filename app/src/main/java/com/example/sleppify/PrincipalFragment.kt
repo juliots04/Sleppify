@@ -61,10 +61,10 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         private const val RECOMMENDED_MAX_RETRIES = 2
         private const val SHORTCUTS_PER_PAGE = 9
         private const val SHORTCUTS_MAX_PAGES = 3
-        // Mínimo de reproducciones reales para entrar al grid de "más escuchadas": evita que
-        // canciones oídas una sola vez ocupen celdas. El grid ya no se rellena a 3 páginas
-        // exactas — 2 páginas o 2 y media son válidas.
-        private const val SHORTCUTS_MIN_PLAYS = 3
+        // Mínimo de reproducciones reales para entrar al grid de "más escuchadas": 1 reproducción
+        // real (>=30s) ya califica. El ordenamiento estricto por count desc garantiza que canciones
+        // con más reproducciones siempre superen a las escuchadas una sola vez.
+        private const val SHORTCUTS_MIN_PLAYS = 1
         // Partial-bind payload: refresh only the play/equalizer icon without reloading artwork or
         // re-creating click listeners (avoids the flash/jank when tapping a shortcut).
         private const val PAYLOAD_EQ = "eq"
@@ -862,37 +862,36 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         submitBg {
             val totalNeeded = SHORTCUTS_PER_PAGE * SHORTCUTS_MAX_PAGES
 
-            // YT Music Speed Dial logic: recency-first, with the single most-played playlist pinned at pos 0.
+            // 1. Obtener la playlist más escuchada (si tiene al menos SHORTCUTS_MIN_PLAYS reproducciones)
             val topPlaylist = PlayCountStore.getTopPlaylists(appContext, 1)
-                .firstOrNull { it.playlistId != LocalFilesStore.PLAYLIST_ID }
+                .firstOrNull { it.playlistId != LocalFilesStore.PLAYLIST_ID && it.count >= SHORTCUTS_MIN_PLAYS }
 
-            // Composite score: frequency weighted by recency decay.
-            // score = count / (1 + daysSinceLastPlayed / 3)
-            val nowMs = System.currentTimeMillis()
+            // 2. Obtener todas las canciones con al menos SHORTCUTS_MIN_PLAYS reproducciones reales
             val allEntries = PlayCountStore.getAllEntries(appContext)
-                .filter { it.count >= SHORTCUTS_MIN_PLAYS }
-                .sortedByDescending { entry ->
-                    val daysSince = (nowMs - entry.lastPlayedAtMs) / 86_400_000.0
-                    entry.count / (1.0 + daysSince / 3.0)
-                }
+                .filter { it.count >= SHORTCUTS_MIN_PLAYS && (it.playlistId.isEmpty() || it.videoId != it.playlistId) }
+
+            // 3. Unir candidatos (playlist top + canciones) y ordenar estrictamente por reproducciones desc,
+            //    usando lastPlayedAtMs únicamente como criterio de desempate para ítems con el mismo conteo.
+            //    De esta forma, si una canción tiene 50 reproducciones y la playlist tiene 2, la canción
+            //    es Top 1 (no se fija la playlist artificialmente en posición 0).
+            val candidates = mutableListOf<PlayCountStore.PlayCountEntry>()
+            if (topPlaylist != null) {
+                candidates.add(topPlaylist)
+            }
+            candidates.addAll(allEntries)
+            candidates.sortWith(compareByDescending<PlayCountStore.PlayCountEntry> { it.count }
+                .thenByDescending { it.lastPlayedAtMs })
 
             val seenIds = HashSet<String>()
             val merged = mutableListOf<PlayCountStore.PlayCountEntry>()
 
-            // Pin the most-played playlist at position 0
-            if (topPlaylist != null) {
-                merged.add(topPlaylist)
-                seenIds.add(topPlaylist.videoId)
-            }
-
-            // Fill remaining slots with composite score (recency + frequency)
-            for (t in allEntries) {
+            // Fill slots strictly by play count (most listened first)
+            for (t in candidates) {
                 if (merged.size >= totalNeeded) break
                 if (t.videoId in seenIds) continue
-                // Una sola playlist en el grid: la fijada en la posición 0. Las pseudo-entradas
-                // agregadas (videoId == playlistId) que la nube reimporta al store crudo no
-                // pueden colarse como segunda fila de playlist.
-                if (!t.playlistId.isNullOrEmpty() && t.videoId == t.playlistId) continue
+                // Solo permitimos como máximo una playlist (topPlaylist) en el grid: excluimos cualquier
+                // otra pseudo-entrada donde videoId == playlistId.
+                if (!t.playlistId.isNullOrEmpty() && t.videoId == t.playlistId && t.videoId != topPlaylist?.videoId) continue
                 seenIds.add(t.videoId)
                 merged.add(t)
             }
@@ -1041,7 +1040,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         if (firstContentRevealDone) return
         if (!force && !hasAnyContent()) return
         firstContentRevealDone = true
-        (activity as? MainActivity)?.revealModuleContent()
+        (activity as? MainActivity)?.revealModuleContent(this)
     }
 
     private fun hasAnyContent(): Boolean =
@@ -2044,12 +2043,12 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                             .format(DecodeFormat.PREFER_RGB_565)
                             .override(radioCardWidthPx, radioCardWidthPx)
                             .diskCacheStrategy(DiskCacheStrategy.ALL)
-                            .placeholder(R.color.surface_high)
+                            .placeholder(R.color.artwork_background)
                             .transform(SHARED_YT_CROP, SHARED_CENTER_CROP)
                             .into(ivCover)
                     } catch (_: Exception) {}
                 } else {
-                    ivCover.setImageResource(R.color.surface_high)
+                    ivCover.setImageResource(R.color.artwork_background)
                 }
             }
         }
@@ -2760,11 +2759,11 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                                     .override(radioCardWidthPx, radioCardWidthPx)
                                     .diskCacheStrategy(DiskCacheStrategy.ALL)
                                     .centerCrop()
-                                    .placeholder(R.color.surface_high)
+                                    .placeholder(R.color.artwork_background)
                                     .into(ivCover)
                             } catch (_: Exception) {}
                         } else {
-                            ivCover.setImageResource(R.color.surface_high)
+                            ivCover.setImageResource(R.color.artwork_background)
                         }
                     }
                 }
@@ -2939,7 +2938,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                         if (!fallbackUrl.isNullOrEmpty() && fallbackUrl != currentTag) {
                             holder.ivThumb.setTag(R.id.tag_artwork_signature, fallbackUrl)
                             val cellPx = (120 * holder.itemView.context.resources.displayMetrics.density).toInt()
-                            try { Glide.with(this@PrincipalFragment).load(ThumbnailUrls.atSize(fallbackUrl, cellPx, 72)).format(DecodeFormat.PREFER_RGB_565).override(cellPx, cellPx).placeholder(R.color.surface_high).transform(SHARED_YT_CROP, SHARED_CENTER_CROP).into(holder.ivThumb) } catch (_: Exception) {}
+                            try { Glide.with(this@PrincipalFragment).load(ThumbnailUrls.atSize(fallbackUrl, cellPx, 72)).format(DecodeFormat.PREFER_RGB_565).override(cellPx, cellPx).placeholder(R.color.artwork_background).transform(SHARED_YT_CROP, SHARED_CENTER_CROP).into(holder.ivThumb) } catch (_: Exception) {}
                         }
                     }
                 } else if (LocalFilesStore.isLocalVideoId(entry.videoId) && isAdded) {
@@ -2955,7 +2954,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                     if (entry.imageUrl != currentTag) {
                         holder.ivThumb.setTag(R.id.tag_artwork_signature, entry.imageUrl)
                         val cellPx = (120 * holder.itemView.context.resources.displayMetrics.density).toInt()
-                        try { Glide.with(this@PrincipalFragment).load(ThumbnailUrls.atSize(entry.imageUrl, cellPx, 72)).format(DecodeFormat.PREFER_RGB_565).override(cellPx, cellPx).placeholder(R.color.surface_high).transform(SHARED_YT_CROP, SHARED_CENTER_CROP).into(holder.ivThumb) } catch (_: Exception) {}
+                        try { Glide.with(this@PrincipalFragment).load(ThumbnailUrls.atSize(entry.imageUrl, cellPx, 72)).format(DecodeFormat.PREFER_RGB_565).override(cellPx, cellPx).placeholder(R.color.artwork_background).transform(SHARED_YT_CROP, SHARED_CENTER_CROP).into(holder.ivThumb) } catch (_: Exception) {}
                     }
                 }
             }
@@ -3071,7 +3070,7 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
                     if (!track.thumbnailUrl.isNullOrEmpty() && isAdded) {
                         // Sin CENTER_CROP: las miniaturas 16:9 se muestran completas (fitCenter en
                         // el XML) en vez de recortadas a 1:1.
-                        try { Glide.with(this@PrincipalFragment).load(track.thumbnailUrl).placeholder(R.color.surface_high).transform(SHARED_YT_CROP).into(ivArt) } catch (_: Exception) {}
+                        try { Glide.with(this@PrincipalFragment).load(track.thumbnailUrl).placeholder(R.color.artwork_background).transform(SHARED_YT_CROP).into(ivArt) } catch (_: Exception) {}
                     } else {
                         try { Glide.with(this@PrincipalFragment).clear(ivArt) } catch (_: Exception) {}
                         ivArt.setImageDrawable(null)

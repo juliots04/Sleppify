@@ -16,7 +16,7 @@
         android:id="@+id/ivCoverArt"
         android:layout_width="50dp"
         android:layout_height="50dp"
-        android:background="@color/surface_high"
+        android:background="@color/artwork_background"
         android:scaleType="fitCenter"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toTopOf="parent"
