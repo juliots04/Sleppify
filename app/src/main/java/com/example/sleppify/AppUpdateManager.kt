@@ -106,6 +106,14 @@ object AppUpdateManager {
             .build()
     }
 
+    private val checkClient by lazy {
+        httpClient.newBuilder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(10, TimeUnit.SECONDS)
+            .callTimeout(20, TimeUnit.SECONDS)
+            .build()
+    }
+
     /**
      * Lee el manifiesto del hosting de forma BLOQUEANTE (llamar solo fuera del main thread —
      * lo usa el executor de checkForUpdate). Devuelve null si ya estás al día; lanza excepción
@@ -114,8 +122,8 @@ object AppUpdateManager {
     @JvmStatic
     @Throws(Exception::class)
     fun fetchUpdateBlocking(): UpdateInfo? {
-        val request = Request.Builder().url(MANIFEST_URL).build()
-        httpClient.newCall(request).execute().use { response ->
+        val request = Request.Builder().url(MANIFEST_URL).header("Cache-Control", "no-cache").build()
+        checkClient.newCall(request).execute().use { response ->
             if (!response.isSuccessful) {
                 throw IllegalStateException("HTTP ${response.code}")
             }
@@ -134,7 +142,7 @@ object AppUpdateManager {
             if (remoteCode <= BuildConfig.VERSION_CODE || apk.isBlank()) {
                 return null // al día
             }
-            val apkUrl = if (apk.startsWith("http")) apk else UPDATE_BASE_URL + apk
+            val apkUrl = UpdateArtifactUrl.resolve(response.request.url.toString(), apk)
             return UpdateInfo(remoteName, remoteCode, apkUrl, notes, size, dialogTitle, mandatory)
         }
     }
@@ -181,19 +189,20 @@ object AppUpdateManager {
 
         val appContext = context.applicationContext
         val updatesDir = File(appContext.cacheDir, "updates")
-        if (updatesDir.exists()) {
-            updatesDir.listFiles()?.forEach { it.delete() }
-        } else {
-            updatesDir.mkdirs()
-        }
         val targetFile = File(updatesDir, "sleppify-update.apk")
 
         downloadExecutor.execute {
             try {
+                if (!updatesDir.isDirectory && !updatesDir.mkdirs()) {
+                    throw IllegalStateException("No se pudo preparar la carpeta de actualizaciones.")
+                }
+                updatesDir.listFiles()?.filter { it.isFile }?.forEach { it.delete() }
                 val request = Request.Builder().url(update.apkUrl).build()
                 httpClient.newCall(request).execute().use { response ->
                     if (!response.isSuccessful) {
-                        finishDownloadWithError("Error de descarga (${response.code})")
+                        finishDownloadWithError(if (response.code == 404)
+                            "El APK publicado no está disponible en el servidor. Inténtalo cuando se repare la publicación."
+                            else "Error de descarga (${response.code})")
                         return@execute
                     }
                     val body = response.body ?: run {
@@ -225,20 +234,33 @@ object AppUpdateManager {
                             }
                         }
                     }
-                }
-
-                downloadInFlight = false
-                lastProgress = 100
-                mainHandler.post {
-                    progressListener?.invoke(100)
-                    installStartedListener?.invoke()
-                    val launched = installApk(appContext, targetFile)
-                    inProgressUpdate = null
-                    if (!launched) {
-                        errorListener?.invoke("No se pudo abrir el instalador. Habilita \"instalar apps desconocidas\".")
+                    if (totalBytesRead == 0L
+                        || (contentLength > 0 && totalBytesRead != contentLength)
+                        || (update.sizeBytes > 0 && totalBytesRead != update.sizeBytes)) {
+                        throw IllegalStateException("El APK se descargó incompleto. Vuelve a intentarlo.")
                     }
                 }
+
+                val archive = appContext.packageManager.getPackageArchiveInfo(targetFile.absolutePath, 0)
+                    ?: throw IllegalStateException("El servidor no devolvió un APK válido.")
+                val archiveCode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) archive.longVersionCode
+                    else @Suppress("DEPRECATION") archive.versionCode.toLong()
+                if (archive.packageName != appContext.packageName || archiveCode != update.versionCode.toLong()) {
+                    throw IllegalStateException("El APK no coincide con la versión anunciada por el servidor.")
+                }
+                mainHandler.post {
+                    val progress = progressListener
+                    val started = installStartedListener
+                    val error = errorListener
+                    clearDownloadState()
+                    lastProgress = 100
+                    progress?.invoke(100)
+                    val launched = installApk(appContext, targetFile)
+                    if (launched) started?.invoke()
+                    else error?.invoke("No se pudo abrir el instalador. Habilita \"instalar apps desconocidas\".")
+                }
             } catch (e: Exception) {
+                targetFile.delete()
                 Log.e(TAG, "download failed", e)
                 finishDownloadWithError(e.message ?: "descarga fallida")
             }
@@ -246,9 +268,20 @@ object AppUpdateManager {
     }
 
     private fun finishDownloadWithError(message: String) {
+        mainHandler.post {
+            val error = errorListener
+            clearDownloadState()
+            error?.invoke(message)
+        }
+    }
+
+    private fun clearDownloadState() {
         downloadInFlight = false
         inProgressUpdate = null
-        mainHandler.post { errorListener?.invoke(message) }
+        lastProgress = 0
+        progressListener = null
+        installStartedListener = null
+        errorListener = null
     }
 
     /** ¿Puede la app lanzar el instalador de APKs? (permiso "instalar apps desconocidas"). */

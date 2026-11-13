@@ -1573,6 +1573,10 @@ public class MusicPlayerFragment extends Fragment implements PlaybackEventBus.Li
     private void setupFragBrandHeader(@NonNull View root) {
         llFragBrandHeader = root.findViewById(R.id.llFragBrandHeader);
         tvFragBrandTitle = root.findViewById(R.id.tvFragBrandTitle);
+        tvFragBrandTitle.setOnClickListener(v -> {
+            if (getActivity() instanceof MainActivity) ((MainActivity) getActivity()).checkForUpdatesSilently();
+        });
+        tvFragBrandTitle.setContentDescription("Sleppify. Buscar actualizaciones");
         btnFragHeaderSearch = root.findViewById(R.id.btnFragHeaderSearch);
         btnFragSignIn = root.findViewById(R.id.btnFragSignIn);
         btnFragProfilePhoto = root.findViewById(R.id.btnFragProfilePhoto);

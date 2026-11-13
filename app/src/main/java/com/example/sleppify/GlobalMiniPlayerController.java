@@ -317,21 +317,25 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
     }
 
     public void openFullPlayer() {
+        openFullPlayer(true);
+    }
+
+    public void openFullPlayer(boolean animate) {
         if (activity.isFinishing() || activity.isDestroyed()
                 || activity.getSupportFragmentManager().isStateSaved()) return;
         // Animate mini-player out
-        animateOut();
+        if (animate) animateOut(); else hide();
 
         SongPlayerFragment existingPlayer = activity.findSongPlayerFragment();
         if (existingPlayer != null && existingPlayer.isAdded()) {
-            activity.openSongPlayer();
+            activity.openSongPlayer(animate);
             return;
         }
 
         // No player — create one from snapshot
         PlaybackHistoryStore.Snapshot snapshot = PlaybackHistoryStore.load(activity);
         if (snapshot.isValid()) {
-            openPlayerFromSnapshot(snapshot, snapshot.isPlaying);
+            openPlayerFromSnapshot(snapshot, snapshot.isPlaying, animate);
         }
     }
 
@@ -339,6 +343,10 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
 
     public void hide() {
         if (llMiniPlayer == null) return;
+        llMiniPlayer.animate().cancel();
+        animatingOut = false;
+        llMiniPlayer.setTranslationY(0f);
+        resetNavTranslationZ();
         llMiniPlayer.setVisibility(View.GONE);
     }
 
@@ -482,7 +490,8 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
 
     private void openPlayerFromSnapshot(
             @NonNull PlaybackHistoryStore.Snapshot snapshot,
-            boolean startPlaying
+            boolean startPlaying,
+            boolean animate
     ) {
         if (!snapshot.isValid()) return;
 
@@ -506,7 +515,7 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
         if (existingPlayer != null && existingPlayer.isAdded()) {
             existingPlayer.externalReplaceQueue(ids, titles, artists, durations, images, snapshotIndex, startPlaying);
             injectOriginalQueueFromSnapshot(existingPlayer, snapshot);
-            activity.openSongPlayer();
+            activity.openSongPlayer(animate);
             return;
         }
 
@@ -517,15 +526,18 @@ public final class GlobalMiniPlayerController implements PlaybackEventBus.Listen
                 snapshotIndex, startPlaying
         );
 
-        playerFragment.externalPrepareEnterSlide();
+        if (animate) playerFragment.externalPrepareEnterSlide();
         injectOriginalQueueFromSnapshot(playerFragment, snapshot);
 
-        activity.getSupportFragmentManager()
+        androidx.fragment.app.FragmentTransaction transaction = activity.getSupportFragmentManager()
                 .beginTransaction()
                 .setReorderingAllowed(true)
-                .add(R.id.playerContainer, playerFragment, AppConstants.TAG_SONG_PLAYER)
-                .runOnCommit(playerFragment::externalAnimateEnterSlide)
-                .commit();
+                .add(R.id.playerContainer, playerFragment, AppConstants.TAG_SONG_PLAYER);
+        if (animate) transaction.runOnCommit(playerFragment::externalAnimateEnterSlide).commit();
+        else {
+            transaction.commitNow();
+            playerFragment.externalShowImmediately();
+        }
     }
 
     private void injectOriginalQueueFromSnapshot(

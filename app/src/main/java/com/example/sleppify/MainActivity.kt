@@ -392,10 +392,11 @@ class MainActivity : AppCompatActivity() {
         if (intent?.getBooleanExtra("SHOW_SETTINGS", false) == true) {
             enterSettings()
         }
-        if (intent?.action == ACTION_PLAY_FROM_SEARCH
+        if (intent?.action == ACTION_OPEN_CURRENT_PLAYER) {
+            handlePlayFromSearchIntent(intent)
+        } else if (intent?.action == ACTION_PLAY_FROM_SEARCH
             || intent?.action == ACTION_PLAY_NEXT
             || intent?.action == ACTION_ADD_TO_QUEUE
-            || intent?.action == ACTION_OPEN_CURRENT_PLAYER
             || intent?.action == ACTION_TOGGLE_CURRENT_PLAYBACK) {
             bottomNav.post { handlePlayFromSearchIntent(intent) }
         }
@@ -597,7 +598,7 @@ class MainActivity : AppCompatActivity() {
             // Use the same entry as the mini-player, including snapshot restoration.
             // Opening a notification must not navigate through (or recreate) Library.
             pendingOpenCurrentPlayer = true
-            fragmentContainer.post { openPendingCurrentPlayer() }
+            openPendingCurrentPlayer()
             intent.action = null
             return
         }
@@ -616,7 +617,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPostResume() {
         super.onPostResume()
-        fragmentContainer.post { openPendingCurrentPlayer() }
+        openPendingCurrentPlayer()
     }
 
     private fun openPendingCurrentPlayer() {
@@ -625,7 +626,7 @@ class MainActivity : AppCompatActivity() {
             || !lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) return
         pendingOpenCurrentPlayer = false
         hideModuleLoadingOverlayImmediate()
-        globalMiniPlayer?.openFullPlayer()
+        globalMiniPlayer?.openFullPlayer(false)
     }
 
     private fun invokeSearchActionOnMusicFragment(intent: Intent): Boolean {
@@ -1303,6 +1304,18 @@ class MainActivity : AppCompatActivity() {
      * Para un usuario recién instalado se re-dispara al terminar el login (ver [handleSignedInUser]/
      * [onWebSessionEstablished]), así lo ve al FINAL de la configuración, ya con todo cargado.
      */
+    private var silentUpdateCheckInFlight = false
+
+    fun checkForUpdatesSilently() {
+        if (silentUpdateCheckInFlight || updateDialog?.isShowing == true || AppUpdateManager.isDownloadInFlight()) return
+        silentUpdateCheckInFlight = true
+        AppUpdateManager.checkForUpdate(applicationContext) { update, _ ->
+            silentUpdateCheckInFlight = false
+            if (update != null && !isFinishing && !isDestroyed
+                && lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) showUpdateAvailablePopup(update)
+        }
+    }
+
     private fun maybeShowStartupUpdatePopup() {
         if (updatePopupShownThisProcess) return
         // Gate: cuenta completamente montada. Si aún no (primer arranque en curso), no molestar;
@@ -1342,8 +1355,7 @@ class MainActivity : AppCompatActivity() {
      * ni tocando fuera — la única salida es tocar "Actualizar".
      */
     fun showUpdateAvailablePopup(update: AppUpdateManager.UpdateInfo) {
-        if (isFinishing || isDestroyed) return
-        updateDialog?.dismiss() // nunca dos a la vez
+        if (isFinishing || isDestroyed || updateDialog?.isShowing == true) return
         val view = layoutInflater.inflate(R.layout.dialog_update_available, null)
         // Header editable desde el panel (con fallback ya resuelto en AppUpdateManager).
         view.findViewById<TextView>(R.id.tvUpdateDialogTitle).text = update.dialogTitle
@@ -1399,11 +1411,18 @@ class MainActivity : AppCompatActivity() {
                     pbDownload.progress = percent
                     tvPercent.text = "$percent%"
                 },
-                onInstallStarted = { tvPercent.text = "Instalando…" },
+                onInstallStarted = {
+                    llProgress.visibility = View.GONE
+                    btnGo.visibility = View.VISIBLE
+                    btnLater.visibility = if (optional) View.VISIBLE else View.GONE
+                    dialog.setCancelable(optional)
+                },
                 onError = { message ->
                     AppSnackbar.show(this, "Error al descargar: $message")
                     llProgress.visibility = View.GONE
                     btnGo.visibility = View.VISIBLE
+                    btnLater.visibility = if (optional) View.VISIBLE else View.GONE
+                    dialog.setCancelable(optional)
                 }
             )
         }
@@ -1592,10 +1611,18 @@ class MainActivity : AppCompatActivity() {
         if (bar != null) rootView.removeView(bar)
     }
 
-    fun openSongPlayer() {
+    @JvmOverloads
+    fun openSongPlayer(animate: Boolean = true) {
         dismissSavedBar()
         val player = findSongPlayerFragment() ?: return
         if (player.isAdded) {
+            if (!animate || !player.isHidden) {
+                player.externalShowImmediately()
+                globalMiniPlayer?.hide()
+                supportFragmentManager.beginTransaction().setReorderingAllowed(true)
+                    .show(player).setMaxLifecycle(player, Lifecycle.State.RESUMED).commitNow()
+                return
+            }
             player.externalPrepareEnterSlide()
             globalMiniPlayer?.animateOut()
             supportFragmentManager.beginTransaction()

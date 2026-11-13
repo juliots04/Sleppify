@@ -5701,6 +5701,19 @@ public class SongPlayerFragment extends Fragment {
         persistPlaybackSnapshot(true);
     }
 
+    public void externalShowImmediately() {
+        playerEnterAnimationRunning = false;
+        collapsingToMiniMode = false;
+        swipeDismissAnimationRunning = false;
+        View root = getView();
+        if (root != null) {
+            root.animate().cancel();
+            root.setTranslationY(0f);
+            root.setAlpha(1f);
+            root.setVisibility(View.VISIBLE);
+        }
+    }
+
     public void externalPrepareEnterSlide() {
         playerEnterAnimationRunning = true;
         collapsingToMiniMode = false;
@@ -5758,6 +5771,7 @@ public class SongPlayerFragment extends Fragment {
     /** Runs the actual slide-to-rest. Split out so it can start either from the first pre-draw
      *  (after layout, so the opening frames aren't dropped) or from a posted fallback. */
     private void startEnterSlide(@NonNull View root, int fallbackDistance) {
+        if (!playerEnterAnimationRunning) return;
         if (!isAdded() || getView() != root) {
             playerEnterAnimationRunning = false;
             return;

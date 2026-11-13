@@ -612,6 +612,8 @@ class PrincipalFragment : Fragment(), PlaybackEventBus.Listener {
         }
 
         styleBrandTitle(tvFragBrandTitle)
+        tvFragBrandTitle?.setOnClickListener { (activity as? MainActivity)?.checkForUpdatesSilently() }
+        tvFragBrandTitle?.contentDescription = "Sleppify. Buscar actualizaciones"
 
         btnFragHeaderSearch?.setOnClickListener {
             (activity as? MainActivity)?.openSearchFragment()

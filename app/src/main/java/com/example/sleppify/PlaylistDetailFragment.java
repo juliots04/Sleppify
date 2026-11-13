@@ -312,6 +312,9 @@ public class PlaylistDetailFragment extends Fragment
      *  the same prefetch batch on every onScrolled frame while the anchor row is unchanged. */
     private int lastArtPrefetchKey = Integer.MIN_VALUE;
     private boolean pendingOfflineToggle = false;
+    private boolean offlineDownloadPreparing;
+    private long offlinePreparationGeneration;
+    private int pendingOfflineEnqueues;
     private final Map<String, Long> lastOfflineStateLookupTimeByTrack = new LinkedHashMap<String, Long>(
             256, 0.75f, true) {
         @Override
@@ -323,6 +326,8 @@ public class PlaylistDetailFragment extends Fragment
     private long lastCachedSongPlayerTime = 0;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private Runnable pendingVisibleRefresh;
+    private long trackLoadGeneration;
+    private long trackRenderGeneration;
     private final ExecutorService offlineReadyStateExecutor = Executors.newSingleThreadExecutor();
     private final AtomicLong offlineReadyStateGeneration = new AtomicLong(0L);
 
@@ -730,11 +735,14 @@ public class PlaylistDetailFragment extends Fragment
 
     @Override
     public void onDestroyView() {
+        trackLoadGeneration++;
+        trackRenderGeneration++;
+        offlinePreparationGeneration++;
+        offlineDownloadPreparing = false;
         cancelVisibleRefresh();
         stopObservingOfflineDownload();
         setOfflineDownloadVisualState(false, "");
         pendingImportTrackIds.clear();
-        clearEnterCachedFallback();
         if (offlineAutoRetryRunnable != null) {
             mainHandler.removeCallbacks(offlineAutoRetryRunnable);
             offlineAutoRetryRunnable = null;
@@ -889,9 +897,8 @@ public class PlaylistDetailFragment extends Fragment
             boolean loadMore,
             @NonNull String message
     ) {
-        if (pendingEnterCachedFallback != null && !pendingEnterCachedFallback.isEmpty()
-                && TextUtils.equals(playlistId, pendingEnterFallbackPlaylistId)) {
-            renderEnterCachedFallback();
+        if (TextUtils.equals(currentPlaylistId, playlistId) && !currentTracks.isEmpty()) {
+            playlistTracksLoadMoreInFlight = false;
             return;
         }
         revealPlaylistContentIfNeeded(true);
@@ -928,17 +935,6 @@ public class PlaylistDetailFragment extends Fragment
     private long lastEnterRevalidateAtMs = 0L;
     private String lastEnterRevalidatePlaylistId = "";
 
-    // Refresh INVISIBLE al entrar: cuando la revalidación silenciosa va a disparar, la caché
-    // (posiblemente obsoleta — los mixes de YT cambian por completo entre visitas) NO se pinta;
-    // el skeleton sigue hasta que llegue la versión fresca y el usuario ve directamente la lista
-    // final, nunca el swap. La caché queda de respaldo: si la red falla o tarda más de
-    // ENTER_FRESH_WAIT_MAX_MS, se pinta para no dejar la pantalla en blanco.
-    private static final long ENTER_FRESH_WAIT_MAX_MS = 4_000L;
-    @Nullable
-    private List<PlaylistTrack> pendingEnterCachedFallback;
-    private String pendingEnterFallbackPlaylistId = "";
-    private final Runnable enterFreshFallbackRunnable = this::renderEnterCachedFallback;
-
     /** True si la revalidación silenciosa al entrar VA a disparar para esta playlist (mismo
      *  criterio y throttle que {@link #maybeRevalidateOnEnter}). */
     private boolean enterRevalidateDue(@NonNull String playlistId) {
@@ -950,23 +946,6 @@ public class PlaylistDetailFragment extends Fragment
         }
         return !(TextUtils.equals(playlistId, lastEnterRevalidatePlaylistId)
                 && System.currentTimeMillis() - lastEnterRevalidateAtMs < ENTER_REVALIDATE_THROTTLE_MS);
-    }
-
-    /** Respaldo del refresh invisible: la versión fresca no llegó a tiempo — pinta la caché. */
-    private void renderEnterCachedFallback() {
-        List<PlaylistTrack> fallback = pendingEnterCachedFallback;
-        String pid = pendingEnterFallbackPlaylistId;
-        pendingEnterCachedFallback = null;
-        pendingEnterFallbackPlaylistId = "";
-        if (fallback == null || fallback.isEmpty() || !isAdded()) return;
-        if (!TextUtils.equals(currentPlaylistId, pid)) return;
-        renderTracks(fallback, pid, true);
-    }
-
-    private void clearEnterCachedFallback() {
-        pendingEnterCachedFallback = null;
-        pendingEnterFallbackPlaylistId = "";
-        mainHandler.removeCallbacks(enterFreshFallbackRunnable);
     }
 
     /**
@@ -987,8 +966,10 @@ public class PlaylistDetailFragment extends Fragment
         }
         lastEnterRevalidatePlaylistId = playlistId;
         lastEnterRevalidateAtMs = System.currentTimeMillis();
+        final View ownerView = getView();
+        final long requestGeneration = trackLoadGeneration;
         mainHandler.postDelayed(() -> {
-            if (!isAdded() || !TextUtils.equals(currentPlaylistId, playlistId)) return;
+            if (!isActiveTrackLoad(ownerView, requestGeneration, playlistId) || isHidden()) return;
             if (playlistTracksLoadMoreInFlight) return;
             String token = TextUtils.isEmpty(accessToken) ? resolveYoutubeAccessToken("") : accessToken;
             playlistTracksRequestedLimit = PLAYLIST_TRACKS_INITIAL_FETCH_LIMIT;
@@ -1210,7 +1191,8 @@ public class PlaylistDetailFragment extends Fragment
         }
 
         if (currentTracks.isEmpty()) {
-            pendingOfflineToggle = true;
+            pendingOfflineToggle = !pendingOfflineToggle;
+            notifyHeaderStateChanged();
             return;
         }
 
@@ -1236,6 +1218,9 @@ public class PlaylistDetailFragment extends Fragment
         }
 
         setCurrentPlaylistOfflineAutoEnabled(false);
+        offlinePreparationGeneration++;
+        offlineDownloadPreparing = false;
+        pendingOfflineToggle = false;
         WorkManager.getInstance(requireContext().getApplicationContext())
                 .cancelAllWorkByTag(currentPlaylistOfflineTag());
 
@@ -1844,7 +1829,7 @@ public class PlaylistDetailFragment extends Fragment
             boolean forceRefresh,
             boolean loadMore
     ) {
-        if (playlistId.isEmpty()) {
+        if (!isAdded() || getView() == null || playlistId.isEmpty()) {
             playlistTracksLoadMoreInFlight = false;
             playlistTracksCanLoadMore = false;
             return;
@@ -1856,34 +1841,36 @@ public class PlaylistDetailFragment extends Fragment
         String effectiveAccessToken = resolveYoutubeAccessToken(accessToken);
         int requestedLimit = resolveTrackFetchLimit(forceRefresh, loadMore);
 
+        final View ownerView = getView();
+        final long requestGeneration = ++trackLoadGeneration;
         boolean localFilesContext = isLocalFilesContext(playlistId);
         boolean favoritesContext = isFavoritesPlaylistContext(playlistId);
         boolean customContext = isCustomPlaylistContext(playlistId);
 
         // Local files — load from device MediaStore cache. A LOCAL_ALBUM:: id shows just that album.
         if (localFilesContext) {
-            playlistTracksLoadMoreInFlight = false;
             playlistTracksCanLoadMore = false;
-            if (!isAdded()) return;
-            boolean albumContext = LocalFilesStore.isLocalAlbumId(playlistId);
-            if (LocalFilesStore.getCachedFiles(requireContext()).isEmpty()
-                    || LocalFilesStore.isCacheStale(requireContext())) {
-                LocalFilesStore.cacheFiles(requireContext(), LocalFilesStore.scanLocalFiles(requireContext()));
-            }
-            List<LocalFilesStore.LocalTrack> localTracks = albumContext
-                    ? LocalFilesStore.getTracksForAlbum(requireContext(), LocalFilesStore.albumNameFromId(playlistId))
-                    : LocalFilesStore.getCachedFiles(requireContext());
-            List<PlaylistTrack> mapped = new ArrayList<>(localTracks.size());
-            for (LocalFilesStore.LocalTrack t : localTracks) {
-                mapped.add(new PlaylistTrack(
-                        t.getVideoId(),
-                        t.getTitle(),
-                        t.getArtist(),
-                        t.getDuration(),
-                        t.getAlbumArtUri()
-                ));
-            }
-            renderTracks(mapped, playlistId, false);
+            final Context localContext = requireContext().getApplicationContext();
+            trackStateLookupExecutor.execute(() -> {
+                boolean albumContext = LocalFilesStore.isLocalAlbumId(playlistId);
+                if (LocalFilesStore.getCachedFiles(localContext).isEmpty()
+                        || LocalFilesStore.isCacheStale(localContext)) {
+                    LocalFilesStore.cacheFiles(localContext, LocalFilesStore.scanLocalFiles(localContext));
+                }
+                List<LocalFilesStore.LocalTrack> localTracks = albumContext
+                        ? LocalFilesStore.getTracksForAlbum(localContext, LocalFilesStore.albumNameFromId(playlistId))
+                        : LocalFilesStore.getCachedFiles(localContext);
+                List<PlaylistTrack> mapped = new ArrayList<>(localTracks.size());
+                for (LocalFilesStore.LocalTrack t : localTracks) {
+                    mapped.add(new PlaylistTrack(t.getVideoId(), t.getTitle(), t.getArtist(),
+                            t.getDuration(), t.getAlbumArtUri()));
+                }
+                mainHandler.post(() -> {
+                    if (!isActiveTrackLoad(ownerView, requestGeneration, playlistId)) return;
+                    playlistTracksLoadMoreInFlight = false;
+                    renderTracks(mapped, playlistId, false);
+                });
+            });
             return;
         }
 
@@ -1897,7 +1884,6 @@ public class PlaylistDetailFragment extends Fragment
         final boolean bgCustom = customContext;
         final boolean bgForceRefresh = forceRefresh;
         final boolean bgLoadMore = loadMore;
-        final Handler mainHandler = new Handler(Looper.getMainLooper());
 
         trackStateLookupExecutor.execute(() -> {
             final List<PlaylistTrack> bgCachedTracks;
@@ -1906,14 +1892,14 @@ public class PlaylistDetailFragment extends Fragment
                         loadCachedTracksInternal(bgCtx, bgPlaylistId, true));
             } catch (Exception e) {
                 mainHandler.post(() -> {
-                    if (!isAdded()) return;
+                    if (!isAdded() || getView() != ownerView || requestGeneration != trackLoadGeneration) return;
                     continueBindAfterCacheLoad(bgPlaylistId, bgAccessToken, bgRequestedLimit,
                             bgFav, bgCustom, bgForceRefresh, bgLoadMore, new ArrayList<>());
                 });
                 return;
             }
             mainHandler.post(() -> {
-                if (!isAdded()) return;
+                if (!isAdded() || getView() != ownerView || requestGeneration != trackLoadGeneration) return;
                 continueBindAfterCacheLoad(bgPlaylistId, bgAccessToken, bgRequestedLimit,
                         bgFav, bgCustom, bgForceRefresh, bgLoadMore, bgCachedTracks);
             });
@@ -1930,6 +1916,8 @@ public class PlaylistDetailFragment extends Fragment
             boolean loadMore,
             @NonNull List<PlaylistTrack> cachedTracks
     ) {
+        final View ownerView = getView();
+        final long requestGeneration = trackLoadGeneration;
         if (favoritesContext || customContext) {
             // Clean HTML entities from stored titles/artists
             List<PlaylistTrack> cleaned = new ArrayList<>(cachedTracks.size());
@@ -1964,7 +1952,7 @@ public class PlaylistDetailFragment extends Fragment
                     youTubeMusicService.fetchVideoDurations(effectiveAccessToken, missingDurationIds, new YouTubeMusicService.VideoDurationCallback() {
                         @Override
                         public void onSuccess(@NonNull Map<String, String> durations) {
-                            if (!isAdded()) return;
+                            if (!isActiveTrackLoad(ownerView, requestGeneration, playlistId)) return;
                             if (!durations.isEmpty()) {
                                 List<PlaylistTrack> enriched = new ArrayList<>(tracksToEnrich.size());
                                 boolean changed = false;
@@ -2002,44 +1990,17 @@ public class PlaylistDetailFragment extends Fragment
         boolean canRequestRemote = !playlistId.isEmpty() && !effectiveAccessToken.isEmpty();
         boolean hasCompleteCache = hasCompleteTracksCache(playlistId, cachedTracks);
 
-        boolean willRevalidateOnEnter = false;
-        if (!cachedTracks.isEmpty()) {
-            if (!forceRefresh && !loadMore) {
-                boolean canFetchRemote = (canRequestRemote
-                        || isAlbumBrowseId(playlistId)
-                        || isAutoGeneratedPlaylistId(playlistId)
-                        || isRadioOrMixPlaylistId(playlistId))
-                        && hasValidatedInternet(requireContext());
-
-                if (canFetchRemote && enterRevalidateDue(playlistId)) {
-                    // Refresh invisible al entrar: cuando la playlist necesita revalidarse
-                    // (mixes dinámicos, recaps o playlists de YT que se actualizan), NO pintamos
-                    // la caché obsoleta para evitar que aparezcan unos milisegundos las canciones
-                    // anteriores y luego parpadeen al reemplazarse por las actuales.
-                    // Mantenemos el loading overlay/skeleton mientras llega la versión fresca.
-                    // La caché queda como respaldo si la red falla o tarda más de ENTER_FRESH_WAIT_MAX_MS.
-                    pendingEnterCachedFallback = cachedTracks;
-                    pendingEnterFallbackPlaylistId = playlistId;
-                    lastEnterRevalidatePlaylistId = playlistId;
-                    lastEnterRevalidateAtMs = System.currentTimeMillis();
-                    mainHandler.removeCallbacks(enterFreshFallbackRunnable);
-                    mainHandler.postDelayed(enterFreshFallbackRunnable, ENTER_FRESH_WAIT_MAX_MS);
-
-                    // Procedemos directamente al fetch de red
-                    willRevalidateOnEnter = true;
-                } else {
-                    playlistTracksLoadMoreInFlight = false;
-                    playlistTracksCanLoadMore = !hasCompleteCache;
-                    // Render cached tracks immediately for instant, lag-free UI (offline o recién revalidada)
-                    renderTracks(cachedTracks, playlistId, true);
-                    return;
-                }
-            } else if (!forceRefresh) {
-                renderTracks(cachedTracks, playlistId, true);
+        if (!cachedTracks.isEmpty() && !forceRefresh) {
+            playlistTracksLoadMoreInFlight = false;
+            playlistTracksCanLoadMore = !hasCompleteCache;
+            renderTracks(cachedTracks, playlistId, true);
+            if (!loadMore) {
+                maybeRevalidateOnEnter(playlistId, effectiveAccessToken);
+                return;
             }
+            playlistTracksLoadMoreInFlight = true;
         }
-
-        final boolean effectiveForceRefresh = forceRefresh || willRevalidateOnEnter;
+        final boolean effectiveForceRefresh = forceRefresh;
 
         // Albums (artist-page "MPRE…" browse ids) resolve through InnerTube with the web cookie, not
         // the OAuth playlist endpoint — so they load even when no OAuth token is available. Handle
@@ -2060,7 +2021,7 @@ public class PlaylistDetailFragment extends Fragment
             youTubeMusicService.fetchAlbumTracks(albumCookie.trim(), playlistId, new YouTubeMusicService.MixTracksCallback() {
                 @Override
                 public void onSuccess(@NonNull List<YouTubeMusicService.TrackResult> tracks) {
-                    if (!isAdded()) return;
+                    if (!isActiveTrackLoad(ownerView, requestGeneration, playlistId)) return;
                     playlistTracksLoadMoreInFlight = false;
                     playlistTracksCanLoadMore = false;
                     List<PlaylistTrack> mapped = new ArrayList<>();
@@ -2101,7 +2062,7 @@ public class PlaylistDetailFragment extends Fragment
 
                 @Override
                 public void onError(@NonNull String error) {
-                    if (!isAdded()) return;
+                    if (!isActiveTrackLoad(ownerView, requestGeneration, playlistId)) return;
                     playlistTracksLoadMoreInFlight = false;
                     if (!cachedTracks.isEmpty()) {
                         renderTracks(cachedTracks, playlistId, true);
@@ -2138,7 +2099,7 @@ public class PlaylistDetailFragment extends Fragment
             youTubeMusicService.fetchMixTracks(mixCookie, playlistId, currentPlaylistParams, new YouTubeMusicService.MixTracksCallback() {
                 @Override
                 public void onSuccess(@NonNull List<YouTubeMusicService.TrackResult> tracks) {
-                    if (!isAdded()) return;
+                    if (!isActiveTrackLoad(ownerView, requestGeneration, playlistId)) return;
                     playlistTracksLoadMoreInFlight = false;
                     playlistTracksCanLoadMore = false;
                     List<PlaylistTrack> mapped = new ArrayList<>();
@@ -2193,7 +2154,7 @@ public class PlaylistDetailFragment extends Fragment
 
                 @Override
                 public void onError(@NonNull String error) {
-                    if (!isAdded()) return;
+                    if (!isActiveTrackLoad(ownerView, requestGeneration, playlistId)) return;
                     playlistTracksLoadMoreInFlight = false;
                     // /next falló: intenta el endpoint BROWSE con el token del card (mixes personales).
                     loadMixViaBrowseFallback(playlistId, mixCookie, effectiveAccessToken, effectiveForceRefresh,
@@ -2225,7 +2186,7 @@ public class PlaylistDetailFragment extends Fragment
                     new YouTubeMusicService.PlaylistTracksCallback() {
                 @Override
                 public void onSuccess(@NonNull List<YouTubeMusicService.PlaylistTrackResult> browseTracks) {
-                    if (!isAdded()) return;
+                    if (!isActiveTrackLoad(ownerView, requestGeneration, playlistId)) return;
                     playlistTracksLoadMoreInFlight = false;
                     playlistTracksCanLoadMore = false;
                     if (browseTracks.isEmpty()) {
@@ -2248,7 +2209,7 @@ public class PlaylistDetailFragment extends Fragment
 
                 @Override
                 public void onError(@NonNull String error) {
-                    if (!isAdded()) return;
+                    if (!isActiveTrackLoad(ownerView, requestGeneration, playlistId)) return;
                     playlistTracksLoadMoreInFlight = false;
                     if (!cachedTracks.isEmpty()) {
                         renderTracks(cachedTracks, playlistId, true);
@@ -2291,7 +2252,7 @@ public class PlaylistDetailFragment extends Fragment
         youTubeMusicService.fetchPlaylistTracks(effectiveAccessToken, playlistId, requestedLimit, new YouTubeMusicService.PlaylistTracksCallback() {
             @Override
             public void onSuccess(@NonNull List<YouTubeMusicService.PlaylistTrackResult> tracks) {
-                if (!isAdded()) {
+                if (!isActiveTrackLoad(ownerView, requestGeneration, playlistId)) {
                     return;
                 }
 
@@ -2317,7 +2278,7 @@ public class PlaylistDetailFragment extends Fragment
 
             @Override
             public void onError(@NonNull String error) {
-                if (!isAdded()) {
+                if (!isActiveTrackLoad(ownerView, requestGeneration, playlistId)) {
                     return;
                 }
 
@@ -2356,9 +2317,15 @@ public class PlaylistDetailFragment extends Fragment
         });
     }
 
+    private boolean isActiveTrackLoad(View ownerView, long generation, String playlistId) {
+        return isAdded() && ownerView != null && getView() == ownerView
+                && generation == trackLoadGeneration && TextUtils.equals(currentPlaylistId, playlistId);
+    }
+
     private int resolveTrackFetchLimit(boolean forceRefresh, boolean loadMore) {
         if (forceRefresh) {
-            playlistTracksRequestedLimit = PLAYLIST_TRACKS_INITIAL_FETCH_LIMIT;
+            playlistTracksRequestedLimit = Math.min(PLAYLIST_TRACKS_FETCH_MAX_LIMIT,
+                    Math.max(PLAYLIST_TRACKS_INITIAL_FETCH_LIMIT, currentTracks.size()));
             playlistTracksCanLoadMore = false;
             return playlistTracksRequestedLimit;
         }
@@ -2506,7 +2473,7 @@ public class PlaylistDetailFragment extends Fragment
     }
 
     private void startOfflinePlaylistDownload(boolean userInitiated) {
-        if (!isAdded()) {
+        if (!isAdded() || offlineDownloadPreparing || pendingOfflineEnqueues > 0) {
             return;
         }
         // A fresh user-initiated download resets the auto-retry budget for this playlist.
@@ -2514,9 +2481,6 @@ public class PlaylistDetailFragment extends Fragment
             offlineAutoRetryCountByPlaylist.remove(currentPlaylistId);
         }
         if (currentTracks.isEmpty()) {
-            if (userInitiated) {
-
-            }
             return;
         }
         recordDownloadedPlaylistMeta();
@@ -2529,6 +2493,8 @@ public class PlaylistDetailFragment extends Fragment
         final String offlineTag = currentPlaylistOfflineTag();
 
         // Optimistic UI: show queued state immediately
+        offlineDownloadPreparing = true;
+        final long preparationGeneration = ++offlinePreparationGeneration;
         offlineDownloadQueued = true;
         notifyHeaderStateChanged();
 
@@ -2564,8 +2530,11 @@ public class PlaylistDetailFragment extends Fragment
             }
             if (ids.isEmpty()) {
                 mainHandler.post(() -> {
+                    if (preparationGeneration != offlinePreparationGeneration) return;
+                    offlineDownloadPreparing = false;
                     offlineDownloadQueued = false;
                     notifyHeaderStateChanged();
+                    maybeUpdateOfflineReadyState();
                 });
                 return;
             }
@@ -2573,7 +2542,8 @@ public class PlaylistDetailFragment extends Fragment
             final int finalSkipped = skippedAlreadyOffline;
             final int finalTotal = totalWithVideoId;
             mainHandler.post(() -> {
-                if (!isAdded()) return;
+                if (!isAdded() || preparationGeneration != offlinePreparationGeneration) return;
+                offlineDownloadPreparing = false;
 
                 String uniqueName = OFFLINE_DOWNLOAD_QUEUE_UNIQUE_NAME;
                 OfflineDownloadScheduler.Request request = new OfflineDownloadScheduler.Request(
@@ -2801,7 +2771,7 @@ public class PlaylistDetailFragment extends Fragment
         offlineObserverNotifyTerminalToasts = notifyTerminalToasts;
 
         offlineDownloadObserver = workInfos -> {
-            if (!isAdded()) {
+            if (!isAdded() || offlineDownloadPreparing || pendingOfflineEnqueues > 0) {
                 return;
             }
 
@@ -3112,12 +3082,18 @@ public class PlaylistDetailFragment extends Fragment
             @NonNull String uniqueName,
             @NonNull OfflineDownloadScheduler.Request request
     ) {
+        pendingOfflineEnqueues++;
         OfflineDownloadScheduler.enqueue(requireContext(), request, uniqueName, enqueued -> {
+            pendingOfflineEnqueues = Math.max(0, pendingOfflineEnqueues - 1);
             if (!isAdded() || getView() == null) return;
             if (!enqueued) {
                 offlineDownloadQueued = false;
                 setOfflineDownloadVisualState(false, "");
                 notifyHeaderStateChanged();
+            }
+            if (pendingOfflineEnqueues == 0) {
+                stopObservingOfflineDownload();
+                observeOfflineDownload(uniqueName);
             }
         });
     }
@@ -3527,11 +3503,8 @@ public class PlaylistDetailFragment extends Fragment
             @NonNull String playlistId,
             boolean fromCache
     ) {
-        // Llegó un render real para esta playlist: el respaldo del refresh invisible ya no hace
-        // falta (si este render ES la versión fresca, pintar la caché después lo pisaría).
-        if (TextUtils.equals(playlistId, pendingEnterFallbackPlaylistId)) {
-            clearEnterCachedFallback();
-        }
+        final View ownerView = getView();
+        final long renderGeneration = ++trackRenderGeneration;
         String selectedVideoId = getCurrentTrackVideoId();
         // Gate: when the local-music setting is OFF, local tracks ("local_*") that the user
         // mixed into OTHER playlists must not surface in the display list, queue, now-playing,
@@ -3571,8 +3544,8 @@ public class PlaylistDetailFragment extends Fragment
                         filtered.add(t);
                     }
                 }
-                new Handler(Looper.getMainLooper()).post(() -> {
-                    if (!isAdded()) return;
+                mainHandler.post(() -> {
+                    if (!isAdded() || getView() != ownerView || renderGeneration != trackRenderGeneration) return;
                     currentTracks.clear();
                     currentTracks.addAll(filtered);
                     finalizeRenderTracks(playlistId, fromCache, selectedVideoId);
@@ -3595,6 +3568,7 @@ public class PlaylistDetailFragment extends Fragment
             pendingOfflineToggle = false;
             onOfflineTogglePressed();
         }
+        if (currentTracks.isEmpty()) pendingOfflineToggle = false;
 
         boolean isYouTubePlaylist = !isFavoritesPlaylistContext(playlistId)
                 && !isCustomPlaylistContext(playlistId)
@@ -4078,9 +4052,8 @@ public class PlaylistDetailFragment extends Fragment
     }
 
     private void renderFallbackOrEmpty(@NonNull String playlistId) {
-        if (pendingEnterCachedFallback != null && !pendingEnterCachedFallback.isEmpty()
-                && TextUtils.equals(playlistId, pendingEnterFallbackPlaylistId)) {
-            renderEnterCachedFallback();
+        if (TextUtils.equals(currentPlaylistId, playlistId) && !currentTracks.isEmpty()) {
+            playlistTracksLoadMoreInFlight = false;
             return;
         }
         renderTracks(sanitizeTracksForPlaylist(playlistId, new ArrayList<>()), playlistId, false);
@@ -6288,20 +6261,26 @@ public class PlaylistDetailFragment extends Fragment
                 holder.btnSharePlaylist.setVisibility(View.GONE);
                 return;
             }
-            boolean offlineAutoEnabled = isCurrentPlaylistOfflineAutoEnabled();
             boolean completeOffline = isPersistedOfflineCompleteStateForCurrentPlaylist();
-            boolean isDownloading = offlineDownloadRunning || offlineDownloadQueued;
+            boolean isDownloading = pendingOfflineToggle || offlineDownloadPreparing
+                    || pendingOfflineEnqueues > 0 || offlineDownloadRunning || offlineDownloadQueued;
             holder.btnEditPlaylist.setVisibility(View.VISIBLE);
             boolean saveAction = canSaveCurrentPlaylist();
-            holder.btnEditPlaylist.setImageResource(saveAction ? R.drawable.ic_plus_24 : R.drawable.ic_edit_24);
-            holder.btnEditPlaylist.setContentDescription(saveAction ? "Guardar playlist en la biblioteca" : "Cambiar nombre de playlist");
+            boolean savedAction = isSaveablePlaylistType() && !saveAction;
+            holder.btnEditPlaylist.setImageResource(saveAction ? R.drawable.ic_plus_24
+                    : savedAction ? R.drawable.ic_check_small : R.drawable.ic_edit_24);
+            holder.btnEditPlaylist.setBackgroundResource(savedAction ? R.drawable.bg_playlist_action_white : R.drawable.bg_playlist_action_dark);
+            holder.btnEditPlaylist.setColorFilter(savedAction ? Color.BLACK : Color.WHITE);
+            holder.btnEditPlaylist.setContentDescription(saveAction ? "Guardar playlist en la biblioteca"
+                    : savedAction ? "Playlist guardada en la biblioteca" : "Cambiar nombre de playlist");
             holder.btnDownload.setVisibility(View.VISIBLE);
-            holder.btnDownload.setImageResource(completeOffline ? R.drawable.ic_check_small : R.drawable.ic_download_bold);
-            holder.btnDownload.setBackgroundResource(R.drawable.bg_playlist_action_dark);
-            holder.btnDownload.setColorFilter(completeOffline || isDownloading || offlineAutoEnabled
-                    ? ContextCompat.getColor(requireContext(), R.color.stitch_blue) : Color.WHITE);
-            holder.btnDownload.setContentDescription(completeOffline ? "Playlist descargada"
-                    : isDownloading ? "Descargando playlist" : "Descargar playlist");
+            boolean activeDownload = isDownloading || completeOffline;
+            holder.btnDownload.setImageResource(isDownloading ? R.drawable.ic_download_pending
+                    : completeOffline ? R.drawable.ic_check_small : R.drawable.ic_download_bold);
+            holder.btnDownload.setBackgroundResource(activeDownload ? R.drawable.bg_playlist_action_white : R.drawable.bg_playlist_action_dark);
+            holder.btnDownload.setColorFilter(activeDownload ? Color.BLACK : Color.WHITE);
+            holder.btnDownload.setContentDescription(isDownloading ? "Descarga en curso o pendiente. Toca para cancelar"
+                    : completeOffline ? "Playlist descargada" : "Descargar playlist");
         }
 
         @Override
@@ -6358,7 +6337,7 @@ public class PlaylistDetailFragment extends Fragment
                 });
                 btnEditPlaylist.setOnClickListener(v -> {
                     if (canSaveCurrentPlaylist()) saveCurrentPlaylistToLibrary();
-                    else showRenamePlaylistDialog();
+                    else if (!isSaveablePlaylistType()) showRenamePlaylistDialog();
                 });
                 btnSharePlaylist.setOnClickListener(v -> shareCurrentPlaylist());
                 btnShufflePlay.setOnClickListener(v -> {
@@ -6426,12 +6405,17 @@ public class PlaylistDetailFragment extends Fragment
         }
     }
 
-    private boolean canSaveCurrentPlaylist() {
+    private boolean isSaveablePlaylistType() {
         if (!isAdded() || isLocalFilesContext(currentPlaylistId)
                 || isCustomPlaylistContext(currentPlaylistId)
                 || FavoritesPlaylistStore.PLAYLIST_ID.equals(currentPlaylistId)
                 || YouTubeMusicService.SPECIAL_LIKED_VIDEOS_ID.equals(currentPlaylistId)) return false;
         if (!isAutoGeneratedPlaylistId(currentPlaylistId) && !forceSingleCoverArt) return false;
+        return true;
+    }
+
+    private boolean canSaveCurrentPlaylist() {
+        if (!isSaveablePlaylistType()) return false;
         if (SavedPlaylistsStore.contains(requireContext(), currentPlaylistId)) return false;
         for (YouTubeMusicService.TrackResult item : MusicPlayerFragment.getYouTubeLibraryPlaylists()) {
             if (TextUtils.equals(currentPlaylistId, PlaylistDetailLauncher.normalizeOpenId(item.contentId))) return false;

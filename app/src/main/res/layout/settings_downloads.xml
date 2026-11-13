@@ -59,6 +59,66 @@
             android:layout_height="1dp"
             android:background="#1AFFFFFF" />
 
+        <LinearLayout
+            android:id="@+id/rowCustomDownloadLocation"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:paddingVertical="14dp">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Mostrar descargas en el dispositivo"
+                android:textColor="@color/text_primary"
+                android:textSize="16sp" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/swCustomDownloadLocation"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/tvDownloadLocation"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Music/Sleppify"
+            android:textColor="@color/text_secondary"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/btnChooseDownloadFolder"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:layout_marginBottom="12dp"
+            android:paddingHorizontal="20dp"
+            android:minHeight="44dp"
+            android:gravity="center_vertical"
+            android:background="@drawable/bg_download_folder_button"
+            android:clickable="true"
+            android:focusable="true"
+            android:text="Elegir carpeta"
+            android:textColor="@color/stitch_blue"
+            android:textSize="15sp" />
+
+        <TextView
+            android:id="@+id/tvDownloadLocationStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingBottom="14dp"
+            android:visibility="gone"
+            android:textColor="@color/text_secondary"
+            android:textSize="13sp" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="#1AFFFFFF" />
+
         <!-- Almacenamiento en tarjeta SD -->
         <LinearLayout
             android:id="@+id/sectionSdStorage"
@@ -222,66 +282,6 @@
                 android:minWidth="0dp"
                 android:minHeight="0dp" />
         </LinearLayout>
-
-        <View
-            android:layout_width="match_parent"
-            android:layout_height="1dp"
-            android:background="#1AFFFFFF" />
-
-        <LinearLayout
-            android:id="@+id/rowCustomDownloadLocation"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="horizontal"
-            android:gravity="center_vertical"
-            android:paddingVertical="14dp">
-
-            <TextView
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:text="Mostrar Descargas en Almacenamiento"
-                android:textColor="@color/text_primary"
-                android:textSize="16sp" />
-
-            <com.google.android.material.materialswitch.MaterialSwitch
-                android:id="@+id/swCustomDownloadLocation"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content" />
-        </LinearLayout>
-
-        <TextView
-            android:id="@+id/tvDownloadLocation"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="Music/Sleppify"
-            android:textColor="@color/text_secondary"
-            android:textSize="13sp" />
-
-        <TextView
-            android:id="@+id/btnChooseDownloadFolder"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="10dp"
-            android:layout_marginBottom="12dp"
-            android:paddingHorizontal="20dp"
-            android:minHeight="44dp"
-            android:gravity="center_vertical"
-            android:background="@drawable/bg_download_folder_button"
-            android:clickable="true"
-            android:focusable="true"
-            android:text="Elegir carpeta"
-            android:textColor="@color/stitch_blue"
-            android:textSize="15sp" />
-
-        <TextView
-            android:id="@+id/tvDownloadLocationStatus"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:paddingBottom="14dp"
-            android:visibility="gone"
-            android:textColor="@color/text_secondary"
-            android:textSize="13sp" />
 
         <View
             android:layout_width="match_parent"

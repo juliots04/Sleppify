@@ -16,7 +16,7 @@ final class PlayerQueueSheet {
     private final CoordinatorLayout host;
     private final View content;
     private final View miniPlayer;
-    private final View statusBarScrim;
+    private final View playerScrim;
     private final WindowInsetsControllerCompat systemBars;
     private boolean originalLightStatusBar;
     private boolean appliedLightStatusBar;
@@ -30,6 +30,14 @@ final class PlayerQueueSheet {
         this.content = content;
         miniPlayer = content.findViewById(R.id.llSheetMiniPlayer);
         systemBars = new WindowInsetsControllerCompat(window, window.getDecorView());
+        playerScrim = new View(parent.getContext());
+        playerScrim.setBackgroundColor(android.graphics.Color.BLACK);
+        playerScrim.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        playerScrim.setVisibility(View.GONE);
+        ConstraintLayout.LayoutParams playerScrimParams = new ConstraintLayout.LayoutParams(0, 0);
+        playerScrimParams.topToTop = playerScrimParams.bottomToBottom = ConstraintLayout.LayoutParams.PARENT_ID;
+        playerScrimParams.startToStart = playerScrimParams.endToEnd = ConstraintLayout.LayoutParams.PARENT_ID;
+        parent.addView(playerScrim, playerScrimParams);
         host = new CoordinatorLayout(parent.getContext());
         ConstraintLayout.LayoutParams hostParams = new ConstraintLayout.LayoutParams(0, 0);
         hostParams.topToTop = ConstraintLayout.LayoutParams.PARENT_ID;
@@ -38,15 +46,6 @@ final class PlayerQueueSheet {
         hostParams.endToEnd = ConstraintLayout.LayoutParams.PARENT_ID;
         host.setVisibility(View.GONE);
         parent.addView(host, hostParams);
-        statusBarScrim = new View(parent.getContext());
-        statusBarScrim.setBackgroundColor(android.graphics.Color.BLACK);
-        statusBarScrim.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
-        statusBarScrim.setVisibility(View.GONE);
-        ConstraintLayout.LayoutParams scrimParams = new ConstraintLayout.LayoutParams(0, 0);
-        scrimParams.topToTop = ConstraintLayout.LayoutParams.PARENT_ID;
-        scrimParams.startToStart = ConstraintLayout.LayoutParams.PARENT_ID;
-        scrimParams.endToEnd = ConstraintLayout.LayoutParams.PARENT_ID;
-        parent.addView(statusBarScrim, scrimParams);
         ViewCompat.setOnApplyWindowInsetsListener(host, (view, insets) -> {
             Insets bars = applyInsets(insets);
             // The host already avoids these bars. Passing them to the behavior again pushes
@@ -70,11 +69,6 @@ final class PlayerQueueSheet {
             layout.setMargins(bars.left, bars.top, bars.right, bars.bottom);
             host.setLayoutParams(layout);
         }
-        ViewGroup.LayoutParams scrim = statusBarScrim.getLayoutParams();
-        if (scrim.height != bars.top) {
-            scrim.height = bars.top;
-            statusBarScrim.setLayoutParams(scrim);
-        }
         return bars;
     }
 
@@ -85,8 +79,9 @@ final class PlayerQueueSheet {
 
     private void setPresentationProgress(float progress) {
         if (miniPlayer != null) miniPlayer.setAlpha(progress);
-        statusBarScrim.setAlpha(progress);
-        if (showing) setLightStatusBar(progress < 0.25f && originalLightStatusBar);
+        float backgroundAlpha = SheetPresentation.backgroundAlpha(progress);
+        playerScrim.setAlpha(backgroundAlpha);
+        if (showing) setLightStatusBar(backgroundAlpha < 0.45f && originalLightStatusBar);
     }
 
     private void setLightStatusBar(boolean light) {
@@ -128,7 +123,7 @@ final class PlayerQueueSheet {
         content.setTranslationY(height());
         androidx.core.view.ViewCompat.offsetTopAndBottom(content, -content.getTop());
         setPresentationProgress(0f);
-        statusBarScrim.setVisibility(View.VISIBLE);
+        playerScrim.setVisibility(View.VISIBLE);
         host.setVisibility(View.VISIBLE);
         return token;
     }
@@ -200,7 +195,7 @@ final class PlayerQueueSheet {
         showing = false;
         content.animate().cancel();
         host.setVisibility(View.GONE);
-        statusBarScrim.setVisibility(View.GONE);
+        playerScrim.setVisibility(View.GONE);
         setPresentationProgress(0f);
         content.setTranslationY(0f);
         detachBehavior();
